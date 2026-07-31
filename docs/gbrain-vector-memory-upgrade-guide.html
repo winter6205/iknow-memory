@@ -1,0 +1,2558 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="GBrain 向量记忆库图原生 GraphRAG 升级方案开发指南"
+    />
+    <title>GBrain 向量记忆库 · 图原生升级开发指南</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #f4f5f1;
+        --paper-2: #eaece6;
+        --surface: #fff;
+        --surface-raised: #fbfcf9;
+        --ink: #191c20;
+        --ink-soft: #4c5158;
+        --ink-faint: #777d85;
+        --line: #dcded6;
+        --line-strong: #c4c7bc;
+        --accent: #0e7a6d;
+        --accent-soft: rgba(14, 122, 109, 0.1);
+        --amber: #b45309;
+        --amber-soft: rgba(180, 83, 9, 0.1);
+        --indigo: #4f46e5;
+        --indigo-soft: rgba(79, 70, 229, 0.07);
+        --rose: #be123c;
+        --rose-soft: rgba(190, 18, 60, 0.07);
+        --violet: #7c3aed;
+        --violet-soft: rgba(124, 58, 237, 0.08);
+        --green: #087443;
+        --green-soft: rgba(8, 116, 67, 0.08);
+        --code-bg: #16181d;
+        --code-ink: #e6e8ea;
+        --code-comment: #8c929b;
+        --code-key: #f0a868;
+        --code-str: #9ecba4;
+        --code-num: #d3a6c8;
+        --grid-line: rgba(25, 28, 32, 0.045);
+        --shadow-sm: 0 1px 2px rgba(25, 28, 32, 0.06);
+        --shadow-md: 0 8px 26px rgba(25, 28, 32, 0.11);
+        --display:
+          "Segoe UI Variable Display", "PingFang SC", "Microsoft YaHei",
+          system-ui, sans-serif;
+        --sans:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+        --mono:
+          "Cascadia Code", "JetBrains Mono", "SFMono-Regular", Consolas,
+          monospace;
+        --rail-w: 286px;
+        --content-max: 980px;
+        --r: 8px;
+      }
+      [data-theme="dark"] {
+        color-scheme: dark;
+        --paper: #131519;
+        --paper-2: #1a1d22;
+        --surface: #1e2127;
+        --surface-raised: #23272e;
+        --ink: #e9ebee;
+        --ink-soft: #b2b7bf;
+        --ink-faint: #7f858f;
+        --line: #2c3038;
+        --line-strong: #414752;
+        --accent: #2fd0bb;
+        --accent-soft: rgba(47, 208, 187, 0.12);
+        --amber: #f5b04c;
+        --amber-soft: rgba(245, 176, 76, 0.12);
+        --indigo: #a5b0ff;
+        --indigo-soft: rgba(165, 176, 255, 0.09);
+        --rose: #fb7185;
+        --rose-soft: rgba(251, 113, 133, 0.09);
+        --violet: #c4b5fd;
+        --violet-soft: rgba(196, 181, 253, 0.1);
+        --green: #5bd99a;
+        --green-soft: rgba(91, 217, 154, 0.09);
+        --grid-line: rgba(233, 235, 238, 0.04);
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+        --shadow-md: 0 8px 28px rgba(0, 0, 0, 0.46);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html {
+        scroll-behavior: smooth;
+        scroll-padding-top: 24px;
+      }
+      body {
+        margin: 0;
+        color: var(--ink);
+        font: 16px/1.74 var(--sans);
+        background-color: var(--paper);
+        background-image:
+          radial-gradient(
+            1100px 520px at 88% -12%,
+            var(--accent-soft),
+            transparent 62%
+          ),
+          radial-gradient(
+            900px 500px at -12% 112%,
+            var(--amber-soft),
+            transparent 62%
+          ),
+          linear-gradient(var(--grid-line) 1px, transparent 1px),
+          linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+        background-size:
+          auto,
+          auto,
+          34px 34px,
+          34px 34px;
+        background-attachment: fixed;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+      ::selection {
+        background: var(--accent);
+        color: #f8fafc;
+      }
+      a {
+        color: var(--accent);
+        text-underline-offset: 3px;
+      }
+      a:hover {
+        color: var(--amber);
+      }
+      :focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 3px;
+        border-radius: 4px;
+      }
+      .sr-only {
+        position: absolute !important;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+      #progress {
+        position: fixed;
+        inset: 0 auto auto 0;
+        width: 100%;
+        height: 3px;
+        z-index: 1000;
+        transform-origin: left;
+        transform: scaleX(0);
+        background: linear-gradient(90deg, var(--accent), var(--amber));
+        animation: read-progress linear;
+        animation-timeline: scroll(root);
+      }
+      @keyframes read-progress {
+        to {
+          transform: scaleX(1);
+        }
+      }
+      .layout {
+        display: flex;
+        min-height: 100vh;
+      }
+      .main {
+        flex: 1;
+        min-width: 0;
+      }
+      .content {
+        max-width: var(--content-max);
+        margin: 0 auto;
+        padding: 54px 48px 120px;
+      }
+      .rail {
+        width: var(--rail-w);
+        flex: 0 0 var(--rail-w);
+        position: sticky;
+        top: 0;
+        align-self: flex-start;
+        height: 100vh;
+        overflow-y: auto;
+        padding: 26px 18px 48px;
+        background: var(--paper-2);
+        border-right: 1px solid var(--line);
+        scrollbar-width: thin;
+        z-index: 900;
+      }
+      .brand {
+        display: flex;
+        gap: 11px;
+        align-items: center;
+        color: var(--ink);
+        text-decoration: none;
+      }
+      .brand-mark {
+        display: grid;
+        place-items: center;
+        width: 38px;
+        height: 38px;
+        flex: 0 0 38px;
+        border-radius: var(--r);
+        background: var(--ink);
+        color: var(--paper);
+        font: 700 15px/1 var(--display);
+        transition:
+          transform 0.16s,
+          background 0.16s;
+      }
+      .brand:hover .brand-mark {
+        transform: rotate(-4deg);
+        background: var(--accent);
+        color: #fff;
+      }
+      .brand-name {
+        display: block;
+        font: 700 15px/1.25 var(--display);
+      }
+      .brand-sub {
+        display: block;
+        margin-top: 3px;
+        color: var(--ink-faint);
+        font: 700 9.5px/1 var(--mono);
+        letter-spacing: 0.14em;
+      }
+      .rail-tag {
+        margin: 22px 0 8px;
+        color: var(--ink-faint);
+        font: 700 10px/1 var(--mono);
+        letter-spacing: 0.17em;
+        text-transform: uppercase;
+      }
+      .nav a {
+        position: relative;
+        display: flex;
+        gap: 10px;
+        align-items: baseline;
+        margin: 1px 0;
+        padding: 7px 9px 7px 14px;
+        border-radius: 6px;
+        color: var(--ink-soft);
+        font-size: 13px;
+        line-height: 1.35;
+        text-decoration: none;
+        transition:
+          background 0.12s,
+          color 0.12s,
+          transform 0.12s;
+      }
+      .nav a::before {
+        content: "";
+        position: absolute;
+        left: 4px;
+        top: 50%;
+        width: 3px;
+        height: 0;
+        border-radius: 2px;
+        background: var(--accent);
+        transform: translateY(-50%);
+        transition: height 0.15s;
+      }
+      .nav a:hover,
+      .nav a.active {
+        color: var(--accent);
+        background: var(--accent-soft);
+        transform: translateX(2px);
+      }
+      .nav a:hover::before,
+      .nav a.active::before {
+        height: 55%;
+      }
+      .nav .no {
+        min-width: 20px;
+        color: var(--ink-faint);
+        font: 700 10px/1 var(--mono);
+      }
+      .rail-foot {
+        margin-top: 22px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+      .btn {
+        appearance: none;
+        border: 1px solid var(--line-strong);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--ink-soft);
+        font: 13px/1 var(--mono);
+        cursor: pointer;
+        transition:
+          transform 0.12s,
+          border-color 0.12s,
+          color 0.12s;
+      }
+      .btn:hover {
+        color: var(--accent);
+        border-color: var(--accent);
+        transform: translateY(-1px);
+      }
+      .btn.icon {
+        display: grid;
+        place-items: center;
+        width: 34px;
+        height: 34px;
+        padding: 0;
+      }
+      .menu-toggle {
+        display: none;
+      }
+      .rail-scrim {
+        display: none;
+      }
+      .eyebrow {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin: 0 0 14px;
+        color: var(--accent);
+        font: 700 11px/1 var(--mono);
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+      .eyebrow::after {
+        content: "";
+        width: 42px;
+        height: 1px;
+        background: currentColor;
+        opacity: 0.5;
+      }
+      h1,
+      h2,
+      h3,
+      h4 {
+        font-family: var(--display);
+        font-weight: 700;
+        line-height: 1.2;
+        color: var(--ink);
+      }
+      h1 {
+        max-width: 18ch;
+        margin: 0 0 18px;
+        font-size: clamp(2.35rem, 5vw, 4rem);
+        letter-spacing: -0.035em;
+      }
+      h2 {
+        position: relative;
+        margin: 66px 0 18px;
+        padding-top: 13px;
+        font-size: clamp(1.55rem, 2.7vw, 2rem);
+        letter-spacing: -0.018em;
+        border-top: 1px solid var(--line);
+      }
+      h2::before {
+        content: "";
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        margin-right: 12px;
+        background: var(--accent);
+        transform: translateY(-2px) rotate(45deg);
+      }
+      h3 {
+        margin: 38px 0 13px;
+        font-size: 1.25rem;
+        letter-spacing: -0.01em;
+      }
+      h4 {
+        margin: 22px 0 8px;
+        font-size: 1rem;
+      }
+      h2[id],
+      h3[id] {
+        scroll-margin-top: 28px;
+      }
+      p {
+        margin: 0 0 16px;
+      }
+      .lede {
+        max-width: 68ch;
+        margin-bottom: 22px;
+        color: var(--ink-soft);
+        font-size: 18px;
+        line-height: 1.66;
+      }
+      strong {
+        font-weight: 680;
+        color: var(--ink);
+      }
+      .art-meta {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1px;
+        margin: 25px 0 24px;
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        overflow: hidden;
+        background: var(--line);
+        box-shadow: var(--shadow-sm);
+      }
+      .meta-item {
+        padding: 14px 16px;
+        background: var(--surface);
+      }
+      .meta-k {
+        display: block;
+        margin-bottom: 5px;
+        color: var(--accent);
+        font: 700 9.5px/1 var(--mono);
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+      .meta-v {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 13px;
+        line-height: 1.55;
+      }
+      .meta-v code {
+        font-size: 11px;
+      }
+      .stage-banner {
+        display: flex;
+        align-items: stretch;
+        margin: 22px 0 28px;
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        overflow: hidden;
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+      }
+      .sb-step {
+        flex: 1;
+        min-width: 0;
+        padding: 9px 4px;
+        text-align: center;
+        border-right: 1px solid var(--line);
+        color: var(--ink-faint);
+        font: 9px/1.3 var(--mono);
+        text-decoration: none;
+      }
+      .sb-step:last-child {
+        border: 0;
+      }
+      .sb-step:hover {
+        background: var(--paper-2);
+        color: var(--ink);
+      }
+      .sb-step.here {
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-weight: 700;
+      }
+      .sb-no {
+        display: block;
+        font-size: 11px;
+        font-weight: 700;
+      }
+      .sb-label {
+        display: block;
+        margin-top: 2px;
+      }
+      .tablewrap {
+        overflow-x: auto;
+        margin: 20px 0 25px;
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13.5px;
+      }
+      th,
+      td {
+        padding: 11px 14px;
+        text-align: left;
+        vertical-align: top;
+        border-bottom: 1px solid var(--line);
+      }
+      th {
+        white-space: nowrap;
+        background: var(--paper-2);
+        color: var(--ink-soft);
+        font: 700 10.5px/1.35 var(--mono);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      tbody tr {
+        transition: background 0.1s;
+      }
+      tbody tr:hover {
+        background: var(--accent-soft);
+      }
+      tbody tr:last-child td {
+        border-bottom: 0;
+      }
+      td code {
+        white-space: nowrap;
+      }
+      ul,
+      ol {
+        margin: 0 0 18px;
+        padding-left: 24px;
+      }
+      li {
+        margin: 6px 0;
+      }
+      li::marker {
+        color: var(--accent);
+        font-weight: 700;
+      }
+      code {
+        padding: 1px 6px;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        background: var(--paper-2);
+        color: var(--amber);
+        font: 0.85em/1.5 var(--mono);
+      }
+      pre {
+        position: relative;
+        margin: 18px 0 24px;
+        padding: 22px 24px;
+        overflow: auto;
+        border: 1px solid rgba(0, 0, 0, 0.26);
+        border-top: 3px solid var(--accent);
+        border-radius: 10px;
+        background: var(--code-bg);
+        color: var(--code-ink);
+        font: 13px/1.65 var(--mono);
+        box-shadow: var(--shadow-md);
+        tab-size: 2;
+      }
+      pre code {
+        padding: 0;
+        border: 0;
+        background: none;
+        color: inherit;
+        font: inherit;
+        white-space: pre;
+      }
+      .tok-c {
+        color: var(--code-comment);
+        font-style: italic;
+      }
+      .tok-k {
+        color: var(--code-key);
+      }
+      .tok-s {
+        color: var(--code-str);
+      }
+      .tok-n {
+        color: var(--code-num);
+      }
+      .callout {
+        margin: 22px 0;
+        padding: 16px 20px;
+        border: 1px solid var(--line);
+        border-left: 4px solid var(--indigo);
+        border-radius: var(--r);
+        background: linear-gradient(
+          180deg,
+          var(--indigo-soft),
+          var(--surface) 76%
+        );
+        box-shadow: var(--shadow-sm);
+        transition:
+          transform 0.14s,
+          box-shadow 0.14s;
+      }
+      .callout:hover {
+        transform: translateX(3px);
+        box-shadow: var(--shadow-md);
+      }
+      .callout.warn {
+        border-left-color: var(--rose);
+        background: linear-gradient(
+          180deg,
+          var(--rose-soft),
+          var(--surface) 76%
+        );
+      }
+      .callout.vision {
+        border-left-color: var(--accent);
+        background: linear-gradient(
+          180deg,
+          var(--accent-soft),
+          var(--surface) 76%
+        );
+      }
+      .callout.quote {
+        border-left-color: var(--amber);
+        background: linear-gradient(
+          180deg,
+          var(--amber-soft),
+          var(--surface) 76%
+        );
+      }
+      .co-head {
+        margin-bottom: 8px;
+        color: var(--indigo);
+        font: 700 10px/1.2 var(--mono);
+        letter-spacing: 0.15em;
+        text-transform: uppercase;
+      }
+      .warn .co-head {
+        color: var(--rose);
+      }
+      .vision .co-head {
+        color: var(--accent);
+      }
+      .quote .co-head {
+        color: var(--amber);
+      }
+      .callout p:last-child,
+      .callout ul:last-child,
+      .callout ol:last-child {
+        margin-bottom: 0;
+      }
+      .decision-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 22px 0;
+      }
+      .decision {
+        position: relative;
+        padding: 20px;
+        border: 1px solid var(--line);
+        border-top: 3px solid var(--accent);
+        border-radius: var(--r);
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+      }
+      .decision:nth-child(2n) {
+        border-top-color: var(--amber);
+      }
+      .decision h3 {
+        margin: 0 0 12px;
+        font-size: 1.18rem;
+      }
+      .decision .dno {
+        display: inline-block;
+        margin-right: 8px;
+        color: var(--accent);
+        font: 700 12px/1 var(--mono);
+      }
+      .decision p:last-child,
+      .decision ul:last-child {
+        margin-bottom: 0;
+      }
+      .decision.full {
+        grid-column: 1/-1;
+      }
+      .trinity {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 10px;
+        margin: 24px 0;
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+      }
+      .tri-row {
+        display: grid;
+        grid-template-columns: 118px minmax(0, 1fr) 230px;
+        gap: 16px;
+        align-items: center;
+        padding: 16px 18px;
+        border: 1px solid var(--line);
+        border-left: 5px solid var(--indigo);
+        border-radius: var(--r);
+        background: var(--surface-raised);
+      }
+      .tri-row.vector {
+        border-left-color: var(--accent);
+      }
+      .tri-row.nerve {
+        border-left-color: var(--amber);
+      }
+      .tri-name {
+        font: 700 18px/1.2 var(--display);
+      }
+      .tri-body {
+        color: var(--ink-soft);
+        font: 12.5px/1.55 var(--mono);
+      }
+      .tri-note {
+        color: var(--ink-faint);
+        font-size: 12.5px;
+      }
+      .tri-note strong {
+        color: var(--rose);
+      }
+      .pipeline {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(170px, 1fr));
+        gap: 0;
+        margin: 24px 0;
+        overflow-x: auto;
+        padding-bottom: 6px;
+      }
+      .pipe-step {
+        position: relative;
+        min-width: 170px;
+        padding: 18px 20px 18px 18px;
+        border: 1px solid var(--line);
+        border-right: 0;
+        background: var(--surface);
+      }
+      .pipe-step:first-child {
+        border-radius: var(--r) 0 0 var(--r);
+      }
+      .pipe-step:last-child {
+        border-right: 1px solid var(--line);
+        border-radius: 0 var(--r) var(--r) 0;
+      }
+      .pipe-step:not(:last-child)::after {
+        content: "→";
+        position: absolute;
+        z-index: 2;
+        right: -12px;
+        top: 50%;
+        width: 24px;
+        height: 24px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--line);
+        border-radius: 50%;
+        background: var(--paper);
+        color: var(--accent);
+        font: 700 13px/1 var(--mono);
+        transform: translateY(-50%);
+      }
+      .pipe-no {
+        color: var(--accent);
+        font: 700 11px/1 var(--mono);
+      }
+      .pipe-step h4 {
+        margin: 8px 0 7px;
+      }
+      .pipe-step p {
+        margin: 0;
+        color: var(--ink-soft);
+        font-size: 12.5px;
+        line-height: 1.5;
+      }
+      .legend-inline {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 10px 0 16px;
+        color: var(--ink-faint);
+        font: 11px/1.4 var(--mono);
+      }
+      .legend-inline span {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .legend-line {
+        width: 25px;
+        height: 0;
+        border-top: 2px solid var(--accent);
+      }
+      .legend-line.dashed {
+        border-top-style: dashed;
+      }
+      .legend-new {
+        width: 15px;
+        height: 15px;
+        border: 2px solid var(--rose);
+        border-radius: 3px;
+        background: var(--rose-soft);
+      }
+      .mermaid-shell {
+        margin: 22px 0;
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+        overflow-x: auto;
+      }
+      .mermaid-shell figcaption {
+        margin: 6px 0 12px;
+        color: var(--ink-faint);
+        font: 11px/1.5 var(--mono);
+      }
+      pre.mermaid {
+        min-width: 760px;
+        margin: 0;
+        padding: 20px;
+        border-top-color: var(--accent);
+        white-space: pre;
+      }
+      .mermaid-shell.rendered pre.mermaid {
+        min-width: 0;
+        background: transparent;
+        border: 0;
+        box-shadow: none;
+      }
+      .mermaid-shell svg {
+        display: block;
+        max-width: 100%;
+        height: auto;
+        margin: auto;
+      }
+      .mermaid-error {
+        display: none;
+        margin: 12px 0 0;
+        color: var(--rose);
+        font-size: 12px;
+      }
+      .mermaid-shell.failed .mermaid-error {
+        display: block;
+      }
+      .phase-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 20px 0;
+      }
+      .phase {
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-left: 4px solid var(--accent);
+        border-radius: var(--r);
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+      }
+      .phase:nth-child(2) {
+        border-left-color: var(--indigo);
+      }
+      .phase:nth-child(3) {
+        border-left-color: var(--amber);
+      }
+      .phase:nth-child(4) {
+        border-left-color: var(--violet);
+      }
+      .phase-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        align-items: baseline;
+        margin-bottom: 9px;
+      }
+      .phase h3 {
+        margin: 0;
+        font-size: 1.1rem;
+      }
+      .roi {
+        color: var(--accent);
+        font: 700 10px/1 var(--mono);
+        letter-spacing: 0.1em;
+      }
+      .phase p {
+        font-size: 13.5px;
+        color: var(--ink-soft);
+      }
+      .phase p:last-child {
+        margin-bottom: 0;
+      }
+      .risk-list {
+        counter-reset: risk;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1px;
+        margin: 22px 0;
+        border: 1px solid var(--line);
+        border-radius: var(--r);
+        overflow: hidden;
+        background: var(--line);
+      }
+      .risk {
+        counter-increment: risk;
+        position: relative;
+        padding: 18px 18px 18px 52px;
+        background: var(--surface);
+        font-size: 13.5px;
+      }
+      .risk::before {
+        content: counter(risk);
+        position: absolute;
+        left: 17px;
+        top: 18px;
+        display: grid;
+        place-items: center;
+        width: 23px;
+        height: 23px;
+        border: 1px solid var(--rose);
+        border-radius: 50%;
+        color: var(--rose);
+        font: 700 10px/1 var(--mono);
+      }
+      .risk strong {
+        display: block;
+        margin-bottom: 4px;
+      }
+      .sources {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+        margin: 20px 0;
+      }
+      .source-group {
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        border-top: 3px solid var(--accent);
+        border-radius: var(--r);
+        background: var(--surface);
+        box-shadow: var(--shadow-sm);
+      }
+      .source-group:nth-child(2) {
+        border-top-color: var(--amber);
+      }
+      .source-group:nth-child(3) {
+        grid-column: 1/-1;
+        border-top-color: var(--indigo);
+      }
+      .source-group h3 {
+        margin: 0 0 12px;
+      }
+      .source-group ul {
+        margin: 0;
+      }
+      .source-group a {
+        overflow-wrap: anywhere;
+      }
+      .doc-foot {
+        margin-top: 66px;
+        padding-top: 22px;
+        border-top: 1px solid var(--line);
+        color: var(--ink-faint);
+        font-size: 12.5px;
+      }
+      .status {
+        display: inline-block;
+        padding: 1px 7px;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        font: 700 10px/1.5 var(--mono);
+      }
+      .status.new {
+        color: var(--rose);
+        border-color: var(--rose);
+        background: var(--rose-soft);
+      }
+      .status.have {
+        color: var(--green);
+        border-color: var(--green);
+        background: var(--green-soft);
+      }
+      .status.risk {
+        color: var(--amber);
+        border-color: var(--amber);
+        background: var(--amber-soft);
+      }
+      @media (max-width: 960px) {
+        .rail {
+          position: fixed;
+          left: 0;
+          top: 0;
+          transform: translateX(-105%);
+          transition: transform 0.2s;
+          box-shadow: var(--shadow-md);
+        }
+        .rail.open {
+          transform: none;
+        }
+        .menu-toggle {
+          display: grid;
+          position: fixed;
+          top: 14px;
+          left: 14px;
+          z-index: 950;
+          place-items: center;
+          width: 42px;
+          height: 42px;
+          padding: 0;
+          border: 1px solid var(--line);
+          border-radius: var(--r);
+          background: var(--surface);
+          color: var(--ink);
+          font-size: 18px;
+          box-shadow: var(--shadow-md);
+          cursor: pointer;
+        }
+        .rail-scrim {
+          position: fixed;
+          inset: 0;
+          z-index: 850;
+          background: rgba(9, 12, 16, 0.46);
+        }
+        .rail-scrim.open {
+          display: block;
+        }
+        .content {
+          padding: 74px 22px 100px;
+        }
+        .tri-row {
+          grid-template-columns: 1fr;
+        }
+        .tri-note {
+          padding-top: 8px;
+          border-top: 1px solid var(--line);
+        }
+        .decision-grid,
+        .phase-grid,
+        .sources,
+        .risk-list {
+          grid-template-columns: 1fr;
+        }
+        .decision.full,
+        .source-group:nth-child(3) {
+          grid-column: auto;
+        }
+        .stage-banner {
+          flex-wrap: wrap;
+        }
+        .sb-step {
+          flex: 1 1 18%;
+          border-bottom: 1px solid var(--line);
+        }
+        .sb-label {
+          display: none;
+        }
+      }
+      @media (max-width: 620px) {
+        .content {
+          padding-left: 17px;
+          padding-right: 17px;
+        }
+        h1 {
+          font-size: 2.25rem;
+        }
+        .art-meta {
+          grid-template-columns: 1fr;
+        }
+        .pipeline {
+          grid-template-columns: 1fr;
+          gap: 8px;
+          overflow: visible;
+        }
+        .pipe-step,
+        .pipe-step:first-child,
+        .pipe-step:last-child {
+          min-width: 0;
+          border: 1px solid var(--line);
+          border-radius: var(--r);
+        }
+        .pipe-step:not(:last-child)::after {
+          content: "↓";
+          right: auto;
+          left: 50%;
+          top: auto;
+          bottom: -17px;
+          transform: translateX(-50%);
+        }
+        .stage-banner {
+          display: grid;
+          grid-template-columns: repeat(6, 1fr);
+        }
+        .sb-step {
+          border-right: 1px solid var(--line);
+        }
+        th,
+        td {
+          padding: 9px 11px;
+        }
+        .mermaid-shell {
+          padding: 10px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+        * {
+          animation: none !important;
+          transition: none !important;
+        }
+        .callout:hover,
+        .btn:hover,
+        .brand:hover .brand-mark {
+          transform: none;
+        }
+      }
+      @media print {
+        .rail,
+        .menu-toggle,
+        .rail-scrim,
+        #progress {
+          display: none !important;
+        }
+        body {
+          background: #fff;
+        }
+        .content {
+          max-width: none;
+          padding: 0;
+        }
+        .tablewrap,
+        .callout,
+        .decision,
+        .phase,
+        .source-group,
+        .trinity,
+        .mermaid-shell {
+          box-shadow: none;
+          break-inside: avoid;
+        }
+        a {
+          color: inherit;
+          text-decoration: none;
+        }
+        .stage-banner {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="progress" aria-hidden="true"></div>
+    <button
+      class="menu-toggle"
+      id="menuToggle"
+      type="button"
+      aria-label="打开目录"
+      aria-controls="rail"
+      aria-expanded="false"
+    >
+      ☰
+    </button>
+    <div class="rail-scrim" id="railScrim" aria-hidden="true"></div>
+    <div class="layout">
+      <nav class="rail" id="rail" aria-label="文档目录">
+        <a class="brand" href="#top"
+          ><span class="brand-mark">GB</span
+          ><span
+            ><span class="brand-name">GBrain 升级指南</span
+            ><span class="brand-sub">GRAPH-NATIVE FIELD GUIDE</span></span
+          ></a
+        >
+        <div class="rail-tag">本页目录</div>
+        <div class="nav" id="toc">
+          <a href="#tldr"><span class="no">0</span>TL;DR · 五个决策</a>
+          <a href="#diagnosis"><span class="no">1</span>现状诊断</a>
+          <a href="#vision"><span class="no">2</span>目标愿景</a>
+          <a href="#decisions"><span class="no">3</span>核心决策详解</a>
+          <a href="#architecture"><span class="no">4</span>目标架构</a>
+          <a href="#data-model"><span class="no">5</span>数据模型演进</a>
+          <a href="#seams"><span class="no">6</span>二次开发接缝</a>
+          <a href="#migration"><span class="no">7</span>分阶段迁移路径</a>
+          <a href="#evaluation"><span class="no">8</span>评估与验证</a>
+          <a href="#risks"><span class="no">9</span>风险与陷阱</a>
+          <a href="#references"><span class="no">10</span>参考来源</a>
+        </div>
+        <div class="rail-foot">
+          <button
+            class="btn icon"
+            id="themeBtn"
+            type="button"
+            aria-label="切换深浅主题"
+            title="切换深浅主题"
+          >
+            ☾
+          </button>
+        </div>
+      </nav>
+      <main class="main" id="main">
+        <article class="content" id="top">
+          <p class="eyebrow">Graph-native upgrade · 开发决策指南</p>
+          <h1>GBrain 向量记忆库<br />图原生升级方案</h1>
+          <p class="lede">
+            把成熟的混合检索主干向 GraphRAG
+            演进：以知识图谱为骨架、向量库为血肉、Postgres 为神经，同时保住
+            gbrain 已有的检索与时间模型优势。
+          </p>
+
+          <div class="art-meta" aria-label="文档元信息">
+            <div class="meta-item">
+              <span class="meta-k">对象</span
+              ><span class="meta-v"
+                ><code>_upstream_gbrain/</code>（garrytan/gbrain，本地快照
+                v0.42.57.0 / commit <code>058f448</code>）的向量记忆库 /
+                知识检索子系统。</span
+              >
+            </div>
+            <div class="meta-item">
+              <span class="meta-k">范围边界</span
+              ><span class="meta-v"
+                >只覆盖知识库检索：写入侧抽取/嵌入/落库，读取侧召回/融合/重排，存储/索引与事实层时间演化。明确排除智能体私有记忆（会话历史、用户画像、agent
+                反思、多 agent 共享大脑）。</span
+              >
+            </div>
+            <div class="meta-item">
+              <span class="meta-k">方法</span
+              ><span class="meta-v"
+                >codebase-memory 图谱 + 4 路并行子代理（2 路源码深挖 + 2 路 2026
+                网络权威调研）+ 主管线 <code>hybrid.ts</code> 交叉验证。</span
+              >
+            </div>
+            <div class="meta-item">
+              <span class="meta-k">真值原则</span
+              ><span class="meta-v"
+                >凡官方
+                <code>docs/architecture/RETRIEEVAL.md</code> 与源码冲突，以
+                <code>src/core/search/hybrid.ts</code>
+                源码为准。姊妹文档：<code>upstream-gbrain-vector-retrieval.md</code>。</span
+              >
+            </div>
+          </div>
+
+          <div class="stage-banner" aria-label="章节进度">
+            <a class="sb-step here" href="#tldr"
+              ><span class="sb-no">0</span><span class="sb-label">决策</span></a
+            ><a class="sb-step" href="#diagnosis"
+              ><span class="sb-no">1</span><span class="sb-label">诊断</span></a
+            ><a class="sb-step" href="#vision"
+              ><span class="sb-no">2</span><span class="sb-label">愿景</span></a
+            ><a class="sb-step" href="#decisions"
+              ><span class="sb-no">3</span><span class="sb-label">详解</span></a
+            ><a class="sb-step" href="#architecture"
+              ><span class="sb-no">4</span><span class="sb-label">架构</span></a
+            ><a class="sb-step" href="#data-model"
+              ><span class="sb-no">5</span><span class="sb-label">模型</span></a
+            ><a class="sb-step" href="#seams"
+              ><span class="sb-no">6</span><span class="sb-label">接缝</span></a
+            ><a class="sb-step" href="#migration"
+              ><span class="sb-no">7</span><span class="sb-label">迁移</span></a
+            ><a class="sb-step" href="#evaluation"
+              ><span class="sb-no">8</span><span class="sb-label">评估</span></a
+            ><a class="sb-step" href="#risks"
+              ><span class="sb-no">9</span><span class="sb-label">风险</span></a
+            ><a class="sb-step" href="#references"
+              ><span class="sb-no">10</span
+              ><span class="sb-label">来源</span></a
+            >
+          </div>
+
+          <section aria-labelledby="tldr">
+            <h2 id="tldr">0. TL;DR：五个决策</h2>
+            <div class="tablewrap">
+              <table>
+                <caption class="sr-only">
+                  D1 至 D5 五个核心决策
+                </caption>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>决策</th>
+                    <th>一句话</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>D1</strong></td>
+                    <td><strong>演进，不重构</strong></td>
+                    <td>
+                      gbrain
+                      的混合检索栈与时间模型已领先多数参考实现；升级是“把图从检索辅助升为检索主结构”，不是推倒重来。
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><strong>D2</strong></td>
+                    <td>
+                      <strong>Postgres 原生为主线，neo4j/AGE 为可选后端</strong>
+                    </td>
+                    <td>
+                      neo4j <strong>非必选</strong>（+1 JVM、Python
+                      生态绑定、破全栈 Postgres 哲学）；主线用
+                      <code>entities/relations/aliases</code> 三表 +
+                      <code>tstzrange</code> + PPR，AGE/neo4j 作生产可选。
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><strong>D3</strong></td>
+                    <td>
+                      <strong
+                        >检索范式 = PPR 单步多跳 + 双层向量 +
+                        社区摘要按需</strong
+                      >
+                    </td>
+                    <td>
+                      借鉴 HippoRAG 2（PPR 取代迭代，便宜
+                      10-30×）、LightRAG（双层 key-value，抛弃昂贵
+                      Leiden）、DRIFT（全局问答按需触发，降 77% token）。
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><strong>D4</strong></td>
+                    <td>
+                      <strong
+                        >抽取层 = LLM 三元组抽取 + canonical 实体合并</strong
+                      >
+                    </td>
+                    <td>
+                      这是 BrainBench “+31 P@5” 的真正来源，也是 gbrain
+                      当前最大缺口（links 全规则抽取、无实体合并）。GLiNER 前端
+                      NER + LLM schema-guided 关系抽取 + 嵌入聚类消解。
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><strong>D5</strong></td>
+                    <td>
+                      <strong
+                        >事实层 = 现有 bi-temporal 升级为 Graphiti 式
+                        valid-window + 因果边</strong
+                      >
+                    </td>
+                    <td>
+                      gbrain 的 <code>facts</code> 表已有
+                      <code
+                        >valid_from/valid_until/expired_at/superseded_by</code
+                      >
+                      + halflife 衰减 + 4 档 temporal verdict。Graphiti
+                      哲学已内置一半，补齐“不删除只失效 + 自动冲突失效 +
+                      因果边”即可。
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="callout vision">
+              <div class="co-head">一句话愿景</div>
+              <p>
+                把 gbrain 从“围着检索重排序打转的 SQL typed-edge
+                层”，升级为“以知识图谱为骨架、向量库为血肉、Postgres
+                为神经”的复合认知检索引擎，对应用户参考报告的
+                <strong>骨架 + 血肉 + 神经</strong> 三位一体。
+              </p>
+            </div>
+          </section>
+
+          <section aria-labelledby="diagnosis">
+            <h2 id="diagnosis">1. 现状诊断：gbrain 向量记忆库到底有什么</h2>
+            <h3 id="read-stack">
+              1.1 读取侧：已经很重的混合栈（保留，不动主干）
+            </h3>
+            <p>
+              <code>hybridSearch</code>（<code>hybrid.ts:809</code>）18
+              阶段主管线，四路召回 + 多级重排：
+            </p>
+            <ul>
+              <li>
+                <strong>四路召回</strong>：向量（pgvector HNSW cosine
+                <code>&lt;=&gt;</code>）/ 关键词（tsvector BM25）/
+                关系（typed-edge 图遍历）/ 源加权（SQL CASE）。
+              </li>
+              <li>
+                <strong>融合</strong>：RRF
+                加权（<code>RRF_K=60</code>，<code>hybrid.ts:47</code>）→ cosine
+                重打分（<code>0.7·normRRF + 0.3·cosine</code
+                >，<code>hybrid.ts:1986</code>）→
+                <code>compiled_truth ×2.0</code>（<code>hybrid.ts:48</code>）。
+              </li>
+              <li>
+                <strong>post-fusion 5 级</strong
+                >：backlink（<code>0.05·log</code>）/ salience / recency 半衰期
+                / title-phrase /
+                graph-signals（邻接×1.05、跨源×1.10、会话×0.95）/
+                alias_resolved×1.05。
+              </li>
+              <li>
+                <strong>精排</strong>：cross-encoder rerank（zerank-2，官方
+                reshuffle 60% top-1）→ alias hop×1.10 → autocut 断崖 →
+                token-budget。
+              </li>
+              <li>
+                <strong>三档 mode bundle</strong>：conservative / balanced /
+                tokenmax，<code>knobs_hash</code> v=11 防缓存污染。
+              </li>
+            </ul>
+            <div class="callout vision">
+              <div class="co-head">判断</div>
+              <p>
+                这套读取侧是 gbrain 的护城河，<strong
+                  >升级只加旁路（PPR 臂、图遍历臂增强），不重写主干</strong
+                >。
+              </p>
+            </div>
+
+            <h3 id="write-memory">1.2 写入侧：分层记忆模型（被低估的强项）</h3>
+            <div class="tablewrap">
+              <table>
+                <caption class="sr-only">
+                  gbrain 写入侧分层记忆模型
+                </caption>
+                <thead>
+                  <tr>
+                    <th>层</th>
+                    <th>表</th>
+                    <th>真相</th>
+                    <th>时间维度</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>compiled_truth</strong></td>
+                    <td><code>pages.compiled_truth</code></td>
+                    <td>
+                      <strong>不是 LLM 编译</strong>，是 markdown
+                      <code>&lt;!-- timeline --&gt;</code> sentinel
+                      之上的<strong>人工/agent 维护 executive summary</strong
+                      >，检索 ×2.0 boost 是 +31 P@5 主因
+                    </td>
+                    <td><code>page_versions</code> 全文快照</td>
+                  </tr>
+                  <tr>
+                    <td><strong>facts（热记忆）</strong></td>
+                    <td><code>facts</code></td>
+                    <td>
+                      LLM 抽取 5
+                      类（event/preference/commitment/belief/fact），单用户会话实时抽取
+                    </td>
+                    <td>
+                      <span class="status have">✅ 已有</span>
+                      <code
+                        >valid_from/valid_until/expired_at/superseded_by/consolidated_into/confidence</code
+                      >
+                      + per-kind halflife
+                      指数衰减（<code>facts/decay.ts:25</code>）
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><strong>takes（冷存储）</strong></td>
+                    <td><code>takes</code></td>
+                    <td>
+                      LLM 抽取 4 类（fact/take/bet/hunch），带 holder/weight，可
+                      resolve 标定（Brier）
+                    </td>
+                    <td>
+                      <code
+                        >since_date/until_date/superseded_by/resolved_at/active</code
+                      >，append-only chain
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><strong>links（图边）</strong></td>
+                    <td><code>links</code></td>
+                    <td>
+                      <strong>全确定性规则抽取</strong>（正则动词 + frontmatter
+                      + NER gazetteer + tree-sitter），<strong>零 LLM</strong>
+                    </td>
+                    <td>
+                      仅 <code>created_at</code>，无
+                      weight/confidence/可变时间戳
+                    </td>
+                  </tr>
+                  <tr>
+                    <td><strong>矛盾裁决</strong></td>
+                    <td><code>eval_contradictions_cache</code></td>
+                    <td>
+                      LLM cross-source judge，4 档
+                      verdict（temporal_supersession/regression/evolution/negation_artifact）
+                    </td>
+                    <td>
+                      <span class="status have">✅ 已有</span> DAG
+                      因果演化的雏形
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="callout quote">
+              <div class="co-head">关键发现</div>
+              <p>
+                gbrain 的时间模型已相当扎实（append-only + soft-supersede +
+                halflife + 4 档 temporal verdict）。<strong
+                  >Graphiti 的 bi-temporal 哲学 gbrain 已内置一半</strong
+                >。这意味着 D5 是“补齐”而非“新建”。
+              </p>
+            </div>
+
+            <h3 id="graph-subsystem">
+              1.3 图子系统：SQL typed-edge，不是真图（主战场）
+            </h3>
+            <ul>
+              <li>
+                <strong>节点</strong> = <code>pages</code> 行（单一
+                <code>type</code> 字段），<strong
+                  >无 property graph、无 node-level embedding</strong
+                >（embedding 只在 chunk 级）。
+              </li>
+              <li>
+                <strong>边</strong> = <code>links</code> 行（<code
+                  >link_type</code
+                >
+                单值，13
+                个封闭词汇：founded/invested_in/works_at/mentions…），<strong
+                  >无 weight/confidence/可变时间戳</strong
+                >。
+              </li>
+              <li>
+                <strong>遍历</strong> = 纯 SQL 递归
+                CTE（<code>relationalFanout</code>，深度默认 2 硬顶
+                3，<code>postgres-engine.ts:3039</code>），<strong>within-source</strong>（跨源禁用，安全审计特性）。
+              </li>
+              <li>
+                <strong>实体消解</strong> = 4 步 slug 字符串解析 + alias
+                双表（<code>slug_aliases</code>/<code>page_aliases</code>），<strong
+                  >无 canonical_entity_id 合并模型</strong
+                >，“张总↔张三”做不到真正合并。
+              </li>
+              <li>
+                <strong>社区/全局</strong> =
+                <strong>完全没有</strong> Leiden/分层摘要/map-reduce；<code
+                  >synthesize_concepts</code
+                >
+                只是 flat tag-bucket + LLM narrative。
+              </li>
+              <li>
+                <strong>code 子图</strong
+                >（<code>code_edges_chunk/symbol</code>）独立于
+                <code>links</code>，检索管线不消费。
+              </li>
+            </ul>
+
+            <h3 id="gaps">1.4 距 GraphRAG 的真实缺口（按优先级）</h3>
+            <div class="tablewrap">
+              <table>
+                <caption class="sr-only">
+                  GraphRAG 缺口优先级
+                </caption>
+                <thead>
+                  <tr>
+                    <th>P</th>
+                    <th>缺口</th>
+                    <th>现状</th>
+                    <th>影响</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>P0</strong></td>
+                    <td>(entity, relation, entity) 三元组抽取</td>
+                    <td>links 全规则，无三元组表</td>
+                    <td>社区发现/子图查询/向量-图混合召回全做不出</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P0</strong></td>
+                    <td>canonical 实体合并模型</td>
+                    <td>alias 是字符串键，非 (entity_id, variants[])</td>
+                    <td>图谱碎片化，多跳断链</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P0</strong></td>
+                    <td>多跳图遍历算子（PPR/shortestPath）</td>
+                    <td>只有 depth≤3 递归 CTE</td>
+                    <td>跨文档隐性关联召不回</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P1</strong></td>
+                    <td>node-level embedding + 图拓扑融合</td>
+                    <td>只有 chunk 级向量</td>
+                    <td>向量召回锚不到图节点</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P1</strong></td>
+                    <td>因果边（caused/enabled/prevented）</td>
+                    <td>link_type 全描述型动词</td>
+                    <td>无因果推理</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P1</strong></td>
+                    <td>抽取质量独立 F1 评估</td>
+                    <td>只有 takes-quality rubric，无 fact-level P/R</td>
+                    <td>抽取上限不可测</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P2</strong></td>
+                    <td>社区检测 + 分层摘要</td>
+                    <td>无</td>
+                    <td>全局/主题问答做不出</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P2</strong></td>
+                    <td>置信度随证据动态重算</td>
+                    <td>confidence 只在抽取时定值 + 时间衰减</td>
+                    <td>无 Bayesian 权重传播</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section aria-labelledby="vision">
+            <h2 id="vision">2. 目标愿景：骨架 + 血肉 + 神经</h2>
+            <p>
+              对应用户参考报告（neo4j GraphRAG 复合记忆）的三位一体，映射到
+              gbrain：
+            </p>
+            <div
+              class="trinity"
+              role="img"
+              aria-label="骨架、血肉、神经三位一体目标框图"
+            >
+              <div class="tri-row">
+                <div class="tri-name">骨架（图）</div>
+                <div class="tri-body">
+                  entities + triples + PPR 多跳 + 因果边
+                </div>
+                <div class="tri-note">
+                  <strong>本次主战场</strong>（D3/D4/D5）
+                </div>
+              </div>
+              <div class="tri-row vector">
+                <div class="tri-name">血肉（向量）</div>
+                <div class="tri-body">
+                  content_chunks.embedding + node-level embedding
+                </div>
+                <div class="tri-note">
+                  <span class="status have">✅ 已扎实</span> 补 node 级（D3）
+                </div>
+              </div>
+              <div class="tri-row nerve">
+                <div class="tri-name">神经（Postgres）</div>
+                <div class="tri-body">facts/takes bi-temporal + KV 状态</div>
+                <div class="tri-note">
+                  <span class="status have">✅ 已领先</span> 补
+                  valid-window（D5）
+                </div>
+              </div>
+            </div>
+            <h3 id="four-stage">四阶段检索管线</h3>
+            <div class="pipeline" aria-label="四阶段检索管线">
+              <div class="pipe-step">
+                <span class="pipe-no">01</span>
+                <h4>向量定位</h4>
+                <p>
+                  现有向量臂 + <strong>node-level embedding</strong>，从
+                  Semantic Search 锚到实体节点。
+                </p>
+              </div>
+              <div class="pipe-step">
+                <span class="pipe-no">02</span>
+                <h4>图遍历</h4>
+                <p>
+                  <strong>PPR 单步多跳</strong>（HippoRAG 式）取代或增强现有递归
+                  CTE 臂。
+                </p>
+              </div>
+              <div class="pipe-step">
+                <span class="pipe-no">03</span>
+                <h4>社区摘要</h4>
+                <p>
+                  <strong>按需触发</strong>（DRIFT 式），常规问答不跑 Leiden
+                  全局视角。
+                </p>
+              </div>
+              <div class="pipe-step">
+                <span class="pipe-no">04</span>
+                <h4>上下文融合</h4>
+                <p>
+                  现有 RRF + rerank + evidence 契约，加入可溯源的子图推理链路。
+                </p>
+              </div>
+            </div>
+            <div class="tablewrap">
+              <table>
+                <caption class="sr-only">
+                  用户报告目标与 gbrain 四阶段落地对照
+                </caption>
+                <thead>
+                  <tr>
+                    <th>阶段</th>
+                    <th>用户报告</th>
+                    <th>gbrain 落地</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1 向量定位</td>
+                    <td>Semantic Search 发现 Seed Nodes</td>
+                    <td>
+                      现有向量臂 +
+                      <strong>node-level embedding</strong> 锚到实体节点
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>2 图遍历</td>
+                    <td>Cypher 1~3 跳 + 代价剪枝</td>
+                    <td>
+                      <strong>PPR 单步多跳</strong>（HippoRAG
+                      式）取代/增强现有递归 CTE 臂
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>3 社区摘要</td>
+                    <td>Leiden 全局视角</td>
+                    <td><strong>按需触发</strong>（DRIFT 式），常规问答不跑</td>
+                  </tr>
+                  <tr>
+                    <td>4 上下文融合</td>
+                    <td>局部+逻辑链+全局 → LLM</td>
+                    <td>
+                      现有 RRF + rerank + evidence 契约，<strong
+                        >加子图推理链路作为可溯源 evidence</strong
+                      >
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section aria-labelledby="decisions">
+            <h2 id="decisions">3. 核心决策详解</h2>
+            <div class="decision-grid">
+              <article class="decision" id="d1">
+                <h3><span class="dno">D1</span>演进，不重构</h3>
+                <p>
+                  <strong>依据</strong>：gbrain 读取侧混合栈 +
+                  分层时间模型已领先多数 RAG
+                  参考实现（治理、真向量臂、RRF、bi-temporal facts、4 档
+                  temporal verdict 都已内建）。BrainBench +31 P@5 证明现有“图 +
+                  抽取质量”方向正确，只是图还停留在 SQL typed-edge。
+                </p>
+                <p>
+                  <strong>动作</strong>：所有升级以“加旁路 / 加列 / 加表 / 加
+                  cycle phase”形式接入现有 seam（见 §6），<strong
+                    >不动 <code>hybridSearch</code> 主干、不动双引擎 lockstep
+                    契约</strong
+                  >。
+                </p>
+              </article>
+              <article class="decision" id="d2">
+                <h3><span class="dno">D2</span>存储选型：Postgres 原生主线</h3>
+                <p><strong>依据（2026 选型调研）</strong>：</p>
+                <ul>
+                  <li>
+                    <strong>neo4j 非必选</strong>：引入 = +1 JVM 进程 + Bolt
+                    协议 + 跨库双写，且 <code>neo4j-graphrag</code> 高级包是
+                    Python 生态（gbrain 是 TS/Bun），打破“全栈
+                    Postgres”哲学。杀手锏（GDS 图算法）在 gbrain 当前规模（百万
+                    chunk 级以下）overkill。
+                  </li>
+                  <li>
+                    <strong>Kuzu 已死</strong>（Apple 2025-10 收购并
+                    archive），排除。
+                  </li>
+                  <li>
+                    <strong>FalkorDB</strong> 快（比 neo4j ~9×）但需独立 Redis
+                    进程，破哲学，排除主线。
+                  </li>
+                  <li>
+                    <strong>Postgres 原生只有两候选</strong>：Apache
+                    AGE（openCypher，但
+                    <strong>PGLite 兼容性是生死未知数</strong>，无成功案例）vs
+                    pgvector+递归 CTE（兼容完美、表达力弱）。
+                  </li>
+                </ul>
+                <p><strong>动作</strong>：</p>
+                <ul>
+                  <li>
+                    <strong>主线</strong>：<code
+                      >entities(id, source_id, name, type, summary,
+                      embedding)</code
+                    >
+                    +
+                    <code
+                      >triples(subject_id, relation, object_id,
+                      evidence_chunk_id, confidence, valid_window tstzrange,
+                      superseded_by)</code
+                    >
+                    +
+                    <code>entity_aliases(entity_id, alias_norm)</code> 三表，纯
+                    Postgres，pglite/postgres 双引擎同形 DDL。
+                  </li>
+                  <li>
+                    <strong>多跳</strong>：应用层 PPR（SQL 递归 CTE 实现，或
+                    <code>graphology</code> 内存图），不依赖 DB 图算法。
+                  </li>
+                  <li>
+                    <strong>可选后端</strong>：<code>graph-backend/</code>
+                    适配器层，生产 PG 自托管可切 Apache
+                    AGE（openCypher），未来真需要 GDS 再评估 neo4j。<strong
+                      >prototype 阶段硬验证 PGLite 能否加载 AGE</strong
+                    >，不能则主线不变。
+                  </li>
+                </ul>
+              </article>
+              <article class="decision" id="d3">
+                <h3>
+                  <span class="dno">D3</span>检索范式：PPR + 双层向量 + 社区按需
+                </h3>
+                <p><strong>依据（2026 算法前沿）</strong>：</p>
+                <ul>
+                  <li>
+                    <strong>HippoRAG 2（ICML 2025）</strong>：PPR
+                    单步多跳比迭代检索便宜 10-30×、快 6-13×，不牺牲事实问答；其
+                    error analysis 明确“抽取质量决定上限”，与 gbrain BrainBench
+                    互证。
+                  </li>
+                  <li>
+                    <strong>LightRAG（EMNLP 2025）</strong>：双层
+                    key-value（low-level 匹配实体 / high-level 匹配关系主题）+
+                    增量更新，抛弃昂贵 Leiden 社区摘要。
+                  </li>
+                  <li>
+                    <strong>DRIFT（GraphRAG 0.4）</strong
+                    >：全局问答按需触发，token 降 77%。
+                  </li>
+                </ul>
+                <p><strong>动作</strong>：</p>
+                <ul>
+                  <li>
+                    新增 <strong>PPR 检索臂</strong>：向量召回 chunk →
+                    锚到实体节点（node-level embedding）→ 在 triples 图上跑
+                    Personalized PageRank → 重排注入 RRF。作为
+                    <code>hybridSearch</code> 第五臂（与 relational 臂并存，mode
+                    bundle 控制开关）。
+                  </li>
+                  <li>
+                    <strong>双层关键词</strong>：现有 tsvector 臂扩展为
+                    low-level（实体名）+ high-level（关系/主题）双查询。
+                  </li>
+                  <li>
+                    <strong>社区摘要</strong>：新增 cycle phase
+                    <code>synthesize_communities</code
+                    >，<strong>离线批处理、按需触发</strong>（仅全局/主题问题走），不进常规检索热路径。
+                  </li>
+                </ul>
+              </article>
+              <article class="decision" id="d4">
+                <h3>
+                  <span class="dno">D4</span>抽取层：LLM 三元组 + canonical
+                  实体合并（+31 的来源）
+                </h3>
+                <p>
+                  <strong>依据</strong>：gbrain links
+                  全规则抽取、无实体合并，这是距 GraphRAG 最大缺口，也是
+                  BrainBench “抽取质量 +31” 的真正含义（现状靠 compiled_truth
+                  人工精华 + alias 折叠近似，非自动抽取）。2026 最佳实践：GLiNER
+                  前端 NER + LLM schema-guided 关系抽取 + 嵌入聚类消解。
+                </p>
+                <p><strong>动作</strong>：</p>
+                <ul>
+                  <li>
+                    新增 cycle phase <code>extract_triples</code>：复用现有
+                    LLM-as-extractor 管线（已有 injection sanitize /
+                    dream_generated 反自食 gate / parse barrier / 4-strategy
+                    JSON fallback），prompt 拓为
+                    <strong>5W1H + 关系补全</strong>的统一三元组抽取，输出
+                    <code
+                      >(subject, relation, object, evidence_span,
+                      confidence)</code
+                    >
+                    写 <code>triples</code> 表。
+                  </li>
+                  <li>
+                    <strong>canonical 实体合并</strong>：新增
+                    <code>entities</code> 表 + <code>entity_aliases</code>，LLM
+                    按 type 聚类（用抽取阶段的 one-line description
+                    作消歧上下文，抓“Edwin Aldrin↔Buzz
+                    Aldrin”零字符重叠合并）；规模化先按嵌入相似度/同姓氏
+                    blocking 切 50-100 小批。
+                  </li>
+                  <li>
+                    <strong>增量</strong>：新文档只抽取 → 只与已有 canonical
+                    集合消解 → 追加边（不全量重建），复用现有
+                    watermark/idempotency 机制。
+                  </li>
+                  <li>
+                    现有
+                    <code>links</code>
+                    表<strong>保留</strong>（规则边作为高置信先验），与
+                    <code>triples</code>（LLM 边）并存，检索侧加权融合。
+                  </li>
+                </ul>
+              </article>
+              <article class="decision full" id="d5">
+                <h3>
+                  <span class="dno">D5</span>事实层：bi-temporal 升级 + 因果边
+                </h3>
+                <p>
+                  <strong>依据</strong>：gbrain <code>facts</code> 已有
+                  <code>valid_from/valid_until/expired_at/superseded_by</code> +
+                  halflife + 4 档 temporal verdict。Graphiti
+                  哲学已内置一半。缺“不删除只失效的显式语义 + 自动冲突失效 +
+                  因果边 + 字段级版本”。
+                </p>
+                <p><strong>动作</strong>：</p>
+                <ul>
+                  <li>
+                    <code>facts</code>/<code>triples</code> 的时间列统一升级为
+                    <code>tstzrange valid_window</code> + GiST 索引，检索按
+                    <code>valid_window @&gt; $time</code>
+                    切片（可查“曾经是/现在是/T 时刻是”）。
+                  </li>
+                  <li>
+                    <strong>自动冲突失效</strong
+                    >：<code>extract_triples</code>/<code>extract_facts</code>
+                    写入时跑 contradiction check（复用
+                    <code>eval_contradictions_cache</code> 的 4 档
+                    verdict），冲突时旧事实写
+                    <code>invalid_at</code>（不删除），新事实
+                    <code>supersede</code>，对齐 Graphiti 的 ADD/SUPERSEDE/NOOP
+                    算子。
+                  </li>
+                  <li>
+                    <strong>因果边</strong>：<code>triples.relation</code>
+                    词汇表加
+                    <code>caused/enabled/prevented</code
+                    >，抽取时识别；为未来因果推理/反事实留接口（P2，不阻塞）。
+                  </li>
+                </ul>
+              </article>
+            </div>
+          </section>
+
+          <section aria-labelledby="architecture">
+            <h2 id="architecture">4. 目标架构</h2>
+            <div class="legend-inline" aria-label="架构图图例">
+              <span><i class="legend-line"></i>主链路</span
+              ><span><i class="legend-line dashed"></i>按需或数据关联</span
+              ><span><i class="legend-new"></i>⭐ 新增或增强</span>
+            </div>
+            <figure class="mermaid-shell" id="architectureFigure">
+              <figcaption>
+                写入侧离线 cycle 与读取侧在线 hybridSearch。粉色节点与 ⭐
+                文本双重标识新增项。
+              </figcaption>
+              <pre class="mermaid">
+flowchart TB
+    subgraph WRITE["写入侧（离线 cycle）"]
+        W1["源文件"] --&gt; W2["分块 recursive/code"]
+        W2 --&gt; W3["contextual prefix（Haiku）"]
+        W3 --&gt; W4["embedding（chunk 级）"]
+        W2 --&gt; W5["extract_triples（LLM 三元组）⭐新"]
+        W5 --&gt; W6["entity resolution（canonical 合并）⭐新"]
+        W6 --&gt; W7["entities + triples + aliases 落库"]
+        W4 --&gt; W8["content_chunks.embedding"]
+        W7 --&gt; W9["node-level embedding ⭐新"]
+        W7 -.按需.-&gt; W10["synthesize_communities（Leiden/分层摘要）⭐新"]
+    end
+
+    subgraph READ["读取侧（在线 hybridSearch）"]
+        Q["query"] --&gt; A1["向量臂（chunk）"]
+        Q --&gt; A2["关键词臂（双层 low/high）⭐增强"]
+        Q --&gt; A3["关系臂（递归 CTE）"]
+        Q --&gt; A4["PPR 臂（单步多跳）⭐新"]
+        A1 &amp; A2 &amp; A3 &amp; A4 --&gt; F["RRF 融合 + cosine 重打分"]
+        F --&gt; P["post-fusion 5 级（保留）"]
+        P --&gt; RK["cross-encoder rerank"]
+        RK --&gt; AC["autocut + budget"]
+        AC --&gt; O["结果 + evidence 契约 + 子图推理链路 ⭐增强"]
+    end
+
+    W8 -.-&gt; A1
+    W9 -.-&gt; A4
+    W7 -.-&gt; A4
+
+    style W5 fill:#fce7f3,stroke:#be123c,color:#191c20
+    style W6 fill:#fce7f3,stroke:#be123c,color:#191c20
+    style W9 fill:#fce7f3,stroke:#be123c,color:#191c20
+    style W10 fill:#fce7f3,stroke:#be123c,color:#191c20
+    style A2 fill:#fce7f3,stroke:#be123c,color:#191c20
+    style A4 fill:#fce7f3,stroke:#be123c,color:#191c20
+    style O fill:#fce7f3,stroke:#be123c,color:#191c20
+    style F fill:#fef9c3,stroke:#b45309,color:#191c20</pre>
+              <p class="mermaid-error" role="status">
+                ⚠️ Mermaid CDN 未加载或渲染失败。上方保留 Mermaid
+                原始代码，可直接复制到本地 Mermaid 工具查看。
+              </p>
+            </figure>
+          </section>
+
+          <section aria-labelledby="data-model">
+            <h2 id="data-model">5. 数据模型演进</h2>
+            <h3 id="new-tables">5.1 新增表（pglite/postgres 双引擎同形）</h3>
+            <pre
+              aria-label="新增实体、别名与三元组表 SQL"
+            ><code><span class="tok-c">-- canonical 实体（骨架节点）</span>
+<span class="tok-k">CREATE TABLE</span> entities (
+  id          BIGSERIAL <span class="tok-k">PRIMARY KEY</span>,
+  source_id   TEXT <span class="tok-k">NOT NULL DEFAULT</span> <span class="tok-s">'default'</span>,
+  name        TEXT <span class="tok-k">NOT NULL</span>,              <span class="tok-c">-- canonical 名</span>
+  type        TEXT <span class="tok-k">NOT NULL</span>,              <span class="tok-c">-- person/org/product/concept/event/location</span>
+  summary     TEXT <span class="tok-k">NOT NULL DEFAULT</span> <span class="tok-s">''</span>,   <span class="tok-c">-- 跨文档合成的 profile（hub 节点）</span>
+  embedding   VECTOR(<span class="tok-n">1536</span>),               <span class="tok-c">-- node-level 向量（D3 锚点）</span>
+  created_at  TIMESTAMPTZ <span class="tok-k">NOT NULL DEFAULT</span> now(),
+  <span class="tok-k">UNIQUE</span> (source_id, name, type)
+);
+
+<span class="tok-c">-- 实体别名（消解入口）</span>
+<span class="tok-k">CREATE TABLE</span> entity_aliases (
+  id          BIGSERIAL <span class="tok-k">PRIMARY KEY</span>,
+  entity_id   BIGINT <span class="tok-k">NOT NULL REFERENCES</span> entities(id) <span class="tok-k">ON DELETE CASCADE</span>,
+  alias_norm  TEXT <span class="tok-k">NOT NULL</span>,              <span class="tok-c">-- 复用 normalizeAlias()</span>
+  <span class="tok-k">UNIQUE</span> (entity_id, alias_norm)
+);
+
+<span class="tok-c">-- 三元组（骨架边 + 事实）</span>
+<span class="tok-k">CREATE TABLE</span> triples (
+  id                BIGSERIAL <span class="tok-k">PRIMARY KEY</span>,
+  source_id         TEXT <span class="tok-k">NOT NULL DEFAULT</span> <span class="tok-s">'default'</span>,
+  subject_id        BIGINT <span class="tok-k">NOT NULL REFERENCES</span> entities(id) <span class="tok-k">ON DELETE CASCADE</span>,
+  relation          TEXT <span class="tok-k">NOT NULL</span>,        <span class="tok-c">-- 含因果词汇 caused/enabled/prevented</span>
+  object_id         BIGINT <span class="tok-k">REFERENCES</span> entities(id) <span class="tok-k">ON DELETE CASCADE</span>,
+  object_literal    TEXT,                 <span class="tok-c">-- 宾语为字面值时（如 "20%"）</span>
+  evidence_chunk_id INTEGER <span class="tok-k">REFERENCES</span> content_chunks(id) <span class="tok-k">ON DELETE SET NULL</span>,
+  confidence        REAL <span class="tok-k">NOT NULL DEFAULT</span> <span class="tok-n">1.0</span>,
+  extractor         TEXT <span class="tok-k">NOT NULL DEFAULT</span> <span class="tok-s">'llm'</span>,  <span class="tok-c">-- 'llm'|'rule'|'manual'</span>
+  valid_window      TSTZRANGE,            <span class="tok-c">-- bi-temporal（D5），GiST 索引</span>
+  superseded_by     BIGINT <span class="tok-k">REFERENCES</span> triples(id),
+  created_at        TIMESTAMPTZ <span class="tok-k">NOT NULL DEFAULT</span> now()
+);
+<span class="tok-k">CREATE INDEX</span> idx_triples_subject <span class="tok-k">ON</span> triples(subject_id);
+<span class="tok-k">CREATE INDEX</span> idx_triples_object <span class="tok-k">ON</span> triples(object_id);
+<span class="tok-k">CREATE INDEX</span> idx_triples_valid <span class="tok-k">ON</span> triples <span class="tok-k">USING GIST</span> (valid_window);</code></pre>
+            <h3 id="existing-tables">5.2 现有表演进（加列，不破坏）</h3>
+            <ul>
+              <li>
+                <code>links</code>：加
+                <code>weight REAL DEFAULT 1.0</code>、<code
+                  >confidence REAL DEFAULT 1.0</code
+                >（规则边置信度），<strong>保留全部现有列与约束</strong>。
+              </li>
+              <li>
+                <code>facts</code>：<code>valid_from/valid_until</code> 迁移为
+                <code>valid_window TSTZRANGE</code>（双写过渡），保留
+                <code>expired_at/superseded_by</code>。
+              </li>
+              <li>
+                <code>pages</code>：加
+                <code>entity_id BIGINT REFERENCES entities(id)</code
+                >（page↔entity 关联，可选）。
+              </li>
+            </ul>
+          </section>
+
+          <section aria-labelledby="seams">
+            <h2 id="seams">6. 二次开发接缝（映射 gbrain 现有 seam）</h2>
+            <div class="tablewrap">
+              <table>
+                <caption class="sr-only">
+                  升级项与现有 gbrain 接缝映射
+                </caption>
+                <thead>
+                  <tr>
+                    <th>升级项</th>
+                    <th>切入 seam</th>
+                    <th>说明</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>三元组抽取</td>
+                    <td>
+                      新增 cycle phase <code>extract_triples</code>（挂
+                      <code>cycle.ts</code> ALL_PHASES）
+                    </td>
+                    <td>复用 facts/extract 的 gate 管线</td>
+                  </tr>
+                  <tr>
+                    <td>实体合并</td>
+                    <td>新增 <code>src/core/entities/merge.ts</code></td>
+                    <td>
+                      复用 <code>normalizeAlias</code> + resolve.ts 4 步链
+                    </td>
+                  </tr>
+                  <tr>
+                    <td>PPR 臂</td>
+                    <td>
+                      <code>hybridSearch</code> RRF lists 装配处（relational
+                      臂即范例，<code>hybrid.ts:1028</code>）
+                    </td>
+                    <td>mode bundle 加 <code>ppr_retrieval</code> knob</td>
+                  </tr>
+                  <tr>
+                    <td>node-level embedding</td>
+                    <td>
+                      <code>embedding-column.ts</code> registry +
+                      <code>gbrain embed</code>
+                    </td>
+                    <td>搜索侧路由已支持</td>
+                  </tr>
+                  <tr>
+                    <td>社区摘要</td>
+                    <td>
+                      新增 cycle phase <code>synthesize_communities</code>
+                    </td>
+                    <td>替代/增强 <code>synthesize_concepts</code></td>
+                  </tr>
+                  <tr>
+                    <td>bi-temporal</td>
+                    <td>
+                      <code>migrate.ts</code> MIGRATIONS 数组（双引擎
+                      sqlFor.pglite 分支）
+                    </td>
+                    <td>必须双引擎同步 + parity 测试 pin</td>
+                  </tr>
+                  <tr>
+                    <td>图后端适配</td>
+                    <td>
+                      新增 <code>src/core/graph-backend/{sql,age}.ts</code>
+                    </td>
+                    <td>agent_mode/config flag 切换</td>
+                  </tr>
+                  <tr>
+                    <td>抽取质量评估</td>
+                    <td>
+                      <code>src/core/search/eval.ts</code> + 新增
+                      <code>eval extract-triples</code>
+                    </td>
+                    <td>加 fact/triple-level P/R/F1</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section aria-labelledby="migration">
+            <h2 id="migration">7. 分阶段迁移路径</h2>
+            <div class="phase-grid">
+              <article class="phase">
+                <div class="phase-head">
+                  <h3>P0 · 地基（2-4 周）</h3>
+                  <span class="roi">ROI 最高</span>
+                </div>
+                <p><strong>目标</strong>：canonical 实体 + 三元组抽取</p>
+                <p>
+                  <strong>交付</strong>：<code
+                    >entities/triples/entity_aliases</code
+                  >
+                  表 + <code>extract_triples</code> phase + 实体合并 + 抽取 F1
+                  评估
+                </p>
+                <p><strong>风险</strong>：LLM 抽取成本/一致性</p>
+              </article>
+              <article class="phase">
+                <div class="phase-head">
+                  <h3>P1 · 图检索（3-5 周）</h3>
+                  <span class="roi">ROI 高</span>
+                </div>
+                <p><strong>目标</strong>：PPR 多跳 + node-level embedding</p>
+                <p>
+                  <strong>交付</strong>：PPR 臂 + node embedding + 双层关键词 +
+                  mode bundle
+                </p>
+                <p><strong>风险</strong>：PPR 性能、双引擎同步</p>
+              </article>
+              <article class="phase">
+                <div class="phase-head">
+                  <h3>P2 · 时间/因果（2-4 周）</h3>
+                  <span class="roi">ROI 中</span>
+                </div>
+                <p>
+                  <strong>目标</strong>：bi-temporal valid-window + 因果边 +
+                  自动失效
+                </p>
+                <p>
+                  <strong>交付</strong>：<code>tstzrange</code> 迁移 +
+                  contradiction check + 因果词汇
+                </p>
+                <p><strong>风险</strong>：迁移兼容、双写过渡</p>
+              </article>
+              <article class="phase">
+                <div class="phase-head">
+                  <h3>P3 · 全局/可选后端（按需）</h3>
+                  <span class="roi">ROI 中</span>
+                </div>
+                <p><strong>目标</strong>：社区摘要 + AGE/neo4j 可选</p>
+                <p>
+                  <strong>交付</strong>：<code>synthesize_communities</code> +
+                  graph-backend 适配器
+                </p>
+                <p><strong>风险</strong>：PGLite×AGE 兼容（硬验证）</p>
+              </article>
+            </div>
+            <div class="tablewrap">
+              <table>
+                <caption class="sr-only">
+                  P0 至 P3 分阶段迁移路径
+                </caption>
+                <thead>
+                  <tr>
+                    <th>阶段</th>
+                    <th>目标</th>
+                    <th>交付</th>
+                    <th>ROI</th>
+                    <th>风险</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>P0 · 地基</strong>（2-4 周）</td>
+                    <td>canonical 实体 + 三元组抽取</td>
+                    <td>
+                      <code>entities/triples/entity_aliases</code> 表 +
+                      <code>extract_triples</code> phase + 实体合并 + 抽取 F1
+                      评估
+                    </td>
+                    <td>最高（+31 来源）</td>
+                    <td>LLM 抽取成本/一致性</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P1 · 图检索</strong>（3-5 周）</td>
+                    <td>PPR 多跳 + node-level embedding</td>
+                    <td>PPR 臂 + node embedding + 双层关键词 + mode bundle</td>
+                    <td>高（多跳召回）</td>
+                    <td>PPR 性能、双引擎同步</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P2 · 时间/因果</strong>（2-4 周）</td>
+                    <td>bi-temporal valid-window + 因果边 + 自动失效</td>
+                    <td>
+                      <code>tstzrange</code> 迁移 + contradiction check +
+                      因果词汇
+                    </td>
+                    <td>中（事实演化）</td>
+                    <td>迁移兼容、双写过渡</td>
+                  </tr>
+                  <tr>
+                    <td><strong>P3 · 全局/可选后端</strong>（按需）</td>
+                    <td>社区摘要 + AGE/neo4j 可选</td>
+                    <td>
+                      <code>synthesize_communities</code> + graph-backend 适配器
+                    </td>
+                    <td>中（全局问答）</td>
+                    <td>PGLite×AGE 兼容（硬验证）</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="callout warn">
+              <div class="co-head">⚠️ prototype 硬验证点（P3 前置）</div>
+              <p>
+                PGLite WASM 能否加载 Apache AGE。不能，则主线（SQL 三表 + 应用层
+                PPR）不变，AGE 仅作生产自托管可选。
+              </p>
+            </div>
+          </section>
+
+          <section aria-labelledby="evaluation">
+            <h2 id="evaluation">8. 评估与验证</h2>
+            <ul>
+              <li>
+                <strong>检索端</strong>：现有
+                BrainBench（P@5/R@5，<code>search/eval.ts</code>，默认 k=5）+
+                longmemeval + replay × 3 modes，paired bootstrap +
+                Bonferroni。升级后对比 baseline，<strong
+                  >P0 目标：P@5 从 49.1 进一步提升</strong
+                >。
+              </li>
+              <li>
+                <strong>抽取端（新增）</strong>：<code
+                  >eval extract-triples</code
+                >
+                子命令，gold set + P/R/F1（entity resolution + triple
+                correctness），对齐 Anthropic Cookbook 的 F1 闭环（改 prompt →
+                重跑 → 看 F1 漂移）。
+              </li>
+              <li>
+                <strong>质量端</strong>：takes-quality 5 维 rubric 保留；新增
+                RAGAS 四维（faithfulness/context recall 重点）。
+              </li>
+              <li>
+                <strong>双引擎</strong>：<code
+                  >test/e2e/engine-parity.test.ts</code
+                >
+                pin 所有新表 DDL。
+              </li>
+            </ul>
+          </section>
+
+          <section aria-labelledby="risks">
+            <h2 id="risks">9. 风险与陷阱（二次开发必读）</h2>
+            <div class="risk-list">
+              <div class="risk">
+                <strong>双引擎 lockstep</strong>任何新表/新列必须 pglite +
+                postgres 同形 DDL，parity 测试 pin（gbrain 铁律）。
+              </div>
+              <div class="risk">
+                <strong>缓存污染</strong>改任一检索 knob 需同步
+                <code>KNOBS_HASH_VERSION</code>（现 v=11）；PPR 臂进 mode bundle
+                要折进 knobs_hash。
+              </div>
+              <div class="risk">
+                <strong>PGLite × AGE 未知</strong>无成功案例，prototype
+                硬验证，不做假设。
+              </div>
+              <div class="risk">
+                <strong>跨源遍历是安全审计特性</strong
+                ><code>relationalFanout</code> within-source 限制不可绕过；PPR
+                臂默认同样 within-source，跨源需独立 security review。
+              </div>
+              <div class="risk">
+                <strong>mentions 密度炸弹</strong>规则 mentions
+                边默认排除在遍历外（<code
+                  >link_source IS DISTINCT FROM 'mentions'</code
+                >）；LLM triples 需设 confidence 下限防噪。
+              </div>
+              <div class="risk">
+                <strong>LLM 抽取成本/一致性</strong>复用现有
+                gate（sanitize/反自食/parse barrier）；prompt caching + Message
+                Batches API 压成本；抽取质量是上限（HippoRAG error analysis
+                互证）。
+              </div>
+              <div class="risk">
+                <strong>compiled_truth 是人工精华</strong>×2.0 boost
+                不可动，它是现状 P@5
+                的承重墙；三元组抽取是“自动化补强”，不替代人工 compiled_truth。
+              </div>
+              <div class="risk">
+                <strong>官方 RETRIEVAL.md 流程图过时</strong>真实顺序以
+                <code>hybrid.ts</code> 为准（dedup → rerank → autocut → slice →
+                budget）。
+              </div>
+            </div>
+          </section>
+
+          <section aria-labelledby="references">
+            <h2 id="references">10. 参考来源</h2>
+            <div class="sources">
+              <section class="source-group">
+                <h3>2026 前沿（网络权威）</h3>
+                <ul>
+                  <li>
+                    HippoRAG 2（ICML 2025）：<a
+                      href="https://arxiv.org/abs/2502.14802"
+                      rel="noreferrer"
+                      >https://arxiv.org/abs/2502.14802</a
+                    >，PPR 单步多跳
+                  </li>
+                  <li>
+                    LightRAG（EMNLP 2025，港大）：<a
+                      href="https://arxiv.org/abs/2410.05779"
+                      rel="noreferrer"
+                      >https://arxiv.org/abs/2410.05779</a
+                    >，双层 key-value + 增量
+                  </li>
+                  <li>
+                    Graphiti（Zep）：<a
+                      href="https://arxiv.org/abs/2501.13956"
+                      rel="noreferrer"
+                      >https://arxiv.org/abs/2501.13956</a
+                    >
+                    /
+                    <a
+                      href="https://github.com/getzep/graphiti"
+                      rel="noreferrer"
+                      >https://github.com/getzep/graphiti</a
+                    >，bi-temporal KG
+                  </li>
+                  <li>
+                    Microsoft GraphRAG DRIFT：<a
+                      href="https://www.microsoft.com/en-us/research/blog/graphrag-improving-global-search-via-dynamic-community-selection/"
+                      rel="noreferrer"
+                      >Microsoft Research</a
+                    >，全局按需，降 77% token
+                  </li>
+                  <li>
+                    GLiNER：<a
+                      href="https://github.com/Knowledgator/GLiNER"
+                      rel="noreferrer"
+                      >https://github.com/Knowledgator/GLiNER</a
+                    >，zero-shot NER 前端
+                  </li>
+                </ul>
+              </section>
+              <section class="source-group">
+                <h3>存储选型</h3>
+                <ul>
+                  <li>
+                    Apache AGE：<a
+                      href="https://age.apache.org/"
+                      rel="noreferrer"
+                      >https://age.apache.org/</a
+                    >
+                    /
+                    <a href="https://github.com/apache/age" rel="noreferrer"
+                      >https://github.com/apache/age</a
+                    >
+                  </li>
+                  <li>
+                    neo4j-graphrag：<a
+                      href="https://github.com/neo4j/neo4j-graphrag-python"
+                      rel="noreferrer"
+                      >https://github.com/neo4j/neo4j-graphrag-python</a
+                    >
+                  </li>
+                  <li>
+                    FalkorDB：<a
+                      href="https://github.com/FalkorDB/FalkorDB"
+                      rel="noreferrer"
+                      >https://github.com/FalkorDB/FalkorDB</a
+                    >
+                  </li>
+                  <li>
+                    PGLite：<a href="https://pglite.dev/" rel="noreferrer"
+                      >https://pglite.dev/</a
+                    >
+                  </li>
+                  <li>
+                    Kuzu（archived）：<a
+                      href="https://github.com/kuzudb"
+                      rel="noreferrer"
+                      >https://github.com/kuzudb</a
+                    >
+                  </li>
+                </ul>
+              </section>
+              <section class="source-group">
+                <h3>gbrain 源码证据</h3>
+                <p>
+                  见 §1 各 file:line；现状全景见
+                  <code>upstream-gbrain-vector-retrieval.md</code>。
+                </p>
+              </section>
+            </div>
+          </section>
+
+          <footer class="doc-foot">
+            <p>
+              本方案为 iknow 对 upstream gbrain
+              向量记忆库的升级决策；范围限定知识检索子系统，排除智能体私有记忆。所有
+              gbrain 现状结论经源码核实，2026 前沿结论经网络权威调研。
+            </p>
+          </footer>
+        </article>
+      </main>
+    </div>
+    <script>
+      (function () {
+        const root = document.documentElement;
+        const themeBtn = document.getElementById("themeBtn");
+        const stored = localStorage.getItem("gbrain-guide-theme");
+        const initial =
+          stored ||
+          (matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light");
+        function applyTheme(theme) {
+          root.dataset.theme = theme;
+          themeBtn.textContent = theme === "dark" ? "☀" : "☾";
+          themeBtn.setAttribute(
+            "aria-label",
+            theme === "dark" ? "切换到浅色主题" : "切换到深色主题"
+          );
+        }
+        applyTheme(initial);
+        themeBtn.addEventListener("click", () => {
+          const next = root.dataset.theme === "dark" ? "light" : "dark";
+          localStorage.setItem("gbrain-guide-theme", next);
+          applyTheme(next);
+        });
+
+        const rail = document.getElementById("rail");
+        const toggle = document.getElementById("menuToggle");
+        const scrim = document.getElementById("railScrim");
+        function setMenu(open) {
+          rail.classList.toggle("open", open);
+          scrim.classList.toggle("open", open);
+          toggle.setAttribute("aria-expanded", String(open));
+          toggle.setAttribute("aria-label", open ? "关闭目录" : "打开目录");
+          if (open) {
+            rail.querySelector("a").focus();
+          }
+        }
+        toggle.addEventListener("click", () =>
+          setMenu(!rail.classList.contains("open"))
+        );
+        scrim.addEventListener("click", () => setMenu(false));
+        document.addEventListener("keydown", (e) => {
+          if (e.key === "Escape" && rail.classList.contains("open")) {
+            setMenu(false);
+            toggle.focus();
+          }
+        });
+        document.querySelectorAll("#toc a").forEach((a) =>
+          a.addEventListener("click", () => {
+            if (matchMedia("(max-width: 960px)").matches) setMenu(false);
+          })
+        );
+
+        const tocLinks = [...document.querySelectorAll("#toc a")];
+        const sections = tocLinks
+          .map((a) => document.querySelector(a.getAttribute("href")))
+          .filter(Boolean);
+        const io = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              if (entry.isIntersecting) {
+                tocLinks.forEach((a) =>
+                  a.classList.toggle(
+                    "active",
+                    a.getAttribute("href") === "#" + entry.target.id
+                  )
+                );
+                document
+                  .querySelectorAll(".sb-step")
+                  .forEach((a) =>
+                    a.classList.toggle(
+                      "here",
+                      a.getAttribute("href") === "#" + entry.target.id
+                    )
+                  );
+              }
+            });
+          },
+          { rootMargin: "-12% 0px -72% 0px", threshold: 0 }
+        );
+        sections.forEach((section) => io.observe(section));
+
+        window.mermaidFallback = function () {
+          document
+            .querySelectorAll(".mermaid-shell")
+            .forEach((el) => el.classList.add("failed"));
+        };
+        const script = document.createElement("script");
+        script.src =
+          "https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js";
+        script.async = true;
+        script.onload = async () => {
+          try {
+            mermaid.initialize({
+              startOnLoad: false,
+              securityLevel: "strict",
+              theme: root.dataset.theme === "dark" ? "dark" : "neutral",
+              flowchart: { htmlLabels: true, curve: "basis" },
+              themeVariables: {
+                fontFamily: "Segoe UI, Microsoft YaHei, sans-serif",
+                primaryColor:
+                  root.dataset.theme === "dark" ? "#1e2127" : "#ffffff",
+                primaryTextColor:
+                  root.dataset.theme === "dark" ? "#e9ebee" : "#191c20",
+                primaryBorderColor:
+                  root.dataset.theme === "dark" ? "#414752" : "#c4c7bc",
+                lineColor:
+                  root.dataset.theme === "dark" ? "#7f858f" : "#777d85",
+                clusterBkg:
+                  root.dataset.theme === "dark" ? "#1a1d22" : "#eaece6",
+                clusterBorder:
+                  root.dataset.theme === "dark" ? "#414752" : "#c4c7bc",
+              },
+            });
+            await mermaid.run({ querySelector: "pre.mermaid" });
+            document
+              .querySelectorAll(".mermaid-shell")
+              .forEach((el) => el.classList.add("rendered"));
+          } catch (err) {
+            console.warn("Mermaid render failed; raw source retained.", err);
+            window.mermaidFallback();
+          }
+        };
+        script.onerror = window.mermaidFallback;
+        document.head.appendChild(script);
+      })();
+    </script>
+  </body>
+</html>

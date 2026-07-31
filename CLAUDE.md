@@ -51,4 +51,5 @@
 ### Domain docs
 
 - docs/CONTEXT.md — 项目领域语言 
+- README.md - 项目概览、安装、运行、部署
 

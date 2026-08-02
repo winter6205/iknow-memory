@@ -19,8 +19,8 @@ import { loadEnv } from "../src/config.ts";
  * `docs/handoff/2026-07-29-graphrag-mcp-host-acceptance.md`):
  *   - concurrent `loadEnv()` under env mutation (no shared cache, but
  *     also no current use case)
- *   - parseEnvFile read-throw paths (only used when
- *     GRAPHRAG_MEMORY_FROM_FILE=1; stage 0 has no .env shipped)
+ *   - parseEnvFile read-throw paths (.env.local fallback; stage 0 has
+ *     no .env.local shipped)
  */
 describe("loadEnv — stage 0 stdio-only contract", () => {
   // GRAPHRAG_MEMORY_EMBED_DIMENSIONS is now always required; scrub

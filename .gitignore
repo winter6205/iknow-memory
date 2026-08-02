@@ -3,7 +3,7 @@ dist/
 *.tsbuildinfo
 coverage/
 
-_upstream_gbrain
+_upstream_gbrain/
 
 # Host-local env (operator secrets + endpoint overrides)
 .env.local

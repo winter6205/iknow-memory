@@ -5,6 +5,9 @@ coverage/
 
 _upstream_gbrain
 
+# Host-local env (operator secrets + endpoint overrides)
+.env.local
+
 # Claude Code 运行时产物（post-push 钩子日志等）
 .claude/scratchpad/
 

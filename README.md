@@ -12,7 +12,7 @@
 ## 当前状态
 
 - **阶段 0+1 已完成**：chunks-only ingest/retrieve + vector cosine + valid_window 时间切片
-- **P0 进行中**：三元组抽取 + canonical 实体合并（升级方案 ROI 最高）
+- **P0 规划中**：三元组抽取 + canonical 实体合并（升级方案 ROI 最高；P0a schema 原型已验证，见 `acff699`）
 - **后续**：P1 图检索（PPR + node embedding）→ P2 时间/因果 → P3 社区
 
 ## 运行

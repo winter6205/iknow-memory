@@ -1,6 +1,6 @@
 # iknow-memory
 
-外置知识记忆 MCP 服务（host-agnostic，以 gbrain 为学习对象）。
+外置记忆 MCP 服务。
 
 ## 定位
 
@@ -73,11 +73,11 @@ pgvector 模式：
 
 ## MCP Tools
 
-| Tool | 输入 | 输出 | 说明 |
-|------|------|------|------|
-| `ingest` | `{content, source_ref, metadata?, valid_from?, valid_until?}` | `{chunk_ids}` | 写入：chunk → embed → store |
-| `retrieve` | `{query, valid_at?, filters?, limit?}` | `{chunks[]}` | 读取：embed → vector search + valid_window 过滤 |
-| `echo` | `{message}` | `{message}` | 健康检查 |
+| Tool       | 输入                                                          | 输出          | 说明                                            |
+| ---------- | ------------------------------------------------------------- | ------------- | ----------------------------------------------- |
+| `ingest`   | `{content, source_ref, metadata?, valid_from?, valid_until?}` | `{chunk_ids}` | 写入：chunk → embed → store                     |
+| `retrieve` | `{query, valid_at?, filters?, limit?}`                        | `{chunks[]}`  | 读取：embed → vector search + valid_window 过滤 |
+| `echo`     | `{message}`                                                   | `{message}`   | 健康检查                                        |
 
 ## 项目结构
 

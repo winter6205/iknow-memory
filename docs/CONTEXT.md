@@ -1,8 +1,6 @@
 # iknow-memory — 领域词汇表
 
-> 本文件是 iknow-memory（外置知识记忆 MCP 服务）的**领域词汇 SSOT**. 仅 `domain-modeling` 技能可写; 其他技能按 `docs/agents/context-contract.md` 消费.
->
-> 词汇范围仅限 iknow-memory 内部; 顶层 `docs/CONTEXT.md` 覆盖 iknow runtime / harness / 4-tool 词汇——`knowledge memory` / `session memory` / `context assembly` / `memory unit` 等顶层定义在此**引用但不重定义**.
+> 本文件是 iknow-memory（外置知识记忆 MCP 服务）的**领域词汇 SSOT**. 仅 `domain-modeling` 技能可写; 其他技能只读消费.
 
 ---
 
@@ -13,22 +11,22 @@
 **iknow-memory**: the standalone, host-agnostic knowledge memory MCP server. Stores, indexes, and retrieves semantic facts with temporal validity; exposes MCP tools (`ingest`, `retrieve`) over stdio. Does not assemble context, trigger retrieval, or manage conversation state — those are the host's job.
 _Avoid_: "knowledge base" (implies curated documents, not extracted facts); "memory backend" (too generic)
 
-**MCP tool**: a function exposed via Model Context Protocol (`tools/list` + `tools/call`). iknow-memory defines its own tool protocol — not constrained by iknow's legacy 4-tool contract (`kb_retrieve` / `kb_verify` / `kb_compile` / `kb_governance`).
-_Avoid_: "tool" alone (ambiguous with iknow harness tools); "API endpoint" (MCP is not REST)
+**MCP tool**: a function exposed via Model Context Protocol (`tools/list` + `tools/call`). iknow-memory defines its own tool protocol — not constrained by any legacy tool contract.
+_Avoid_: "tool" alone (ambiguous with host tools); "API endpoint" (MCP is not REST)
 
 **host**: any MCP client that discovers and calls iknow-memory tools (Claude Code, iknow harness, custom agents). The host owns context engineering (JIT retrieval triggers, cache layout, prompt assembly). iknow-memory never reaches into the host.
 _Avoid_: "client" (too generic); "consumer" (implies passive reading, hosts actively orchestrate)
 
 ### Memory units
 
-**chunk**: a fixed-window text slice produced by the chunker during ingest. Identified by UUID, carries `embedding`, `source_ref`, `metadata`, `valid_from`, `valid_until`, `created_at`. The atomic unit of vector storage and retrieval in stage 1. <!-- project-override: top-level `docs/CONTEXT.md` `Chunk` is a 4-tool kb_retrieve return value (legacy runtime); this `chunk` is the independent MCP server's storage unit. Distinct runtime, distinct concept, distinct lifecycle. -->
+**chunk**: a fixed-window text slice produced by the chunker during ingest. Identified by UUID, carries `embedding`, `source_ref`, `metadata`, `valid_from`, `valid_until`, `created_at`. The atomic unit of vector storage and retrieval in stage 1.
 _Avoid_: "document" (a chunk is a slice, not a whole document); "passage" (implies semantic completeness); "segment" (ambiguous with context segments)
 
 **entity**: a canonical real-world referent extracted from chunks (person, concept, system, event). Identified by UUID, carries `canonical_name`, `type`, `embedding`, `metadata`. Multiple surface forms (aliases) resolve to one entity. _Stage: P0 (not yet implemented)._
 _Avoid_: "node" (graph-generic, use only when discussing Neo4j topology); "concept" (one entity type, not the general term); "mention" (a mention is an occurrence, not the canonical entity)
 
-**triple**: a directed typed edge `(head_entity, relation, tail_entity)` extracted from a chunk. Carries `confidence`, `source_chunk_id`, `valid_window`, `created_at`. The atomic unit of graph knowledge. _Stage: P0 (not yet implemented)._ <!-- project-override: top-level `docs/CONTEXT.md` `Fact` is a kb_compile content-hash-stable claim (legacy 4-tool); `triple` is the independent MCP server's graph primitive. Explicitly avoid `Fact` here to prevent cross-runtime confusion. -->
-_Avoid_: "fact" (ambiguous with gbrain's `facts` table and iknow's `CompiledFact`); "edge" (graph-generic, use only in Neo4j context); "link" (gbrain's rule-based links are not triples)
+**triple**: a directed typed edge `(head_entity, relation, tail_entity)` extracted from a chunk. Carries `confidence`, `source_chunk_id`, `valid_window`, `created_at`. The atomic unit of graph knowledge. _Stage: P0 (not yet implemented)._
+_Avoid_: "fact" (ambiguous with gbrain's `facts` table); "edge" (graph-generic, use only in Neo4j context); "link" (gbrain's rule-based links are not triples)
 
 **alias**: a surface-form string that resolves to a canonical entity (name variant, abbreviation, spelling). Stored in `entity_aliases` with `entity_id` foreign key. _Stage: P0 (not yet implemented)._
 _Avoid_: "synonym" (implies bidirectional equivalence); "variant" (one alias type, not the general term)
@@ -41,7 +39,7 @@ _Avoid_: "master entity" (implies hierarchy); "root entity" (implies tree struct
 **vector search**: brute-force cosine similarity over chunk embeddings (stage 1) or HNSW index (future). Returns ranked chunks by cosine score. The only retrieval arm in stage 1.
 _Avoid_: "semantic search" (too broad, includes BM25); "embedding search" (the search is over embeddings, not for them)
 
-**BM25**: Okapi BM25 lexical ranking (k1=1.2, b=0.75) over tokenized chunk text. A retrieval arm that complements vector search by matching exact terms. _Stage: not yet in product retrieve (algorithm validated in stage2 prototype)._
+**BM25**: Okapi BM25 lexical ranking (k1=1.2, b=0.75) over tokenized chunk text. A retrieval arm that complements vector search by matching exact terms. _Stage: not yet in product retrieve (algorithm validated in prototype)._
 _Avoid_: "keyword search" (BM25 is ranked, not boolean); "lexical search" (acceptable alias but BM25 is more precise)
 
 **hybrid retrieval**: multi-arm recall (vector + BM25 + graph traversal) fused by Reciprocal Rank Fusion (RRF, k=60) with weighted arms (vector 0.8, BM25 0.2), followed by cosine re-score blend (0.7 normRRF + 0.3 cosine). _Stage: P1._
@@ -111,14 +109,12 @@ _Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified)
 
 ## Flagged ambiguities
 
-- **chunk (iknow-memory) vs Chunk (top-level)**: iknow-memory `chunk` is the independent MCP server's storage unit. Top-level `Chunk` is the legacy 4-tool kb_retrieve return value. Distinct runtimes, distinct concepts. iknow-memory does not consume or produce the top-level `Chunk`.
-- **triple vs Fact**: in iknow-memory, "triple" is the canonical term for (head, relation, tail). "Fact" is avoided because it collides with gbrain's `facts` table (bi-temporal claims) and iknow's `CompiledFact` (4-tool contract). If you must say "fact" in iknow-memory context, qualify it: "graph fact" or "temporal fact".
+- **triple vs fact**: in iknow-memory, "triple" is the canonical term for (head, relation, tail). "Fact" is avoided because it collides with gbrain's `facts` table (bi-temporal claims). If you must say "fact" in iknow-memory context, qualify it: "graph fact" or "temporal fact".
 - **valid_window vs valid_at**: `valid_window` is a property of stored data (when is this true?); `valid_at` is a property of the query (when am I asking about?). The filter is `valid_window @> valid_at`.
 - **Neo4j vs Postgres**: entities/triples live in Neo4j (native graph traversal); chunks/embeddings live in Postgres/pgvector (vector search). This is a deliberate split, not a migration path. Do not propose "just use Postgres for everything" without addressing the native-graph-node constraint.
 - **rerank fail-open**: rerank failure returns the fused order unchanged. This is intentional — a dead reranker should not block retrieval. Do not add retry/fallback logic that changes this contract without explicit decision.
-- **context engineering is NOT our job**: JIT retrieval triggers, cache breakpoint planning, prompt assembly, budget allocation — these belong to the host. iknow-memory returns ranked chunks; what the host does with them is the host's problem. The stage2 prototype's `assemble.ts` / `cache.ts` / `jit.ts` are abandoned, not deferred.
+- **context engineering is NOT our job**: JIT retrieval triggers, cache breakpoint planning, prompt assembly, budget allocation — these belong to the host. iknow-memory returns ranked chunks; what the host does with them is the host's problem.
 - **gbrain is a learning object, not a dependency**: design decisions (RRF k=60, cosine re-score 0.7/0.3, rerank fail-open, PPR) are adopted from gbrain's upgrade guide. gbrain code (`_upstream_gbrain/`) is read-only reference — zero runtime import/link/symlink. We implement better, not copy.
-- **stage2 prototype status**: commit 84efe62 on branch `worktree-prototype-stage2-give-memory` is a throwaway validation. Its retrieval algorithms (BM25/hybrid/rerank) are decision references; its context engineering (assemble/cache/jit/tui/demo) is abandoned. Do not import from it; do not treat its numbers as product benchmarks.
 
 ## Bootstrap mode
 
@@ -126,6 +122,5 @@ If this file only had template examples and no real project terms, seed via:
 
 1. Read `src/core/types.ts` for storage vocabulary
 2. Read `src/tools/ingest.ts` and `retrieve.ts` for tool contracts
-3. Read wayfinder map Decisions-so-far for settled decisions
-4. Read `docs/gbrain-vector-memory-upgrade-guide.html` §1.4 for gbrain gap vocabulary
-5. Invoke `arthurpower:domain-modeling` to ratify new terms before adding them here
+3. Read `docs/gbrain-vector-memory-upgrade-guide.html` §1.4 for gbrain gap vocabulary
+4. Invoke `arthurpower:domain-modeling` to ratify new terms before adding them here

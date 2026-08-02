@@ -7,12 +7,12 @@
 - **外置记忆服务**：通过 MCP（Model Context Protocol）接入任何智能体 host
 - **host-agnostic**：不依赖任何特定 host（iknow / Claude Code / 自定义 agent 均可接入）
 - **不做上下文工程**：JIT retrieval / cache 布局 / 上下文组装是 host 的事，server 只负责"存得对、查得准、可时间切片"
-- **以 gbrain 为学习对象**：优点全部实现（混合检索 / 分层记忆 / bi-temporal），缺点全部改进（三元组抽取 / canonical 实体合并 / PPR 多跳 / 社区检测）
+- **以 gbrain 为学习对象**：目标实现其优点（混合检索 / 分层记忆 / bi-temporal），改进其缺点（三元组抽取 / canonical 实体合并 / PPR 多跳 / 社区检测）
 
 ## 当前状态
 
 - **阶段 0+1 已完成**：chunks-only ingest/retrieve + vector cosine + valid_window 时间切片
-- **P0 进行中**：三元组抽取 + canonical 实体合并（升级方案 ROI 最高）
+- **P0 规划中**：三元组抽取 + canonical 实体合并（升级方案 ROI 最高；P0a schema 原型已验证，见 `acff699`）
 - **后续**：P1 图检索（PPR + node embedding）→ P2 时间/因果 → P3 社区
 
 ## 运行

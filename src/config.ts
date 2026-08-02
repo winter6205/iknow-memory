@@ -1,10 +1,8 @@
 /**
  * Runtime config for iknow-memory MCP server.
  *
- * Loads from process.env + optional `.env` / `.env.local` (cwd).
- * Precedence: process.env > `.env.local` > `.env` (matching the root iknow
- * config convention at src/config/env.ts, but with a graphrag-namespaced
- * prefix to keep this package decoupled from iknow's env).
+ * Loads from process.env with `.env.local` (cwd) as fallback.
+ * Precedence: process.env > `.env.local`.
  *
  * Never logs secret values.
  */
@@ -119,12 +117,10 @@ function parseEnvFile(path: string): Record<string, string> {
 }
 
 function readEnv(key: string): string | undefined {
-  const file =
-    process.env["GRAPHRAG_MEMORY_FROM_FILE"] === "1"
-      ? parseEnvFile(join(process.cwd(), ".env.local"))
-      : undefined;
-  if (file && key in file) return file[key];
-  return process.env[key];
+  const fromProcess = process.env[key];
+  if (fromProcess !== undefined) return fromProcess;
+  const file = parseEnvFile(join(process.cwd(), ".env.local"));
+  return file[key];
 }
 
 /**

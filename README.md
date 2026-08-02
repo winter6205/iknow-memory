@@ -12,7 +12,7 @@
 ## 当前状态
 
 - **阶段 0+1 已完成**：chunks-only ingest/retrieve + vector cosine + valid_window 时间切片
-- **P0 进行中**：三元组抽取 + canonical 实体合并（升级方案 ROI 最高）
+- **P0 规划中**：三元组抽取 + canonical 实体合并（升级方案 ROI 最高；P0a schema 原型已验证，见 `acff699`）
 - **后续**：P1 图检索（PPR + node embedding）→ P2 时间/因果 → P3 社区
 
 ## 运行
@@ -42,8 +42,8 @@ npm run typecheck  # tsc --noEmit
       "command": "node",
       "args": ["path/to/iknow-memory/dist/index.js"],
       "env": {
-        "IKNOW_MEMORY_STORAGE": "memory",
-        "IKNOW_MEMORY_EMBED_DIMENSIONS": "2048"
+        "GRAPHRAG_MEMORY_STORAGE": "memory",
+        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048"
       }
     }
   }
@@ -59,17 +59,20 @@ pgvector 模式：
       "command": "node",
       "args": ["path/to/iknow-memory/dist/index.js"],
       "env": {
-        "IKNOW_MEMORY_STORAGE": "pgvector",
-        "IKNOW_MEMORY_DB_URL": "postgresql://...",
-        "IKNOW_MEMORY_EMBED_DIMENSIONS": "2048",
-        "IKNOW_MEMORY_EMBED_BASE_URL": "http://localhost:20128/v1",
-        "IKNOW_MEMORY_EMBED_MODEL": "zhipueb/embedding-3",
-        "IKNOW_MEMORY_EMBED_API_KEY_ENV": "NINE_ROUTER_KEY"
+        "GRAPHRAG_MEMORY_STORAGE": "pgvector",
+        "GRAPHRAG_MEMORY_DB_URL": "postgresql://...",
+        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048",
+        "GRAPHRAG_MEMORY_EMBED_MODEL": "zhipueb/embedding-3",
+        "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV": "ANTHROPIC_AUTH_TOKEN"
       }
     }
   }
 }
 ```
+
+> **Base URL**：`GRAPHRAG_MEMORY_EMBED_BASE_URL` 不写死在 `.mcp.json` 里。
+> 优先从进程环境继承（`~/.bashrc` 动态网关探测），fallback 到项目根
+> `.env.local`（gitignored）。WSL 环境下网关 IP 会变，写死会失效。
 
 ## MCP Tools
 

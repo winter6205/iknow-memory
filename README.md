@@ -42,8 +42,8 @@ npm run typecheck  # tsc --noEmit
       "command": "node",
       "args": ["path/to/iknow-memory/dist/index.js"],
       "env": {
-        "IKNOW_MEMORY_STORAGE": "memory",
-        "IKNOW_MEMORY_EMBED_DIMENSIONS": "2048"
+        "GRAPHRAG_MEMORY_STORAGE": "memory",
+        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048"
       }
     }
   }
@@ -59,25 +59,28 @@ pgvector 模式：
       "command": "node",
       "args": ["path/to/iknow-memory/dist/index.js"],
       "env": {
-        "IKNOW_MEMORY_STORAGE": "pgvector",
-        "IKNOW_MEMORY_DB_URL": "postgresql://...",
-        "IKNOW_MEMORY_EMBED_DIMENSIONS": "2048",
-        "IKNOW_MEMORY_EMBED_BASE_URL": "http://localhost:20128/v1",
-        "IKNOW_MEMORY_EMBED_MODEL": "zhipueb/embedding-3",
-        "IKNOW_MEMORY_EMBED_API_KEY_ENV": "NINE_ROUTER_KEY"
+        "GRAPHRAG_MEMORY_STORAGE": "pgvector",
+        "GRAPHRAG_MEMORY_DB_URL": "postgresql://...",
+        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048",
+        "GRAPHRAG_MEMORY_EMBED_MODEL": "zhipueb/embedding-3",
+        "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV": "ANTHROPIC_AUTH_TOKEN"
       }
     }
   }
 }
 ```
 
+> **Base URL**：`GRAPHRAG_MEMORY_EMBED_BASE_URL` 不写死在 `.mcp.json` 里。
+> 优先从进程环境继承（`~/.bashrc` 动态网关探测），fallback 到项目根
+> `.env.local`（gitignored）。WSL 环境下网关 IP 会变，写死会失效。
+
 ## MCP Tools
 
-| Tool | 输入 | 输出 | 说明 |
-|------|------|------|------|
-| `ingest` | `{content, source_ref, metadata?, valid_from?, valid_until?}` | `{chunk_ids}` | 写入：chunk → embed → store |
-| `retrieve` | `{query, valid_at?, filters?, limit?}` | `{chunks[]}` | 读取：embed → vector search + valid_window 过滤 |
-| `echo` | `{message}` | `{message}` | 健康检查 |
+| Tool       | 输入                                                          | 输出          | 说明                                            |
+| ---------- | ------------------------------------------------------------- | ------------- | ----------------------------------------------- |
+| `ingest`   | `{content, source_ref, metadata?, valid_from?, valid_until?}` | `{chunk_ids}` | 写入：chunk → embed → store                     |
+| `retrieve` | `{query, valid_at?, filters?, limit?}`                        | `{chunks[]}`  | 读取：embed → vector search + valid_window 过滤 |
+| `echo`     | `{message}`                                                   | `{message}`   | 健康检查                                        |
 
 ## 项目结构
 

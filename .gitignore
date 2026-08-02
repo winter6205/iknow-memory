@@ -10,3 +10,4 @@ _upstream_gbrain
 
 docs/archive
 .tmp-tickets
+.claude/worktrees/

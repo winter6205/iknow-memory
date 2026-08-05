@@ -4,7 +4,7 @@
 entity/triple layer (consumed by spec 2 extraction+merge and spec 3
 integration+evaluation).
 **Architecture:** One new file `src/core/storage/schema-p0.ts` exporting
-`upSchemaP0(client)`; one small wiring edit to `pgvector-backend.ts`'s
+`upSchemaP0(client, dimensions)`; one small wiring edit to `pgvector-backend.ts`'s
 existing `ensureTable` init path. No new dependencies, no Neo4j runtime
 (ADR-0001).
 **Tech Stack:** TypeScript + node-postgres `pg` + Postgres/pgvector (already
@@ -47,7 +47,7 @@ behaviors, not internal decomposition.
 
 ### T2. `[implementation]` Scaffold `schema-p0.ts` + idempotency probe
 
-- **Affects:** `src/core/storage/schema-p0.ts` (new — exports `upSchemaP0`,
+- **Affects:** `src/core/storage/schema-p0.ts` (new — exports `upSchemaP0(client, dimensions)`,
   the four table helpers, and the BEGIN/COMMIT/ROLLBACK wrapper); empty stub
   acceptable on intermediate commits but T2's commit must call `CREATE TABLE
 IF NOT EXISTS` for at least one table so idempotency is real, not theoretical;
@@ -115,7 +115,7 @@ IF NOT EXISTS` for at least one table so idempotency is real, not theoretical;
   helper); `tests/schema-p0.test.ts` (add tests for `extraction_records`,
   `valid_window @>` boundary semantics, full introspection sweep);
   `src/core/storage/pgvector-backend.ts` (one line addition inside the
-  existing `ensureTable` transaction, calling `upSchemaP0(client)` after the
+  existing `ensureTable` transaction, calling `upSchemaP0(client, this.dimensions)` after the
   existing `chunks` DDL — exact insertion point left to implementer per the
   existing try/catch shape).
 - **Acceptance:** against a real Postgres:

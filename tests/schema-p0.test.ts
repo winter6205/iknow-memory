@@ -309,7 +309,283 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       expect(Number(after.rows[0].count)).toBe(0);
     });
   });
+
+  // -------------------------------------------------------------------
+  // T4: DDL contract lock for triples.
+  //
+  // Runs after the idempotency test (which drops + recreates all P0 tables
+  // and the minimal `chunks` stand-in), so `triples` and `chunks` exist with
+  // the pinned DDL when these tests execute (vitest is sequential within a
+  // describe). Each test pins one row of specs/p0-schema.md
+  // §"Testing Strategy" against the triples table.
+  // -------------------------------------------------------------------
+  describe("triples DDL contract", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    /**
+     * Read column names for a given table from information_schema.columns.
+     * Local copy of the T3 helper so this describe is self-contained.
+     */
+    async function readColumns(
+      c: pg.Client,
+      tableName: string
+    ): Promise<Set<string>> {
+      const res = await c.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_name = $1 AND table_schema = 'public'`,
+        [tableName]
+      );
+      return new Set(res.rows.map((r) => r.column_name));
+    }
+
+    /**
+     * Read the five triples indexes from pg_indexes + pg_class/pg_am so the
+     * access-method type (btree vs gist) can be asserted without relying on
+     * the Postgres-generated index definition text.
+     */
+    async function readTriplesIndexAm(
+      c: pg.Client
+    ): Promise<Map<string, string>> {
+      const res = await c.query<{ indexname: string; amname: string }>(
+        `SELECT i.indexname, am.amname
+           FROM pg_indexes i
+           JOIN pg_class r ON r.relname = i.indexname
+           JOIN pg_am am ON am.oid = r.relam
+          WHERE i.schemaname = 'public' AND i.tablename = 'triples'`
+      );
+      return new Map(res.rows.map((r) => [r.indexname, r.amname]));
+    }
+
+    it("triples exposes every column pinned in the DDL contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "triples");
+      const expected = [
+        "id",
+        "head_id",
+        "tail_id",
+        "relation_raw",
+        "relation_norm",
+        "confidence",
+        "source_chunk_id",
+        "valid_window",
+        "created_at",
+      ];
+      for (const col of expected) {
+        expect(cols, `triples.${col} missing`).toContain(col);
+      }
+    });
+
+    it("triples has the five pinned indexes with the right access methods", async () => {
+      const c = requireClient();
+      const ams = await readTriplesIndexAm(c);
+
+      // GiST on valid_window — must be gist, not a btree fallback.
+      expect(ams.get("triples_valid_window_idx")).toBe("gist");
+      // The four btree indexes.
+      expect(ams.get("triples_head_id_idx")).toBe("btree");
+      expect(ams.get("triples_tail_id_idx")).toBe("btree");
+      expect(ams.get("triples_source_chunk_id_idx")).toBe("btree");
+      expect(ams.get("triples_relation_norm_idx")).toBe("btree");
+    });
+
+    it("CHECK rejects confidence out of [0,1] (negative)", async () => {
+      const c = requireClient();
+      const { headId, tailId } = await mintTripleEntities(c);
+      await expect(
+        c.query(
+          `INSERT INTO triples
+             (id, head_id, tail_id, relation_raw, relation_norm, confidence, valid_window)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            crypto.randomUUID(),
+            headId,
+            tailId,
+            "raw",
+            "norm",
+            -0.5,
+            tstzrangeAll(c),
+          ]
+        )
+      ).rejects.toThrow();
+    });
+
+    it("CHECK rejects confidence out of [0,1] (above 1)", async () => {
+      const c = requireClient();
+      const { headId, tailId } = await mintTripleEntities(c);
+      await expect(
+        c.query(
+          `INSERT INTO triples
+             (id, head_id, tail_id, relation_raw, relation_norm, confidence, valid_window)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            crypto.randomUUID(),
+            headId,
+            tailId,
+            "raw",
+            "norm",
+            1.5,
+            tstzrangeAll(c),
+          ]
+        )
+      ).rejects.toThrow();
+    });
+
+    it("NOT NULL rejects a NULL relation_raw", async () => {
+      const c = requireClient();
+      const { headId, tailId } = await mintTripleEntities(c);
+      await expect(
+        c.query(
+          `INSERT INTO triples
+             (id, head_id, tail_id, relation_raw, relation_norm, confidence, valid_window)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            crypto.randomUUID(),
+            headId,
+            tailId,
+            null,
+            "norm",
+            0.5,
+            tstzrangeAll(c),
+          ]
+        )
+      ).rejects.toThrow();
+    });
+
+    it("NOT NULL rejects a NULL relation_norm", async () => {
+      const c = requireClient();
+      const { headId, tailId } = await mintTripleEntities(c);
+      await expect(
+        c.query(
+          `INSERT INTO triples
+             (id, head_id, tail_id, relation_raw, relation_norm, confidence, valid_window)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [
+            crypto.randomUUID(),
+            headId,
+            tailId,
+            "raw",
+            null,
+            0.5,
+            tstzrangeAll(c),
+          ]
+        )
+      ).rejects.toThrow();
+    });
+
+    it("FK ON DELETE SET NULL: deleting the source chunk NULLs source_chunk_id and keeps the triple", async () => {
+      const c = requireClient();
+      const { headId, tailId } = await mintTripleEntities(c);
+      const chunkId = crypto.randomUUID();
+      await c.query(`INSERT INTO chunks (id, content) VALUES ($1, $2)`, [
+        chunkId,
+        "chunk-for-set-null",
+      ]);
+      const tripleId = crypto.randomUUID();
+      await c.query(
+        `INSERT INTO triples
+           (id, head_id, tail_id, relation_raw, relation_norm, confidence,
+            source_chunk_id, valid_window)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [tripleId, headId, tailId, "raw", "norm", 0.5, chunkId, tstzrangeAll(c)]
+      );
+
+      // Delete the chunk; the triple must survive with a nulled source_chunk_id
+      // (spec coverage-contract row 2).
+      await c.query(`DELETE FROM chunks WHERE id = $1`, [chunkId]);
+
+      const after = await c.query<{ source_chunk_id: string | null }>(
+        `SELECT source_chunk_id FROM triples WHERE id = $1`,
+        [tripleId]
+      );
+      expect(after.rowCount).toBe(1);
+      expect(after.rows[0].source_chunk_id).toBeNull();
+    });
+
+    it("FK ON DELETE RESTRICT: deleting an entity referenced as head_id fails", async () => {
+      const c = requireClient();
+      const { headId, tailId } = await mintTripleEntities(c);
+      await c.query(
+        `INSERT INTO triples
+           (id, head_id, tail_id, relation_raw, relation_norm, confidence, valid_window)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          crypto.randomUUID(),
+          headId,
+          tailId,
+          "raw",
+          "norm",
+          0.5,
+          tstzrangeAll(c),
+        ]
+      );
+      // RESTRICT must block the delete of the head entity (spec row 5).
+      await expect(
+        c.query(`DELETE FROM entities WHERE id = $1`, [headId])
+      ).rejects.toThrow();
+    });
+
+    it("FK ON DELETE RESTRICT: deleting an entity referenced as tail_id fails", async () => {
+      const c = requireClient();
+      const { headId, tailId } = await mintTripleEntities(c);
+      await c.query(
+        `INSERT INTO triples
+           (id, head_id, tail_id, relation_raw, relation_norm, confidence, valid_window)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [
+          crypto.randomUUID(),
+          headId,
+          tailId,
+          "raw",
+          "norm",
+          0.5,
+          tstzrangeAll(c),
+        ]
+      );
+      // RESTRICT must block the delete of the tail entity.
+      await expect(
+        c.query(`DELETE FROM entities WHERE id = $1`, [tailId])
+      ).rejects.toThrow();
+    });
+  });
 });
+
+/**
+ * Mint two fresh entities to be used as a triple's head_id / tail_id. type
+ * must be one of the CHECK'd values ('person' etc); canonical_name is unique
+ * per call so the test never collides with earlier rows.
+ */
+async function mintTripleEntities(
+  c: pg.Client
+): Promise<{ headId: string; tailId: string }> {
+  const headId = crypto.randomUUID();
+  const tailId = crypto.randomUUID();
+  await c.query(
+    `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, $3)`,
+    [headId, `t4-head-${headId}`, "concept"]
+  );
+  await c.query(
+    `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, $3)`,
+    [tailId, `t4-tail-${tailId}`, "concept"]
+  );
+  return { headId, tailId };
+}
+
+/**
+ * A tstzrange literal covering `[2026-01-01, +inf)` — left-closed, no upper
+ * bound (spec: null upper bound = forever). Used so valid_window satisfies
+ * its NOT NULL while standing outside the boundary-probe semantics T5 owns.
+ */
+function tstzrangeAll(c: pg.Client): unknown {
+  void c;
+  return `[2026-01-01,)` as unknown;
+}
 
 /**
  * Count rows in pg_tables filtered to the four P0 tables + chunks. Used as

@@ -290,8 +290,27 @@ Binary — each maps to a command + expected output:
 
 ## Open Questions
 
-Gate the handoff to `writing-plans`; each needs an operator decision:
+All three Open Questions were resolved on 2026-08-06 at the writing-plans
+handoff (T1 of `plans/p0-schema.md`). Recorded here so downstream specs do
+not re-litigate them:
 
-1. **UUID version (A3)** — `uuid v4` (random, zero dependency) vs `v7` (time-ordered, less B-tree write amplification; needs a dep or runtime support). All four tables' PKs follow the answer; `chunks.id` (stage 1, v4) is NOT reopened.
-2. **DB-layer dedup for triples (A15)** — confirmed default keeps dedup app-level (#4 D6 semantic key). The known limitation from P0b V4 (deleted chunk → orphan triple silently absorbs a re-extracted duplicate and drops the new chunk's provenance) is inherited by spec 2. Decide now if this spec must instead carry a partial unique index / exclusion constraint, or if spec 2 owns the remedy.
-3. **Migration mechanism (A22)** — confirmed default is `CREATE TABLE IF NOT EXISTS` in `schema-p0.ts`, no `schema_meta` table, no forward-migration framework. Future ALTERs are manual SQL. Reopen only if operator wants version tracking from day one.
+1. **UUID version (A3) — RESOLVED: `uuid v4`.** Node's built-in
+   `crypto.randomUUID()` provides a v4 UUID with zero new dependency.
+   `chunks.id` (stage 1) already uses v4 and is not reopened. All four P0
+   tables (`entities`, `entity_aliases`, `triples`, `extraction_records`)
+   declare `id uuid PRIMARY KEY` and rely on the app to generate v4. The
+   v7 trade-off (time-ordered, lower B-tree write amplification) is
+   deferred to a future spec that may revisit the entire PK strategy at
+   once.
+2. **DB-layer dedup for triples (A15) — RESOLVED: app-level only.** No
+   unique index, no exclusion constraint at the DB layer. The semantic
+   dedup key `(head_id, relation_norm, tail_id)` + `valid_window` overlap
+   is enforced at the extraction write layer in spec 2 (#4 D6). The P0b
+   V4 known limitation (deleted chunk → orphan triple absorbs a
+   re-extracted duplicate and drops the new chunk's provenance) is
+   inherited by spec 2 and is spec 2's responsibility to address.
+3. **Migration mechanism (A22) — RESOLVED: `CREATE TABLE IF NOT EXISTS`
+   only.** No `schema_meta` table, no forward-migration framework, no
+   version tracking. Future ALTERs are manual SQL applied outside the
+   bootstrap path. Reopen only if an operator requests version tracking
+   from day one.

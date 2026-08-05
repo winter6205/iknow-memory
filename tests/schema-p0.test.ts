@@ -554,6 +554,258 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       ).rejects.toThrow();
     });
   });
+
+  // -------------------------------------------------------------------
+  // T5: DDL contract lock for extraction_records + valid_window @>
+  // boundary probes + complete index inventory (the 13 indexes pinned
+  // by specs/p0-schema.md §"Indexes").
+  //
+  // Runs after the idempotency test which drops + recreates the schema,
+  // so all four P0 tables + the minimal `chunks` stand-in are present.
+  // Each test pins one row of §"Testing Strategy" coverage contract 8
+  // (@> probes) and §"Success Criteria" row 6 (13-index inventory).
+  // -------------------------------------------------------------------
+  describe("extraction_records DDL contract + valid_window @>", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    async function readColumns(
+      c: pg.Client,
+      tableName: string
+    ): Promise<Set<string>> {
+      const res = await c.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_name = $1 AND table_schema = 'public'`,
+        [tableName]
+      );
+      return new Set(res.rows.map((r) => r.column_name));
+    }
+
+    /**
+     * Read pg_indexes rows for the named P0 tables (entities,
+     * entity_aliases, triples, extraction_records). Returns a map keyed
+     * by index name with the raw `indexdef` string so callers can assert
+     * uniqueness / access method without re-querying pg_class.
+     */
+    async function readP0Indexes(
+      c: pg.Client
+    ): Promise<Map<string, { tablename: string; indexdef: string }>> {
+      const res = await c.query<{
+        indexname: string;
+        tablename: string;
+        indexdef: string;
+      }>(
+        `SELECT indexname, tablename, indexdef FROM pg_indexes
+           WHERE schemaname = 'public'
+             AND tablename IN ('entities','entity_aliases','triples','extraction_records')`
+      );
+      const map = new Map<string, { tablename: string; indexdef: string }>();
+      for (const row of res.rows) {
+        map.set(row.indexname, {
+          tablename: row.tablename,
+          indexdef: row.indexdef,
+        });
+      }
+      return map;
+    }
+
+    it("extraction_records exposes every column pinned in the DDL contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "extraction_records");
+      const expected = [
+        "id",
+        "batch_id",
+        "chunk_id",
+        "status",
+        "error_code",
+        "error_msg",
+        "triples_count",
+        "unmapped_count",
+        "started_at",
+        "finished_at",
+        "created_at",
+      ];
+      for (const col of expected) {
+        expect(cols, `extraction_records.${col} missing`).toContain(col);
+      }
+    });
+
+    it("CHECK rejects an unknown extraction_records.status value", async () => {
+      const c = requireClient();
+      await expect(
+        c.query(
+          `INSERT INTO extraction_records
+             (id, batch_id, status, started_at)
+             VALUES ($1, $2, $3, now())`,
+          [crypto.randomUUID(), crypto.randomUUID(), "running"]
+        )
+      ).rejects.toThrow();
+    });
+
+    it("extraction_records has the four pinned btree indexes", async () => {
+      const c = requireClient();
+      const idx = await readP0Indexes(c);
+      for (const name of [
+        "extraction_records_chunk_id_idx",
+        "extraction_records_batch_id_idx",
+        "extraction_records_status_idx",
+        "extraction_records_created_at_idx",
+      ]) {
+        const entry = idx.get(name);
+        expect(entry, `${name} missing`).toBeDefined();
+        expect(entry!.tablename).toBe("extraction_records");
+        expect(entry!.indexdef).toMatch(/USING btree/i);
+      }
+      // Per-index column matches.
+      expect(idx.get("extraction_records_chunk_id_idx")!.indexdef).toMatch(
+        /\(chunk_id\)/
+      );
+      expect(idx.get("extraction_records_batch_id_idx")!.indexdef).toMatch(
+        /\(batch_id\)/
+      );
+      expect(idx.get("extraction_records_status_idx")!.indexdef).toMatch(
+        /\(status\)/
+      );
+      expect(idx.get("extraction_records_created_at_idx")!.indexdef).toMatch(
+        /\(created_at\)/
+      );
+    });
+
+    it("the full P0 index inventory contains exactly the 12 pinned indexes", async () => {
+      // Spec §"Success Criteria" row 6 + §"Testing Strategy" row 9:
+      // introspect every index in the §"Indexes" table; the count must
+      // match exactly and the names must be the ones we pinned in
+      // schema-p0.ts. We assert by explicit name-list rather than a raw
+      // count so the test fails loudly if a stray index appears or a
+      // pinned one is renamed.
+      //
+      // Spec prose says "13 tabled indexes" but the §Indexes table
+      // itself lists 12 (1 entities + 2 entity_aliases + 5 triples +
+      // 4 extraction_records). The DDL is ground truth — this test
+      // pins what the schema ships, not the prose summary.
+      const c = requireClient();
+      const idx = await readP0Indexes(c);
+      const pinned = [
+        // entities (1)
+        "entities_canonical_name_idx",
+        // entity_aliases (2)
+        "entity_aliases_entity_id_alias_idx",
+        "entity_aliases_alias_idx",
+        // triples (5)
+        "triples_valid_window_idx",
+        "triples_head_id_idx",
+        "triples_tail_id_idx",
+        "triples_source_chunk_id_idx",
+        "triples_relation_norm_idx",
+        // extraction_records (4)
+        "extraction_records_chunk_id_idx",
+        "extraction_records_batch_id_idx",
+        "extraction_records_status_idx",
+        "extraction_records_created_at_idx",
+      ];
+      expect(pinned.length).toBe(12);
+      for (const name of pinned) {
+        expect(idx.has(name), `${name} missing from pg_indexes`).toBe(true);
+      }
+      // No foreign P0-name indexes (defends against accidental duplicates).
+      // Implicit `_pkey` indexes from the PK constraints are owned by
+      // Postgres itself, not by our DDL — exclude them so the comparison
+      // matches the 12 modeled indexes we ship.
+      const p0IndexNames = [...idx.keys()].filter(
+        (n) =>
+          !n.endsWith("_pkey") &&
+          (n.startsWith("entities_") ||
+            n.startsWith("entity_aliases_") ||
+            n.startsWith("triples_") ||
+            n.startsWith("extraction_records_"))
+      );
+      // All pinned indexes must be exactly the set we own; if pg decided
+      // to create a sibling index with a different name (e.g. on a
+      // different access method) we'd want to know.
+      expect(p0IndexNames.sort()).toEqual([...pinned].sort());
+    });
+
+    it("valid_window @> is left-closed, right-open, with NULL upper = forever", async () => {
+      // Spec coverage-contract row 8: three boundary probes plus the
+      // unbounded-forever case. Asserted via direct SQL so we pin the
+      // Postgres-level semantics (the @> operator on tstzrange).
+      const c = requireClient();
+
+      type Probe = { range: string; instant: string; expectContained: boolean };
+      const probes: Probe[] = [
+        // [t, t+1h) contains t (left-closed)
+        {
+          range: "[2026-01-01 00:00:00+00,2026-01-01 01:00:00+00)",
+          instant: "2026-01-01 00:00:00+00",
+          expectContained: true,
+        },
+        // [t, t+1h) contains t+30min (interior point)
+        {
+          range: "[2026-01-01 00:00:00+00,2026-01-01 01:00:00+00)",
+          instant: "2026-01-01 00:30:00+00",
+          expectContained: true,
+        },
+        // [t, t+1h) does NOT contain t+1h (right-open)
+        {
+          range: "[2026-01-01 00:00:00+00,2026-01-01 01:00:00+00)",
+          instant: "2026-01-01 01:00:00+00",
+          expectContained: false,
+        },
+        // [t, NULL) — null upper bound = forever, so a far-future instant
+        // is contained.
+        {
+          range: "[2026-01-01 00:00:00+00,)",
+          instant: "2099-12-31 23:59:59+00",
+          expectContained: true,
+        },
+      ];
+
+      for (const p of probes) {
+        const res = await c.query<{ contains: boolean }>(
+          `SELECT $1::tstzrange @> $2::timestamptz AS contains`,
+          [p.range, p.instant]
+        );
+        expect(res.rows[0].contains, `${p.range} @> ${p.instant}`).toBe(
+          p.expectContained
+        );
+      }
+    });
+
+    it("FK ON DELETE SET NULL: deleting the chunk NULLs extraction_records.chunk_id and keeps the row", async () => {
+      // Spec coverage-contract row 4: chunks -> extraction_records.chunk_id.
+      const c = requireClient();
+      const chunkId = crypto.randomUUID();
+      await c.query(`INSERT INTO chunks (id, content) VALUES ($1, $2)`, [
+        chunkId,
+        "chunk-for-extraction-record-set-null",
+      ]);
+
+      const recordId = crypto.randomUUID();
+      const batchId = crypto.randomUUID();
+      await c.query(
+        `INSERT INTO extraction_records
+           (id, batch_id, chunk_id, status, started_at)
+           VALUES ($1, $2, $3, $4, now())`,
+        [recordId, batchId, chunkId, "pending"]
+      );
+
+      // Delete the chunk; the record must survive with a nulled chunk_id.
+      await c.query(`DELETE FROM chunks WHERE id = $1`, [chunkId]);
+
+      const after = await c.query<{ chunk_id: string | null }>(
+        `SELECT chunk_id FROM extraction_records WHERE id = $1`,
+        [recordId]
+      );
+      expect(after.rowCount).toBe(1);
+      expect(after.rows[0].chunk_id).toBeNull();
+    });
+  });
 });
 
 /**

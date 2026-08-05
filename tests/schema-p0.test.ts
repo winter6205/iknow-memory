@@ -108,6 +108,207 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       expect(tableNames).toContain(t);
     }
   });
+
+  // -------------------------------------------------------------------
+  // T3: DDL contract lock for entities + entity_aliases.
+  //
+  // The idempotency test above drops + recreates the schema, so by the
+  // time these tests run (vitest is sequential within a describe) the
+  // tables exist with the pinned DDL. Each test below pins one row of
+  // specs/p0-schema.md §"Testing Strategy" against these two tables:
+  //   - column enumeration (info_schema.columns)
+  //   - index inventory for the three indexes serving these two tables
+  //   - CHECK rejections on type / alias_type
+  //   - FK CASCADE entity -> aliases (ordering caveat noted inline)
+  //
+  // Triples / extraction_records coverage is intentionally left to
+  // later tickets (T4+) — this describe only locks the two tables it
+  // owns per the T3 split.
+  // -------------------------------------------------------------------
+  describe("entities + entity_aliases DDL contract", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    /**
+     * Read column names for a given table from information_schema.columns.
+     * Single source of truth for the column-enumeration probes; the
+     * caller asserts presence via toContain on the returned set.
+     */
+    async function readColumns(
+      c: pg.Client,
+      tableName: string
+    ): Promise<Set<string>> {
+      const res = await c.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_name = $1 AND table_schema = 'public'`,
+        [tableName]
+      );
+      return new Set(res.rows.map((r) => r.column_name));
+    }
+
+    /**
+     * Read the per-table indexes that this ticket owns (the three indexes
+     * pinned in specs/p0-schema.md §"Indexes" for entities +
+     * entity_aliases). Returns a map keyed by index name with
+     * { isUnique, definition } so callers can assert uniqueness on the
+     * (entity_id, alias) index without hard-coding the Postgres-generated
+     * index name.
+     */
+    async function readOwnedIndexes(
+      c: pg.Client
+    ): Promise<Map<string, { isUnique: boolean; definition: string }>> {
+      const res = await c.query<{
+        indexname: string;
+        indexdef: string;
+      }>(
+        `SELECT indexname, indexdef FROM pg_indexes
+           WHERE schemaname = 'public'
+             AND tablename IN ('entities','entity_aliases')`
+      );
+      const map = new Map<string, { isUnique: boolean; definition: string }>();
+      for (const row of res.rows) {
+        // pg_indexes.indexdef starts with "CREATE [UNIQUE] INDEX ..."
+        const isUnique = /^CREATE UNIQUE INDEX/i.test(row.indexdef);
+        map.set(row.indexname, { isUnique, definition: row.indexdef });
+      }
+      return map;
+    }
+
+    it("entities exposes every column pinned in the DDL contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "entities");
+      const expected = [
+        "id",
+        "canonical_name",
+        "type",
+        "embedding",
+        "metadata",
+        "merged_into",
+        "retired",
+        "created_at",
+      ];
+      for (const col of expected) {
+        expect(cols, `entities.${col} missing`).toContain(col);
+      }
+    });
+
+    it("entity_aliases exposes every column pinned in the DDL contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "entity_aliases");
+      const expected = ["id", "entity_id", "alias", "alias_type", "created_at"];
+      for (const col of expected) {
+        expect(cols, `entity_aliases.${col} missing`).toContain(col);
+      }
+    });
+
+    it("entities has the canonical_name btree index", async () => {
+      const c = requireClient();
+      const idx = await readOwnedIndexes(c);
+      const entry = idx.get("entities_canonical_name_idx");
+      expect(entry, "entities_canonical_name_idx missing").toBeDefined();
+      // Sanity: must be a plain (non-unique) btree on canonical_name.
+      expect(entry!.isUnique).toBe(false);
+      expect(entry!.definition).toMatch(/USING btree/i);
+      expect(entry!.definition).toMatch(/\(canonical_name\)/);
+    });
+
+    it("entity_aliases has a UNIQUE (entity_id, alias) index and a non-unique (alias) btree index", async () => {
+      const c = requireClient();
+      const idx = await readOwnedIndexes(c);
+
+      // UNIQUE (entity_id, alias) — pg names this index from the CREATE
+      // statement we ship; pin the name explicitly so a future rename is
+      // caught.
+      const uniq = idx.get("entity_aliases_entity_id_alias_idx");
+      expect(uniq, "entity_aliases_entity_id_alias_idx missing").toBeDefined();
+      expect(uniq!.isUnique, "UNIQUE index lost its uniqueness").toBe(true);
+      expect(uniq!.definition).toMatch(/\(entity_id, alias\)/);
+
+      // Cross-entity L0 alias lookup.
+      const aliasIdx = idx.get("entity_aliases_alias_idx");
+      expect(aliasIdx, "entity_aliases_alias_idx missing").toBeDefined();
+      expect(aliasIdx!.isUnique).toBe(false);
+      expect(aliasIdx!.definition).toMatch(/USING btree/i);
+      expect(aliasIdx!.definition).toMatch(/\(alias\)/);
+    });
+
+    it("CHECK rejects an unknown entities.type value", async () => {
+      const c = requireClient();
+      // Minimal NOT-NULL columns only — embedding is nullable, metadata
+      // has a server default, so omitting them isolates the CHECK.
+      await expect(
+        c.query(
+          `INSERT INTO entities (id, canonical_name, type)
+             VALUES ($1, $2, $3)`,
+          [crypto.randomUUID(), "robot-x", "robot"]
+        )
+      ).rejects.toThrow();
+    });
+
+    it("CHECK rejects an unknown entity_aliases.alias_type value", async () => {
+      const c = requireClient();
+      // First create a valid parent entity — alias_type CHECK runs before
+      // the FK check, so this still isolates the CHECK behaviour.
+      const entityId = crypto.randomUUID();
+      await c.query(
+        `INSERT INTO entities (id, canonical_name, type)
+           VALUES ($1, $2, $3)`,
+        [entityId, "alice-t3-alias-check", "person"]
+      );
+      await expect(
+        c.query(
+          `INSERT INTO entity_aliases (id, entity_id, alias, alias_type)
+             VALUES ($1, $2, $3, $4)`,
+          [crypto.randomUUID(), entityId, "ali", "nickname"]
+        )
+      ).rejects.toThrow();
+    });
+
+    it("FK CASCADE: deleting an entity removes its aliases", async () => {
+      const c = requireClient();
+      // Spec coverage-contract row 6: only testable when no triple
+      // references the entity, because triples.{head_id,tail_id} are
+      // ON DELETE RESTRICT — which is the whole point of RESTRICT, and
+      // why the CASCADE test must stand on its own entity with zero
+      // triples. The order below is intentional and the comment above
+      // matches the spec note.
+      const entityId = crypto.randomUUID();
+      const aliasId = crypto.randomUUID();
+      await c.query(
+        `INSERT INTO entities (id, canonical_name, type)
+           VALUES ($1, $2, $3)`,
+        [entityId, "eve-t3-cascade", "person"]
+      );
+      await c.query(
+        `INSERT INTO entity_aliases (id, entity_id, alias, alias_type)
+           VALUES ($1, $2, $3, $4)`,
+        [aliasId, entityId, "eve-alias", "name"]
+      );
+
+      const before = await c.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM entity_aliases WHERE entity_id = $1`,
+        [entityId]
+      );
+      expect(Number(before.rows[0].count)).toBe(1);
+
+      // Direct SQL — RESTRICT would block this DELETE if any triple
+      // referenced the entity, but our entity has zero triples, so the
+      // CASCADE on entity_aliases.entity_id fires as designed.
+      await c.query(`DELETE FROM entities WHERE id = $1`, [entityId]);
+
+      const after = await c.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM entity_aliases WHERE id = $1`,
+        [aliasId]
+      );
+      expect(Number(after.rows[0].count)).toBe(0);
+    });
+  });
 });
 
 /**

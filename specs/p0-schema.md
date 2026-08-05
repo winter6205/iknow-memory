@@ -134,7 +134,10 @@ async function createExtractionRecords(client: PoolClient): Promise<void> {
   /* ... */
 }
 
-export async function upSchemaP0(client: PoolClient): Promise<void> {
+export async function upSchemaP0(
+  client: PoolClient,
+  dimensions: number
+): Promise<void> {
   await client.query("BEGIN");
   try {
     await createEntities(client);
@@ -284,7 +287,7 @@ Binary — each maps to a command + expected output:
 3. Every FK action behaves as tabled: 3× SET NULL, 2× RESTRICT, 1× CASCADE, each proven by an actual DELETE.
 4. `valid_window @>` point semantics match `docs/CONTEXT.md` valid_window entry (left-closed, right-open, null = forever) — three boundary probes pass.
 5. All 7 CHECK constraints reject their invalid row (actual failed INSERTs asserted).
-6. Index inventory introspection returns exactly the 13 tabled indexes.
+6. Index inventory introspection returns exactly the 12 tabled indexes.
 7. `npm run typecheck` and `npm run build` exit 0; full `npm test` exits 0 (no regression in stage-1 suites).
 8. Cross-spec contract: extraction+merge spec (spec 2) and integration+evaluation spec (spec 3) can reference every field they need by the names above — verified when those specs are drafted (no "missing column" findings).
 

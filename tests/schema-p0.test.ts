@@ -94,11 +94,11 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     `);
 
     // First invocation.
-    await upSchemaP0(c);
+    await upSchemaP0(c, 1536);
     const firstCount = await countPgTables(c);
 
     // Second invocation must not throw AND must not change the table count.
-    await expect(upSchemaP0(c)).resolves.toBeUndefined();
+    await expect(upSchemaP0(c, 1536)).resolves.toBeUndefined();
     const secondCount = await countPgTables(c);
 
     expect(secondCount).toBe(firstCount);
@@ -196,6 +196,24 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       for (const col of expected) {
         expect(cols, `entities.${col} missing`).toContain(col);
       }
+    });
+
+    it("entities.embedding is a vector column with the pinned dimension", async () => {
+      // M3: pin the embedding column's TYPE, not just its presence. The
+      // idempotency test above creates the schema with dimension 1536, so
+      // format_type must resolve to `vector(1536)`. This catches a
+      // dimension drift like the H1 hardcode (vector(N) vs vector(1536))
+      // that mere column-enumeration would miss.
+      const c = requireClient();
+      const res = await c.query<{ column_type: string }>(
+        `SELECT format_type(atttypid, atttypmod) AS column_type
+           FROM pg_attribute
+           JOIN pg_class ON pg_class.oid = pg_attribute.attrelid
+          WHERE pg_class.relname = 'entities'
+            AND pg_attribute.attname = 'embedding'`
+      );
+      expect(res.rowCount).toBe(1);
+      expect(res.rows[0].column_type).toBe("vector(1536)");
     });
 
     it("entity_aliases exposes every column pinned in the DDL contract", async () => {

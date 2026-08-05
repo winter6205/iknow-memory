@@ -17,14 +17,25 @@
  */
 import type { PoolClient } from "pg";
 
-/** entities: canonical entity rows (+ soft-merge columns, #6 Q1-Q2). */
-async function createEntities(client: PoolClient): Promise<void> {
+/**
+ * entities: canonical entity rows (+ soft-merge columns, #6 Q1-Q2).
+ *
+ * `dimensions` is the configured embedding width (from GRAPHRAG_MEMORY_EMBED_DIMENSIONS,
+ * defaults to 2048) — the SAME value as `chunks.embedding vector(N)`. The
+ * entities.embedding column must match chunks.embedding width so vector
+ * writes into either table share one dimension contract (specs/p0-schema.md
+ * #6 Q1: N = chunks embedding dim).
+ */
+async function createEntities(
+  client: PoolClient,
+  dimensions: number
+): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS entities (
       id            uuid PRIMARY KEY,
       canonical_name text NOT NULL,
       type          text NOT NULL CHECK (type IN ('person','concept','system','event')),
-      embedding     vector(1536),
+      embedding     vector(${dimensions}),
       metadata      jsonb DEFAULT '{}',
       merged_into   uuid REFERENCES entities(id) ON DELETE SET NULL,
       retired       boolean NOT NULL DEFAULT false,
@@ -129,11 +140,14 @@ async function createExtractionRecords(client: PoolClient): Promise<void> {
  * superuser or extension-create privilege; that is fine for our local dev
  * Postgres (`postgres` superuser) and aligns with the existing backend.
  */
-export async function upSchemaP0(client: PoolClient): Promise<void> {
+export async function upSchemaP0(
+  client: PoolClient,
+  dimensions: number
+): Promise<void> {
   await client.query("BEGIN");
   try {
     await client.query("CREATE EXTENSION IF NOT EXISTS vector");
-    await createEntities(client);
+    await createEntities(client, dimensions);
     await createEntityAliases(client);
     await createTriples(client);
     await createExtractionRecords(client);

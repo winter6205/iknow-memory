@@ -6,6 +6,9 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "extract": "bin/extract.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -21,6 +24,7 @@
     "test": "vitest run",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "extract": "node dist/cli/extract.js",
     "prepare": "husky"
   },
   "dependencies": {

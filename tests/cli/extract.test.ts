@@ -18,13 +18,15 @@
  * startup string — verified empirically against the same Postgres 16 the
  * other suites use.
  *
- * Env injection gap (documented): T6's `buildLlm()` auto-selects a
- * `FakeLLMClient({ scripted: ok })` whenever GRAPHRAG_MEMORY_ANTHROPIC_API_KEY
- * is unset. There is no env hook (e.g. no GRAPHRAG_MEMORY_TEST_FAKE_OUTPUTS)
- * to inject a custom queue or a 5xx. So the subprocess cannot exercise
- * Success Criterion #6's "5xx on chunk 3" shape — that assertion is covered
- * via the `runCli`-direct unit-style path at the bottom of this file, using
- * an injected FakeLLMClient queue (4 ok + 1 5xx) and a scriptable fake pool
+ * Keyless real-run refusal (CR High #1): T6's `buildLlm()` throws
+ * ConfigError for a real extraction when GRAPHRAG_MEMORY_ANTHROPIC_API_KEY is
+ * unset; the `FakeLLMClient` (scripted ok) is only reachable behind `--dry-run`
+ * / `--list-unmapped` or via direct `runCli` injection. There is no env hook
+ * (e.g. no GRAPHRAG_MEMORY_TEST_FAKE_OUTPUTS) to inject a custom queue or a
+ * 5xx through the subprocess. So the subprocess cannot exercise Success
+ * Criterion #6's "5xx on chunk 3" shape — that assertion is covered via the
+ * `runCli`-direct unit-style path at the bottom of this file, using an
+ * injected FakeLLMClient queue (4 ok + 1 5xx) and a scriptable fake pool
  * against the same real Postgres. Per the binding contract, this fallback
  * is the documented path for #6 when env injection is unavailable.
  *
@@ -176,13 +178,15 @@ describe("extract CLI subprocess e2e (T9)", () => {
   }
 
   // -----------------------------------------------------------------
-  // Scenario 1: empty DB → exit 0, zero rows.
+  // Scenario 1: empty DB → exit 0, zero rows. Uses --dry-run because a real
+  // extraction now refuses to run keyless (CR High #1); dry-run exercises the
+  // same pipeline shape without writes.
   // -----------------------------------------------------------------
-  it("empty DB: --batch-size 1 exits 0 with no rows written", async () => {
+  it("empty DB: --dry-run --batch-size 1 exits 0 with no rows written", async () => {
     const c = requireClient();
     await resetSchema(c);
 
-    const result = await runCliSubprocess(["--batch-size", "1"]);
+    const result = await runCliSubprocess(["--dry-run", "--batch-size", "1"]);
     expect(result.code).toBe(0);
     expect(await countRows(c, "entities")).toBe(0);
     expect(await countRows(c, "triples")).toBe(0);
@@ -190,43 +194,32 @@ describe("extract CLI subprocess e2e (T9)", () => {
   });
 
   // -----------------------------------------------------------------
-  // Scenario 2 (Success Criterion #5): happy path populates entities /
-  // triples / extraction_records linked via source_chunk_id.
+  // Scenario 2 (Success Criterion #5 — refusal half): a *real* extraction
+  // without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY must refuse to run, exit 1,
+  // surface a typed ConfigError on stderr, and write ZERO rows (the canned
+  // FakeLLMClient must NOT silently auto-fill the write path — CR High #1).
   //
-  // The canned scripted FakeLLMClient (auto-selected by buildLlm when
-  // GRAPHRAG_MEMORY_ANTHROPIC_API_KEY is unset) returns one output:
-  //   { head: Alice, tail: Acme, relationNorm: MEMBER_OF, confidence: 0.9 }
-  // So 1 chunk → 2 entity rows + 1 triple + 1 succeeded record.
+  // The legacy "happy path writes" assertion used to live here: it relied
+  // on the implicit canned fake being auto-selected, which is exactly the
+  // production-data-corruption path the fix removes. Equivalent write-path
+  // coverage now lives in `extract.unit.test.ts` (`runCli` + injected
+  // FakeLLMClient + real pg.Pool via direct injection).
   // -----------------------------------------------------------------
-  it("happy path (Success Criterion #5): one chunk → entities + triples + succeeded record", async () => {
+  it("real extraction without API key refuses with ConfigError and writes nothing (CR High #1)", async () => {
     const c = requireClient();
     await resetSchema(c);
-    const chunkId = await insertChunk(c, "Alice works at Acme Corp.");
+    await insertChunk(c, "Alice works at Acme Corp.");
 
     const result = await runCliSubprocess(["--batch-size", "1"]);
-    expect(result.code).toBe(0);
-
-    // ≥1 entities (Alice + Acme), ≥1 triples linked via source_chunk_id.
-    const entitiesCount = await countRows(c, "entities");
-    expect(entitiesCount).toBeGreaterThanOrEqual(2);
-
-    const triples = await c.query<{ source_chunk_id: string | null }>(
-      `SELECT source_chunk_id FROM triples`
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY"
     );
-    expect(triples.rows.length).toBeGreaterThanOrEqual(1);
-    for (const row of triples.rows) {
-      expect(row.source_chunk_id).toBe(chunkId);
-    }
-
-    const records = await c.query<{
-      status: string;
-      triples_count: number;
-      chunk_id: string;
-    }>(`SELECT status, triples_count, chunk_id FROM extraction_records`);
-    expect(records.rows).toHaveLength(1);
-    expect(records.rows[0]?.status).toBe("succeeded");
-    expect(records.rows[0]?.chunk_id).toBe(chunkId);
-    expect(Number(records.rows[0]?.triples_count)).toBeGreaterThanOrEqual(1);
+    expect(result.stderr).toContain("extract config error");
+    // Zero rows: the canned fake MUST NOT reach the write path.
+    expect(await countRows(c, "entities")).toBe(0);
+    expect(await countRows(c, "triples")).toBe(0);
+    expect(await countRows(c, "extraction_records")).toBe(0);
   });
 
   // -----------------------------------------------------------------
@@ -383,11 +376,21 @@ describe("extract CLI subprocess e2e (T9)", () => {
     expect(result.code).toBe(1);
   });
 
-  it("exit code 0: empty args against a fresh schema is a successful no-op", async () => {
+  it("exit code 0: --dry-run against a fresh schema is a successful no-op", async () => {
+    const c = requireClient();
+    await resetSchema(c);
+    const result = await runCliSubprocess(["--dry-run"]);
+    expect(result.code).toBe(0);
+  });
+
+  it("exit code 1: empty args (real extraction) refuses keyless with ConfigError", async () => {
     const c = requireClient();
     await resetSchema(c);
     const result = await runCliSubprocess([]);
-    expect(result.code).toBe(0);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY"
+    );
   });
 });
 

@@ -61,7 +61,7 @@ loop line is mandatory and verbatim (ADR-0012).
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** T4, T5
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T3. `[implementation]` Relation normalization cascade + vocabulary
 
@@ -78,7 +78,7 @@ tests/extraction/prompt.test.ts` exits 0; a triple whose raw relation matches no
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** T4
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T4. `[implementation]` Extraction pipeline + dedup + records
 
@@ -97,7 +97,7 @@ tests/extraction/dedup.test.ts tests/extraction/records.test.ts` exits 0; insert
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** T6, T7, T8, T10
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T5. `[implementation]` Canonical entity merge gates + embedding + resolve
 
@@ -114,7 +114,7 @@ tests/extraction/dedup.test.ts tests/extraction/records.test.ts` exits 0; insert
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** T6, T7, T8
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T6. `[implementation]` CLI wiring + isolation guard
 
@@ -130,7 +130,7 @@ dist/cli/extract.js --dry-run --batch-size 1` against a fresh DB exits 0 and wri
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** T8, T9
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T7. `[implementation]` Real Postgres integration tests
 
@@ -144,7 +144,7 @@ dist/cli/extract.js --dry-run --batch-size 1` against a fresh DB exits 0 and wri
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** none (terminal)
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T8. `[implementation]` Defensive contract (5 boundary classes)
 
@@ -158,7 +158,7 @@ tests/entities/defensive.test.ts tests/cli/defensive.test.ts` exits 0; each of t
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** none (terminal)
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T9. `[implementation]` CLI subprocess e2e
 
@@ -171,7 +171,7 @@ tests/entities/defensive.test.ts tests/cli/defensive.test.ts` exits 0; each of t
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** none (terminal)
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ### T10. `[implementation]` Real LLM smoke + docs
 
@@ -185,7 +185,7 @@ tests/entities/defensive.test.ts tests/cli/defensive.test.ts` exits 0; each of t
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit on ticket branch
 - **Blocks:** none (terminal)
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete
 
 ## Dependency graph
 

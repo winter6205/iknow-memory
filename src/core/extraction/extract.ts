@@ -26,6 +26,8 @@ export type ExtractionOutcome =
 export const EMPTY_CHUNK_CODE = "EMPTY_CHUNK";
 /** Error code for a chunk exceeding the LLM context window (overflow boundary). */
 export const OVERSIZED_CHUNK_CODE = "OVERSIZED_CHUNK";
+/** Error code for an LLM client that threw during extraction (exception boundary). */
+export const LLM_EXCEPTION_CODE = "LLM_EXCEPTION";
 
 /** Default content-length cap when the caller does not supply one. */
 const DEFAULT_MAX_CONTENT_LENGTH = 100_000;
@@ -55,8 +57,20 @@ export async function extractChunk(
   const validation = validateChunk(chunk, max);
   if (validation) return failed(validation.code, validation.msg);
 
-  const response = await ctx.llm.extract(chunk.content);
+  // T8 boundary-class fix: spec requires mark-and-continue; a throwing LLM
+  // client must not abort the batch, so the call is wrapped and the throw
+  // surfaces as a sealed failed outcome.
+  let response: ExtractionResponse;
+  try {
+    response = await ctx.llm.extract(chunk.content);
+  } catch (err) {
+    return failed(LLM_EXCEPTION_CODE, errorMessage(err));
+  }
   return classify(response);
+}
+
+function errorMessage(err: unknown): string {
+  return (err as { message?: string })?.message ?? "unknown LLM error";
 }
 
 interface ValidationFailure {

@@ -14,7 +14,10 @@
  *     extraction failures mark-and-continue absorbs).
  *
  * LLM client: `AnthropicLLMClient` when GRAPHRAG_MEMORY_ANTHROPIC_API_KEY is
- * set, else `FakeLLMClient` (canned ok) so `--dry-run` and CI run keyless.
+ * set. With the key unset, `FakeLLMClient` (canned ok) is only used by
+ * `--dry-run` and `--list-unmapped` (CI / keyless); a *real* extraction with
+ * no key throws ConfigError (exit 1) instead of silently writing canned
+ * triples (CR High #1).
  */
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
@@ -47,6 +50,7 @@ import {
   NineRouterEmbedder,
   type EmbeddingClient,
 } from "../core/embedder.js";
+import { normalizeEntityType } from "./entity-type.js";
 
 export interface CliFlags {
   batchSize: number;
@@ -346,14 +350,18 @@ async function persistOutputs(
   let triples = 0;
   let unmapped = 0;
   for (const out of outputs) {
+    // Normalize LLM types to the closed P0 set up front (CR High #2) so the
+    // merge gates and the persisted row agree on the same type value.
+    const headType = normalizeEntityType(out.headType);
+    const tailType = normalizeEntityType(out.tailType);
     const headId = await resolveEntity(deps, client, {
       canonicalName: out.head,
-      type: out.headType,
+      type: headType,
       description: out.description,
     });
     const tailId = await resolveEntity(deps, client, {
       canonicalName: out.tail,
-      type: out.tailType,
+      type: tailType,
       description: out.description,
     });
     await upsertTriple(client, {
@@ -416,10 +424,16 @@ async function insertEntity(
   id: string,
   incoming: IncomingEntity
 ): Promise<void> {
+  // CR High #2: the DDL pins entities.type to a closed 4-value CHECK set
+  // (person/concept/system/event). The LLM emits an open-string type, so we
+  // normalize it into the closed set here — otherwise the INSERT would reject
+  // the whole chunk transaction (write-failure → exit 2) on any non-listed
+  // raw type (e.g. "Organization", "Location").
+  const type = normalizeEntityType(incoming.type);
   await client.query(
     `INSERT INTO entities (id, canonical_name, type, metadata, retired)
      VALUES ($1, $2, $3, '{}', false)`,
-    [id, incoming.canonicalName, incoming.type]
+    [id, incoming.canonicalName, type]
   );
 }
 
@@ -435,11 +449,24 @@ const CANNED_OUTPUT = {
   confidence: 0.9,
 };
 
-/** Build the LLM client from env: real when a key is set, else a fake. */
-function buildLlm(): LLMClient {
+/**
+ * Build the LLM client from env. Real `AnthropicLLMClient` when a key is set;
+ * keyless operation is only allowed on non-extraction paths (`--dry-run` and
+ * `--list-unmapped`), where a scripted fake gives deterministic output. A real
+ * extraction with no key would silently INSERT canned triples into Postgres,
+ * so that path throws ConfigError instead (CR High #1) rather than
+ * auto-falling back to the fake.
+ */
+function buildLlm({ flags }: { flags: CliFlags }): LLMClient {
   const apiKey = process.env.GRAPHRAG_MEMORY_ANTHROPIC_API_KEY?.trim();
   if (!apiKey) {
-    // No key → scripted fake; canned ok so dry-run has deterministic output.
+    if (!(flags.dryRun || flags.listUnmapped)) {
+      throw new ConfigError(
+        "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY; pass --dry-run or --list-unmapped for keyless operation"
+      );
+    }
+    // No key + dry-run/list-unmapped → scripted fake; canned ok so dry-run
+    // has deterministic output. The fake never reaches the real write path.
     return new FakeLLMClient({
       scripted: async () => ({ kind: "ok", outputs: [CANNED_OUTPUT] }),
     });
@@ -485,16 +512,27 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     );
     return 1;
   }
+  const parsed = parseArgs(argv);
+  if (!parsed.ok) {
+    process.stderr.write(`${USAGE}\nextract: ${parsed.error}\n`);
+    return 2;
+  }
   const pool = new Pool({ connectionString: env.dbUrl });
-  const deps: CliDeps = {
-    pool,
-    llm: buildLlm(),
-    embedder: buildEmbedder(env),
-    dims: env.embedDimensions,
-    logger: createLogger(env.logLevel),
-  };
   try {
+    const deps: CliDeps = {
+      pool,
+      llm: buildLlm({ flags: parsed.flags }),
+      embedder: buildEmbedder(env),
+      dims: env.embedDimensions,
+      logger: createLogger(env.logLevel),
+    };
     return await runCli(argv, deps);
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      process.stderr.write(`extract config error: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
   } finally {
     await pool.end();
   }

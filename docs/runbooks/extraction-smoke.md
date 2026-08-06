@@ -82,7 +82,30 @@ SELECT count(*) FROM triples;
 SELECT count(*) FROM entities;
 ```
 
-## 6. Troubleshooting
+## 6. Entity-type normalization
+
+`entities.type` is pinned by a DDL CHECK constraint to exactly
+`('person','concept','system','event')` (specs/p0-schema.md). The LLM emits
+an open-string type, so the CLI normalizes every `headType` / `tailType` into
+that closed set at the boundary (`src/cli/entity-type.ts :: normalizeEntityType`)
+before the INSERT — otherwise a non-listed raw type (e.g. `"Organization"`,
+`"Location"`) would violate the CHECK and roll back the whole chunk (exit 2).
+
+Mapping (case-insensitive; input is trimmed + lowercased first):
+
+| Raw LLM type                                                       | Persisted                        |
+| ------------------------------------------------------------------ | -------------------------------- |
+| person, human, individual, user, agent                             | person                           |
+| organization, company, team, group, org, concept                   | concept                          |
+| system, tool, platform, service, location, place, system_component | system                           |
+| event, incident, occurrence, action                                | event                            |
+| anything else / empty / unknown                                    | concept (with an info-level log) |
+
+The mapping is a conservative, defensible default — operators can tune it in
+`src/cli/entity-type.ts`. Unknown types fold to `concept` and emit a structured
+`normalize-entity-type-fallback` info log so the folding is auditable.
+
+## 7. Troubleshooting
 
 ### Exit codes
 
@@ -104,7 +127,7 @@ SELECT count(*) FROM entities;
 - **Exit `1` on startup with no LLM call** → config error; check the storage /
   DB / embedding env vars from §1–§2.
 
-## 7. Record the result
+## 8. Record the result
 
 After the run, paste the actual command output (stdout/stderr + exit code) into
 the PR description. That recorded output is the T10 Success Criterion.

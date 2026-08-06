@@ -21,10 +21,16 @@ import { FakeEmbedder } from "../../src/core/embedder.js";
 
 class FakeClient implements CliClient {
   queries: string[] = [];
-  async query(text: string, _values?: unknown[]) {
+  valuesList: unknown[][] = [];
+  /** Optional per-query row override; receives the SQL text. */
+  rowsOverride?: (text: string) => unknown[];
+  async query(text: string, values?: unknown[]) {
     this.queries.push(text);
-    // Default: empty result set (SELECT) — covers scan and list-unmapped.
-    return { rows: [] };
+    // Always push (even when undefined) so valuesList[i] stays in lockstep
+    // with queries[i] — queries without bound params still occupy a slot.
+    this.valuesList.push(values ?? []);
+    const rows = this.rowsOverride ? this.rowsOverride(text) : [];
+    return { rows };
   }
   release(): void {}
 }
@@ -124,5 +130,61 @@ describe("runCli --list-unmapped", () => {
     const code = await runCli(["--list-unmapped"], deps);
     expect(code).toBe(0);
     expect(extractCalls).toBe(0);
+  });
+});
+
+describe("entity-type normalization through the pipeline (CR High #2)", () => {
+  it("persists a CHECK-safe type when the LLM emits 'Organization'", async () => {
+    const client = new FakeClient();
+    const llm = new FakeLLMClient({
+      scripted: async () => ({
+        kind: "ok" as const,
+        // Realistic LLM output: open-string, capitalized, non-listed type that
+        // would previously violate the DDL CHECK and roll back the chunk.
+        outputs: [
+          {
+            head: "Alice",
+            headType: "Organization", // → concept
+            relationRaw: "works at",
+            relationNorm: "MEMBER_OF",
+            tail: "Acme",
+            tailType: "Location", // → system
+            description: "Alice works at Acme",
+            evidenceSpan: "Alice works at Acme",
+            confidence: 0.9,
+          },
+        ],
+      }),
+    });
+    // The scan must return one chunk so persistOutputs runs.
+    client.rowsOverride = (text) =>
+      /FROM chunks c/.test(text)
+        ? [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }]
+        : [];
+
+    const deps = makeDeps(client, llm);
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+
+    // Capture the INSERT INTO entities … VALUES calls and assert the persisted
+    // type is in the closed CHECK set (never the raw "Organization"). Queries
+    // and valuesList are pushed in lockstep so we can zip them.
+    const entityInserts: unknown[][] = [];
+    for (let i = 0; i < client.queries.length; i += 1) {
+      if (client.queries[i]?.includes("INSERT INTO entities")) {
+        entityInserts.push(client.valuesList[i] ?? []);
+      }
+    }
+    expect(entityInserts.length).toBeGreaterThanOrEqual(2);
+    const closedSet = ["person", "concept", "system", "event"];
+    for (const values of entityInserts) {
+      const type = values[2] as string; // (id, canonical_name, type, …)
+      expect(closedSet).toContain(type);
+    }
+    // The wonky types were folded to their mapped families.
+    const persistedTypes = entityInserts.map((v) => v[2]);
+    expect(persistedTypes).toContain("concept"); // Organization
+    expect(persistedTypes).toContain("system"); // Location
   });
 });

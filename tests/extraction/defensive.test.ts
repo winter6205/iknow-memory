@@ -23,6 +23,7 @@ import {
   extractChunk,
   EMPTY_CHUNK_CODE,
   OVERSIZED_CHUNK_CODE,
+  LLM_EXCEPTION_CODE,
 } from "../../src/core/extraction/extract.js";
 import type { ExtractionOutput } from "../../src/core/extraction/types.js";
 
@@ -135,16 +136,20 @@ describe("extractChunk — concurrent boundary", () => {
 });
 
 describe("extractChunk — exception boundary (LLM client that throws)", () => {
-  it("BUG: spec says extractChunk must never throw on an LLM failure, but the impl does not wrap ctx.llm.extract in try/catch — a rejected client propagates the rejection out of extractChunk. Pinning current behavior so the coordinator decides on a fix.", async () => {
+  it("does not throw on an LLM exception; returns a sealed failed outcome with LLM_EXCEPTION so the batch can mark-and-continue", async () => {
     const throwingLlm = {
       extract: async (): Promise<never> => {
         throw new Error("sdk exploded");
       },
     };
-    const call = extractChunk(
+    const out = await extractChunk(
       { id: "chunk-throw", content: "some text" },
       { llm: throwingLlm }
     );
-    await expect(call).rejects.toThrow("sdk exploded");
+    expect(out).toEqual({
+      kind: "failed",
+      errorCode: LLM_EXCEPTION_CODE,
+      errorMsg: expect.any(String),
+    });
   });
 });

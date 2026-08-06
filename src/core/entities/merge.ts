@@ -166,6 +166,12 @@ async function l2DescGate(
       c.description,
       incoming.description
     );
+    if (observed === null) {
+      // T8 boundary-class fix: cannot prove merge → skip candidate, do not
+      // synthesize a false cosine.
+      log({ level: "L2", reason: EMBED_FAILURE_REASON });
+      continue;
+    }
     if (observed < config.l2DescLowThreshold) {
       log({
         level: "L2",
@@ -206,6 +212,11 @@ async function l3NameDescGate(
       computeEntityEmbeddingText(c.canonicalName, c.description),
       computeEntityEmbeddingText(incoming.canonicalName, incoming.description)
     );
+    if (observed === null) {
+      // T8 boundary-class fix: cannot prove merge → skip candidate.
+      log({ level: "L3", reason: EMBED_FAILURE_REASON });
+      continue;
+    }
     if (observed >= config.l3NameDescHighThreshold) {
       return {
         id: c.id,
@@ -235,14 +246,30 @@ async function l3NameDescGate(
   return lastReject;
 }
 
-/** Embed two texts and return their cosine similarity. */
+/** Gray-zone reason logged when the embedder throws (boundary-class fix). */
+const EMBED_FAILURE_REASON = "embed-failure";
+
+/**
+ * Embed two texts and return their cosine similarity, or `null` when the
+ * embedder throws.
+ *
+ * T8 boundary-class fix: a throwing embedder must not abort merge evaluation;
+ * inability to compute cosine → no merge proof → the gate skips that candidate
+ * rather than rejecting/merging on a fabricated value. If every candidate is
+ * skipped, the merge loop falls through to `created-new`. The failure is
+ * logged as a gray-zone entry by the caller.
+ */
 async function embedCosine(
   embedder: Embedder,
   a: string,
   b: string
-): Promise<number> {
-  const [va, vb] = await embedder.embed([a, b]);
-  return cosineSimilarity(va, vb);
+): Promise<number | null> {
+  try {
+    const [va, vb] = await embedder.embed([a, b]);
+    return cosineSimilarity(va, vb);
+  } catch {
+    return null;
+  }
 }
 
 /** Default gray-zone sink: project logger to stderr. */

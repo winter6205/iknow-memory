@@ -164,7 +164,7 @@ describe("mergeEntitiesWithGating — concurrent boundary", () => {
 });
 
 describe("mergeEntitiesWithGating — exception boundary (embedder throws)", () => {
-  it("BUG: spec description expects mergeEntitiesWithGating to catch an embedder throw and return a sealed outcome, but merge.ts does not wrap the embedder call in try/catch — a rejecting embedder propagates the rejection out of mergeEntitiesWithGating. Pinning current behavior for the coordinator.", async () => {
+  it("does not throw on an embedder exception; returns a sealed outcome (created-new) when the embedder cannot compute any cosine, so the batch can mark-and-continue", async () => {
     const throwingEmbedder: Embedder = {
       embed: async (): Promise<number[][]> => {
         throw new Error("embedder exploded");
@@ -179,11 +179,13 @@ describe("mergeEntitiesWithGating — exception boundary (embedder throws)", () 
           "a long description that would force L2 or L3 to call the embedder",
       }),
     ];
-    const call = mergeEntitiesWithGating(
+    const out = await mergeEntitiesWithGating(
       { canonicalName: "Alice", type: "person", description: "engineer" },
       candidates,
       { embedder: throwingEmbedder, config: DEFAULT_MERGE_CONFIG }
     );
-    await expect(call).rejects.toThrow("embedder exploded");
+    // L0/L1 miss, L2 skips (short incoming desc), L3 skip-on-embed-failure → created-new.
+    expect(out.decision).toBe("created-new");
+    expect(out.canonicalId).toBe("");
   });
 });

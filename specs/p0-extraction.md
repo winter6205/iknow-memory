@@ -329,15 +329,20 @@ Each criterion is binary (yes/no) and maps to a measurable check.
 
 ## Open Questions
 
-These are items the spec needs to either resolve in implementation, or escalate to a future ticket.
+These items are tracked for implementation reference. Items 1–7 were resolved by `T1 [decision]` on 2026-08-07 (answers recorded in the committing message and locked into `MergeConfig` defaults / `vocabulary.ts` header / package.json). Items 8–9 are still open (see below).
 
-1. **L3 "middle threshold" — single floor or band?** (#6 Q2 phrasing: "取中间值" — single value). P0c prototype measured single floor (≥ 0.5). P0d prototype verdict explicitly says: spec must pin this down. **Default in this spec: single floor at `0.5`**; tunable via `MergeConfig.l3NameDescHighThreshold` and `l3NameDescLowThreshold` (band mode is the alternative; pin one based on Bootstrap data — see #15 evaluation ticket). Operator can override.
-2. **L2 description floor value.** P0c prototype measured `0.30`. **Default in this spec: `0.30`** (tunable via `MergeConfig.l2DescLowThreshold`).
-3. **Description minimum length for L2.** P0c prototype used `minDescriptionLength=8`. **Default: `8`** (descriptions shorter than 8 chars skip L2 and proceed straight to L3).
-4. **`maxChainDepth` for `resolveCanonicalId`.** P0c prototype default `16`. **Default: `16`** (configurable; cycle detection via visited set).
-5. **L0 fast-path — add description-coherence check?** P0c prototype flagged this as Medium non-blocking (current L0 fast = name exact + type same). **Default in this spec: no desc check at L0** (keeps L0 cost=0; documented limitation).
-6. **Vocabulary entry freeze timing.** Per #4 D7 + #5 Q2: vocabulary must stabilize before evaluation harness filter rule freeze. **This spec lands the initial vocabulary (≤36 entries).** Growth automation deferred; `--list-unmapped` is the human-review signal. Frozen-on / frozen-by recorded in `vocabulary.ts` header.
-7. **`@anthropic-ai/sdk` version**. Default: latest stable at time of implementation. Operator pin: any version bump = Ask-first per Boundaries.
+### RESOLVED 2026-08-07 (T1)
+
+1. **[RESOLVED] L3 "middle threshold" — single floor or band?** → **Single floor at `0.5`** (P0c prototype verdict; band mode is the documented alternative via `MergeConfig.l3NameDescHighThreshold` / `l3NameDescLowThreshold` — switchable if #15 Bootstrap data mandates). Default pinned in `MergeConfig`.
+2. **[RESOLVED] L2 description floor value.** → **`0.30`** (P0c prototype verdict). Default pinned in `MergeConfig.l2DescLowThreshold`.
+3. **[RESOLVED] Description minimum length for L2.** → **`8`** characters. Descriptions shorter than 8 chars skip L2 and proceed straight to L3. Default pinned in `MergeConfig.minDescriptionLength`.
+4. **[RESOLVED] `maxChainDepth` for `resolveCanonicalId`.** → **`16`** (configurable; cycle detection via visited set). Default pinned in `MergeConfig.maxChainDepth`.
+5. **[RESOLVED] L0 fast-path — add description-coherence check?** → **No** description check at L0 (keeps L0 cost=0; documented limitation). L0 fast = name exact + type same, per #6 Q3 hybrid algorithm.
+6. **[RESOLVED] Vocabulary entry freeze timing.** → **Initial vocabulary lands with this implementation (≤36 entries).** Frozen-on date and frozen-by recorded in `src/core/extraction/vocabulary.ts` header. Growth automation deferred; `--list-unmapped` is the human-review signal.
+7. **[RESOLVED] `@anthropic-ai/sdk` version.** → **`0.115.0`** (latest stable as of 2026-08-07; verified via `npm view @anthropic-ai/sdk version`). Pinned in `package.json#dependencies`. Per Boundaries, any version bump = Ask-first.
+
+### Still open (out of T1 scope)
+
 8. **CLI `--list-unmapped` scope.** Counts over `triples.relation_norm='UNMAPPED'` (per spec 1 schema, single table). If human-review needs `relation_raw` surface instead of relation-row count, add `--by-raw` flag in a follow-up.
 9. **Spec 1 Open Question alignment.** This spec assumes the three spec-1 Open Questions are resolved as documented in `specs/p0-schema.md` (`uuid v4`, app-level dedup, `CREATE IF NOT EXISTS`). If any of those flip during PR #11 review, this spec's retry classification + dedup key + idempotency probe may need follow-up edits.
 

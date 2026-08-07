@@ -27,6 +27,8 @@ import type {
   StorageBackend,
 } from "../types.js";
 import { GraphragError } from "../errors.js";
+import type { PoolClient } from "pg";
+import { upSchemaP0 } from "./schema-p0.js";
 
 /**
  * Minimal structural subset of the `pg` package we use. Declared as an
@@ -40,6 +42,14 @@ interface PgModule {
 interface PgPool {
   query: (text: string, values: unknown[]) => Promise<{ rows: unknown[] }>;
   end: () => Promise<void>;
+  // Acquired client carries a single in-flight transaction; upSchemaP0
+  // takes ownership of the BEGIN/COMMIT/ROLLBACK and releases via finally
+  // — see ensureTable().
+  connect: () => Promise<PgClient>;
+}
+interface PgClient {
+  query: (text: string, values: unknown[]) => Promise<{ rows: unknown[] }>;
+  release: () => void;
 }
 
 /** Serialized pgvector literal: `[0.1,0.2,...]` with no spaces. */
@@ -151,21 +161,40 @@ export class PgvectorBackend implements StorageBackend {
    */
   private async ensureTable(): Promise<void> {
     const pool = this.pool!;
+    // Acquire a dedicated client so upSchemaP0 can wrap its DDL in a
+    // BEGIN/COMMIT/ROLLBACK transaction without conflicting with the
+    // pool-level `query` path used elsewhere in this class. Release in
+    // finally whether the transaction commits or rolls back. connect() is
+    // inside the try so a connection failure is wrapped in the same
+    // GraphragError STORAGE_ERROR as the DDL failures below (M1).
     try {
-      await pool.query("CREATE EXTENSION IF NOT EXISTS vector", []);
-      await pool.query(
-        `CREATE TABLE IF NOT EXISTS chunks (
-           id uuid PRIMARY KEY,
-           content text NOT NULL,
-           embedding vector(${this.dimensions}) NOT NULL,
-           valid_from timestamptz NOT NULL,
-           valid_until timestamptz NULL,
-           source_ref text NOT NULL,
-           metadata jsonb NOT NULL,
-           created_at timestamptz NOT NULL
-         )`,
-        []
-      );
+      const client = await pool.connect();
+      try {
+        await client.query("CREATE EXTENSION IF NOT EXISTS vector", []);
+        await client.query(
+          `CREATE TABLE IF NOT EXISTS chunks (
+             id uuid PRIMARY KEY,
+             content text NOT NULL,
+             embedding vector(${this.dimensions}) NOT NULL,
+             valid_from timestamptz NOT NULL,
+             valid_until timestamptz NULL,
+             source_ref text NOT NULL,
+             metadata jsonb NOT NULL,
+             created_at timestamptz NOT NULL
+           )`,
+          []
+        );
+        // P0 schema: entities + entity_aliases + triples + extraction_records.
+        // upSchemaP0 is idempotent (every statement is IF NOT EXISTS) and
+        // owns its own BEGIN/COMMIT/ROLLBACK — we MUST NOT wrap it in an
+        // outer transaction. Cast our minimal PgClient to PoolClient: only
+        // .query is actually used by upSchemaP0, so the structural surface
+        // is sufficient. Pass this.dimensions so entities.embedding width
+        // matches chunks.embedding width (H1).
+        await upSchemaP0(client as unknown as PoolClient, this.dimensions);
+      } finally {
+        client.release();
+      }
     } catch (err) {
       throw new GraphragError(
         `PgvectorBackend: ensureTable failed (${(err as Error).message})`,

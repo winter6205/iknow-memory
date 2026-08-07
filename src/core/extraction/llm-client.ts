@@ -157,10 +157,16 @@ export class AnthropicLLMClient implements LLMClient {
     | { kind: "4xx" | "5xx"; message: string }
   > {
     try {
+      // max_tokens 4096 + thinking disabled (T10 smoke): thinking-capable
+      // models (deepseek-v4-flash-free etc.) burn a 1024-token budget on
+      // reasoning alone, so text never appears and extraction fails `format`.
+      // Structured extraction needs no extended thinking — disable it and give
+      // the JSON array room to complete.
       const message = await this.anthropic.messages.create({
         model: this.model,
-        max_tokens: 1024,
+        max_tokens: 4096,
         system: SYSTEM_PROMPT,
+        thinking: { type: "disabled" },
         messages: [{ role: "user", content: chunkText }],
       });
       return { kind: "ok", message };

@@ -240,4 +240,65 @@ describe("AnthropicLLMClient retry classification", () => {
     expect(sleep).toHaveBeenCalledTimes(2);
     expect(fake.messages.create).toHaveBeenCalledTimes(3);
   });
+
+  it("sends max_tokens 4096 so structured JSON survives thinking-capable models", async () => {
+    const fake = makeFakeAnthropic(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify([
+            {
+              head: "Alice",
+              headType: "person",
+              relationRaw: "works at",
+              relationNorm: "MEMBER_OF",
+              tail: "Acme",
+              tailType: "system",
+              description: "Alice works at Acme",
+              evidenceSpan: "Alice works at Acme",
+              confidence: 0.9,
+            },
+          ]),
+        },
+      ],
+    }));
+    const client = new AnthropicLLMClient({
+      model: "test-model",
+      apiKey: "sk-test",
+      baseUrl: "https://api.test/v1",
+      anthropic: fake as never,
+    });
+
+    await client.extract("Alice works at Acme");
+
+    const params = fake.messages.create.mock.calls[0]?.[0] as {
+      max_tokens?: unknown;
+      thinking?: unknown;
+    };
+    expect(params.max_tokens).toBe(4096);
+  });
+
+  it("disables extended thinking for deterministic structured output", async () => {
+    const fake = makeFakeAnthropic(async () => ({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify([]),
+        },
+      ],
+    }));
+    const client = new AnthropicLLMClient({
+      model: "test-model",
+      apiKey: "sk-test",
+      baseUrl: "https://api.test/v1",
+      anthropic: fake as never,
+    });
+
+    await client.extract("any chunk");
+
+    const params = fake.messages.create.mock.calls[0]?.[0] as {
+      thinking?: unknown;
+    };
+    expect(params.thinking).toEqual({ type: "disabled" });
+  });
 });

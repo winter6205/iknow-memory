@@ -31,7 +31,7 @@ _Avoid_: "fact" (ambiguous with gbrain's `facts` table); "edge" (graph-generic, 
 **alias**: a surface-form string that resolves to a canonical entity (name variant, abbreviation, spelling). Stored in `entity_aliases` with `entity_id` foreign key. _Stage: P0 (not yet implemented)._
 _Avoid_: "synonym" (implies bidirectional equivalence); "variant" (one alias type, not the general term)
 
-**canonical entity**: the merged, deduplicated entity that multiple aliases and mentions resolve to. Merging uses embedding clustering + optional LLM arbitration. The merge is the P0 "canonical entity resolution" deliverable. _Stage: P0 (not yet implemented)._
+**canonical entity**: the merged, deduplicated entity that multiple aliases and mentions resolve to. P0 merging uses rule + embedding hybrid with hierarchical gating (zero LLM in P0; an LLM judge interface is reserved but not implemented — issue #6 Q3). The merge is the P0 "canonical entity resolution" deliverable. _Stage: P0 (not yet implemented)._
 _Avoid_: "master entity" (implies hierarchy); "root entity" (implies tree structure)
 
 ### Retrieval
@@ -70,7 +70,7 @@ _Avoid_: "causal link" (link is gbrain's rule-based term); "reason edge" (ambigu
 
 ### Graph storage
 
-**Neo4j sidecar**: the graph storage engine for entities/triples/communities. Runs as a separate process alongside the MCP server; connected via a single long-lived driver (pool ≈ 16). Chosen because graph retrieval requires **native graph node traversal** (PPR, Louvain, node-level embedding) — SQL JOIN and Apache AGE do not meet this constraint.
+**Neo4j sidecar**: graph engine deployed alongside the MCP server for P1+ native multi-hop traversal (PPR, Louvain, node-level embedding); a read-only projection of Postgres-authoritative entities/triples, never a system of record (issue #3 D1). In P0 the server does not connect to it at all — projection synchronization graduated to P1, with outbox as the leading candidate (issue #7 Q3b). SQL JOIN and Apache AGE do not meet the native-traversal constraint, hence the sidecar.
 _Avoid_: "graph database" (too generic); "Neo4j CE" (edition detail, not architectural term); "graph backend" (acceptable alias)
 
 **community**: a cluster of densely-connected entities detected by Louvain (Neo4j GDS). Each community gets a hierarchical summary for global/topic QA. _Stage: P3 (not yet implemented)._
@@ -104,14 +104,14 @@ _Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified)
 - **query → embedder → vector search → ranked chunks**: stage 1 retrieve path
 - **query → hybrid retrieval (vector + BM25 + graph) → RRF fusion → rerank → top-K**: P1 retrieve path
 - **valid_window + valid_at → temporal filter**: chunks/triples outside the query's time window are excluded
-- **entity → Neo4j node; triple → Neo4j edge**: graph storage mapping (P0/P1)
+- **entity → Neo4j node; triple → Neo4j edge**: read-only projection of Postgres (P1 onward; P0 has no Neo4j connection — issue #3 D1, #7 Q3b)
 - **community → Louvain → hierarchical summary**: P3 global QA path
 
 ## Flagged ambiguities
 
 - **triple vs fact**: in iknow-memory, "triple" is the canonical term for (head, relation, tail). "Fact" is avoided because it collides with gbrain's `facts` table (bi-temporal claims). If you must say "fact" in iknow-memory context, qualify it: "graph fact" or "temporal fact".
 - **valid_window vs valid_at**: `valid_window` is a property of stored data (when is this true?); `valid_at` is a property of the query (when am I asking about?). The filter is `valid_window @> valid_at`.
-- **Neo4j vs Postgres**: entities/triples live in Neo4j (native graph traversal); chunks/embeddings live in Postgres/pgvector (vector search). This is a deliberate split, not a migration path. Do not propose "just use Postgres for everything" without addressing the native-graph-node constraint.
+- **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for entities, triples, aliases, and (P0) extraction_records; Neo4j is a derived read-only projection. In P0 the server does not connect to Neo4j at all (issue #3 D1; #7 Q1 graph arm reads Postgres JOINs; #7 Q3b projection sync and #7 Q3c read-your-writes graduate to P1). The rationale for keeping Neo4j as a future projection is native graph node traversal (PPR, Louvain, node-level embedding); SQL JOIN and Apache AGE do not meet that constraint. Do not propose writing to Neo4j outside the projection path, or "just use Postgres for everything" without addressing that constraint.
 - **rerank fail-open**: rerank failure returns the fused order unchanged. This is intentional — a dead reranker should not block retrieval. Do not add retry/fallback logic that changes this contract without explicit decision.
 - **context engineering is NOT our job**: JIT retrieval triggers, cache breakpoint planning, prompt assembly, budget allocation — these belong to the host. iknow-memory returns ranked chunks; what the host does with them is the host's problem.
 - **gbrain is a learning object, not a dependency**: design decisions (RRF k=60, cosine re-score 0.7/0.3, rerank fail-open, PPR) are adopted from gbrain's upgrade guide. gbrain code (`_upstream_gbrain/`) is read-only reference — zero runtime import/link/symlink. We implement better, not copy.

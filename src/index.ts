@@ -67,6 +67,13 @@ const EXIT_CODES = {
 interface ServerDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
+  /**
+   * Retrieval pipeline config (T7). Always present — loadEnv() always
+   * returns it. Structural type from GraphragEnv so createServer can pass
+   * it as retrieveTool's graphConfig without importing src/core/retrieval/*
+   * (preserves the isolation guard in tests/cli/isolation-retrieval.test.ts).
+   */
+  retrieval: GraphragEnv["retrieval"];
 }
 
 /**
@@ -127,17 +134,25 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     embedder = new FakeEmbedder(env.embedDimensions);
   }
 
-  return { embedder, storage };
+  // T7 wiring: thread the validated retrieval config into the server deps so
+  // createServer() can pass it as graphConfig to retrieveTool.
+  return { embedder, storage, retrieval: env.retrieval };
 }
 
 export async function createServer(): Promise<McpServer> {
   const env = loadEnv();
   const logger = createLogger(env.logLevel);
   const deps = await buildDeps(env);
+  // T7 debug gate: DEBUG=1 surfaces the retrieve envelope's `debug` payload
+  // (Success Criterion #4). Absent → no debug key.
+  const debug = process.env.DEBUG === "1";
   const registry = buildRegistry([
     echoTool,
     ingestTool(deps),
-    retrieveTool(deps),
+    // T7: wire the graph config + debug gate into the retrieve tool. The
+    // graph arm activates only when storage exposes graphArmSeed (pgvector);
+    // memory mode stays vector-only and the envelope stays `{ chunks }`.
+    retrieveTool({ ...deps, graphConfig: deps.retrieval, debug }),
   ]);
 
   const server = new McpServer(

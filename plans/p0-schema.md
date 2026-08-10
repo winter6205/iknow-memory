@@ -44,6 +44,7 @@ behaviors, not internal decomposition.
 - **Why [decision]:** T2–T5 consume these answers; without them the code in
   T2–T5 would either pick a wrong default or block waiting for input.
 - **Commit:** 1 commit = this 1 task.
+- **Status:** [x] complete (Open Questions resolved in `specs/p0-schema.md`: uuid v4 / app-layer dedup / `CREATE IF NOT EXISTS`. Recorded in spec §Open Questions and at PR #11)
 
 ### T2. `[implementation]` Scaffold `schema-p0.ts` + idempotency probe
 
@@ -60,7 +61,7 @@ IF NOT EXISTS` for at least one table so idempotency is real, not theoretical;
   documented Validation block.
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit
 - **Commit:** 1 commit = this 1 task.
-- **Status:** [ ] pending
+- **Status:** [x] complete (PR #11 MERGED 2026-08-07, commit `ffc3172`. `upSchemaP0` ships in `src/core/storage/schema-p0.ts`; idempotent double-call probe green in `tests/schema-p0.test.ts`)
 
 ### T3. `[implementation]` Land `entities` + `entity_aliases` tables and tests
 
@@ -86,6 +87,7 @@ IF NOT EXISTS` for at least one table so idempotency is real, not theoretical;
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit
 - **Commit:** 1 commit = this 1 task.
 - **[blocks: T1, T2]**
+- **Status:** [x] complete (PR #11 MERGED 2026-08-07. `entities` + `entity_aliases` helpers in `src/core/storage/schema-p0.ts`; CHECK on `entities.type` / `entity_aliases.alias_type`, indexes per spec Indexes table, FK CASCADE on `entity_aliases.entity_id` — all probed by `tests/schema-p0.test.ts`)
 
 ### T4. `[implementation]` Land `triples` table and FK/CHECK/index tests
 
@@ -108,6 +110,7 @@ IF NOT EXISTS` for at least one table so idempotency is real, not theoretical;
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit
 - **Commit:** 1 commit = this 1 task.
 - **[blocks: T3]**
+- **Status:** [x] complete (PR #11 MERGED 2026-08-07. `triples` helper in `src/core/storage/schema-p0.ts`; CHECK on `confidence BETWEEN 0 AND 1` + `relation_norm NOT NULL` + `relation_raw NOT NULL`; FK `ON DELETE SET NULL` on `source_chunk_id`, `ON DELETE RESTRICT` on `head_id`/`tail_id`; GiST on `valid_window` + btree on `(head_id)`/`(tail_id)`/`(source_chunk_id)`/`(relation_norm)` — all probed by `tests/schema-p0.test.ts`)
 
 ### T5. `[implementation]` Land `extraction_records` table, boundary probes, and wire into `pgvector-backend.ts`
 
@@ -137,6 +140,7 @@ IF NOT EXISTS` for at least one table so idempotency is real, not theoretical;
 - **Per-ticket loop:** tdd → typecheck+tests → code-review → verification-before-completion → commit
 - **Commit:** 1 commit = this 1 task.
 - **[blocks: T4]**
+- **Status:** [x] complete (PR #11 MERGED 2026-08-07. `extraction_records` helper in `src/core/storage/schema-p0.ts`; CHECK on `status IN ('pending','succeeded','failed')`; btree on `(chunk_id)`/`(batch_id)`/`(status)`/`(created_at)`; `valid_window @>` right-open + null-forever-valid boundary probes; one-line `upSchemaP0(client, this.dimensions)` wire inside `pgvector-backend.ts` `ensureTable` transaction — no public API change to `StorageBackend`. Full `npm test` 318/318 green)
 
 ## Cross-references
 

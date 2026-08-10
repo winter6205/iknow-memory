@@ -20,12 +20,9 @@
  * dependency entirely: see the dynamic import in the constructor and in
  * src/index.ts:buildDeps.
  */
-import type {
-  ChunkRecord,
-  RetrievedChunk,
-  SearchOptions,
-  StorageBackend,
-} from "../types.js";
+import type { ChunkRecord, RetrievedChunk, SearchOptions } from "../types.js";
+import type { GraphRagStorageBackend } from "./backend.js";
+import type { GraphArmStorage } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
 import { upSchemaP0 } from "./schema-p0.js";
@@ -56,6 +53,29 @@ interface PgClient {
 function toVectorLiteral(embedding: number[]): string {
   return `[${embedding.join(",")}]`;
 }
+
+/**
+ * Soft-merge survivor-only seed query (T3 contract):
+ * `merged_into IS NULL AND retired = false`, ordered by cosine distance.
+ */
+const SEED_ENTITIES_SQL =
+  "SELECT id, canonical_name FROM entities " +
+  "WHERE embedding IS NOT NULL AND merged_into IS NULL AND retired = false " +
+  "ORDER BY embedding <=> $1::vector LIMIT $2";
+
+/**
+ * One-hop traversal (T3 contract — single JOIN chunks, two-sided temporal
+ * filter). `$1` is the seed-id array, `$2` is validAt, `$3` is the limit.
+ */
+const ONE_HOP_CHUNKS_SQL =
+  "SELECT DISTINCT c.id, c.content, c.source_ref, c.valid_from, c.valid_until " +
+  "FROM triples t " +
+  "JOIN chunks c ON t.source_chunk_id = c.id " +
+  "WHERE (t.head_id = ANY($1::uuid[]) OR t.tail_id = ANY($1::uuid[])) " +
+  "AND t.valid_window @> $2::timestamptz " +
+  "AND c.valid_window @> $2::timestamptz " +
+  "ORDER BY c.id " +
+  "LIMIT $3";
 
 /** Cast for the row shape we expect from our SELECT/UPSERT queries. */
 interface ChunkRow {
@@ -95,7 +115,7 @@ function rowToRetrievedChunk(row: ChunkRow): RetrievedChunk {
  * CREATE EXTENSION + CREATE TABLE IF NOT EXISTS), so a fresh database
  * works out of the box.
  */
-export class PgvectorBackend implements StorageBackend {
+export class PgvectorBackend implements GraphRagStorageBackend {
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
 
@@ -347,4 +367,82 @@ export class PgvectorBackend implements StorageBackend {
       this.pool = undefined;
     }
   }
+
+  /**
+   * Graph-arm storage seam (spec-3 p0-integration T4). Composed inline —
+   * no closure over private state beyond `this`. Methods use `this.ensureReady()`
+   * to access the lazy pool, then delegate to local `pool.query` so the
+   * failure-wrapping stays in one place (see seedQuery / oneHopQuery).
+   *
+   * The two SQL strings are pinned here (not in query-builder.ts) because
+   * the pgvector backend binds concrete values (embedding dimension,
+   * parameter casts); the query-builder module owns the *pure* shape
+   * assertions that T3 already locked. The T4 unit test asserts the
+   * single-JOIN / no-recursion contract on these emitted strings.
+   */
+  readonly graphArmSeed: GraphArmStorage = {
+    /**
+     * Top-K seed entities by cosine similarity to `embedding`.
+     * Soft-merge survivor-only (merged_into IS NULL AND retired = false).
+     */
+    seedEntitiesByEmbedding: async (embedding, topK) => {
+      try {
+        const pool = await this.ensureReady();
+        const result = await pool.query(SEED_ENTITIES_SQL, [
+          toVectorLiteral(embedding),
+          topK,
+        ]);
+        return result.rows.map((r) => {
+          const row = r as { id: string; canonical_name: string };
+          return { id: row.id, canonical_name: row.canonical_name };
+        });
+      } catch (err) {
+        throw new GraphragError(
+          `PgvectorBackend.graphArmSeed.seedEntitiesByEmbedding failed: ${(err as Error).message}`,
+          "STORAGE_ERROR"
+        );
+      }
+    },
+
+    /**
+     * One-hop traversal from `seedIds` through triples to chunks. Two-sided
+     * temporal filter (`triples.valid_window @> $validAt` AND
+     * `chunks.valid_window @> $validAt`). Exactly one JOIN chunks (single-hop
+     * hard limit, Success Criterion #8).
+     */
+    chunksByOneHopFromEntities: async (seedIds, validAt, limit) => {
+      // ANY($1::uuid[]) over an empty JS array triggers ambiguous Postgres
+      // type inference. Short-circuit to the empty result — no DB round-trip.
+      if (seedIds.length === 0) return [];
+      try {
+        const pool = await this.ensureReady();
+        const result = await pool.query(ONE_HOP_CHUNKS_SQL, [
+          seedIds,
+          validAt,
+          limit,
+        ]);
+        return result.rows.map((r) => {
+          const row = r as {
+            id: string;
+            content: string;
+            source_ref: string;
+            valid_from: Date;
+            valid_until: Date | null;
+          };
+          return {
+            id: row.id,
+            content: row.content,
+            source_ref: row.source_ref,
+            valid_from: row.valid_from.toISOString(),
+            valid_until: row.valid_until?.toISOString() ?? null,
+          };
+        });
+      } catch (err) {
+        throw new GraphragError(
+          `PgvectorBackend.graphArmSeed.chunksByOneHopFromEntities failed: ${(err as Error).message}`,
+          "STORAGE_ERROR"
+        );
+      }
+    },
+  };
 }

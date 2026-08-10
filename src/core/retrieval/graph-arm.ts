@@ -1,0 +1,167 @@
+/**
+ * Graph-arm pure orchestration (spec-3 p0-integration T3).
+ *
+ * Runs the graph retrieval pipeline: embed the query → top-K seed entities →
+ * one-hop triples → chunks. Honors `entityLinkTopK` / `candidateCap` and the
+ * `graphArmFloor` under-floor gate. Fail-open by design: any storage error
+ * degrades to `belowFloor=true` with a `failureReason`, never a throw; the
+ * T5 orchestrator decides whether the whole retrieve call degrades.
+ */
+import { RetrievalArmError } from "./types.js";
+import type { EmbeddingClient } from "../embedder.js";
+import type {
+  ArmHit,
+  ArmResult,
+  GraphArmStorage,
+  RetrieveConfig,
+} from "./types.js";
+
+/** Runtime deps injected by the retrieve orchestrator (T5). */
+export interface GraphArmDeps {
+  embedder: EmbeddingClient;
+  storage: GraphArmStorage;
+  config: RetrieveConfig;
+}
+
+/**
+ * Run the graph arm for a query. Returns an `ArmResult`; throws only on
+ * fatal embed failure wrapped as `RetrievalArmError`. Storage failures are
+ * swallowed into a degraded `ArmResult` per the fail-open contract.
+ */
+export async function runGraphArm(
+  query: string,
+  deps: GraphArmDeps,
+  now: Date
+): Promise<ArmResult> {
+  const embedding = await embedQuery(deps, query);
+  let seeds: Array<{ id: string; canonical_name: string }>;
+  try {
+    seeds = await getSeedEntities(deps, embedding);
+  } catch (err) {
+    return armResultWithError(err);
+  }
+  // Short-circuit: an empty seed set has no reachable one-hop path. The
+  // floor (which counts chunks) would also fail on 0 rows, but skipping the
+  // round-trip avoids an empty-uuid-array bind against the storage layer.
+  if (seeds.length === 0) {
+    return {
+      arm: "graph",
+      hits: [],
+      belowFloor: true,
+      failureReason: "graph arm yielded 0 seed entities",
+    };
+  }
+  let rows;
+  try {
+    rows = await storageOneHop(deps, seeds, now);
+  } catch (err) {
+    return armResultWithError(err);
+  }
+  // Floor counts chunks (per spec §Boundaries: "if chunksByOneHopFromEntities
+  // returns < graphArmFloor hits, set degraded: true"), not seed entities.
+  // E.g. seeds=3 + oneHopRows=[g1] (floor=3) MUST be belowFloor=true, because
+  // 1 < 3. Seeds are an upstream cap, not a correctness signal.
+  if (shouldFlagBelowFloor(rows.length, deps.config.graphArmFloor)) {
+    return {
+      arm: "graph",
+      hits: [],
+      belowFloor: true,
+      failureReason: `graph arm yielded ${rows.length} chunk(s) < floor ${deps.config.graphArmFloor}`,
+    };
+  }
+  return { arm: "graph", hits: mapChunksToHits(rows), belowFloor: false };
+}
+
+/**
+ * Embed the query into a single vector. Embed failures are fatal (no
+ * fallback) and are wrapped as `RetrievalArmError` for the T5 orchestrator.
+ */
+async function embedQuery(
+  deps: GraphArmDeps,
+  query: string
+): Promise<number[]> {
+  try {
+    const vectors = await deps.embedder.embed([query]);
+    const vec = vectors[0];
+    if (!vec) {
+      throw new RetrievalArmError(
+        "graph-arm embed returned no vector",
+        "graph"
+      );
+    }
+    return vec;
+  } catch (err) {
+    if (err instanceof RetrievalArmError) throw err;
+    throw new RetrievalArmError(
+      `graph-arm embed failed: ${(err as Error).message}`,
+      "graph"
+    );
+  }
+}
+
+/** Top-K seed entities by embedding similarity (soft-merge survivors). */
+async function getSeedEntities(
+  deps: GraphArmDeps,
+  embedding: number[]
+): Promise<Array<{ id: string; canonical_name: string }>> {
+  return deps.storage.seedEntitiesByEmbedding(
+    embedding,
+    deps.config.entityLinkTopK
+  );
+}
+
+/** One-hop chunks reachable from the surviving seed ids. */
+async function storageOneHop(
+  deps: GraphArmDeps,
+  seeds: Array<{ id: string; canonical_name: string }>,
+  now: Date
+): Promise<
+  Array<{
+    id: string;
+    content: string;
+    source_ref: string;
+    valid_from: string;
+    valid_until: string | null;
+  }>
+> {
+  return deps.storage.chunksByOneHopFromEntities(
+    seeds.map((s) => s.id),
+    now.toISOString(),
+    deps.config.candidateCap
+  );
+}
+
+/** True when the one-hop chunk count does not reach the graph-arm floor. */
+function shouldFlagBelowFloor(chunkCount: number, floor: number): boolean {
+  return chunkCount < floor;
+}
+
+/** Map storage rows to `ArmHit`s with deterministic 1-based ranking. */
+function mapChunksToHits(
+  rows: Array<{
+    id: string;
+    content: string;
+    source_ref: string;
+    valid_from: string;
+    valid_until: string | null;
+  }>
+): ArmHit[] {
+  return rows.map((r, i) => ({
+    id: r.id,
+    arm: "graph" as const,
+    rank: i + 1,
+    // No cosine from storage; fall back to a monotone graph relevance score.
+    score: 1 / (1 + i),
+    content: r.content,
+    source_ref: r.source_ref,
+    valid_window: [r.valid_from, r.valid_until],
+  }));
+}
+
+/** Degrade to an empty under-floor result carrying the failure reason. */
+function armResultWithError(err: unknown): ArmResult {
+  const message = err instanceof Error ? err.message : String(err);
+  // Log at warn; the T5 envelope makes the failure observable to the caller.
+  console.warn(`graph-arm degraded: ${message}`);
+  return { arm: "graph", hits: [], belowFloor: true, failureReason: message };
+}

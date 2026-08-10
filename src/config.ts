@@ -8,6 +8,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import type { RetrieveConfig } from "./core/retrieval/types.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -93,6 +94,12 @@ export interface GraphragEnv {
    * FakeEmbedder". See the EMBED_API_KEY_* constants for resolution order.
    */
   embedApiKey: string | undefined;
+  /**
+   * Retrieval pipeline knobs (spec-3 p0-integration T5). Loaded from the
+   * GRAPHRAG_MEMORY_RETRIEVAL_* family; validated at startup. This is the
+   * config source of truth for the RRF fusion + graph-arm floor behavior.
+   */
+  retrieval: RetrieveConfig;
 }
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -160,6 +167,101 @@ function parseEmbedDimensions(raw: string | undefined): number {
   return n;
 }
 
+// --- Retrieval config (spec-3 p0-integration T5) ---
+
+const RETRIEVAL_W_VEC_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC";
+const RETRIEVAL_W_GRAPH_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH";
+const RETRIEVAL_ENTITY_LINK_TOP_K_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K";
+const RETRIEVAL_CANDIDATE_CAP_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP";
+const RETRIEVAL_GRAPH_ARM_FLOOR_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR";
+
+/**
+ * Parse a positive integer env var with an optional lower bound. `fallback`
+ * is used when the var is unset (or blank). Rejects non-numeric, non-integer,
+ * and out-of-range values with ConfigError naming the offending var.
+ */
+function parsePositiveInt(
+  name: string,
+  raw: string | undefined,
+  opts: { min: number; fallback: number }
+): number {
+  const value =
+    raw !== undefined && raw.trim() !== "" ? raw : String(opts.fallback);
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < opts.min) {
+    throw new ConfigError(
+      `${name} must be a positive integer >= ${opts.min}, got "${raw}"`
+    );
+  }
+  return n;
+}
+
+/**
+ * Parse a finite strictly-positive number (RRF weights). `fallback` is used
+ * when the var is unset (or blank). Rejects non-finite (NaN/Infinity), zero,
+ * and negative values.
+ */
+function parseFinitePositive(
+  name: string,
+  raw: string | undefined,
+  fallback: number
+): number {
+  const value = raw !== undefined && raw.trim() !== "" ? raw : String(fallback);
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new ConfigError(
+      `${name} must be a finite positive number, got "${raw}"`
+    );
+  }
+  return n;
+}
+
+/**
+ * Load + validate the GRAPHRAG_MEMORY_RETRIEVAL_* family into a RetrieveConfig.
+ * Defaults: w_vec=1, w_graph=1, entityLinkTopK=8, candidateCap=50,
+ * graphArmFloor=3 — matching the spec glossary. Enforces the spec
+ * §Boundaries: finite positive weights; entityLinkTopK > 0;
+ * candidateCap >= entityLinkTopK; graphArmFloor > 0.
+ */
+function parseRetrievalConfig(): RetrieveConfig {
+  const entityLinkTopK = parsePositiveInt(
+    RETRIEVAL_ENTITY_LINK_TOP_K_VAR,
+    readEnv(RETRIEVAL_ENTITY_LINK_TOP_K_VAR),
+    { min: 1, fallback: 8 }
+  );
+  const candidateCap = parsePositiveInt(
+    RETRIEVAL_CANDIDATE_CAP_VAR,
+    readEnv(RETRIEVAL_CANDIDATE_CAP_VAR),
+    { min: 1, fallback: 50 }
+  );
+  if (candidateCap < entityLinkTopK) {
+    throw new ConfigError(
+      `${RETRIEVAL_CANDIDATE_CAP_VAR} (${candidateCap}) must be >= ${RETRIEVAL_ENTITY_LINK_TOP_K_VAR} (${entityLinkTopK})`
+    );
+  }
+  return {
+    w_vec: parseFinitePositive(
+      RETRIEVAL_W_VEC_VAR,
+      readEnv(RETRIEVAL_W_VEC_VAR),
+      1
+    ),
+    w_graph: parseFinitePositive(
+      RETRIEVAL_W_GRAPH_VAR,
+      readEnv(RETRIEVAL_W_GRAPH_VAR),
+      1
+    ),
+    entityLinkTopK,
+    candidateCap,
+    graphArmFloor: parsePositiveInt(
+      RETRIEVAL_GRAPH_ARM_FLOOR_VAR,
+      readEnv(RETRIEVAL_GRAPH_ARM_FLOOR_VAR),
+      { min: 1, fallback: 3 }
+    ),
+  };
+}
+
 /**
  * Read + validate the runtime environment.
  *
@@ -214,6 +316,8 @@ export function loadEnv(): GraphragEnv {
     );
   }
 
+  const retrieval = parseRetrievalConfig();
+
   return {
     logLevel,
     storage: rawStorage,
@@ -224,6 +328,7 @@ export function loadEnv(): GraphragEnv {
     // Looked up by NAME — the secret value only ever exists in the process
     // environment, never in this file or in any log line.
     embedApiKey,
+    retrieval,
   };
 }
 

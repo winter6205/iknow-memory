@@ -1,0 +1,2713 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SPEC 3 召回路径教学 · 图臂 retrieve + RRF 融合</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --surface-1: #fcfcfb;
+        --page-plane: #f9f9f7;
+        --text-primary: #0b0b0b;
+        --text-secondary: #52514e;
+        --muted: #898781;
+        --gridline: #e1e0d9;
+        --baseline: #c3c2b7;
+        --border: rgba(11, 11, 11, 0.1);
+
+        /* categorical slots (fixed order) */
+        --series-1: #2a78d6; /* blue   — vector arm */
+        --series-2: #eb6834; /* orange — graph arm */
+        --series-3: #1baf7a; /* aqua   — fused result */
+        --series-4: #eda100; /* yellow — entity */
+        --series-5: #e87ba4; /* magenta — triple */
+        --series-6: #008300; /* green  — chunk / correct */
+        --series-7: #4a3aa7; /* violet — valid_window */
+        --series-8: #e34948; /* red    — degraded / wrong */
+
+        --good: #0ca30c;
+        --warning: #fab219;
+        --serious: #ec835a;
+        --critical: #d03b3b;
+
+        --font:
+          system-ui, -apple-system, "Segoe UI", "PingFang SC",
+          "Microsoft YaHei", sans-serif;
+        --radius: 10px;
+        --shadow:
+          0 1px 3px rgba(11, 11, 11, 0.08), 0 4px 12px rgba(11, 11, 11, 0.06);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root:where(:not([data-theme="light"])) {
+          color-scheme: dark;
+          --surface-1: #1a1a19;
+          --page-plane: #0d0d0d;
+          --text-primary: #ffffff;
+          --text-secondary: #c3c2b7;
+          --muted: #898781;
+          --gridline: #2c2c2a;
+          --baseline: #383835;
+          --border: rgba(255, 255, 255, 0.1);
+          --series-1: #3987e5;
+          --series-2: #d95926;
+          --series-3: #199e70;
+          --series-4: #c98500;
+          --series-5: #d55181;
+          --series-6: #008300;
+          --series-7: #9085e9;
+          --series-8: #e66767;
+          --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.3);
+        }
+      }
+      :root[data-theme="dark"] {
+        color-scheme: dark;
+        --surface-1: #1a1a19;
+        --page-plane: #0d0d0d;
+        --text-primary: #ffffff;
+        --text-secondary: #c3c2b7;
+        --muted: #898781;
+        --gridline: #2c2c2a;
+        --baseline: #383835;
+        --border: rgba(255, 255, 255, 0.1);
+        --series-1: #3987e5;
+        --series-2: #d95926;
+        --series-3: #199e70;
+        --series-4: #c98500;
+        --series-5: #d55181;
+        --series-6: #008300;
+        --series-7: #9085e9;
+        --series-8: #e66767;
+        --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.3);
+      }
+
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html {
+        scroll-behavior: smooth;
+      }
+      body {
+        font-family: var(--font);
+        background: var(--page-plane);
+        color: var(--text-primary);
+        line-height: 1.6;
+        font-size: 16px;
+      }
+
+      /* ── Top bar ── */
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        background: var(--surface-1);
+        border-bottom: 1px solid var(--border);
+        padding: 12px 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        backdrop-filter: blur(8px);
+      }
+      .topbar .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 700;
+        font-size: 15px;
+      }
+      .brand-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        background: var(--series-7);
+        color: #fff;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .topbar nav {
+        display: flex;
+        gap: 4px;
+        flex-wrap: wrap;
+      }
+      .topbar nav a {
+        color: var(--text-secondary);
+        text-decoration: none;
+        padding: 5px 10px;
+        border-radius: 6px;
+        font-size: 13px;
+      }
+      .topbar nav a:hover {
+        background: var(--gridline);
+        color: var(--text-primary);
+      }
+      .topbar nav a.active {
+        background: var(--series-1);
+        color: #fff;
+        font-weight: 600;
+      }
+
+      /* ── Layout ── */
+      .container {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 28px 24px 80px;
+      }
+      section {
+        margin-top: 56px;
+        scroll-margin-top: 70px;
+      }
+      h1 {
+        font-size: 30px;
+        line-height: 1.25;
+        letter-spacing: -0.02em;
+        margin-bottom: 8px;
+      }
+      h2 {
+        font-size: 22px;
+        margin-bottom: 16px;
+        letter-spacing: -0.01em;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--border);
+      }
+      h2 .sec-num {
+        color: var(--series-1);
+        margin-right: 8px;
+      }
+      h3 {
+        font-size: 17px;
+        margin: 20px 0 10px;
+      }
+      p {
+        margin: 8px 0;
+        color: var(--text-primary);
+      }
+      .lede {
+        font-size: 17px;
+        color: var(--text-secondary);
+        max-width: 70ch;
+      }
+
+      /* ── Cards / diagrams ── */
+      .card {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 20px;
+        margin: 16px 0;
+        box-shadow: var(--shadow);
+      }
+      .grid-2 {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+      }
+      .grid-3 {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 16px;
+      }
+      @media (max-width: 820px) {
+        .grid-2,
+        .grid-3 {
+          grid-template-columns: 1fr;
+        }
+      }
+
+      /* ── Tags / pills ── */
+      .tag {
+        display: inline-block;
+        padding: 1px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 600;
+        margin-right: 6px;
+        vertical-align: 1px;
+      }
+      .tag.vec {
+        background: color-mix(in srgb, var(--series-1) 16%, transparent);
+        color: var(--series-1);
+      }
+      .tag.graph {
+        background: color-mix(in srgb, var(--series-2) 16%, transparent);
+        color: var(--series-2);
+      }
+      .tag.fused {
+        background: color-mix(in srgb, var(--series-3) 16%, transparent);
+        color: var(--series-3);
+      }
+      .tag.entity {
+        background: color-mix(in srgb, var(--series-4) 16%, transparent);
+        color: var(--series-4);
+      }
+      .tag.triple {
+        background: color-mix(in srgb, var(--series-5) 16%, transparent);
+        color: var(--series-5);
+      }
+      .tag.chunk {
+        background: color-mix(in srgb, var(--series-6) 16%, transparent);
+        color: var(--series-6);
+      }
+      .tag.time {
+        background: color-mix(in srgb, var(--series-7) 16%, transparent);
+        color: var(--series-7);
+      }
+      .tag.deg {
+        background: color-mix(in srgb, var(--series-8) 16%, transparent);
+        color: var(--series-8);
+      }
+
+      /* ── Pipeline stepper ── */
+      .pipeline {
+        display: flex;
+        align-items: stretch;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 16px 0;
+      }
+      .step {
+        flex: 1;
+        min-width: 150px;
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 12px 14px;
+        position: relative;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+      .step:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow);
+      }
+      .step.active {
+        border-color: var(--series-1);
+        box-shadow: 0 0 0 2px
+          color-mix(in srgb, var(--series-1) 25%, transparent);
+      }
+      .step .step-num {
+        position: absolute;
+        top: -9px;
+        left: 12px;
+        background: var(--series-1);
+        color: #fff;
+        font-size: 11px;
+        font-weight: 700;
+        border-radius: 999px;
+        padding: 0 8px;
+        line-height: 18px;
+      }
+      .step .step-title {
+        font-weight: 700;
+        font-size: 14px;
+        margin-bottom: 2px;
+      }
+      .step .step-desc {
+        font-size: 12.5px;
+        color: var(--text-secondary);
+        line-height: 1.45;
+      }
+      .step-arrow {
+        align-self: center;
+        color: var(--muted);
+        font-size: 20px;
+      }
+
+      /* ── SVG diagram ── */
+      .diagram-wrap {
+        overflow-x: auto;
+      }
+      svg.diagram {
+        display: block;
+        width: 100%;
+        height: auto;
+      }
+      svg text {
+        font-family: var(--font);
+      }
+      .node {
+        transition:
+          opacity 0.3s ease,
+          filter 0.2s ease;
+      }
+      .node.clickable {
+        cursor: pointer;
+      }
+      .node.clickable:hover {
+        filter: brightness(1.08);
+      }
+      .node .label {
+        font-size: 12.5px;
+        font-weight: 600;
+      }
+      .node .sub {
+        font-size: 10.5px;
+      }
+      .edge {
+        transition: opacity 0.3s ease;
+      }
+      .edge-label {
+        font-size: 11px;
+        font-weight: 600;
+      }
+
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin: 12px 0;
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+      .legend-swatch {
+        width: 14px;
+        height: 14px;
+        border-radius: 3px;
+      }
+      .legend-line {
+        width: 22px;
+        height: 3px;
+        border-radius: 2px;
+      }
+
+      /* ── Code / SQL ── */
+      .code-block {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 14px 16px;
+        font-family:
+          ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+        font-size: 13px;
+        line-height: 1.6;
+        overflow-x: auto;
+        margin: 12px 0;
+      }
+      .code-block .hl {
+        background: color-mix(in srgb, var(--series-4) 18%, transparent);
+        padding: 0 3px;
+        border-radius: 3px;
+      }
+      .code-block .cmt {
+        color: var(--muted);
+      }
+      .code-block .kw {
+        color: var(--series-7);
+        font-weight: 600;
+      }
+      .code-block .fn {
+        color: var(--series-1);
+      }
+      .code-label {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 4px;
+        font-family: ui-monospace, monospace;
+      }
+
+      /* ── Formula ── */
+      .formula {
+        background: var(--surface-1);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 16px 20px;
+        text-align: center;
+        font-size: 20px;
+        margin: 16px 0;
+      }
+      .formula .var {
+        color: var(--series-7);
+        font-weight: 700;
+      }
+      .formula .sub {
+        font-size: 13px;
+        color: var(--text-secondary);
+      }
+
+      /* ── Table ── */
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 12px 0;
+        font-size: 14px;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--gridline);
+      }
+      th {
+        font-weight: 600;
+        color: var(--text-secondary);
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+      }
+      td .mono {
+        font-family: ui-monospace, monospace;
+        font-size: 12.5px;
+      }
+      tr.highlight td {
+        background: color-mix(in srgb, var(--series-3) 10%, transparent);
+      }
+      .num {
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+      }
+
+      /* ── Callouts ── */
+      .note {
+        border-left: 4px solid var(--series-1);
+        padding: 12px 16px;
+        border-radius: 0 8px 8px 0;
+        margin: 16px 0;
+        background: color-mix(in srgb, var(--series-1) 6%, transparent);
+      }
+      .note.warn {
+        border-left-color: var(--warning);
+        background: color-mix(in srgb, var(--warning) 6%, transparent);
+      }
+      .note.ok {
+        border-left-color: var(--good);
+        background: color-mix(in srgb, var(--good) 6%, transparent);
+      }
+      .note.crit {
+        border-left-color: var(--critical);
+        background: color-mix(in srgb, var(--critical) 6%, transparent);
+      }
+      .note .note-title {
+        font-weight: 700;
+        font-size: 14px;
+        margin-bottom: 4px;
+      }
+
+      /* ── Quiz ── */
+      .quiz {
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        margin: 20px 0;
+        overflow: hidden;
+      }
+      .quiz-head {
+        background: var(--surface-1);
+        padding: 12px 18px;
+        font-weight: 700;
+        font-size: 15px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .quiz-q {
+        padding: 16px 18px;
+        background: var(--surface-1);
+      }
+      .quiz-q .q-text {
+        font-size: 15px;
+        margin-bottom: 14px;
+        font-weight: 500;
+      }
+      .options {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+      .option {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 11px 14px;
+        border: 1px solid var(--gridline);
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        font-size: 14px;
+        background: var(--surface-1);
+      }
+      .option:hover {
+        border-color: var(--series-1);
+        background: color-mix(in srgb, var(--series-1) 5%, transparent);
+      }
+      .option.selected {
+        border-color: var(--series-1);
+        background: color-mix(in srgb, var(--series-1) 8%, transparent);
+      }
+      .option.correct {
+        border-color: var(--good);
+        background: color-mix(in srgb, var(--good) 10%, transparent);
+      }
+      .option.wrong {
+        border-color: var(--critical);
+        background: color-mix(in srgb, var(--critical) 8%, transparent);
+      }
+      .option .opt-letter {
+        width: 26px;
+        height: 26px;
+        flex-shrink: 0;
+        border-radius: 50%;
+        border: 1px solid var(--baseline);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-secondary);
+      }
+      .option.selected .opt-letter {
+        background: var(--series-1);
+        border-color: var(--series-1);
+        color: #fff;
+      }
+      .option.correct .opt-letter {
+        background: var(--good);
+        border-color: var(--good);
+        color: #fff;
+      }
+      .option.wrong .opt-letter {
+        background: var(--critical);
+        border-color: var(--critical);
+        color: #fff;
+      }
+      .quiz-feedback {
+        padding: 10px 18px;
+        font-size: 14px;
+        display: none;
+      }
+      .quiz-feedback.show {
+        display: block;
+      }
+      .quiz-feedback.correct {
+        background: color-mix(in srgb, var(--good) 10%, transparent);
+        color: var(--good);
+      }
+      .quiz-feedback.wrong {
+        background: color-mix(in srgb, var(--critical) 10%, transparent);
+        color: var(--critical);
+      }
+      .quiz-foot {
+        padding: 10px 18px;
+        background: var(--surface-1);
+        border-top: 1px solid var(--border);
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+      .btn {
+        padding: 7px 16px;
+        border-radius: 7px;
+        border: 1px solid var(--baseline);
+        background: var(--surface-1);
+        color: var(--text-primary);
+        font-size: 13.5px;
+        cursor: pointer;
+        font-weight: 600;
+        transition: all 0.15s ease;
+      }
+      .btn:hover {
+        border-color: var(--text-secondary);
+      }
+      .btn.primary {
+        background: var(--series-1);
+        border-color: var(--series-1);
+        color: #fff;
+      }
+      .btn.primary:hover {
+        filter: brightness(1.08);
+      }
+
+      /* ── Interactive scenario (drag / step) ── */
+      .scenario-controls {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin: 12px 0;
+      }
+      .slider-row {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 12px 0;
+        flex-wrap: wrap;
+      }
+      .slider-row label {
+        font-size: 13.5px;
+        color: var(--text-secondary);
+      }
+      input[type="range"] {
+        flex: 1;
+        min-width: 180px;
+        accent-color: var(--series-1);
+      }
+      .score-readout {
+        font-family: ui-monospace, monospace;
+        font-size: 14px;
+        font-variant-numeric: tabular-nums;
+        font-weight: 700;
+        color: var(--series-7);
+      }
+
+      .status-banner {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 12px 16px;
+        border-radius: 8px;
+        margin: 12px 0;
+        font-size: 14px;
+      }
+      .status-banner.ok {
+        background: color-mix(in srgb, var(--good) 10%, transparent);
+        color: var(--good);
+      }
+      .status-banner.deg {
+        background: color-mix(in srgb, var(--critical) 10%, transparent);
+        color: var(--critical);
+      }
+
+      /* ── Footer ── */
+      footer {
+        border-top: 1px solid var(--border);
+        margin-top: 72px;
+        padding: 20px 24px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      /* ── Theme toggle ── */
+      .theme-toggle {
+        border: 1px solid var(--baseline);
+        background: var(--surface-1);
+        color: var(--text-primary);
+        border-radius: 7px;
+        padding: 5px 12px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      @media print {
+        .topbar {
+          position: static;
+        }
+        .scenario-controls,
+        .theme-toggle {
+          display: none;
+        }
+      }
+
+      /* ── Animated flow ── */
+      .flow-line {
+        stroke-dasharray: 6 4;
+        animation: dashmove 1s linear infinite;
+      }
+      @keyframes dashmove {
+        to {
+          stroke-dashoffset: -10;
+        }
+      }
+      .pulse {
+        animation: pulse 1.5s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.35;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="topbar">
+      <div class="brand">
+        <span class="brand-badge">iknow-memory</span> SPEC 3 召回路径教学
+      </div>
+      <nav>
+        <a href="#s1">全景</a>
+        <a href="#s2">向量臂</a>
+        <a href="#s3">图臂</a>
+        <a href="#s4">RRF 融合</a>
+        <a href="#s5">降级契约</a>
+        <a href="#s6">练习</a>
+      </nav>
+      <button
+        class="theme-toggle"
+        onclick="toggleTheme()"
+        aria-label="切换明暗主题"
+      >
+        🌓 主题
+      </button>
+    </div>
+
+    <div class="container">
+      <h1>一次 <code>retrieve</code> 调用，内部到底发生了什么</h1>
+      <p class="lede">
+        这是一份交互式教学页面，把 SPEC 3 图臂检索整合（graph-arm retrieve + RRF
+        融合 +
+        降级契约）拆开讲透。点击每一步、拖动滑块、做练习题，动手理解整个召回路径。
+      </p>
+
+      <!-- ══════════════════ S1 全景 ══════════════════ -->
+      <section id="s1">
+        <h2><span class="sec-num">01</span>全景：一次检索的两条臂</h2>
+        <p>
+          SPEC 3 之前，<code>retrieve</code> 只有一条通道：向量臂。SPEC 3
+          加了第二条平行的图臂，再用
+          <strong>RRF 融合</strong
+          >合并两臂结果。点击下面的每一步，观察数据怎么流动。
+        </p>
+
+        <div class="pipeline" id="pipeline">
+          <div class="step" data-step="0">
+            <span class="step-num">①</span>
+            <div class="step-title">嵌入 query</div>
+            <div class="step-desc">
+              embedder 把文字变成向量，两臂共用这一个向量
+            </div>
+          </div>
+          <div class="step-arrow">→</div>
+          <div class="step" data-step="1">
+            <span class="step-num">②</span>
+            <div class="step-title">向量臂</div>
+            <div class="step-desc">余弦相似度搜 chunks，返回 top-K</div>
+          </div>
+          <div class="step-arrow">→</div>
+          <div class="step" data-step="2">
+            <span class="step-num">③</span>
+            <div class="step-title">图臂</div>
+            <div class="step-desc">种子实体 → one-hop 三元组 → chunks</div>
+          </div>
+          <div class="step-arrow">→</div>
+          <div class="step" data-step="3">
+            <span class="step-num">④</span>
+            <div class="step-title">RRF 融合</div>
+            <div class="step-desc">score = w/(k+rank)，双命中叠加</div>
+          </div>
+          <div class="step-arrow">→</div>
+          <div class="step" data-step="4">
+            <span class="step-num">⑤</span>
+            <div class="step-title">返回信封</div>
+            <div class="step-desc">{ chunks } + 可选 degraded / debug</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="diagram-wrap">
+            <svg
+              class="diagram"
+              id="svg-overview"
+              viewBox="0 0 980 560"
+              role="img"
+              aria-label="SPEC 3 全景架构图"
+            >
+              <defs>
+                <marker
+                  id="ar-blue"
+                  markerWidth="9"
+                  markerHeight="9"
+                  refX="8"
+                  refY="3"
+                  orient="auto"
+                >
+                  <path d="M0,0 L0,6 L8,3 z" fill="#2a78d6" />
+                </marker>
+                <marker
+                  id="ar-orange"
+                  markerWidth="9"
+                  markerHeight="9"
+                  refX="8"
+                  refY="3"
+                  orient="auto"
+                >
+                  <path d="M0,0 L0,6 L8,3 z" fill="#eb6834" />
+                </marker>
+                <marker
+                  id="ar-gray"
+                  markerWidth="9"
+                  markerHeight="9"
+                  refX="8"
+                  refY="3"
+                  orient="auto"
+                >
+                  <path d="M0,0 L0,6 L8,3 z" fill="#898781" />
+                </marker>
+              </defs>
+
+              <!-- query box -->
+              <rect
+                x="30"
+                y="250"
+                width="120"
+                height="56"
+                rx="8"
+                fill="var(--surface-1)"
+                stroke="var(--baseline)"
+              />
+              <text
+                x="90"
+                y="276"
+                text-anchor="middle"
+                font-size="13"
+                font-weight="700"
+                fill="var(--text-primary)"
+              >
+                query
+              </text>
+              <text
+                x="90"
+                y="294"
+                text-anchor="middle"
+                font-size="10.5"
+                fill="var(--muted)"
+              >
+                "阿尔茨海默研究"
+              </text>
+
+              <!-- embed box -->
+              <rect
+                x="180"
+                y="250"
+                width="130"
+                height="56"
+                rx="8"
+                fill="var(--surface-1)"
+                stroke="#4a3aa7"
+                stroke-width="1.5"
+              />
+              <text
+                x="245"
+                y="270"
+                text-anchor="middle"
+                font-size="12.5"
+                font-weight="700"
+                fill="#4a3aa7"
+              >
+                embedder.embed
+              </text>
+              <text
+                x="245"
+                y="289"
+                text-anchor="middle"
+                font-size="10.5"
+                fill="var(--muted)"
+              >
+                文字 → 向量
+              </text>
+
+              <!-- vector arm -->
+              <line
+                x1="310"
+                y1="268"
+                x2="430"
+                y2="160"
+                stroke="#2a78d6"
+                stroke-width="2"
+                marker-end="url(#ar-blue)"
+              />
+              <rect
+                x="430"
+                y="120"
+                width="160"
+                height="80"
+                rx="10"
+                fill="color-mix(in srgb, #2a78d6 10%, var(--surface-1))"
+                stroke="#2a78d6"
+              />
+              <text
+                x="510"
+                y="150"
+                text-anchor="middle"
+                font-size="13"
+                font-weight="700"
+                fill="#2a78d6"
+              >
+                向量臂
+              </text>
+              <text
+                x="510"
+                y="169"
+                text-anchor="middle"
+                font-size="10.5"
+                fill="var(--text-secondary)"
+              >
+                storage.search
+              </text>
+              <text
+                x="510"
+                y="185"
+                text-anchor="middle"
+                font-size="10.5"
+                fill="var(--muted)"
+              >
+                余弦 → top-K chunks
+              </text>
+
+              <!-- graph arm -->
+              <line
+                x1="310"
+                y1="285"
+                x2="430"
+                y2="400"
+                stroke="#eb6834"
+                stroke-width="2"
+                marker-end="url(#ar-orange)"
+              />
+              <rect
+                x="430"
+                y="360"
+                width="160"
+                height="80"
+                rx="10"
+                fill="color-mix(in srgb, #eb6834 10%, var(--surface-1))"
+                stroke="#eb6834"
+              />
+              <text
+                x="510"
+                y="390"
+                text-anchor="middle"
+                font-size="13"
+                font-weight="700"
+                fill="#eb6834"
+              >
+                图臂
+              </text>
+              <text
+                x="510"
+                y="409"
+                text-anchor="middle"
+                font-size="10.5"
+                fill="var(--text-secondary)"
+              >
+                种子实体→一跳
+              </text>
+              <text
+                x="510"
+                y="425"
+                text-anchor="middle"
+                font-size="10.5"
+                fill="var(--muted)"
+              >
+                triples→chunks
+              </text>
+
+              <!-- RRF -->
+              <line
+                x1="590"
+                y1="160"
+                x2="700"
+                y2="240"
+                stroke="#2a78d6"
+                stroke-width="2"
+                marker-end="url(#ar-blue)"
+              />
+              <line
+                x1="590"
+                y1="400"
+                x2="700"
+                y2="280"
+                stroke="#eb6834"
+                stroke-width="2"
+                marker-end="url(#ar-orange)"
+              />
+              <rect
+                x="700"
+                y="230"
+                width="130"
+                height="60"
+                rx="10"
+                fill="color-mix(in srgb, #1baf7a 12%, var(--surface-1))"
+                stroke="#1baf7a"
+              />
+              <text
+                x="765"
+                y="258"
+                text-anchor="middle"
+                font-size="13"
+                font-weight="700"
+                fill="#1baf7a"
+              >
+                RRF 融合
+              </text>
+              <text
+                x="765"
+                y="276"
+                text-anchor="middle"
+                font-size="10.5"
+                fill="var(--muted)"
+              >
+                score=w/(k+rank)
+              </text>
+
+              <!-- envelope -->
+              <line
+                x1="830"
+                y1="260"
+                x2="900"
+                y2="260"
+                stroke="#898781"
+                stroke-width="2"
+                marker-end="url(#ar-gray)"
+              />
+              <rect
+                x="900"
+                y="226"
+                width="60"
+                height="68"
+                rx="8"
+                fill="var(--surface-1)"
+                stroke="var(--baseline)"
+              />
+              <text
+                x="930"
+                y="262"
+                text-anchor="middle"
+                font-size="10.5"
+                font-weight="700"
+                fill="var(--text-primary)"
+              >
+                信封
+              </text>
+              <text
+                x="930"
+                y="279"
+                text-anchor="middle"
+                font-size="9.5"
+                fill="var(--muted)"
+              >
+                {chunks}
+              </text>
+
+              <!-- legend -->
+              <g transform="translate(30,470)">
+                <rect
+                  x="0"
+                  y="0"
+                  width="14"
+                  height="14"
+                  rx="3"
+                  fill="#2a78d6"
+                />
+                <text x="20" y="12" font-size="12" fill="var(--text-secondary)">
+                  向量臂
+                </text>
+                <rect
+                  x="90"
+                  y="0"
+                  width="14"
+                  height="14"
+                  rx="3"
+                  fill="#eb6834"
+                />
+                <text
+                  x="110"
+                  y="12"
+                  font-size="12"
+                  fill="var(--text-secondary)"
+                >
+                  图臂
+                </text>
+                <rect
+                  x="180"
+                  y="0"
+                  width="14"
+                  height="14"
+                  rx="3"
+                  fill="#1baf7a"
+                />
+                <text
+                  x="200"
+                  y="12"
+                  font-size="12"
+                  fill="var(--text-secondary)"
+                >
+                  融合结果
+                </text>
+                <rect
+                  x="290"
+                  y="0"
+                  width="14"
+                  height="14"
+                  rx="3"
+                  fill="#4a3aa7"
+                />
+                <text
+                  x="310"
+                  y="12"
+                  font-size="12"
+                  fill="var(--text-secondary)"
+                >
+                  嵌入
+                </text>
+              </g>
+            </svg>
+          </div>
+          <p class="note">
+            <span class="note-title">读图方法</span>蓝色线 =
+            向量臂（原有一条）；橙色线 = 图臂（SPEC 3 新增）；绿色框 = RRF
+            融合（两臂结果在这里合并）。
+          </p>
+        </div>
+      </section>
+
+      <!-- ══════════════════ S2 向量臂 ══════════════════ -->
+      <section id="s2">
+        <h2><span class="sec-num">02</span>向量臂：余弦相似度搜 chunks</h2>
+        <p>
+          向量臂是原有路径。query 被嵌入成向量，然后在 chunks
+          里按<strong>余弦相似度</strong>排序，返回 top-K。
+        </p>
+
+        <div class="card">
+          <div class="diagram-wrap">
+            <svg
+              class="diagram"
+              id="svg-vector"
+              viewBox="0 0 980 420"
+              role="img"
+              aria-label="向量臂检索示意"
+            >
+              <defs>
+                <marker
+                  id="arv2"
+                  markerWidth="9"
+                  markerHeight="9"
+                  refX="8"
+                  refY="3"
+                  orient="auto"
+                >
+                  <path d="M0,0 L0,6 L8,3 z" fill="#2a78d6" />
+                </marker>
+              </defs>
+              <text
+                x="30"
+                y="30"
+                font-size="13"
+                font-weight="700"
+                fill="#2a78d6"
+              >
+                query → 嵌入 → 与每个 chunk 的向量比余弦 → 排序
+              </text>
+
+              <!-- query -->
+              <rect
+                x="30"
+                y="60"
+                width="100"
+                height="40"
+                rx="8"
+                fill="var(--surface-1)"
+                stroke="#4a3aa7"
+              />
+              <text
+                x="80"
+                y="85"
+                text-anchor="middle"
+                font-size="12"
+                font-weight="600"
+                fill="var(--text-primary)"
+              >
+                query 向量
+              </text>
+
+              <!-- chunks -->
+              <g id="vector-chunks">
+                <rect
+                  x="280"
+                  y="50"
+                  width="150"
+                  height="44"
+                  rx="8"
+                  fill="color-mix(in srgb,#2a78d6 8%,var(--surface-1))"
+                  stroke="#2a78d6"
+                />
+                <text
+                  x="355"
+                  y="68"
+                  text-anchor="middle"
+                  font-size="11.5"
+                  font-weight="600"
+                  fill="var(--text-primary)"
+                >
+                  chunk#1
+                </text>
+                <text
+                  x="355"
+                  y="85"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  阿尔茨海默研究突破
+                </text>
+                <rect
+                  x="280"
+                  y="110"
+                  width="150"
+                  height="44"
+                  rx="8"
+                  fill="color-mix(in srgb,#2a78d6 8%,var(--surface-1))"
+                  stroke="#2a78d6"
+                />
+                <text
+                  x="355"
+                  y="128"
+                  text-anchor="middle"
+                  font-size="11.5"
+                  font-weight="600"
+                  fill="var(--text-primary)"
+                >
+                  chunk#5
+                </text>
+                <text
+                  x="355"
+                  y="145"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  斯坦福位于加州
+                </text>
+                <rect
+                  x="280"
+                  y="170"
+                  width="150"
+                  height="44"
+                  rx="8"
+                  fill="color-mix(in srgb,#2a78d6 8%,var(--surface-1))"
+                  stroke="#2a78d6"
+                />
+                <text
+                  x="355"
+                  y="188"
+                  text-anchor="middle"
+                  font-size="11.5"
+                  font-weight="600"
+                  fill="var(--text-primary)"
+                >
+                  chunk#9
+                </text>
+                <text
+                  x="355"
+                  y="205"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  量子计算入门
+                </text>
+              </g>
+
+              <!-- scores -->
+              <g
+                id="vector-scores"
+                fill="var(--text-secondary)"
+                font-size="11.5"
+              >
+                <text x="300" y="160" text-anchor="middle">cos = 0.92</text>
+              </g>
+
+              <line
+                x1="130"
+                y1="80"
+                x2="278"
+                y2="72"
+                stroke="#2a78d6"
+                stroke-width="2"
+                marker-end="url(#arv2)"
+              />
+              <line
+                x1="130"
+                y1="80"
+                x2="278"
+                y2="132"
+                stroke="#2a78d6"
+                stroke-width="1.6"
+                stroke-dasharray="4 3"
+                marker-end="url(#arv2)"
+              />
+              <line
+                x1="130"
+                y1="80"
+                x2="278"
+                y2="192"
+                stroke="#2a78d6"
+                stroke-width="1.4"
+                stroke-dasharray="2 4"
+                marker-end="url(#arv2)"
+              />
+
+              <!-- formula -->
+              <g transform="translate(470,60)">
+                <text x="0" y="0" font-size="13" fill="var(--text-primary)">
+                  余弦相似度
+                </text>
+                <text
+                  x="0"
+                  y="26"
+                  font-size="14"
+                  font-weight="700"
+                  fill="#4a3aa7"
+                >
+                  sim(q, c) = q·c / (|q|·|c|)
+                </text>
+                <text
+                  x="0"
+                  y="50"
+                  font-size="11.5"
+                  fill="var(--text-secondary)"
+                >
+                  1 = 完全相同 · 0 = 垂直 · -1 = 相反
+                </text>
+                <rect
+                  x="0"
+                  y="80"
+                  width="200"
+                  height="120"
+                  rx="8"
+                  fill="var(--surface-1)"
+                  stroke="var(--gridline)"
+                />
+                <text
+                  x="12"
+                  y="100"
+                  font-size="11.5"
+                  font-weight="600"
+                  fill="#2a78d6"
+                >
+                  chunk#1 → 0.92 ← 排第 1
+                </text>
+                <text
+                  x="12"
+                  y="124"
+                  font-size="11.5"
+                  fill="var(--text-secondary)"
+                >
+                  chunk#5 → 0.71 ← 排第 2
+                </text>
+                <text
+                  x="12"
+                  y="148"
+                  font-size="11.5"
+                  fill="var(--text-secondary)"
+                >
+                  chunk#9 → 0.13 ← 排第 3
+                </text>
+                <text x="12" y="180" font-size="10.5" fill="var(--muted)">
+                  limit 默认 10，取 top-K
+                </text>
+              </g>
+            </svg>
+          </div>
+          <div class="note">
+            <span class="note-title">它解决什么</span
+            >单跳事实查询——答案落在某一段文本里，且该段在嵌入空间靠近
+            query。<strong>这是纯向量检索最擅长的场景。</strong>
+          </div>
+          <div class="note warn">
+            <span class="note-title">它的局限</span
+            >如果答案需要"跨片段求交"（如"研究阿尔茨海默的斯坦福教授"），向量臂可能漏——因为每段是孤立编码的，chunk#1
+            提了阿尔茨海默、chunk#5 提了斯坦福，但没有任何 chunk
+            同时提到两者。这就是图臂要补的。
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ S3 图臂 ══════════════════ -->
+      <section id="s3">
+        <h2>
+          <span class="sec-num">03</span>图臂：实体链接 → one-hop → chunks
+        </h2>
+        <p>
+          图臂走三步：<strong
+            >找种子实体 → 沿三元组走一跳 → 回到原文 chunks</strong
+          >。下面这张图是核心，点击节点看详情。
+        </p>
+
+        <div class="card">
+          <div class="legend">
+            <span class="legend-item"
+              ><span
+                class="legend-swatch"
+                style="background: var(--series-4)"
+              ></span
+              >实体 (entities)</span
+            >
+            <span class="legend-item"
+              ><span
+                class="legend-swatch"
+                style="background: var(--series-5)"
+              ></span
+              >三元组 (triples)</span
+            >
+            <span class="legend-item"
+              ><span
+                class="legend-swatch"
+                style="background: var(--series-6)"
+              ></span
+              >原文 chunk</span
+            >
+            <span class="legend-item"
+              ><span
+                class="legend-swatch"
+                style="background: var(--series-2)"
+              ></span
+              >图臂路径</span
+            >
+          </div>
+          <div class="diagram-wrap">
+            <svg
+              class="diagram"
+              id="svg-graph"
+              viewBox="0 0 980 520"
+              role="img"
+              aria-label="图臂三层结构图"
+            >
+              <defs>
+                <marker
+                  id="arg-e"
+                  markerWidth="9"
+                  markerHeight="9"
+                  refX="8"
+                  refY="3"
+                  orient="auto"
+                >
+                  <path d="M0,0 L0,6 L8,3 z" fill="#eb6834" />
+                </marker>
+                <marker
+                  id="arg-t"
+                  markerWidth="9"
+                  markerHeight="9"
+                  refX="8"
+                  refY="3"
+                  orient="auto"
+                >
+                  <path d="M0,0 L0,6 L8,3 z" fill="#e87ba4" />
+                </marker>
+              </defs>
+
+              <text
+                x="30"
+                y="28"
+                font-size="13"
+                font-weight="700"
+                fill="#eb6834"
+              >
+                第 ① 步：找 top-K 种子实体
+              </text>
+
+              <!-- seed entities -->
+              <g>
+                <rect
+                  x="80"
+                  y="55"
+                  width="150"
+                  height="52"
+                  rx="9"
+                  fill="color-mix(in srgb,#eda100 12%,var(--surface-1))"
+                  stroke="#eda100"
+                  stroke-width="1.8"
+                  class="node"
+                  id="ent-stanford"
+                />
+                <text
+                  x="155"
+                  y="78"
+                  text-anchor="middle"
+                  font-size="12.5"
+                  font-weight="700"
+                  fill="var(--text-primary)"
+                >
+                  斯坦福大学
+                </text>
+                <text
+                  x="155"
+                  y="96"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  entity · 类型 org
+                </text>
+                <rect
+                  x="320"
+                  y="55"
+                  width="150"
+                  height="52"
+                  rx="9"
+                  fill="color-mix(in srgb,#eda100 12%,var(--surface-1))"
+                  stroke="#eda100"
+                  stroke-width="1.8"
+                  class="node"
+                  id="ent-alz"
+                />
+                <text
+                  x="395"
+                  y="78"
+                  text-anchor="middle"
+                  font-size="12.5"
+                  font-weight="700"
+                  fill="var(--text-primary)"
+                >
+                  阿尔茨海默
+                </text>
+                <text
+                  x="395"
+                  y="96"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  entity · 类型 concept
+                </text>
+                <rect
+                  x="560"
+                  y="55"
+                  width="150"
+                  height="52"
+                  rx="9"
+                  fill="color-mix(in srgb,#eda100 12%,var(--surface-1))"
+                  stroke="#eda100"
+                  stroke-width="1.8"
+                  class="node"
+                  id="ent-user"
+                />
+                <text
+                  x="635"
+                  y="78"
+                  text-anchor="middle"
+                  font-size="12.5"
+                  font-weight="700"
+                  fill="var(--text-primary)"
+                >
+                  用户
+                </text>
+                <text
+                  x="635"
+                  y="96"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  entity · 类型 person
+                </text>
+                <text x="770" y="86" font-size="11" fill="var(--muted)">
+                  ← 相似度排序取 top-K
+                </text>
+              </g>
+
+              <!-- arrow to triples -->
+              <line
+                x1="155"
+                y1="107"
+                x2="155"
+                y2="195"
+                stroke="#eb6834"
+                stroke-width="2"
+                marker-end="url(#arg-e)"
+                class="edge"
+              />
+              <line
+                x1="395"
+                y1="107"
+                x2="395"
+                y2="195"
+                stroke="#eb6834"
+                stroke-width="2"
+                marker-end="url(#arg-e)"
+                class="edge"
+              />
+
+              <text
+                x="30"
+                y="180"
+                font-size="13"
+                font-weight="700"
+                fill="#eb6834"
+              >
+                第 ② 步：沿三元组走一跳（one-hop）
+              </text>
+
+              <!-- triples -->
+              <g>
+                <rect
+                  x="60"
+                  y="200"
+                  width="260"
+                  height="46"
+                  rx="8"
+                  fill="color-mix(in srgb,#e87ba4 12%,var(--surface-1))"
+                  stroke="#e87ba4"
+                  stroke-width="1.8"
+                  class="node"
+                  id="triple-1"
+                />
+                <text
+                  x="190"
+                  y="221"
+                  text-anchor="middle"
+                  font-size="11.5"
+                  fill="var(--text-primary)"
+                >
+                  (斯坦福大学,
+                  <tspan fill="#4a3aa7" font-weight="700">研究</tspan>
+                  , 阿尔茨海默)
+                </text>
+                <text
+                  x="190"
+                  y="238"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  confidence 0.94
+                </text>
+                <rect
+                  x="380"
+                  y="200"
+                  width="230"
+                  height="46"
+                  rx="8"
+                  fill="color-mix(in srgb,#e87ba4 12%,var(--surface-1))"
+                  stroke="#e87ba4"
+                  stroke-width="1.8"
+                  class="node"
+                  id="triple-2"
+                />
+                <text
+                  x="495"
+                  y="221"
+                  text-anchor="middle"
+                  font-size="11.5"
+                  fill="var(--text-primary)"
+                >
+                  (阿尔茨海默,
+                  <tspan fill="#4a3aa7" font-weight="700">影响</tspan>
+                  , 用户)
+                </text>
+                <text
+                  x="495"
+                  y="238"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  confidence 0.81
+                </text>
+                <rect
+                  x="640"
+                  y="200"
+                  width="170"
+                  height="46"
+                  rx="8"
+                  fill="color-mix(in srgb,#e87ba4 12%,var(--surface-1))"
+                  stroke="#e87ba4"
+                  stroke-width="1.8"
+                  class="node"
+                  id="triple-none"
+                  style="opacity: 0.5"
+                />
+                <text
+                  x="725"
+                  y="218"
+                  text-anchor="middle"
+                  font-size="11"
+                  fill="var(--muted)"
+                >
+                  (用户, 位于, 上海)
+                </text>
+                <text
+                  x="725"
+                  y="235"
+                  text-anchor="middle"
+                  font-size="10"
+                  fill="var(--muted)"
+                >
+                  ← 不参与本次
+                </text>
+              </g>
+
+              <text
+                x="30"
+                y="290"
+                font-size="13"
+                font-weight="700"
+                fill="#eb6834"
+              >
+                第 ③ 步：source_chunk_id → 回到原文 chunks
+              </text>
+
+              <!-- chunk arrows from triples -->
+              <line
+                x1="190"
+                y1="246"
+                x2="190"
+                y2="330"
+                stroke="#eb6834"
+                stroke-width="2"
+                marker-end="url(#arg-e)"
+                class="edge"
+              />
+              <line
+                x1="495"
+                y1="246"
+                x2="495"
+                y2="330"
+                stroke="#eb6834"
+                stroke-width="2"
+                marker-end="url(#arg-e)"
+                class="edge"
+              />
+
+              <!-- chunks -->
+              <g>
+                <rect
+                  x="60"
+                  y="335"
+                  width="300"
+                  height="52"
+                  rx="9"
+                  fill="color-mix(in srgb,#008300 12%,var(--surface-1))"
+                  stroke="#008300"
+                  stroke-width="1.8"
+                  class="node"
+                  id="chunk-1"
+                />
+                <text
+                  x="210"
+                  y="357"
+                  text-anchor="middle"
+                  font-size="12"
+                  font-weight="700"
+                  fill="var(--text-primary)"
+                >
+                  chunk#1
+                </text>
+                <text
+                  x="210"
+                  y="375"
+                  text-anchor="middle"
+                  font-size="10.5"
+                  fill="var(--muted)"
+                >
+                  "斯坦福团队在阿尔茨海默研究上取得突破"
+                </text>
+                <rect
+                  x="400"
+                  y="335"
+                  width="280"
+                  height="52"
+                  rx="9"
+                  fill="color-mix(in srgb,#008300 12%,var(--surface-1))"
+                  stroke="#008300"
+                  stroke-width="1.8"
+                  class="node"
+                  id="chunk-2"
+                />
+                <text
+                  x="540"
+                  y="357"
+                  text-anchor="middle"
+                  font-size="12"
+                  font-weight="700"
+                  fill="var(--text-primary)"
+                >
+                  chunk#2
+                </text>
+                <text
+                  x="540"
+                  y="375"
+                  text-anchor="middle"
+                  font-size="10.5"
+                  fill="var(--muted)"
+                >
+                  "阿尔茨海默病影响用户记忆能力"
+                </text>
+              </g>
+
+              <!-- SQL annotation -->
+              <g transform="translate(710, 335)">
+                <rect
+                  x="0"
+                  y="0"
+                  width="250"
+                  height="130"
+                  rx="8"
+                  fill="var(--surface-1)"
+                  stroke="var(--gridline)"
+                />
+                <text
+                  x="12"
+                  y="22"
+                  font-size="11"
+                  font-weight="700"
+                  fill="var(--muted)"
+                >
+                  关键点
+                </text>
+                <text x="12" y="44" font-size="11" fill="var(--text-secondary)">
+                  · 一条 JOIN chunks
+                </text>
+                <text x="12" y="64" font-size="11" fill="var(--text-secondary)">
+                  · 双侧 valid_window
+                </text>
+                <text x="12" y="84" font-size="11" fill="var(--text-secondary)">
+                  @> valid_at
+                </text>
+                <text
+                  x="12"
+                  y="104"
+                  font-size="11"
+                  fill="var(--text-secondary)"
+                >
+                  · 只跳一跳，禁止递归
+                </text>
+                <text x="12" y="124" font-size="11" fill="var(--muted)">
+                  (下方第 ⑤ 步展开)
+                </text>
+              </g>
+
+              <text
+                x="30"
+                y="450"
+                font-size="12.5"
+                font-weight="700"
+                fill="#eb6834"
+              >
+                等价 SQL（图臂两条查询）
+              </text>
+            </svg>
+          </div>
+
+          <div class="code-label">
+            src/core/retrieval/query-builder.ts · buildSeedEntitiesSql
+          </div>
+          <div class="code-block">
+            <span class="kw">SELECT</span> id, canonical_name
+            <span class="kw">FROM</span> entities
+            <span class="kw">WHERE</span> embedding
+            <span class="kw">IS NOT NULL</span>
+            <span class="kw">AND</span> merged_into
+            <span class="kw">IS NULL</span> <span class="kw">AND</span> retired
+            = <span class="fn">false</span>
+            <span class="cmt">-- 只留"存活"实体</span>
+            <span class="kw">ORDER BY</span> embedding &lt;=&gt; $1::<span
+              class="fn"
+              >vector</span
+            >
+            <span class="cmt">-- 余弦距离升序</span>
+            <span class="kw">LIMIT</span> $2 <span class="cmt">-- top-K</span>
+          </div>
+
+          <div class="code-label">
+            src/core/retrieval/query-builder.ts · buildOneHopChunksSql
+          </div>
+          <div class="code-block">
+            <span class="kw">SELECT</span> c.id, c.content, c.source_ref,
+            c.valid_from, c.valid_until <span class="kw">FROM</span> triples t
+            <span class="kw">JOIN</span> chunks c
+            <span class="kw">ON</span> t.source_chunk_id = c.id
+            <span class="cmt">-- ← 这一行就是"一跳"</span>
+            <span class="kw">WHERE</span> (t.head_id =
+            <span class="fn">ANY</span>($1::uuid[])
+            <span class="kw">OR</span> t.tail_id =
+            <span class="fn">ANY</span>($1::uuid[]))
+            <span class="kw">AND</span> t.valid_window @&gt; $2::<span
+              class="fn"
+              >timestamptz</span
+            >
+            <span class="cmt">-- 三元组在查询时刻有效</span>
+            <span class="kw">AND</span> c.valid_window @&gt; $2::<span
+              class="fn"
+              >timestamptz</span
+            >
+            <span class="cmt">-- chunk 也在查询时刻有效</span>
+            <span class="kw">ORDER BY</span> t.confidence
+            <span class="kw">DESC</span> <span class="cmt">-- 高置信优先</span>
+            <span class="kw">LIMIT</span> $3
+          </div>
+        </div>
+
+        <div class="note">
+          <span class="note-title">为什么只能"一跳"？</span
+          ><code>query-builder.ts</code> 里有个
+          <code>assertSingleHop</code> 守卫，写死三条规则：<code
+            >JOIN chunks</code
+          >
+          恰好出现 1 次、禁止 <code>WITH RECURSIVE</code>（递归 CTE）、禁止
+          <code>UNION</code>（第二跳）。这是刻意的——P0
+          只做一跳（实体回证据），多跳是 P1 PPR 的正规课题。
+        </div>
+        <div class="note warn">
+          <span class="note-title">valid_window 双侧过滤</span
+          >既要求<strong>三元组</strong>在查询时刻成立，也要求<strong
+            >原文 chunk</strong
+          >在查询时刻有效。这就是"可时间切片"在检索层的体现——旧的事实不会被当作当前事实返回。
+        </div>
+
+        <!-- interactive graph-arm simulation -->
+        <div class="card">
+          <h3>动手试：拖动 valid_at，观察时间过滤</h3>
+          <p class="lede" style="font-size: 14px">
+            假设用户 2026-03 说"我在北京"，2026-08
+            说"我搬到上海"。拖动时间轴，观察哪个版本的三元组被"时间切片"过滤掉。
+          </p>
+          <div class="slider-row">
+            <label>查询时刻 valid_at</label>
+            <input
+              type="range"
+              id="valid-at-slider"
+              min="2026-02"
+              max="2026-09"
+              step="1"
+              value="2026-08"
+              list="months"
+            />
+            <datalist id="months">
+              <option value="2026-02" label="02月"></option>
+              <option value="2026-03" label="03月"></option>
+              <option value="2026-08" label="08月"></option>
+              <option value="2026-09" label="09月"></option>
+            </datalist>
+            <span class="score-readout" id="valid-at-readout">2026-08</span>
+          </div>
+          <div
+            id="time-slice-view"
+            style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px"
+          >
+            <div
+              style="
+                border: 1px solid var(--gridline);
+                border-radius: 8px;
+                padding: 14px;
+                opacity: 0.35;
+              "
+              id="old-fact"
+            >
+              <div style="font-weight: 700; font-size: 13px">旧事实</div>
+              <div
+                style="
+                  font-size: 12.5px;
+                  color: var(--text-secondary);
+                  margin-top: 4px;
+                "
+              >
+                (用户, 位于, 北京) · valid 2026-03 → 2026-08
+              </div>
+              <div
+                style="font-size: 11.5px; margin-top: 6px"
+                id="old-fact-status"
+              >
+                已失效
+              </div>
+            </div>
+            <div
+              style="
+                border: 1px solid var(--gridline);
+                border-radius: 8px;
+                padding: 14px;
+              "
+              id="new-fact"
+            >
+              <div style="font-weight: 700; font-size: 13px">新事实</div>
+              <div
+                style="
+                  font-size: 12.5px;
+                  color: var(--text-secondary);
+                  margin-top: 4px;
+                "
+              >
+                (用户, 位于, 上海) · valid 2026-08 → ∞
+              </div>
+              <div
+                style="font-size: 11.5px; margin-top: 6px"
+                id="new-fact-status"
+              >
+                当前有效
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ S4 RRF ══════════════════ -->
+      <section id="s4">
+        <h2><span class="sec-num">04</span>RRF 融合：两臂结果怎么合并</h2>
+        <p>
+          两臂各返回一批带排名的结果。RRF（Reciprocal Rank
+          Fusion）把它们合并成一个排序列表——<strong>核心公式</strong>：
+        </p>
+
+        <div class="formula">
+          score = <span class="var">w</span> / (<span class="var">k</span> +
+          rank)　·　k = 60　·　w<sub>vec</sub> = 1, w<sub>graph</sub> = 1
+          <div class="sub">
+            同一 chunk 在两臂都出现 → 分数相加（双命中叠加）
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="grid-3">
+            <div
+              style="
+                border: 1px solid var(--gridline);
+                border-radius: 8px;
+                padding: 14px;
+              "
+            >
+              <div class="tag vec">向量臂</div>
+              <table style="margin: 8px 0 0">
+                <thead>
+                  <tr>
+                    <th>rank</th>
+                    <th>chunk</th>
+                    <th class="num">score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1</td>
+                    <td class="mono">#42</td>
+                    <td class="num">1/61≈0.0164</td>
+                  </tr>
+                  <tr>
+                    <td>2</td>
+                    <td class="mono">#18</td>
+                    <td class="num">1/62≈0.0161</td>
+                  </tr>
+                  <tr>
+                    <td>3</td>
+                    <td class="mono">#07</td>
+                    <td class="num">1/63≈0.0159</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div
+              style="
+                border: 1px solid var(--gridline);
+                border-radius: 8px;
+                padding: 14px;
+              "
+            >
+              <div class="tag graph">图臂</div>
+              <table style="margin: 8px 0 0">
+                <thead>
+                  <tr>
+                    <th>rank</th>
+                    <th>chunk</th>
+                    <th class="num">score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>1</td>
+                    <td class="mono">#42</td>
+                    <td class="num">1/61≈0.0164</td>
+                  </tr>
+                  <tr>
+                    <td>2</td>
+                    <td class="mono">#63</td>
+                    <td class="num">1/62≈0.0161</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div
+              style="
+                border: 1px solid var(--series-3);
+                border-radius: 8px;
+                padding: 14px;
+                box-shadow: var(--shadow);
+              "
+            >
+              <div class="tag fused">RRF 融合结果</div>
+              <table style="margin: 8px 0 0">
+                <thead>
+                  <tr>
+                    <th>chunk</th>
+                    <th class="num">合计</th>
+                    <th>命中的臂</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr class="highlight">
+                    <td class="mono">#42</td>
+                    <td class="num"><strong>0.0328</strong></td>
+                    <td>向量 + 图</td>
+                  </tr>
+                  <tr>
+                    <td class="mono">#18</td>
+                    <td class="num">0.0161</td>
+                    <td>向量</td>
+                  </tr>
+                  <tr>
+                    <td class="mono">#63</td>
+                    <td class="num">0.0161</td>
+                    <td>图</td>
+                  </tr>
+                  <tr>
+                    <td class="mono">#07</td>
+                    <td class="num">0.0159</td>
+                    <td>向量</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="note ok">
+            <span class="note-title">关键洞察</span
+            ><code>chunk#42</code> 在两臂都命中（向量语义 +
+            实体关系两个独立信号），RRF 分数叠加 →
+            排到最前。这就是"双信号比单信号可信"的体现。
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>动手试：拖动 rank，观察 RRF 分数</h3>
+          <p class="lede" style="font-size: 14px">
+            调整 chunk 在两臂的排名，看 RRF
+            分数怎么变。左边排名、右边分数实时更新。
+          </p>
+          <div class="slider-row">
+            <label>chunk#42 在向量臂的 rank</label>
+            <input
+              type="range"
+              id="rrf-vec-rank"
+              min="1"
+              max="10"
+              step="1"
+              value="2"
+            />
+            <span class="score-readout" id="rrf-vec-rank-val">2</span>
+          </div>
+          <div class="slider-row">
+            <label>chunk#42 在图臂的 rank</label>
+            <input
+              type="range"
+              id="rrf-graph-rank"
+              min="1"
+              max="10"
+              step="1"
+              value="5"
+            />
+            <span class="score-readout" id="rrf-graph-rank-val">5</span>
+          </div>
+          <div
+            style="
+              display: grid;
+              grid-template-columns: 1fr 1fr 1fr;
+              gap: 12px;
+              margin-top: 8px;
+              text-align: center;
+            "
+          >
+            <div>
+              <div style="font-size: 12px; color: var(--muted)">向量臂贡献</div>
+              <div class="score-readout" id="rrf-vec-score">0.0161</div>
+            </div>
+            <div>
+              <div style="font-size: 12px; color: var(--muted)">图臂贡献</div>
+              <div class="score-readout" id="rrf-graph-score">0.0154</div>
+            </div>
+            <div>
+              <div style="font-size: 12px; color: var(--muted)">融合总分</div>
+              <div
+                class="score-readout"
+                id="rrf-total"
+                style="color: var(--series-3)"
+              >
+                0.0315
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ══════════════════ S5 降级 ══════════════════ -->
+      <section id="s5">
+        <h2><span class="sec-num">05</span>降级契约：图臂挂了也不影响检索</h2>
+        <p>
+          这是 SPEC 3
+          最值得记住的设计。<strong>检索永远不因图臂失败而失败。</strong>图臂遇到任何异常，都降级成"图臂无效"，返回纯向量结果，并标记
+          <code>degraded: true</code>。
+        </p>
+
+        <div class="grid-3">
+          <div class="card">
+            <div class="tag deg">情况 1</div>
+            <h3 style="margin-top: 8px">Postgres 挂了</h3>
+            <p style="font-size: 13.5px">seed 查询抛错 → 捕获，降级</p>
+            <div class="code-block" style="font-size: 12px">
+              belowFloor: true failureReason: "graph arm ... failed"
+            </div>
+          </div>
+          <div class="card">
+            <div class="tag deg">情况 2</div>
+            <h3 style="margin-top: 8px">0 个种子实体</h3>
+            <p style="font-size: 13.5px">空实体库 → 直接短路，不跑 SQL②</p>
+            <div class="code-block" style="font-size: 12px">
+              belowFloor: true failureReason: "0 seed entities"
+            </div>
+          </div>
+          <div class="card">
+            <div class="tag deg">情况 3</div>
+            <h3 style="margin-top: 8px">命中数 < floor</h3>
+            <p style="font-size: 13.5px">图臂返回太少（&lt;3），视为没起作用</p>
+            <div class="code-block" style="font-size: 12px">
+              belowFloor: true failureReason: "2 chunks < floor 3"
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>动手试：触发降级，看返回信封</h3>
+          <p class="lede" style="font-size: 14px">
+            点按钮模拟不同场景，右侧显示 retrieve 工具实际返回的 JSON 信封。
+          </p>
+          <div class="scenario-controls">
+            <button class="btn" onclick="simScenario('normal')">
+              正常（两臂都工作）
+            </button>
+            <button class="btn" onclick="simScenario('empty')">
+              空实体库（0 种子）
+            </button>
+            <button class="btn" onclick="simScenario('pgdown')">
+              Postgres 挂了
+            </button>
+            <button class="btn" onclick="simScenario('debug')">
+              DEBUG=1 调试模式
+            </button>
+          </div>
+          <div
+            id="sim-status"
+            class="status-banner ok"
+            style="display: none"
+          ></div>
+          <div class="code-label">retrieve 返回信封 (JSON)</div>
+          <div class="code-block" id="sim-envelope" style="font-size: 13px">
+            // 点击上方按钮查看
+          </div>
+        </div>
+
+        <div class="note">
+          <span class="note-title">为什么这样做</span
+          >一个死掉的图臂不应阻塞检索主路径。调用方看到
+          <code>degraded: true</code
+          >，就知道"这次结果只有向量信号，图臂没起作用"——知情但不中断。这是
+          <code>rerank fail-open</code> 契约（README）同一精神的延续。
+        </div>
+      </section>
+
+      <!-- ══════════════════ S6 练习 ══════════════════ -->
+      <section id="s6">
+        <h2><span class="sec-num">06</span>练习：检验你的理解</h2>
+        <p>答完所有题，看下面的分数。每道题点选项后立即反馈，可反复作答。</p>
+
+        <div class="quiz" id="q1">
+          <div class="quiz-head">
+            <span class="sec-num">Q1</span>图臂的"一跳"指的是什么？
+          </div>
+          <div class="quiz-q">
+            <div class="q-text">
+              SPEC 3 图臂从实体出发，经过三元组回到
+              chunks。这个"一跳"具体是什么？
+            </div>
+            <div class="options">
+              <div class="option" data-q="q1" data-val="a">
+                <span class="opt-letter">A</span
+                >从实体沿三元组走到另一个实体（实体→实体）
+              </div>
+              <div class="option" data-q="q1" data-val="b">
+                <span class="opt-letter">B</span>从种子实体出发，沿三元组的
+                source_chunk_id 一次 JOIN 回到原文 chunks
+              </div>
+              <div class="option" data-q="q1" data-val="c">
+                <span class="opt-letter">C</span
+                >在整个知识图谱上做多次跳跃遍历（多跳）
+              </div>
+            </div>
+          </div>
+          <div class="quiz-feedback"></div>
+          <div class="quiz-foot">
+            <button class="btn" onclick="resetQuiz('q1')">重做</button>
+          </div>
+        </div>
+
+        <div class="quiz" id="q2">
+          <div class="quiz-head">
+            <span class="sec-num">Q2</span>RRF 双命中为什么更靠前？
+          </div>
+          <div class="quiz-q">
+            <div class="q-text">
+              chunk#42 在向量臂排第 2、在图臂排第 5。RRF 融合后它的分数是：
+            </div>
+            <div class="options">
+              <div class="option" data-q="q2" data-val="a">
+                <span class="opt-letter">A</span>只取较高的那个：1/(60+2) ≈
+                0.0161
+              </div>
+              <div class="option" data-q="q2" data-val="b">
+                <span class="opt-letter">B</span>两个相加：1/(60+2) + 1/(60+5) ≈
+                0.0315
+              </div>
+              <div class="option" data-q="q2" data-val="c">
+                <span class="opt-letter">C</span>取平均：(1/(60+2) + 1/(60+5)) /
+                2 ≈ 0.0157
+              </div>
+            </div>
+          </div>
+          <div class="quiz-feedback"></div>
+          <div class="quiz-foot">
+            <button class="btn" onclick="resetQuiz('q2')">重做</button>
+          </div>
+        </div>
+
+        <div class="quiz" id="q3">
+          <div class="quiz-head">
+            <span class="sec-num">Q3</span>图臂的 fail-open 降级
+          </div>
+          <div class="quiz-q">
+            <div class="q-text">
+              图臂执行时 Postgres 挂了。retrieve 工具会怎样？
+            </div>
+            <div class="options">
+              <div class="option" data-q="q3" data-val="a">
+                <span class="opt-letter">A</span>整个 retrieve 调用抛错，host
+                收到异常
+              </div>
+              <div class="option" data-q="q3" data-val="b">
+                <span class="opt-letter">B</span>返回纯向量结果，并标记
+                degraded: true
+              </div>
+              <div class="option" data-q="q3" data-val="c">
+                <span class="opt-letter">C</span>返回空结果 { chunks: []
+                }，假装没事
+              </div>
+            </div>
+          </div>
+          <div class="quiz-feedback"></div>
+          <div class="quiz-foot">
+            <button class="btn" onclick="resetQuiz('q3')">重做</button>
+          </div>
+        </div>
+
+        <div class="quiz" id="q4">
+          <div class="quiz-head">
+            <span class="sec-num">Q4</span>valid_window 双侧过滤
+          </div>
+          <div class="quiz-q">
+            <div class="q-text">
+              用户 3 月说"在北京"，8 月说"搬到上海"。查询时刻 valid_at = 2026-07
+              时，图臂会返回哪个三元组？
+            </div>
+            <div class="options">
+              <div class="option" data-q="q4" data-val="a">
+                <span class="opt-letter">A</span>(用户, 位于, 北京)——因为 7
+                月时上海那条还没生效
+              </div>
+              <div class="option" data-q="q4" data-val="b">
+                <span class="opt-letter">B</span>(用户, 位于,
+                上海)——因为是更新的
+              </div>
+              <div class="option" data-q="q4" data-val="c">
+                <span class="opt-letter">C</span>两条都返回，让 LLM 自己判断
+              </div>
+            </div>
+          </div>
+          <div class="quiz-feedback"></div>
+          <div class="quiz-foot">
+            <button class="btn" onclick="resetQuiz('q4')">重做</button>
+          </div>
+        </div>
+
+        <div class="card" id="quiz-score" style="text-align: center">
+          <div style="font-size: 14px; color: var(--muted)">答题进度</div>
+          <div style="font-size: 32px; font-weight: 800" id="quiz-score-val">
+            0 / 4
+          </div>
+          <div
+            style="font-size: 13px; color: var(--text-secondary)"
+            id="quiz-score-msg"
+          >
+            开始作答吧
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        iknow-memory · SPEC 3 召回路径教学 · 数据来自真实代码
+        <code>src/core/retrieval/*</code> · 公式与 RRF (Cormack et al., 2009)
+      </footer>
+    </div>
+
+    <script>
+      /* ═══════════ 主题切换 ═══════════ */
+      function toggleTheme() {
+        const cur = document.documentElement.getAttribute("data-theme");
+        document.documentElement.setAttribute(
+          "data-theme",
+          cur === "dark" ? "light" : "dark"
+        );
+      }
+
+      /* ═══════════ 全景 pipeline 步进器 ═══════════ */
+      document.querySelectorAll("#pipeline .step").forEach((step) => {
+        step.addEventListener("click", () => {
+          document
+            .querySelectorAll("#pipeline .step")
+            .forEach((s) => s.classList.remove("active"));
+          step.classList.add("active");
+        });
+      });
+
+      /* ═══════════ 时间切片滑块 ═══════════ */
+      const validAtSlider = document.getElementById("valid-at-slider");
+      const validAtReadout = document.getElementById("valid-at-readout");
+      const oldFact = document.getElementById("old-fact");
+      const newFact = document.getElementById("new-fact");
+      const oldStatus = document.getElementById("old-fact-status");
+      const newStatus = document.getElementById("new-fact-status");
+
+      function updateTimeSlice() {
+        const v = validAtSlider.value; // e.g. "2026-08"
+        validAtReadout.textContent = v;
+        const ym = v.slice(0, 4) + "-" + v.slice(5, 7); // normalize
+        // 旧事实 valid 2026-03 → 2026-08；新事实 2026-08 → ∞
+        const oldActive = ym >= "2026-03" && ym < "2026-08";
+        const newActive = ym >= "2026-08";
+        oldFact.style.opacity = oldActive ? "1" : "0.35";
+        oldFact.style.borderColor = oldActive
+          ? "var(--good)"
+          : "var(--gridline)";
+        oldStatus.textContent = oldActive ? "当前有效" : "已失效";
+        oldStatus.style.color = oldActive ? "var(--good)" : "var(--critical)";
+        newFact.style.opacity = newActive ? "1" : "0.35";
+        newFact.style.borderColor = newActive
+          ? "var(--good)"
+          : "var(--gridline)";
+        newStatus.textContent = newActive ? "当前有效" : "尚未生效";
+        newStatus.style.color = newActive ? "var(--good)" : "var(--critical)";
+      }
+      validAtSlider.addEventListener("input", updateTimeSlice);
+      updateTimeSlice();
+
+      /* ═══════════ RRF 交互滑块 ═══════════ */
+      const K = 60;
+      const vecRankSlider = document.getElementById("rrf-vec-rank");
+      const graphRankSlider = document.getElementById("rrf-graph-rank");
+      const vecRankVal = document.getElementById("rrf-vec-rank-val");
+      const graphRankVal = document.getElementById("rrf-graph-rank-val");
+      const vecScore = document.getElementById("rrf-vec-score");
+      const graphScore = document.getElementById("rrf-graph-score");
+      const totalScore = document.getElementById("rrf-total");
+
+      function fmt(n) {
+        return n.toFixed(4);
+      }
+
+      function updateRRF() {
+        const rv = Number(vecRankSlider.value),
+          rg = Number(graphRankSlider.value);
+        vecRankVal.textContent = String(rv);
+        graphRankVal.textContent = String(rg);
+        const vs = 1 / (K + rv),
+          gs = 1 / (K + rg);
+        vecScore.textContent = fmt(vs);
+        graphScore.textContent = fmt(gs);
+        totalScore.textContent = fmt(vs + gs);
+      }
+      vecRankSlider.addEventListener("input", updateRRF);
+      graphRankSlider.addEventListener("input", updateRRF);
+      updateRRF();
+
+      /* ═══════════ 降级场景模拟 ═══════════ */
+      const simEnvelope = document.getElementById("sim-envelope");
+      const simStatus = document.getElementById("sim-status");
+      const SCENARIOS = {
+        normal: {
+          status: {
+            cls: "ok",
+            text: "✅ 两臂都工作，返回融合结果",
+            show: true,
+          },
+          env: JSON.stringify(
+            {
+              chunks: [
+                {
+                  id: "42",
+                  content: "斯坦福团队在阿尔茨海默研究上取得突破",
+                  source_ref: "doc1",
+                  valid_window: ["2026-01-01T00:00:00Z", null],
+                  score: 0.0328,
+                },
+                {
+                  id: "18",
+                  content: "阿尔茨海默病影响记忆",
+                  source_ref: "doc1",
+                  valid_window: ["2026-01-01T00:00:00Z", null],
+                  score: 0.0161,
+                },
+                {
+                  id: "63",
+                  content: "斯坦福位于加州",
+                  source_ref: "doc2",
+                  valid_window: ["2026-02-01T00:00:00Z", null],
+                  score: 0.0161,
+                },
+              ],
+            },
+            null,
+            2
+          ),
+        },
+        empty: {
+          status: {
+            cls: "deg",
+            text: "⚠️ 实体库为空 → 图臂降级，返回纯向量结果",
+            show: true,
+          },
+          env: JSON.stringify(
+            {
+              chunks: [
+                {
+                  id: "18",
+                  content: "阿尔茨海默病影响记忆",
+                  source_ref: "doc1",
+                  valid_window: ["2026-01-01T00:00:00Z", null],
+                  score: 0.5,
+                },
+              ],
+              degraded: true,
+            },
+            null,
+            2
+          ),
+        },
+        pgdown: {
+          status: {
+            cls: "deg",
+            text: "🚨 Postgres 挂了 → 图臂降级，返回纯向量结果",
+            show: true,
+          },
+          env: JSON.stringify(
+            {
+              chunks: [
+                {
+                  id: "18",
+                  content: "阿尔茨海默病影响记忆",
+                  source_ref: "doc1",
+                  valid_window: ["2026-01-01T00:00:00Z", null],
+                  score: 0.5,
+                },
+              ],
+              degraded: true,
+            },
+            null,
+            2
+          ),
+        },
+        debug: {
+          status: {
+            cls: "ok",
+            text: "🔍 DEBUG=1 → 返回 debug 载荷，看清两臂各自表现",
+            show: true,
+          },
+          env: JSON.stringify(
+            {
+              chunks: [
+                {
+                  id: "18",
+                  content: "阿尔茨海默病影响记忆",
+                  source_ref: "doc1",
+                  valid_window: ["2026-01-01T00:00:00Z", null],
+                  score: 0.5,
+                },
+              ],
+              degraded: true,
+              debug: {
+                vectorHits: 1,
+                graphHits: 0,
+                graphBelowFloor: true,
+                failureReason: "graph arm yielded 0 seed entities",
+              },
+            },
+            null,
+            2
+          ),
+        },
+      };
+
+      function simScenario(name) {
+        const s = SCENARIOS[name];
+        simEnvelope.textContent = s.env;
+        simStatus.textContent = s.status.text;
+        simStatus.className = "status-banner " + s.status.cls;
+        simStatus.style.display = "flex";
+      }
+
+      /* ═══════════ 练习 ═══════════ */
+      const ANSWERS = { q1: "b", q2: "b", q3: "b", q4: "a" };
+      const EXPLAIN = {
+        q1: "B 正确。图臂的'一跳' = 种子实体 → 三元组的 source_chunk_id → 一次 JOIN chunks 回到原文。A 是实体到实体（那才需要多跳），C 是多跳遍历（P1 PPR 才做）。",
+        q2: "B 正确。RRF 对同一 chunk 的双命中分数相加：1/62 + 1/65 ≈ 0.0161 + 0.0154 ≈ 0.0315。这是 RRF 的核心——双信号叠加排更前。",
+        q3: "B 正确。fail-open：Postgres 挂了 → 图臂降级为 degraded，返回纯向量结果并标 degraded: true。绝不抛错，绝不让检索失败。",
+        q4: "A 正确。valid_at=2026-07 时，(用户,位于,北京) 有效区间 [03, 08) 包含 07 → 命中；(用户,位于,上海) 有效区间 [08, ∞) 不含 07 → 被过滤。时间切片保证查询时刻看到的是当时成立的事实。",
+      };
+      let answered = { q1: false, q2: false, q3: false, q4: false };
+
+      document.querySelectorAll(".option").forEach((opt) => {
+        opt.addEventListener("click", () => {
+          const qid = opt.dataset.q;
+          const val = opt.dataset.val;
+          const quiz = document.getElementById(qid);
+          const options = quiz.querySelectorAll(".option");
+          const feedback = quiz.querySelector(".quiz-feedback");
+          const correct = ANSWERS[qid];
+
+          // prevent re-answer if already correct (allow retry though)
+          options.forEach((o) => o.classList.remove("correct", "wrong"));
+          opt.classList.add(val === correct ? "correct" : "wrong");
+
+          if (val === correct) {
+            feedback.textContent = "✅ 正确！" + EXPLAIN[qid];
+            feedback.className = "quiz-feedback show correct";
+            if (!answered[qid]) {
+              answered[qid] = true;
+              updateScore();
+            }
+          } else {
+            feedback.textContent = "❌ 不对。再想想：" + EXPLAIN[qid];
+            feedback.className = "quiz-feedback show wrong";
+          }
+        });
+      });
+
+      function resetQuiz(qid) {
+        const quiz = document.getElementById(qid);
+        quiz
+          .querySelectorAll(".option")
+          .forEach((o) => o.classList.remove("correct", "wrong"));
+        quiz.querySelector(".quiz-feedback").className = "quiz-feedback";
+        answered[qid] = false;
+        updateScore();
+      }
+
+      function updateScore() {
+        const n = Object.values(answered).filter(Boolean).length;
+        document.getElementById("quiz-score-val").textContent = n + " / 4";
+        const msg = document.getElementById("quiz-score-msg");
+        if (n === 4) msg.textContent = "🏆 全对！你已掌握 SPEC 3 召回路径。";
+        else if (n === 0) msg.textContent = "开始作答吧";
+        else msg.textContent = "继续加油，还剩 " + (4 - n) + " 题";
+      }
+    </script>
+  </body>
+</html>

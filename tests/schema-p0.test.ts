@@ -205,12 +205,20 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       // dimension drift like the H1 hardcode (vector(N) vs vector(1536))
       // that mere column-enumeration would miss.
       const c = requireClient();
+      // Qualify by public schema: without the JOIN pg_namespace + nspname
+      // filter, parallel integration suites that create their own
+      // `entities` table in an isolated search_path (e.g. extraction-pg,
+      // retrieval-pg) make the bare `relname='entities'` match across all
+      // schemas and rowCount>1. The flake was an environmental artefact,
+      // not a real DDL defect.
       const res = await c.query<{ column_type: string }>(
         `SELECT format_type(atttypid, atttypmod) AS column_type
            FROM pg_attribute
            JOIN pg_class ON pg_class.oid = pg_attribute.attrelid
+           JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
           WHERE pg_class.relname = 'entities'
-            AND pg_attribute.attname = 'embedding'`
+            AND pg_attribute.attname = 'embedding'
+            AND pg_namespace.nspname = 'public'`
       );
       expect(res.rowCount).toBe(1);
       expect(res.rows[0].column_type).toBe("vector(1536)");

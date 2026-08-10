@@ -35,6 +35,13 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     "GRAPHRAG_MEMORY_EMBED_API_KEY",
     "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
     "NINE_ROUTER_KEY",
+    // Retrieval pipeline knobs (spec-3 T5) — scrub so a developer's real
+    // values don't trip the boundary validation or leak into assertions.
+    "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC",
+    "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
+    "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
+    "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
+    "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
   ];
   const saved = new Map<string, string | undefined>();
   beforeAll(() => {
@@ -61,6 +68,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "embedDimensions",
       "embedModel",
       "logLevel",
+      "retrieval",
       "storage",
     ]);
     expect(env).not.toHaveProperty("transport");

@@ -11,6 +11,8 @@ coverage/
 
 docs/archive
 .tmp-tickets
+# Nested git worktrees (local checkouts, not product source)
 .claude/worktrees/
 .worktrees/
+# Local study HTML (not iknow-memory SSOT; generated to a personal path)
 .reference/

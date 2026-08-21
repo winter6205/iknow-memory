@@ -12,3 +12,5 @@ coverage/
 docs/archive
 .tmp-tickets
 .claude/worktrees/
+.worktrees/
+.reference/

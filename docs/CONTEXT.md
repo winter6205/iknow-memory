@@ -122,7 +122,7 @@ If this file only had template examples and no real project terms, seed via:
 
 1. Read `src/core/types.ts` for storage vocabulary
 2. Read `src/tools/ingest.ts` and `retrieve.ts` for tool contracts
-3. Read `docs/vector-memory-upgrade-archive.html` §1.4 for the historical capability gap survey (now archived; deprecation banner at top of file)
+3. Read each module's local README / header comment for that capability area's gap vocabulary
 4. Invoke `arthurpower:domain-modeling` to ratify new terms before adding them here
 
-> 2026-08-25 清理说明：本表术语以 iknow-memory 自身定位和领域通用 IR 概念为唯一依据；所有指向特定外部实现作为"学习对象"的措辞已替换或移除。历史归档文档保留作能力对照，不作为 SSOT。
+> 2026-08-25 清理说明：本表术语以 iknow-memory 自身定位和领域通用 IR 概念为唯一依据；所有指向特定外部实现作为"学习对象"的措辞已替换或移除。归档文件不再被 SSOT 引用；本地如需查阅，对应 gitignored 副本仍在工作树中。

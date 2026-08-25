@@ -3,6 +3,10 @@ dist/
 *.tsbuildinfo
 coverage/
 
+# Local-only historical reference: archived upgrade guide, kept on disk
+# for offline reading. Never re-import, re-link, or re-add to git.
+docs/vector-memory-upgrade-archive.html
+
 # Host-local env (operator secrets + endpoint overrides)
 .env.local
 

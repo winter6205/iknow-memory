@@ -107,12 +107,11 @@ src/
 tests/                  # vitest 测试
 docs/
   CONTEXT.md            # 领域词汇表（SSOT）
-  vector-memory-upgrade-archive.html  # 历史路线骨架（已归档；正文内嵌 deprecation 横幅）
 ```
 
 ## 路线
 
-详见 `docs/vector-memory-upgrade-archive.html`（历史路线骨架，保留作能力对照）。
+详见 `docs/CONTEXT.md` 词汇表与各份 ADR/spec 的自我说明。
 
 ## 约束
 

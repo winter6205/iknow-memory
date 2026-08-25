@@ -3,6 +3,8 @@ import {
   AnthropicLLMClient,
   FakeLLMClient,
 } from "../../src/core/extraction/llm-client.ts";
+import { buildExtractionPrompt } from "../../src/core/extraction/prompt.ts";
+import { ALLOWED, PROMPT_HINT } from "../../src/core/extraction/vocabulary.ts";
 import type { ExtractionResponse } from "../../src/core/extraction/types.ts";
 
 /**
@@ -300,5 +302,148 @@ describe("AnthropicLLMClient retry classification", () => {
       thinking?: unknown;
     };
     expect(params.thinking).toEqual({ type: "disabled" });
+  });
+});
+
+/**
+ * G3 / SC7 — the production request must carry the vocabulary.
+ *
+ * `AnthropicLLMClient` composes its request from `buildExtractionPrompt`, so a
+ * captured `messages.create` call contains every `ALLOWED` term (via
+ * `PROMPT_HINT`) plus the chunk, while `extract(chunkText)` stays frozen.
+ *
+ * `buildExtractionPrompt` instructs the `{"outputs": [...]}` wrapper while the
+ * legacy parser expected a bare array; the adapter resolves that by accepting
+ * both shapes.
+ */
+describe("AnthropicLLMClient prompt wiring (G3)", () => {
+  function makeFakeAnthropic(impl: (params: unknown) => Promise<unknown>) {
+    return {
+      messages: {
+        create: vi.fn(async (params: unknown) => impl(params)),
+      },
+    };
+  }
+
+  function makeClient(fake: ReturnType<typeof makeFakeAnthropic>) {
+    return new AnthropicLLMClient({
+      model: "test-model",
+      apiKey: "sk-test",
+      baseUrl: "https://api.test/v1",
+      anthropic: fake as never,
+      sleep: async () => {},
+    });
+  }
+
+  function textMessage(text: string) {
+    return { content: [{ type: "text", text }] };
+  }
+
+  const sampleOutput = {
+    head: "Alice",
+    headType: "person",
+    relationRaw: "works at",
+    relationNorm: "works_for",
+    tail: "Acme",
+    tailType: "system",
+    description: "Alice works at Acme as a senior engineer.",
+    evidenceSpan: "Alice works at Acme",
+    confidence: 0.92,
+  };
+
+  /** Concatenated system + user text of the captured request. */
+  function capturedRequestText(
+    fake: ReturnType<typeof makeFakeAnthropic>,
+    call = 0
+  ): string {
+    const params = fake.messages.create.mock.calls[call]?.[0] as {
+      system?: unknown;
+      messages?: Array<{ role: string; content: unknown }>;
+    };
+    const system = typeof params.system === "string" ? params.system : "";
+    const user = (params.messages ?? [])
+      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .join("\n");
+    return `${system}\n${user}`;
+  }
+
+  it("SC7: captured messages.create request carries every ALLOWED term via PROMPT_HINT", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(JSON.stringify([sampleOutput]))
+    );
+
+    await makeClient(fake).extract("Alice works at Acme");
+
+    const requestText = capturedRequestText(fake);
+    expect(requestText).toContain(PROMPT_HINT);
+    for (const term of ALLOWED) {
+      expect(requestText).toContain(term);
+    }
+  });
+
+  it("sends the buildExtractionPrompt composition as the user message, chunk included", async () => {
+    const chunk = "the quick brown fox jumps over the lazy dog";
+    const fake = makeFakeAnthropic(async () => textMessage(JSON.stringify([])));
+
+    await makeClient(fake).extract(chunk);
+
+    const params = fake.messages.create.mock.calls[0]?.[0] as {
+      messages?: Array<{ role: string; content: unknown }>;
+    };
+    expect(params.messages).toHaveLength(1);
+    expect(params.messages?.[0]?.role).toBe("user");
+    expect(params.messages?.[0]?.content).toBe(buildExtractionPrompt(chunk));
+  });
+
+  it("carries the vocabulary on the format-retry call too", async () => {
+    let n = 0;
+    const fake = makeFakeAnthropic(async () => {
+      n += 1;
+      return n === 1
+        ? textMessage("not json")
+        : textMessage(JSON.stringify([sampleOutput]));
+    });
+
+    const result = await makeClient(fake).extract("Alice works at Acme");
+
+    expect(result).toMatchObject({ kind: "ok" });
+    expect(fake.messages.create).toHaveBeenCalledTimes(2);
+    expect(capturedRequestText(fake, 1)).toContain(PROMPT_HINT);
+  });
+
+  it('parses the {"outputs": [...]} wrapper the prompt schema instructs', async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(JSON.stringify({ outputs: [sampleOutput] }))
+    );
+
+    const result = await makeClient(fake).extract("Alice works at Acme");
+
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") throw new Error("narrow");
+    expect(result.outputs).toHaveLength(1);
+    expect(result.outputs[0]?.relationNorm).toBe("works_for");
+    expect(fake.messages.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts an empty wrapper as a legal zero-output extraction", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(JSON.stringify({ outputs: [] }))
+    );
+
+    const result = await makeClient(fake).extract("nothing extractable here");
+
+    expect(result).toEqual({ kind: "ok", outputs: [] });
+    expect(fake.messages.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a wrapper whose outputs is not an array as kind:'format'", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(JSON.stringify({ outputs: sampleOutput }))
+    );
+
+    const result = await makeClient(fake).extract("Alice works at Acme");
+
+    expect(result).toMatchObject({ kind: "format" });
+    expect(fake.messages.create).toHaveBeenCalledTimes(2);
   });
 });

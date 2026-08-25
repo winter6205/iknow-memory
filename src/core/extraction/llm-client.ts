@@ -9,6 +9,7 @@
  */
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
+import { buildExtractionPrompt } from "./prompt.js";
 import { type ExtractionOutput, type ExtractionResponse } from "./types.js";
 
 /** Public contract — every adapter implements this one method. */
@@ -22,19 +23,14 @@ const BASE_BACKOFF_MS = 100;
 const MAX_BACKOFF_MS = 2000;
 
 // ─── System prompt (sent once per extract call) ───────────────────────────
-// Per the spec's "Schema validation: zod" — the LLM must emit a JSON array of
-// ExtractionOutput objects; the client re-validates before returning kind:"ok".
+// Role only. The vocabulary (PROMPT_HINT), the field rules and the output
+// schema all live in `buildExtractionPrompt`, which composes the user message
+// — one source of format truth per request, so system and user never instruct
+// two different output shapes (G3).
 const SYSTEM_PROMPT = [
-  "You extract structured fact triples from the given chunk.",
-  "Output ONLY a JSON array. Each element has exactly these keys:",
-  "head, headType, relationRaw, relationNorm, tail, tailType,",
-  "description, evidenceSpan, confidence.",
-  "Rules:",
-  "- description is mandatory and must be a non-empty sentence.",
-  "- evidenceSpan must be a verbatim substring of the chunk.",
-  "- confidence is a number in [0, 1].",
-  "- relationNorm may be 'UNMAPPED' if no vocabulary match applies.",
-  "Emit no prose outside the JSON array.",
+  "You extract structured fact triples from the chunk given in the user message.",
+  "Follow the allowed relation vocabulary and the output schema stated there exactly.",
+  "Emit raw JSON only — no prose, no markdown fences.",
 ].join(" ");
 
 /** Zod schema mirrors ExtractionOutput; runtime parse step before returning ok. */
@@ -167,7 +163,10 @@ export class AnthropicLLMClient implements LLMClient {
         max_tokens: 4096,
         system: SYSTEM_PROMPT,
         thinking: { type: "disabled" },
-        messages: [{ role: "user", content: chunkText }],
+        // G3: the request body is the schema-guided prompt, so the vocabulary
+        // and the chunk reach the model together while extract(chunkText)
+        // stays frozen.
+        messages: [{ role: "user", content: buildExtractionPrompt(chunkText) }],
       });
       return { kind: "ok", message };
     } catch (err) {
@@ -205,11 +204,24 @@ function tryParseOutputs(
   } catch (err) {
     return { ok: false, error: `JSON parse: ${(err as Error).message}` };
   }
-  const parsed = ExtractionOutputsSchema.safeParse(raw);
+  const parsed = ExtractionOutputsSchema.safeParse(unwrapOutputs(raw));
   if (!parsed.success) {
     return { ok: false, error: `schema: ${parsed.error.message}` };
   }
   return { ok: true, outputs: parsed.data };
+}
+
+/**
+ * Accept both emitted shapes: the `{"outputs": [...]}` wrapper that
+ * `buildExtractionPrompt` instructs, and a bare array (what smaller models
+ * return anyway). Anything else falls through to the schema error.
+ */
+function unwrapOutputs(raw: unknown): unknown {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === "object" && raw !== null && "outputs" in raw) {
+    return (raw as { outputs: unknown }).outputs;
+  }
+  return raw;
 }
 
 function backoffMs(attempt: number): number {

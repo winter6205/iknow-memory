@@ -54,7 +54,7 @@ commit):
 | `GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR`   | optional: graph-arm floor (default `3`)        |
 
 The five `GRAPHRAG_MEMORY_RETRIEVAL_*` knobs are the graph arm's config. The
-retrieval defaults are `1 / 1 / 5 / 20 / 3`
+retrieval defaults are `1 / 1 / 8 / 50 / 3`
 (`w_vec` / `w_graph` / `entityLinkTopK` / `candidateCap` / `graphArmFloor`) per
 `src/config.ts`.
 
@@ -201,7 +201,9 @@ SELECT status, count(*) FROM extraction_records GROUP BY status;
 - Stop the MCP server (Ctrl-C).
 - Remove any scratch files the operator may have written under `/tmp` while
   debugging (the `.gitignore` whitelists one such glob, `/tmp/retrieval-pg-latency.json`,
-  in case you hand-write a latency probe).
+  in case you hand-write a latency probe), including
+  `/tmp/retrieval-p95-probe.mjs` from §7 if you ran the latency
+  re-measurement.
 
 ---
 
@@ -273,6 +275,303 @@ for spec-3** and is owned by the spec-2 runbook (see
 `docs/runbooks/extraction-smoke.md`). The full host-harness acceptance gate for
 this path lives in winter6205/iknow#49 (T-007); spec-3 owns the data path +
 runbook and does not reopen T-007.
+
+---
+
+## 7. Latency re-measurement (spec-3 Success Criterion #17 / SC12c)
+
+**Purpose:** measure `retrieve` p95 with the graph arm active against the
+vector-only baseline on the same machine, on a populated DB
+(**≥ 100 entities, ≥ 500 triples, ≥ 1000 chunks**). The threshold is hard:
+graph-armed p95 ≤ **1.3×** the vector-only p95. Failure is a **re-plan
+trigger** — do not patch retrieval inline and do not relax the budget
+(`specs/p0-wiring-closure.md` SC12c, ASSUMPTION 12).
+
+### 7.1 Prerequisites specific to this measurement
+
+- The T7 `graphConfig` wiring is merged (see the activation note in §1);
+  otherwise the "graph-armed" arm is the vector-only arm and the number is
+  meaningless.
+- `CREATE EXTENSION IF NOT EXISTS vector;` has been run against the target
+  database.
+- The `chunks` table carries a `valid_window` column. The graph arm's one-hop
+  SQL filters on `c.valid_window @> $validAt`, but the inline
+  `CREATE TABLE IF NOT EXISTS chunks` in `PgvectorBackend.ensureTable()` emits
+  only the stage-1 two-column time model (`valid_from` / `valid_until`). The
+  operator's deployed `chunks` DDL must add:
+
+  ```sql
+  valid_window tstzrange GENERATED ALWAYS AS (
+    tstzrange(valid_from, valid_until, '[)')
+  ) STORED
+  ```
+
+  Without it every one-hop query errors, the fail-open graph arm reports
+  `graphBelowFloor: true`, and the measurement silently degrades to
+  vector-vs-vector.
+
+### 7.2 What makes the number valid
+
+Both arms must be the **same handler in the same process against the same
+dataset**, differing only in whether `graphConfig` is passed:
+
+- graph-armed → `createRetrieveHandler({ embedder, storage, graphConfig })`
+- vector-only baseline → `createRetrieveHandler({ embedder, storage })`
+
+Four protocol rules, each of which changes the answer if dropped:
+
+1. **Warm the pool first.** The graph arm is the first code path to issue
+   _concurrent_ queries, so its first call pays to open the extra `pg` pool
+   connections. Discard at least 30 warmup calls per arm.
+2. **Interleave the arms** (alternating which one goes first) so neither
+   systematically absorbs cache-warm or cache-cold slots.
+3. **Use N ≥ 200 samples per arm.** With N = 10 the "p95" is literally the
+   maximum sample — see §7.5.
+4. **Assert the arm is actually armed** before timing: the `DEBUG=1` envelope
+   must show `graphBelowFloor: false` and `graphHits ≥ 1`.
+
+`FakeEmbedder` is the right embedder here: it makes the run keyless and
+deterministic, and it is the conservative choice — a real network embedder adds
+the same constant to both arms and only pushes the ratio closer to 1.
+
+### 7.3 The probe
+
+Build first, then write this throwaway probe to `/tmp/retrieval-p95-probe.mjs`
+(scratch only — it is not part of the repo; delete it after the run). Set
+`REPO` to your checkout:
+
+```js
+// /tmp/retrieval-p95-probe.mjs — throwaway spec-3 #17 / SC12c latency probe.
+// Set REPO to your checkout and run `npm run build` first.
+const REPO = "/workspace";
+const DB_URL =
+  process.env.GRAPHRAG_MEMORY_DB_URL ??
+  "postgresql://postgres@localhost:5432/postgres";
+const DIM = 1536,
+  ENTITIES = 100,
+  TRIPLES = 500,
+  CHUNKS = 1000,
+  ITER = 300,
+  WARMUP = 30;
+
+import { randomUUID } from "node:crypto";
+const { default: pg } = await import(`${REPO}/node_modules/pg/lib/index.js`);
+const { PgvectorBackend } = await import(
+  `${REPO}/dist/core/storage/pgvector-backend.js`
+);
+const { FakeEmbedder } = await import(`${REPO}/dist/core/embedder.js`);
+const { computeEntityEmbeddingText } = await import(
+  `${REPO}/dist/core/entities/embedding.js`
+);
+const { createRetrieveHandler } = await import(
+  `${REPO}/dist/tools/retrieve.js`
+);
+const { loadEnv } = await import(`${REPO}/dist/config.js`);
+
+const SCHEMA = `p95_${randomUUID().slice(0, 8).replace(/-/g, "")}`;
+const URL_ = `${DB_URL}${DB_URL.includes("?") ? "&" : "?"}options=-c%20search_path%3D${SCHEMA},public`;
+const NOW = new Date(),
+  NOW_ISO = NOW.toISOString();
+const FROM = new Date(NOW - 864e5).toISOString(),
+  UNTIL = new Date(+NOW + 365 * 864e5).toISOString();
+const embedder = new FakeEmbedder(DIM);
+const vec = async (t) => `[${(await embedder.embed([t]))[0].join(",")}]`;
+const p = (a, q) =>
+  [...a].sort((x, y) => x - y)[
+    Math.min(a.length - 1, Math.ceil(q * a.length) - 1)
+  ];
+const ms = (n) => Number(n.toFixed(3));
+
+process.env.GRAPHRAG_MEMORY_STORAGE = "pgvector";
+process.env.GRAPHRAG_MEMORY_DB_URL = URL_;
+process.env.GRAPHRAG_MEMORY_EMBED_DIMENSIONS = String(DIM);
+const graphConfig = loadEnv().retrieval;
+
+const c = new pg.Client({ connectionString: URL_ });
+await c.connect();
+await c.query(`CREATE SCHEMA "${SCHEMA}"`);
+await c.query(`SET search_path TO "${SCHEMA}", public`);
+// Same chunks DDL the operator deploys: the one-hop SQL filters c.valid_window.
+await c.query(`CREATE TABLE chunks (
+  id uuid PRIMARY KEY, content text NOT NULL, embedding vector(${DIM}) NOT NULL,
+  valid_from timestamptz NOT NULL, valid_until timestamptz NULL, source_ref text NOT NULL,
+  metadata jsonb NOT NULL, created_at timestamptz NOT NULL,
+  valid_window tstzrange GENERATED ALWAYS AS (tstzrange(valid_from, valid_until, '[)')) STORED)`);
+
+const backend = new PgvectorBackend(URL_, DIM);
+await backend.search((await embedder.embed(["warm"]))[0], {
+  limit: 1,
+  validAt: NOW_ISO,
+});
+
+const eIds = [],
+  cIds = [];
+let buf = [];
+for (let i = 0; i < ENTITIES; i++) {
+  const id = randomUUID();
+  eIds.push(id);
+  buf.push(
+    `('${id}','entity-${i}','concept','${await vec(computeEntityEmbeddingText(`entity-${i}`, "latency"))}'::vector)`
+  );
+}
+await c.query(
+  `INSERT INTO entities (id, canonical_name, type, embedding) VALUES ${buf.join(",")}`
+);
+buf = [];
+for (let i = 0; i < CHUNKS; i++) {
+  const id = randomUUID();
+  cIds.push(id);
+  buf.push(
+    `('${id}','bulk-${i}','${await vec(`bulk-chunk-${i}`)}'::vector,'${FROM}','${UNTIL}','src/${i}','{}',now())`
+  );
+  if (buf.length >= 200) {
+    await c.query(
+      `INSERT INTO chunks (id,content,embedding,valid_from,valid_until,source_ref,metadata,created_at) VALUES ${buf.join(",")}`
+    );
+    buf = [];
+  }
+}
+if (buf.length)
+  await c.query(
+    `INSERT INTO chunks (id,content,embedding,valid_from,valid_until,source_ref,metadata,created_at) VALUES ${buf.join(",")}`
+  );
+buf = [];
+for (let i = 0; i < TRIPLES; i++)
+  buf.push(
+    `('${randomUUID()}','${eIds[i % eIds.length]}','${eIds[(i * 7 + 1) % eIds.length]}','rel','rel',1.0,'${cIds[i % cIds.length]}',tstzrange('${FROM}','${UNTIL}','[)'))`
+  );
+await c.query(
+  `INSERT INTO triples (id,head_id,tail_id,relation_raw,relation_norm,confidence,source_chunk_id,valid_window) VALUES ${buf.join(",")}`
+);
+await c.query("ANALYZE entities");
+await c.query("ANALYZE chunks");
+await c.query("ANALYZE triples");
+
+const input = {
+  query: computeEntityEmbeddingText("entity-0", "latency"),
+  valid_at: NOW_ISO,
+  limit: 10,
+};
+const armed = createRetrieveHandler({
+  embedder,
+  storage: backend,
+  graphConfig,
+});
+const plain = createRetrieveHandler({ embedder, storage: backend });
+// Arm-activation proof — a degraded graph arm would make the comparison meaningless.
+const dbg = JSON.parse(
+  (
+    await createRetrieveHandler({
+      embedder,
+      storage: backend,
+      graphConfig,
+      debug: true,
+    })(input)
+  ).content[0].text
+);
+if (dbg.debug.graphBelowFloor || dbg.debug.graphHits < 1)
+  throw new Error(`graph arm not active: ${JSON.stringify(dbg.debug)}`);
+
+for (let i = 0; i < WARMUP; i++) {
+  await armed(input);
+  await plain(input);
+}
+const g = [],
+  v = [];
+for (let i = 0; i < ITER; i++) {
+  // Alternate order so neither arm systematically absorbs the warm slot.
+  const first = i % 2 === 0 ? armed : plain,
+    second = i % 2 === 0 ? plain : armed;
+  const a = i % 2 === 0 ? g : v,
+    b = i % 2 === 0 ? v : g;
+  let t = performance.now();
+  await first(input);
+  a.push(performance.now() - t);
+  t = performance.now();
+  await second(input);
+  b.push(performance.now() - t);
+}
+console.log(
+  JSON.stringify(
+    {
+      dataset: { entities: ENTITIES, triples: TRIPLES, chunks: CHUNKS },
+      dims: DIM,
+      iterations: ITER,
+      graphConfig,
+      armProof: dbg.debug,
+      graphArmed: { p50Ms: ms(p(g, 0.5)), p95Ms: ms(p(g, 0.95)) },
+      vectorOnly: { p50Ms: ms(p(v, 0.5)), p95Ms: ms(p(v, 0.95)) },
+      p95Ratio: Number((p(g, 0.95) / p(v, 0.95)).toFixed(4)),
+      verdict: p(g, 0.95) / p(v, 0.95) <= 1.3 ? "BUDGET_MET" : "REPLAN_TRIGGER",
+    },
+    null,
+    2
+  )
+);
+
+await backend.close();
+await c.query(`DROP SCHEMA "${SCHEMA}" CASCADE`);
+await c.end();
+```
+
+### 7.4 Exact commands
+
+```bash
+psql "$GRAPHRAG_MEMORY_DB_URL" -c "CREATE EXTENSION IF NOT EXISTS vector;"
+
+npm run build
+
+# Three repeats; the run-to-run spread is the measurement's own noise floor.
+for i in 1 2 3; do node /tmp/retrieval-p95-probe.mjs; done
+```
+
+Record the **median** of the three `p95Ratio` values. The probe creates and
+drops its own scratch schema, so it leaves no rows behind.
+
+### 7.5 Trap: the in-suite probe is not a p95 estimator
+
+`tests/integration/retrieval-pg.test.ts` case 6 also prints a graph-vs-vector
+p95 (`/tmp/retrieval-pg-latency.json`). It is a **soft-record smoke probe, not
+the #17 measurement**, and it reads high by design:
+
+- N = 10, so its "p95" is the single largest sample;
+- no warmup, and the graph loop runs first, so that largest sample is the
+  cold-pool call that opens the extra `pg` connections;
+- the arms are not interleaved.
+
+Measured on the same box, that first graph call costs ~8 ms while calls 4–10
+settle at ~2.9 ms, i.e. the vector arm's own cost. Do not report case 6's
+ratio as the SC12c number.
+
+### 7.6 Result template (paste into the PR body)
+
+```text
+## Retrieve latency budget (spec-3 #17 / SC12c)
+
+- Machine: <cpu> x <vCPU>, <ram>, <kernel>, node <ver>, PostgreSQL <ver> + pgvector <ver>
+- Commit measured: <sha> (<subject>)
+- Dataset: <n> entities / <n> triples / <n> chunks, embed dims <n>
+- Protocol: <n> interleaved iterations per arm, <n>-call warmup, same process
+- Graph arm active: graphBelowFloor=false graphHits=<n> vectorHits=<n>
+- graph-armed p95: <n> ms   (p50 <n> ms)
+- vector-only p95: <n> ms   (p50 <n> ms)
+- p95 ratio: <n.nn>x   budget 1.30x
+- Verdict: BUDGET_MET | REPLAN_TRIGGER
+```
+
+### 7.7 Re-plan exit
+
+If the ratio exceeds 1.3×, stop and escalate with the measured numbers. The
+named exit is re-plan (`specs/p0-wiring-closure.md` ASSUMPTION 12 / SC12c) —
+not an inline retrieval patch, not a criterion waiver. Relaxing the budget is
+Ask-first.
+
+The budget's headroom is not scale-invariant. The graph arm hides behind the
+vector arm only while the seed scan over `entities.embedding` is cheaper than
+the vector scan over `chunks.embedding` — neither column carries an ANN index
+in P0, so both are sequential scans and the ratio tracks the entity:chunk row
+ratio. Re-measure whenever the corpus shape changes materially, not only when
+the code changes.
 
 ---
 

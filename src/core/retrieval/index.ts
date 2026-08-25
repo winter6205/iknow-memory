@@ -14,9 +14,14 @@
  *     EXACTLY `{ chunks: RetrievedChunk[] }` with no `degraded` / `debug`
  *     keys (Success Criterion #4).
  *
+ * The query is embedded once here and the vector is passed into both arms,
+ * which then run concurrently (G5 levers, spec p0-wiring-closure A12). An
+ * embedder that yields no usable vector raises `GraphragError`
+ * ("EMBEDDING_FAILED") before either arm starts — it is never fail-open.
+ *
  * The graph arm is fail-open: storage errors become `belowFloor: true` with
- * a `failureReason`; only a fatal embed failure throws (caught here and
- * treated as a degraded graph result so the envelope surface is consistent).
+ * a `failureReason`, and `runGraphArmSafe` catches anything unexpected so a
+ * graph failure can never reject the fused call.
  */
 import { rrfFuse } from "./rrf.js";
 import { runGraphArm, type GraphArmDeps } from "./graph-arm.js";
@@ -31,6 +36,7 @@ import type {
 import type { RetrievedChunk, StorageBackend } from "../types.js";
 import type { GraphRagStorageBackend } from "../storage/backend.js";
 import type { EmbeddingClient } from "../embedder.js";
+import { GraphragError } from "../errors.js";
 
 /** Inputs — what the orchestrator needs from the retrieve tool. */
 export interface AssembleArgs {
@@ -69,8 +75,11 @@ export async function assembleRetrievalResult(
   args: AssembleArgs,
   deps: AssembleDeps
 ): Promise<RetrieveOutputEnvelope> {
-  const [queryEmbedding] = await deps.embedder.embed([args.query]);
-  const retrieved = await deps.storage.search(queryEmbedding, {
+  // One embed per retrieve (G5 lever (a)): the same vector feeds the vector
+  // search and the graph arm's seed lookup. Embed failure keeps its
+  // pre-lever behavior — it propagates before either arm starts.
+  const queryEmbedding = await embedQuery(deps.embedder, args.query);
+  const vectorSearch = deps.storage.search(queryEmbedding, {
     limit: args.limit,
     validAt: args.validAt,
     ...(args.filters !== undefined ? { filters: args.filters } : {}),
@@ -81,14 +90,19 @@ export async function assembleRetrievalResult(
     // Vector-only: chunks flow through unchanged. RetrievedChunk is
     // already structurally identical to the envelope chunk shape, so no
     // projection is needed for the empty-extra-keys contract.
-    return { chunks: retrieved };
+    return { chunks: await vectorSearch };
   }
 
-  const graphResult = await runGraphArmSafe(
-    args.query,
-    { embedder: deps.embedder, storage: graph.seed, config: graph.config },
-    new Date(args.validAt)
-  );
+  // Concurrent arms (G5 lever (b)). The graph arm is wrapped fail-open, so
+  // it never rejects and can never take the vector results down with it.
+  const [retrieved, graphResult] = await Promise.all([
+    vectorSearch,
+    runGraphArmSafe(
+      queryEmbedding,
+      { storage: graph.seed, config: graph.config },
+      new Date(args.validAt)
+    ),
+  ]);
 
   const fused = rrfFuse(
     toVectorResult(retrieved),
@@ -99,6 +113,31 @@ export async function assembleRetrievalResult(
   const degraded = graphResult.belowFloor ? (true as const) : undefined;
   const debug = buildDebug(deps.debug, retrieved.length, graphResult);
   return buildEnvelope(fused, degraded, debug);
+}
+
+/**
+ * Embed the query into the single vector both arms share.
+ *
+ * An embedder that resolves without a usable vector (empty batch, or a
+ * zero-length vector) is a failure, not a degradation: `undefined` would
+ * otherwise flow into `storage.search` and `runGraphArm` and surface as a
+ * downstream TypeError or a silently unfiltered search. Raising the typed
+ * `EMBEDDING_FAILED` here keeps the pre-lever contract — embed failure
+ * propagates before either arm starts — and leaves the graph arm's
+ * fail-open degradation contract for graph-arm failures only.
+ */
+async function embedQuery(
+  embedder: EmbeddingClient,
+  query: string
+): Promise<number[]> {
+  const [queryEmbedding] = await embedder.embed([query]);
+  if (queryEmbedding === undefined || queryEmbedding.length === 0) {
+    throw new GraphragError(
+      "query embedding empty: embedder returned no usable vector for the retrieve query",
+      "EMBEDDING_FAILED"
+    );
+  }
+  return queryEmbedding;
 }
 
 /**
@@ -119,14 +158,18 @@ function getGraphSeed(
   return { seed: rag.graphArmSeed, config: deps.graphConfig };
 }
 
-/** Wrap `runGraphArm` so an embed failure degrades instead of throwing. */
+/**
+ * Wrap `runGraphArm` so an unexpected throw degrades instead of rejecting.
+ * This is what keeps `Promise.all` fail-open: the vector arm's results
+ * survive any graph-arm failure.
+ */
 async function runGraphArmSafe(
-  query: string,
+  queryEmbedding: number[],
   deps: GraphArmDeps,
   now: Date
 ): Promise<ArmResult> {
   try {
-    return await runGraphArm(query, deps, now);
+    return await runGraphArm(queryEmbedding, deps, now);
   } catch (err) {
     return {
       arm: "graph",

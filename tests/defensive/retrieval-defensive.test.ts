@@ -4,7 +4,8 @@
  * Maps to Success Criterion #16: every public function (`runGraphArm`,
  * `rrfFuse`, `assembleRetrievalResult`) is exercised against each of the
  * five boundary classes:
- *   empty      → K = 0, no arms active, empty-vec, empty-graph
+ *   empty      → K = 0, no arms active, empty-vec, empty-graph, and an empty
+ *                query embedding (typed GraphragError, never fail-open)
  *   negative   → K = -1, limit = -1
  *   overflow   → K = 1e9, limit = 1e9
  *   concurrent → two parallel calls produce deterministic non-interfering
@@ -37,6 +38,9 @@ import type { RetrievedChunk, SearchOptions } from "../../src/core/types.js";
 import type { GraphRagStorageBackend } from "../../src/core/storage/backend.js";
 
 const TEST_DIM = 1536;
+
+/** Query embedding the orchestrator hands to the graph arm (G5 lever (a)). */
+const QUERY_VEC = [0.1, 0.2, 0.3];
 
 /** Default RetrieveConfig the defensive tests run under. */
 const CFG: RetrieveConfig = {
@@ -84,6 +88,8 @@ class FakeGraphBackend implements GraphRagStorageBackend {
   rowError: Error | null = null;
   seedTopKs: number[] = [];
   oneHopLimits: number[] = [];
+  /** Vectors handed to `search` — empty when the vector arm never started. */
+  searchEmbeddings: unknown[] = [];
 
   readonly graphArmSeed: GraphArmStorage = {
     seedEntitiesByEmbedding: async (
@@ -117,12 +123,30 @@ class FakeGraphBackend implements GraphRagStorageBackend {
     return [];
   }
   async search(
-    _queryEmbedding: number[],
+    queryEmbedding: number[],
     opts: SearchOptions
   ): Promise<RetrievedChunk[]> {
+    this.searchEmbeddings.push(queryEmbedding);
     return this.searchResults.slice(0, opts.limit);
   }
   async close(): Promise<void> {}
+}
+
+/**
+ * Embedder that resolves with a caller-chosen batch — used to drive the
+ * empty-embedding boundary (`[]`, `[[]]`) without throwing, so the test
+ * proves the orchestrator's own guard fires rather than a rejection it
+ * merely forwards.
+ */
+class EmptyBatchEmbedder implements EmbeddingClient {
+  calls = 0;
+
+  constructor(private readonly batch: number[][]) {}
+
+  async embed(_texts: string[]): Promise<number[][]> {
+    this.calls += 1;
+    return this.batch;
+  }
 }
 
 /** Helper: wrap a chunk result for the vector arm. */
@@ -161,9 +185,8 @@ describe("runGraphArm — empty boundary (K=0)", () => {
   it("entityLinkTopK=0 → storage receives topK=0, returns belowFloor, zero hits, no one-hop call", async () => {
     const storage = new FakeGraphBackend();
     const out = await runGraphArm(
-      "q",
+      QUERY_VEC,
       {
-        embedder: new FakeEmbedder(),
         storage: storage.graphArmSeed,
         config: { ...CFG, entityLinkTopK: 0 },
       },
@@ -184,9 +207,8 @@ describe("runGraphArm — negative boundary (K=-1)", () => {
     // validation (test seam) must still degrade, never throw.
     const storage = new FakeGraphBackend();
     const out = await runGraphArm(
-      "q",
+      QUERY_VEC,
       {
-        embedder: new FakeEmbedder(),
         storage: storage.graphArmSeed,
         // Cast bypasses the TS type; the runtime guard must still hold.
         config: { ...CFG, entityLinkTopK: -1 } as RetrieveConfig,
@@ -214,9 +236,8 @@ describe("runGraphArm — overflow boundary (K=1e9)", () => {
     storage.rows = [graphRow("g1"), graphRow("g2"), graphRow("g3")];
     const huge = 1e9;
     const out = await runGraphArm(
-      "q",
+      QUERY_VEC,
       {
-        embedder: new FakeEmbedder(),
         storage: storage.graphArmSeed,
         config: { ...CFG, entityLinkTopK: huge } as RetrieveConfig,
       },
@@ -239,21 +260,20 @@ describe("runGraphArm — concurrent boundary", () => {
     ];
     storage.rows = [graphRow("g1"), graphRow("g2"), graphRow("g3")];
     const cfg: GraphArmStorage = storage.graphArmSeed;
-    const embedder = new FakeEmbedder();
     const [a, b, c] = await Promise.all([
       runGraphArm(
-        "q1",
-        { embedder, storage: cfg, config: CFG },
+        [0.1, 0.1, 0.1],
+        { storage: cfg, config: CFG },
         new Date("2024-01-01T00:00:00Z")
       ),
       runGraphArm(
-        "q2",
-        { embedder, storage: cfg, config: CFG },
+        [0.2, 0.2, 0.2],
+        { storage: cfg, config: CFG },
         new Date("2024-01-01T00:00:00Z")
       ),
       runGraphArm(
-        "q3",
-        { embedder, storage: cfg, config: CFG },
+        [0.3, 0.3, 0.3],
+        { storage: cfg, config: CFG },
         new Date("2024-01-01T00:00:00Z")
       ),
     ]);
@@ -271,9 +291,8 @@ describe("runGraphArm — exception boundary (storage throws)", () => {
     const storage = new FakeGraphBackend();
     storage.seedError = new Error("seed boom");
     const out = await runGraphArm(
-      "q",
+      QUERY_VEC,
       {
-        embedder: new FakeEmbedder(),
         storage: storage.graphArmSeed,
         config: CFG,
       },
@@ -293,9 +312,8 @@ describe("runGraphArm — exception boundary (storage throws)", () => {
     ];
     storage.rowError = new Error("row boom");
     const out = await runGraphArm(
-      "q",
+      QUERY_VEC,
       {
-        embedder: new FakeEmbedder(),
         storage: storage.graphArmSeed,
         config: CFG,
       },
@@ -396,11 +414,12 @@ async function runAssemble(opts: {
   backend: FakeGraphBackend;
   graphConfig?: RetrieveConfig;
   debug?: boolean;
+  embedder?: EmbeddingClient;
 }) {
   return assembleRetrievalResult(
     { query: "anything", validAt: "2024-06-01T00:00:00.000Z", limit: 10 },
     {
-      embedder: new FakeEmbedder(TEST_DIM),
+      embedder: opts.embedder ?? new FakeEmbedder(TEST_DIM),
       storage: opts.backend,
       graphConfig: opts.graphConfig,
       debug: opts.debug,
@@ -425,6 +444,44 @@ describe("assembleRetrievalResult — empty boundary (no graphConfig)", () => {
     expect(out.chunks).toEqual([]);
     expect(out.degraded).toBe(true);
     expect(out).not.toHaveProperty("debug");
+  });
+});
+
+describe("assembleRetrievalResult — empty boundary (empty query embedding)", () => {
+  it("embedder returns [] → typed GraphragError(EMBEDDING_FAILED), not a downstream TypeError", async () => {
+    const backend = new FakeGraphBackend();
+    backend.searchResults = [vecChunk("v1")];
+    const err = await runAssemble({
+      backend,
+      graphConfig: CFG,
+      embedder: new EmptyBatchEmbedder([]),
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GraphragError);
+    expect((err as GraphragError).code).toBe("EMBEDDING_FAILED");
+    expect(err).not.toBeInstanceOf(TypeError);
+  });
+
+  it("embedder returns a zero-length vector → same typed EMBEDDING_FAILED", async () => {
+    const backend = new FakeGraphBackend();
+    const err = await runAssemble({
+      backend,
+      graphConfig: CFG,
+      embedder: new EmptyBatchEmbedder([[]]),
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GraphragError);
+    expect((err as GraphragError).code).toBe("EMBEDDING_FAILED");
+  });
+
+  it("empty embedding throws before either arm starts — vector-only path too", async () => {
+    const backend = new FakeGraphBackend();
+    backend.searchResults = [vecChunk("v1")];
+    // No graphConfig: the vector-only path must reject rather than hand
+    // `undefined` to storage.search and search on a garbage vector.
+    await expect(
+      runAssemble({ backend, embedder: new EmptyBatchEmbedder([]) })
+    ).rejects.toBeInstanceOf(GraphragError);
+    expect(backend.searchEmbeddings).toEqual([]);
+    expect(backend.seedTopKs).toEqual([]);
   });
 });
 

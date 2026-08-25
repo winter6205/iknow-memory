@@ -26,7 +26,7 @@ _Avoid_: "document" (a chunk is a slice, not a whole document); "passage" (impli
 _Avoid_: "node" (graph-generic, use only when discussing Neo4j topology); "concept" (one entity type, not the general term); "mention" (a mention is an occurrence, not the canonical entity)
 
 **triple**: a directed typed edge `(head_entity, relation, tail_entity)` extracted from a chunk. Carries `confidence`, `source_chunk_id`, `valid_window`, `created_at`. The atomic unit of graph knowledge. _Stage: P0 (not yet implemented)._
-_Avoid_: "fact" (ambiguous with gbrain's `facts` table); "edge" (graph-generic, use only in Neo4j context); "link" (gbrain's rule-based links are not triples)
+_Avoid_: "fact" (too ambiguous in retrieval context; use "graph fact" / "temporal fact" if needed); "edge" (graph-generic, use only in Neo4j context); "link" (rule-based linkers do not produce typed edges)
 
 **alias**: a surface-form string that resolves to a canonical entity (name variant, abbreviation, spelling). Stored in `entity_aliases` with `entity_id` foreign key. _Stage: P0 (not yet implemented)._
 _Avoid_: "synonym" (implies bidirectional equivalence); "variant" (one alias type, not the general term)
@@ -45,14 +45,14 @@ _Avoid_: "keyword search" (BM25 is ranked, not boolean); "lexical search" (accep
 **hybrid retrieval**: multi-arm recall (vector + BM25 + graph traversal) fused by Reciprocal Rank Fusion (RRF, k=60) with weighted arms (vector 0.8, BM25 0.2), followed by cosine re-score blend (0.7 normRRF + 0.3 cosine). _Stage: P1._
 _Avoid_: "fusion search" (ambiguous); "multi-signal search" (too vague)
 
-**rerank**: a post-fusion reordering step that promotes authoritative/fresh/relevant chunks. In gbrain: cross-encoder (zerank-2). In iknow-memory: TBD (feature-based prototype validated, real cross-encoder or LLM rerank pending). Fail-open: rerank failure returns fused order unchanged.
+**rerank**: a post-fusion reordering step that promotes authoritative/fresh/relevant chunks. Options to evaluate: cross-encoder (e.g. zerank-class models), LLM rerank, or feature-based heuristics. iknow-memory: TBD (feature-based prototype validated, real cross-encoder or LLM rerank pending). Fail-open: rerank failure returns fused order unchanged.
 _Avoid_: "re-sort" (implies trivial ordering); "refinement" (too vague)
 
 **PPR (Personalized PageRank)**: single-step multi-hop graph traversal from query-anchored seed nodes. Replaces iterative BFS/DFS (10-30× cheaper per HippoRAG 2). Requires native graph engine (Neo4j GDS). _Stage: P1._
 _Avoid_: "graph search" (too broad); "random walk" (PPR is a specific algorithm, not generic random walk); "multi-hop retrieval" (describes the effect, not the mechanism)
 
-**mode bundle**: a named preset of retrieval parameters (candidateK, topK, rerank depth, arm weights). gbrain has three: conservative / balanced / tokenmax. iknow-memory: TBD. _Stage: P1._
-_Avoid_: "profile" (ambiguous with embedding profile); "preset" (acceptable but mode bundle is the gbrain term we're learning from)
+**mode bundle**: a named preset of retrieval parameters (candidateK, topK, rerank depth, arm weights). Common presets seen in hybrid RAG systems: conservative / balanced / tokenmax. iknow-memory: TBD. _Stage: P1._
+_Avoid_: "profile" (ambiguous with embedding profile); "preset" (acceptable alias for mode bundle)
 
 ### Time model
 
@@ -63,10 +63,10 @@ _Avoid_: "time range" (ambiguous with query time range); "TTL" (TTL is cache ter
 _Avoid_: "current time" (valid_at can be set to past/future for historical queries); "timestamp" (too generic)
 
 **superseded_by**: a forward pointer from an expired fact to its replacement. Enables "what replaced this?" queries without deletion. _Stage: P2 (not yet implemented)._
-_Avoid_: "replaced_by" (acceptable alias but superseded_by matches gbrain/Graphiti convention); "version" (implies linear versioning, supersession can be non-linear)
+_Avoid_: "replaced_by" (acceptable alias); "version" (implies linear versioning, supersession can be non-linear)
 
 **causal edge**: a typed triple relation expressing causation (`caused`, `enabled`, `prevented`). Enables "why did X happen?" reasoning. Distinct from descriptive relations (`is_a`, `part_of`, `located_in`). _Stage: P2 (not yet implemented)._
-_Avoid_: "causal link" (link is gbrain's rule-based term); "reason edge" (ambiguous)
+_Avoid_: "causal link" (rule-based linkers do not produce typed edges); "reason edge" (ambiguous)
 
 ### Graph storage
 
@@ -92,7 +92,7 @@ _Avoid_: "parse" (implies deterministic grammar, extraction is LLM-based); "NER"
 **extraction F1**: fact-level precision and recall for triple extraction, evaluated against human-annotated ground truth. Separate metrics for entity recognition and relation classification. The quality gate for P0. _Stage: P0._
 _Avoid_: "accuracy" (F1 is more informative for imbalanced extraction); "quality score" (too vague)
 
-**P@5 / R@5**: precision and recall at rank 5 for retrieval evaluation. gbrain's BrainBench uses these as primary metrics. iknow-memory will establish its own baseline. _Stage: P1._
+**P@5 / R@5**: precision and recall at rank 5 for retrieval evaluation. Standard IR metric; widely adopted as primary metric in retrieval benchmarks (e.g. BrainBench). iknow-memory will establish its own baseline. _Stage: P1._
 _Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified)
 
 ## Relationships
@@ -109,12 +109,12 @@ _Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified)
 
 ## Flagged ambiguities
 
-- **triple vs fact**: in iknow-memory, "triple" is the canonical term for (head, relation, tail). "Fact" is avoided because it collides with gbrain's `facts` table (bi-temporal claims). If you must say "fact" in iknow-memory context, qualify it: "graph fact" or "temporal fact".
+- **triple vs fact**: in iknow-memory, "triple" is the canonical term for (head, relation, tail). "Fact" is avoided because it is too generic in retrieval literature (bi-temporal claims in some systems, plain extracted assertions in others). If you must say "fact" in iknow-memory context, qualify it: "graph fact" or "temporal fact".
 - **valid_window vs valid_at**: `valid_window` is a property of stored data (when is this true?); `valid_at` is a property of the query (when am I asking about?). The filter is `valid_window @> valid_at`.
 - **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for entities, triples, aliases, and (P0) extraction_records; Neo4j is a derived read-only projection. In P0 the server does not connect to Neo4j at all (issue #3 D1; #7 Q1 graph arm reads Postgres JOINs; #7 Q3b projection sync and #7 Q3c read-your-writes graduate to P1). The rationale for keeping Neo4j as a future projection is native graph node traversal (PPR, Louvain, node-level embedding); SQL JOIN and Apache AGE do not meet that constraint. Do not propose writing to Neo4j outside the projection path, or "just use Postgres for everything" without addressing that constraint.
 - **rerank fail-open**: rerank failure returns the fused order unchanged. This is intentional — a dead reranker should not block retrieval. Do not add retry/fallback logic that changes this contract without explicit decision.
 - **context engineering is NOT our job**: JIT retrieval triggers, cache breakpoint planning, prompt assembly, budget allocation — these belong to the host. iknow-memory returns ranked chunks; what the host does with them is the host's problem.
-- **gbrain is a learning object, not a dependency**: design decisions (RRF k=60, cosine re-score 0.7/0.3, rerank fail-open, PPR) are adopted from gbrain's upgrade guide. gbrain code (`_upstream_gbrain/`) is read-only reference — zero runtime import/link/symlink. We implement better, not copy.
+- **zero external runtime dependency on any reference implementation**: design decisions (RRF k=60, cosine re-score 0.7/0.3, rerank fail-open, PPR) are first-class product choices documented in CONTEXT.md and PRDs; rationale is independent of any particular reference codebase. Any locally tracked upstream reference directory is read-only and not linked at runtime (zero import/link/symlink/dynamic load). We implement from first principles, not by copying.
 
 ## Bootstrap mode
 
@@ -122,5 +122,7 @@ If this file only had template examples and no real project terms, seed via:
 
 1. Read `src/core/types.ts` for storage vocabulary
 2. Read `src/tools/ingest.ts` and `retrieve.ts` for tool contracts
-3. Read `docs/gbrain-vector-memory-upgrade-guide.html` §1.4 for gbrain gap vocabulary
+3. Read `docs/vector-memory-upgrade-archive.html` §1.4 for the historical capability gap survey (now archived; deprecation banner at top of file)
 4. Invoke `arthurpower:domain-modeling` to ratify new terms before adding them here
+
+> 2026-08-25 清理说明：本表术语以 iknow-memory 自身定位和领域通用 IR 概念为唯一依据；所有指向特定外部实现作为"学习对象"的措辞已替换或移除。历史归档文档保留作能力对照，不作为 SSOT。

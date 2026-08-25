@@ -56,7 +56,8 @@ domain-modeling pass after spec 3 lands):
   `triples.valid_window @> valid_at`, and joins back to chunks via
   `source_chunk_id`. Read-only Postgres JOIN; no writes.
 - **RRF fusion (k=60)** — Reciprocal Rank Fusion with constant `k=60`
-  (matches gbrain upgrade guide §3 + spec-2 precedent). Weighted arms in P0:
+  (Reciprocal Rank Fusion convention; documented in spec-2 architecture).
+  Weighted arms in P0:
   `w_vec = w_graph = 1`. The weights are real-number scaling factors; they
   do NOT span cross-arm scores.
 - **`degraded=true`** — envelope flag added to the `retrieve` JSON payload

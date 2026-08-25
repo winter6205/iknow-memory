@@ -460,10 +460,9 @@
         </p>
         <p class="muted">
           「不做上下文工程」是核心定位：server
-          只保证"存得对、查得准、可时间切片"。 学习对象是
-          gbrain——目标是继承其优点（混合检索 / 分层记忆 /
-          bi-temporal），改进其缺点（三元组抽取、canonical 实体合并、PPR
-          多跳、社区检测）。
+          只保证"存得对、查得准、可时间切片"。 自洽定位：以混合检索、分层记忆与
+          bi-temporal 时间模型为基础能力；以 LLM 三元组抽取、canonical
+          实体合并、PPR 多跳、社区检测为迭代方向。
         </p>
       </div>
 
@@ -476,8 +475,9 @@
           向量 cosine + <code>valid_window</code> 时间切片。
         </p>
         <p>
-          但 <b>P0 规划指出</b>：「gbrain 没有 LLM 三元组抽取，也没有 canonical
-          实体合并——这是 BrainBench +31 P@5 的源头」。 也就是说，当前能存
+          但 <b>P0 规划指出</b>：现有 stage 0+1 缺少 LLM 三元组抽取，也缺少
+          canonical 实体合并——这是业内 hybrid RAG / BrainBench 类基准在 P@5
+          上拉开差距的常见源头。 也就是说，当前能存
           chunk、能按相似度查，但查不到"<b>Alice 工作于 Acme</b
           >"这种带语义的<b>事实三元组</b>，也没有"<b>Alice</b> /
           <b>Alice Smith</b> / <b>A. Smith</b>"合并到同一个 canonical

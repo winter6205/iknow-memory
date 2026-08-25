@@ -21,5 +21,8 @@ docs/archive
 # Nested git worktrees (local checkouts, not product source)
 .claude/worktrees/
 .worktrees/
+# Cloud start writes these; keep husky pre-commit tracked.
+.husky/commit-msg
+.husky/prepare-commit-msg
 # Local study HTML (not iknow-memory SSOT; generated to a personal path)
 .reference/

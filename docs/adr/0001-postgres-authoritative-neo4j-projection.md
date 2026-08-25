@@ -15,6 +15,6 @@ Postgres is the sole system of record for entities / triples / entity_aliases (a
 
 - **Positive**: Single source of truth for writes, transactional, no double-write consistency problem in P0; pgvector's existing infrastructure (HNSW optional, tstzrange, GiST) is reused; build pipeline ships without Neo4j.
 - **Trade-off**: P0 has no native multi-hop retrieval; the P1 cutover requires a full backfill from Postgres into Neo4j plus outbox + read-your-writes solutions (see iknow-memory#7 Q3b/Q3c, P1 fog area).
-- **Rejected alternative (A)**: Neo4j authoritative would inherit gbrain's double-write burden in P0 even though the read path is pure Postgres for now — premature cost without payoff.
+- **Rejected alternative (A)**: Neo4j authoritative would impose a dual-write cost in P0 (entities/triples mirrored into Postgres and Neo4j on every write) even though the read path is pure Postgres for now — premature cost without payoff.
 
 Evidence pointers: winter6205/iknow-memory#3 D1 (2026-08-01 HITL grilling); winter6205/iknow-memory#7 Q1, Q3b (2026-08-02).

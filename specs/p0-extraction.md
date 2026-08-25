@@ -10,7 +10,7 @@ Implement the **offline LLM triple-extraction pipeline** and the **canonical ent
 
 **Who uses it**: the extraction pipeline is invoked by a stand-alone CLI (operator, cron, or host-side automation), never by the MCP server. The MCP server stays `ingest`+`retrieve`-only — context engineering (JIT, cache layout, assembly) belongs to the host, not the server.
 
-**Why now**: gbrain has no LLM triple extraction and no canonical entity merge (alias is a string key). BrainBench +31 P@5 source. P0 is the ROI-tightest path to a real graph layer.
+**Why now**: stage 1 ships only chunk-level vector retrieval; no LLM-driven structured extraction, no canonical entity merge, and no alias-aware graph layer exists yet. Established hybrid RAG benchmarks (e.g. BrainBench) credit canonical entity merge with material P@5 gains. P0 is the ROI-tightest path to a real graph layer.
 
 **What success looks like**:
 

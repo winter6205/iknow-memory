@@ -17,5 +17,14 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
+log "postgres"
+# Installed and configured by cursor-install.sh (in the snapshot); the
+# process does not survive snapshot/boot, so reconcile it here.
+PG_VERSION=16
+if ! pg_isready -h localhost -p 5432 -q; then
+  sudo pg_ctlcluster "$PG_VERSION" main start
+fi
+pg_isready -h localhost -p 5432 -t 30
+
 test -f "$REPO_ROOT/dist/index.js"
 log "ready (MCP is on-demand: node dist/index.js)"

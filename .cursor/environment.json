@@ -1,5 +1,5 @@
 {
-  "install": "bash <(curl -fsSL https://raw.githubusercontent.com/winter6205/dotfiles/main/bootstrap.sh)",
-  "start": "",
+  "install": "bash scripts/cursor-install.sh",
+  "start": "bash scripts/cursor-start.sh",
   "terminals": []
 }

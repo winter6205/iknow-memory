@@ -114,6 +114,7 @@ _Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified)
 - **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for entities, triples, aliases, and (P0) extraction_records; Neo4j is a derived read-only projection. In P0 the server does not connect to Neo4j at all (issue #3 D1; #7 Q1 graph arm reads Postgres JOINs; #7 Q3b projection sync and #7 Q3c read-your-writes graduate to P1). The rationale for keeping Neo4j as a future projection is native graph node traversal (PPR, Louvain, node-level embedding); SQL JOIN and Apache AGE do not meet that constraint. Do not propose writing to Neo4j outside the projection path, or "just use Postgres for everything" without addressing that constraint.
 - **rerank fail-open**: rerank failure returns the fused order unchanged. This is intentional — a dead reranker should not block retrieval. Do not add retry/fallback logic that changes this contract without explicit decision.
 - **context engineering is NOT our job**: JIT retrieval triggers, cache breakpoint planning, prompt assembly, budget allocation — these belong to the host. iknow-memory returns ranked chunks; what the host does with them is the host's problem.
+- **zero external runtime dependency on any reference implementation**: design decisions (RRF k=60, cosine re-score 0.7/0.3, rerank fail-open, PPR) are first-class product choices documented in CONTEXT.md and PRDs; rationale is independent of any particular reference codebase. Any locally tracked upstream reference directory is read-only and not linked at runtime (zero import/link/symlink/dynamic load). We implement from first principles, not by copying.
 
 ## Bootstrap mode
 
@@ -121,4 +122,7 @@ If this file only had template examples and no real project terms, seed via:
 
 1. Read `src/core/types.ts` for storage vocabulary
 2. Read `src/tools/ingest.ts` and `retrieve.ts` for tool contracts
+3. Read `docs/vector-memory-upgrade-archive.html` §1.4 for the historical capability gap survey (now archived; deprecation banner at top of file)
 4. Invoke `arthurpower:domain-modeling` to ratify new terms before adding them here
+
+> 2026-08-25 清理说明：本表术语以 iknow-memory 自身定位和领域通用 IR 概念为唯一依据；所有指向特定外部实现作为"学习对象"的措辞已替换或移除。历史归档文档保留作能力对照，不作为 SSOT。

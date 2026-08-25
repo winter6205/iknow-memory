@@ -107,12 +107,18 @@ src/
 tests/                  # vitest 测试
 docs/
   CONTEXT.md            # 领域词汇表（SSOT）
+  vector-memory-upgrade-archive.html  # 历史路线骨架（已归档；正文内嵌 deprecation 横幅）
 ```
 
 ## 路线
+
+详见 `docs/vector-memory-upgrade-archive.html`（历史路线骨架，保留作能力对照）。
 
 ## 约束
 
 - TS strict ESM · Node ≥20 · Vitest
 - 不依赖 iknow runtime（zero import from iknow `src/`）
+- 不引入任何外部项目源码 / 二进制作运行时依赖；本地若存有上游参考目录，仅作离线对照，禁止 runtime 链接 / import / symlink / 动态加载
 - env 名不写明文（API key 通过 `*_API_KEY_ENV` 间接寻址）
+
+> 2026-08-25 清理说明：本轮去除了以特定外部项目作为"学习对象"的措辞。CLAUDE.md / docs/CONTEXT.md 为唯一 SSOT；历史归档文件保留以备对照。

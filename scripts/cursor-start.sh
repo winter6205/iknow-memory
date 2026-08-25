@@ -10,17 +10,8 @@ cd "$REPO_ROOT"
 
 log() { printf '\n=== cursor-start: %s ===\n' "$*"; }
 
-log "git identity"
-# Repeated per boot: a pod restored from an older snapshot, or booted without
-# the install phase, would otherwise commit as `Cursor Agent`.
-GIT_IDENTITY_NAME='winter6205'
-GIT_IDENTITY_EMAIL='136674824+winter6205@users.noreply.github.com'
-git config --global user.name "$GIT_IDENTITY_NAME"
-git config --global user.email "$GIT_IDENTITY_EMAIL"
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  git config --local user.name "$GIT_IDENTITY_NAME"
-  git config --local user.email "$GIT_IDENTITY_EMAIL"
-fi
+log "git attribution"
+bash "$REPO_ROOT/scripts/cursor-git-attribution.sh"
 
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 if [ -s "$NVM_DIR/nvm.sh" ]; then

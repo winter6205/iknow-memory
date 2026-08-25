@@ -11,6 +11,19 @@ cd "$REPO_ROOT"
 
 log() { printf '\n=== cursor-install: %s ===\n' "$*"; }
 
+log "git identity"
+# Without this the pod keeps its default `Cursor Agent <cursoragent@cursor.com>`
+# and commits are attributed to the bot on the GitHub contributors page.
+GIT_IDENTITY_NAME='winter6205'
+GIT_IDENTITY_EMAIL='136674824+winter6205@users.noreply.github.com'
+git config --global user.name "$GIT_IDENTITY_NAME"
+git config --global user.email "$GIT_IDENTITY_EMAIL"
+# --local only applies inside a work tree; the snapshot build may lack one.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git config --local user.name "$GIT_IDENTITY_NAME"
+  git config --local user.email "$GIT_IDENTITY_EMAIL"
+fi
+
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 if [ -s "$NVM_DIR/nvm.sh" ]; then
   # shellcheck disable=SC1091

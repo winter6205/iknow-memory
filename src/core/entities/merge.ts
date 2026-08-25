@@ -12,6 +12,7 @@
 
 import { cosineSimilarity } from "../cosine.js";
 import type { EmbeddingClient } from "../embedder.js";
+import { GraphragError } from "../errors.js";
 import { createLogger } from "../../logging.js";
 import {
   DEFAULT_MERGE_CONFIG,
@@ -52,6 +53,21 @@ export type MergeOutcome = {
   decision: MergeDecision | "created-new";
 };
 
+/**
+ * Fired when a caller passes `candidateSet: "all"`.
+ *
+ * The `"all" | CandidateEntity[]` shape stays reserved (#6 Q6), but the
+ * blocking-subset loader behind `"all"` is not wired in P0. Treating it as an
+ * empty candidate set would silently answer `created-new` for every call —
+ * a duplicate entity per extraction — so the call is refused instead.
+ */
+export class CandidateSetNotWiredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CandidateSetNotWiredError";
+  }
+}
+
 /** Lowercase + trim + collapse internal whitespace (used by L0). */
 export function normalizeAlias(name: string): string {
   return name.trim().toLowerCase().replace(/\s+/g, " ");
@@ -62,18 +78,23 @@ export function normalizeAlias(name: string): string {
  *
  * The caller owns persistence and UUID generation: when no gate merges, the
  * function returns `{ decision: "created-new" }` and the orchestrator writes
- * a fresh row with a new UUID. `candidateSet` accepts `"all"` (the caller
- * fetches the full entity table) or an explicit array (reserved blocking
- * subset, #6 Q6).
+ * a fresh row with a new UUID. `candidateSet` accepts an explicit array (the
+ * caller fetches the candidates) or `"all"` — the reserved blocking-subset
+ * shape (#6 Q6), which throws `CandidateSetNotWiredError` in P0.
  */
 export async function mergeEntitiesWithGating(
   incoming: IncomingEntity,
   candidateSet: "all" | CandidateEntity[],
   ctx: MergeContext
 ): Promise<MergeOutcome> {
+  if (candidateSet === "all") {
+    throw new CandidateSetNotWiredError(
+      'mergeEntitiesWithGating: candidateSet "all" needs the blocking-subset ' +
+        "loader, which is not wired in P0 — pass an explicit candidate array."
+    );
+  }
   const config = ctx.config ?? DEFAULT_MERGE_CONFIG;
-  const candidates =
-    candidateSet === "all" ? [] : candidateSet.map((c) => ({ ...c }));
+  const candidates = candidateSet.map((c) => ({ ...c }));
   const log = ctx.logGrayZone ?? defaultGrayLog;
 
   const l0 = l0Match(incoming, candidates);
@@ -197,6 +218,10 @@ async function l2DescGate(
  * (default) merges at/above the high threshold and rejects (gray zone) below;
  * band mode also rejects below the low threshold, leaving the middle band as
  * the gray zone. First candidate at/above threshold wins the merge.
+ *
+ * The incoming entity is embedded once for the whole comparison batch and
+ * each candidate contributes its stored `embedding` when it has one, so a
+ * batch costs one embed plus one per candidate that lacks a persisted vector.
  */
 async function l3NameDescGate(
   incoming: IncomingEntity,
@@ -205,13 +230,13 @@ async function l3NameDescGate(
   config: MergeConfig,
   log: GrayLogFn
 ): Promise<GateOutcome | null> {
+  const incomingVector = await embedOne(
+    ctx.embedder,
+    computeEntityEmbeddingText(incoming.canonicalName, incoming.description)
+  );
   let lastReject: GateOutcome | null = null;
   for (const c of candidates) {
-    const observed = await embedCosine(
-      ctx.embedder,
-      computeEntityEmbeddingText(c.canonicalName, c.description),
-      computeEntityEmbeddingText(incoming.canonicalName, incoming.description)
-    );
+    const observed = await l3Cosine(ctx.embedder, c, incomingVector);
     if (observed === null) {
       // T8 boundary-class fix: cannot prove merge → skip candidate.
       log({ level: "L3", reason: EMBED_FAILURE_REASON });
@@ -246,14 +271,77 @@ async function l3NameDescGate(
   return lastReject;
 }
 
+/**
+ * The two failure classes the gates can read as "this cosine is unprovable":
+ * every production embedder failure leg throws `GraphragError`, and
+ * `cosineSimilarity` throws `RangeError` on a dimension mismatch. Anything
+ * else is an unexpected fault, and a skipped candidate would hide it behind a
+ * plausible-looking `created-new`, so it propagates to the caller instead.
+ */
+function isUnprovableEmbed(err: unknown): boolean {
+  return err instanceof GraphragError;
+}
+
+function isDimensionMismatch(err: unknown): boolean {
+  return err instanceof RangeError;
+}
+
+/**
+ * Cosine between one candidate and the already-embedded incoming entity.
+ *
+ * Reuses `candidate.embedding` when the loader supplied one; otherwise embeds
+ * the candidate's `name | description` text. Returns `null` whenever the
+ * cosine cannot be proven — the incoming embed failed, the candidate embed
+ * failed, or a stored vector's dimension disagrees with the live embedder —
+ * so the caller skips that candidate exactly as it does for an embed failure.
+ */
+async function l3Cosine(
+  embedder: Embedder,
+  candidate: CandidateEntity,
+  incomingVector: number[] | null
+): Promise<number | null> {
+  if (incomingVector === null) return null;
+  const candidateVector =
+    candidate.embedding ??
+    (await embedOne(
+      embedder,
+      computeEntityEmbeddingText(candidate.canonicalName, candidate.description)
+    ));
+  if (candidateVector === null) return null;
+  try {
+    return cosineSimilarity(candidateVector, incomingVector);
+  } catch (err) {
+    if (isDimensionMismatch(err)) return null;
+    throw err;
+  }
+}
+
+/**
+ * Embed a single text, or `null` when the embedder reports an embedding
+ * failure or returns nothing. Any other error class propagates.
+ */
+async function embedOne(
+  embedder: Embedder,
+  text: string
+): Promise<number[] | null> {
+  try {
+    const [vector] = await embedder.embed([text]);
+    return vector ?? null;
+  } catch (err) {
+    if (isUnprovableEmbed(err)) return null;
+    throw err;
+  }
+}
+
 /** Gray-zone reason logged when the embedder throws (boundary-class fix). */
 const EMBED_FAILURE_REASON = "embed-failure";
 
 /**
  * Embed two texts and return their cosine similarity, or `null` when the
- * embedder throws.
+ * embedder reports an embedding failure or the two vectors disagree on
+ * dimension.
  *
- * T8 boundary-class fix: a throwing embedder must not abort merge evaluation;
+ * T8 boundary-class fix: a failing embedder must not abort merge evaluation;
  * inability to compute cosine → no merge proof → the gate skips that candidate
  * rather than rejecting/merging on a fabricated value. If every candidate is
  * skipped, the merge loop falls through to `created-new`. The failure is
@@ -267,8 +355,9 @@ async function embedCosine(
   try {
     const [va, vb] = await embedder.embed([a, b]);
     return cosineSimilarity(va, vb);
-  } catch {
-    return null;
+  } catch (err) {
+    if (isUnprovableEmbed(err) || isDimensionMismatch(err)) return null;
+    throw err;
   }
 }
 

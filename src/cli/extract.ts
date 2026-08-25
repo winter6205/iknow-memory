@@ -6,18 +6,27 @@
  * per-chunk transaction (record + entities + triples) → out.
  *
  * Exit-code map (spec's "exit codes 0/1/2" contract):
- *   0 success — incl. `--dry-run`, `--list-unmapped`, and mark-and-continue
- *     batches where SOME chunks failed extraction (Success Criterion #6).
+ *   0 success — incl. `--dry-run`, `--list-unmapped`, `--list-failed`,
+ *     `--backfill-embeddings`, and mark-and-continue batches where SOME
+ *     chunks failed extraction (Success Criterion #6).
  *   1 config / fatal — bad DB URL, Postgres unreachable, ConfigError.
- *   2 usage error (unknown/malformed flag) OR a write-partial-failure (a
- *     chunk's transaction rolled back — distinct from the expected per-chunk
- *     extraction failures mark-and-continue absorbs).
+ *   2 usage error (unknown / malformed / mutually exclusive flags) OR a
+ *     write-partial-failure (a chunk's transaction rolled back — distinct
+ *     from the expected per-chunk extraction failures mark-and-continue
+ *     absorbs).
  *
  * LLM client: `AnthropicLLMClient` when GRAPHRAG_MEMORY_ANTHROPIC_API_KEY is
- * set. With the key unset, `FakeLLMClient` (canned ok) is only used by
- * `--dry-run` and `--list-unmapped` (CI / keyless); a *real* extraction with
- * no key throws ConfigError (exit 1) instead of silently writing canned
- * triples (CR High #1).
+ * set. With the key unset, `FakeLLMClient` (canned ok) is only used by the
+ * non-extraction flags `--dry-run`, `--list-unmapped`, `--list-failed` and
+ * `--backfill-embeddings`; a *real* extraction with no key throws ConfigError
+ * (exit 1) instead of silently writing canned triples (CR High #1).
+ *
+ * Embedder: the same guard on the embedding half. `FakeEmbedder` is legal
+ * only for the read-only flags (`--dry-run`, `--list-unmapped`,
+ * `--list-failed`) and for injected `CliDeps`; a path that PERSISTS a vector
+ * (real extraction, `--backfill-embeddings`) with no embedding credentials
+ * throws ConfigError (exit 1) rather than storing fake vectors a real
+ * embedder can never be compared against (CR High #3).
  */
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
@@ -34,7 +43,14 @@ import {
 } from "../core/extraction/llm-client.js";
 import { upsertTriple } from "../core/extraction/dedup.js";
 import {
+  normalizeRelation,
+  DEFAULT_THRESHOLD,
+  UNMAPPED,
+} from "../core/extraction/normalize.js";
+import { ALLOWED } from "../core/extraction/vocabulary.js";
+import {
   insertRecord,
+  listFailed,
   markSucceeded,
   markFailed,
   newRecordId,
@@ -45,6 +61,8 @@ import {
   type CandidateEntity,
   type IncomingEntity,
 } from "../core/entities/merge.js";
+import { computeEntityEmbeddingText } from "../core/entities/embedding.js";
+import { GraphragError } from "../core/errors.js";
 import {
   FakeEmbedder,
   NineRouterEmbedder,
@@ -58,6 +76,11 @@ export interface CliFlags {
   since: string | null;
   onlyFailed: boolean;
   listUnmapped: boolean;
+  listFailed: boolean;
+  /** `--list-failed` batch filter; null means "every batch". */
+  batchId: string | null;
+  /** A9 repair mode; never set by a normal extraction run. */
+  backfillEmbeddings: boolean;
 }
 
 const DEFAULT_FLAGS: CliFlags = {
@@ -66,9 +89,15 @@ const DEFAULT_FLAGS: CliFlags = {
   since: null,
   onlyFailed: false,
   listUnmapped: false,
+  listFailed: false,
+  batchId: null,
+  backfillEmbeddings: false,
 };
 
-const USAGE = `usage: extract [--batch-size N] [--dry-run] [--since ISO8601] [--only-failed] [--list-unmapped]`;
+const USAGE = `usage: extract [--batch-size N] [--dry-run] [--since ISO8601] [--only-failed] [--list-unmapped] [--list-failed [--batch-id UUID]] [--backfill-embeddings]`;
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Minimal client surface accepted by both pg.PoolClient and test fakes. */
 export interface CliClient {
@@ -106,7 +135,18 @@ export function parseArgs(argv: string[]): ParsedArgs {
     if (arg === "--dry-run") flags.dryRun = true;
     else if (arg === "--only-failed") flags.onlyFailed = true;
     else if (arg === "--list-unmapped") flags.listUnmapped = true;
-    else if (arg === "--batch-size") {
+    else if (arg === "--list-failed") flags.listFailed = true;
+    else if (arg === "--backfill-embeddings") flags.backfillEmbeddings = true;
+    else if (arg === "--batch-id") {
+      // Validated here so a malformed value is a usage error (exit 2) rather
+      // than a Postgres `invalid input syntax for type uuid` fatal (exit 1).
+      const raw = argv[i + 1];
+      if (raw === undefined || !UUID_RE.test(raw)) {
+        return { ok: false, error: `--batch-id requires a UUID` };
+      }
+      flags.batchId = raw;
+      i += 1;
+    } else if (arg === "--batch-size") {
       const n = Number(argv[i + 1]);
       if (!Number.isInteger(n) || n <= 0) {
         return { ok: false, error: `--batch-size requires a positive integer` };
@@ -125,7 +165,40 @@ export function parseArgs(argv: string[]): ParsedArgs {
     }
     i += 1;
   }
+  const conflict = flagConflict(flags);
+  if (conflict) return { ok: false, error: conflict };
   return { ok: true, flags };
+}
+
+/**
+ * The flag combinations `runCli`'s routing cannot honour, named as usage
+ * errors (exit 2) instead of silently resolved by routing order.
+ *
+ * `runCli` picks ONE mode per run in a fixed if-chain, so a second mode flag
+ * is not "also applied", it is dropped. `--dry-run --backfill-embeddings` was
+ * the load-bearing case: backfill is routed before the dry-run branch, so the
+ * pair ran the repair mode's UPDATEs under a flag whose whole contract is
+ * "writes nothing".
+ */
+function flagConflict(flags: CliFlags): string | null {
+  const modes: Array<[string, boolean]> = [
+    ["--list-unmapped", flags.listUnmapped],
+    ["--list-failed", flags.listFailed],
+    ["--backfill-embeddings", flags.backfillEmbeddings],
+  ];
+  const selected = modes.filter(([, on]) => on).map(([name]) => name);
+  if (selected.length > 1) {
+    return `${selected[0]} and ${selected[1]} are mutually exclusive`;
+  }
+  if (flags.dryRun && flags.backfillEmbeddings) {
+    return `--dry-run and --backfill-embeddings are mutually exclusive`;
+  }
+  // `--batch-id` only filters the `--list-failed` report; accepting it on any
+  // other path would silently ignore it instead of naming the mistake.
+  if (flags.batchId !== null && !flags.listFailed) {
+    return `--batch-id is only valid with --list-failed`;
+  }
+  return null;
 }
 
 /** Top-level entry, testable: parse flags, route, map results to exit codes. */
@@ -137,6 +210,12 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   }
   try {
     if (parsed.flags.listUnmapped) return await listUnmapped(deps);
+    if (parsed.flags.listFailed) {
+      return await listFailedReport(deps, parsed.flags);
+    }
+    if (parsed.flags.backfillEmbeddings) {
+      return await backfillEmbeddings(deps);
+    }
     return await runPipeline(deps, parsed.flags);
   } catch (err) {
     reportFatal(deps.logger, err);
@@ -223,6 +302,109 @@ async function listUnmapped(deps: CliDeps): Promise<number> {
   } finally {
     client.release();
   }
+}
+
+/**
+ * `--list-failed` (A15): report failed `extraction_records` rows, no LLM,
+ * no extraction, no writes. `--batch-id` narrows the report to one batch.
+ *
+ * `listFailed()` returns its rows `created_at`-ascending; A15 asks for
+ * newest-first and `records.ts` is not this flag's surface, so the ordering
+ * flip is applied here on the already-bounded failed-row set.
+ */
+async function listFailedReport(
+  deps: CliDeps,
+  flags: CliFlags
+): Promise<number> {
+  const client = await deps.pool.connect();
+  try {
+    await upSchemaP0(client as unknown as PoolClient, deps.dims);
+    const rows = await listFailed(
+      client,
+      flags.batchId ? { batchId: flags.batchId } : {}
+    );
+    if (rows.length === 0) {
+      deps.logger.info("no-failed-records", { batchId: flags.batchId });
+      return 0;
+    }
+    for (const r of [...rows].reverse()) {
+      deps.logger.info("failed-record", {
+        chunk_id: r.chunk_id ?? null,
+        batch_id: r.batch_id ?? null,
+        error_code: r.error_code ?? null,
+        error_msg: r.error_msg ?? null,
+        created_at: r.created_at ?? null,
+      });
+    }
+    return 0;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * `--backfill-embeddings` (A9): the idempotent NULL-embedding repair mode.
+ * Every live entity whose `embedding` is NULL is embedded from its stored
+ * `metadata.description` (empty string when the key is absent) through the
+ * same `computeEntityEmbeddingText` SSOT the insert path uses, then UPDATEd.
+ *
+ * Its own flag, never a step of a normal extraction run: no chunk scan, no
+ * LLM call, no extraction record — the UPDATE below is the only write.
+ *
+ * Idempotency is observable in the run output: an immediate second run scans
+ * 0 rows and reports `backfilled: 0`. Each row is its own auto-committed
+ * UPDATE instead of one batch transaction, so an interrupted repair keeps
+ * the rows it already filled and a re-run picks up the remainder.
+ */
+async function backfillEmbeddings(deps: CliDeps): Promise<number> {
+  const client = await deps.pool.connect();
+  try {
+    await upSchemaP0(client as unknown as PoolClient, deps.dims);
+    const { rows } = await client.query(
+      `SELECT id, canonical_name,
+              coalesce(metadata->>'description', '') AS description
+         FROM entities
+        WHERE retired = false AND embedding IS NULL
+        ORDER BY created_at`,
+      []
+    );
+    let backfilled = 0;
+    for (const row of rows) {
+      backfilled += await backfillOne(deps, client, row);
+    }
+    deps.logger.info("backfill-embeddings-complete", {
+      scanned: rows.length,
+      backfilled,
+    });
+    return 0;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Embed and UPDATE one scanned row; returns how many rows the UPDATE actually
+ * changed, which is what the run reports. The `embedding IS NULL` guard is
+ * repeated in the WHERE clause so a vector some other writer stored between
+ * the scan and this UPDATE survives (A8 first-write-wins) and is counted as
+ * not backfilled rather than silently overwritten.
+ */
+async function backfillOne(
+  deps: CliDeps,
+  client: CliClient,
+  row: { id: string; canonical_name: string; description: string | null }
+): Promise<number> {
+  const embedding = await embedEntity(deps, {
+    canonicalName: row.canonical_name,
+    description: row.description ?? "",
+  });
+  const { rows } = await client.query(
+    `UPDATE entities SET embedding = $2::vector
+      WHERE id = $1 AND embedding IS NULL
+      RETURNING id`,
+    [row.id, toVectorLiteral(embedding)]
+  );
+  return rows.length;
 }
 
 /** Dry-run: simulate extraction, print what would happen, write no rows. */
@@ -350,46 +532,132 @@ async function persistOutputs(
   let triples = 0;
   let unmapped = 0;
   for (const out of outputs) {
-    // Normalize LLM types to the closed P0 set up front (CR High #2) so the
-    // merge gates and the persisted row agree on the same type value.
-    const headType = normalizeEntityType(out.headType);
-    const tailType = normalizeEntityType(out.tailType);
-    const headId = await resolveEntity(deps, client, {
-      canonicalName: out.head,
-      type: headType,
-      description: out.description,
-    });
-    const tailId = await resolveEntity(deps, client, {
-      canonicalName: out.tail,
-      type: tailType,
-      description: out.description,
-    });
+    const { headId, tailId } = await resolveEndpoints(deps, client, out);
+    if (headId === tailId) {
+      logSelfLoopRejection(deps, chunkId, out, headId);
+      continue;
+    }
+    const relationNorm = await vetRelationNorm(deps, out);
     await upsertTriple(client, {
       headId,
       tailId,
       relationRaw: out.relationRaw,
-      relationNorm: out.relationNorm,
+      relationNorm,
       confidence: out.confidence,
       sourceChunkId: chunkId,
       validWindow: { start: startedAt, end: null },
     });
     triples += 1;
-    if (out.relationNorm === "UNMAPPED") unmapped += 1;
+    if (relationNorm === UNMAPPED) unmapped += 1;
   }
   return { triples, unmapped };
+}
+
+/**
+ * Resolve the two ends of one output.
+ *
+ * SC6 invariant: the head and the tail of a single output are mutually
+ * exclusive merge candidates. The extraction schema gives one output ONE
+ * `description`, which both ends are resolved with, so leaving the head in
+ * the tail's candidate set lets the L3 name+description cosine fold the tail
+ * into the head — the triple then asserts a relation from an entity to
+ * itself. Excluding the resolved `headId` from the tail's candidate array
+ * removes that path before the gates run, without touching
+ * `mergeEntitiesWithGating`'s locked signature (G7).
+ */
+async function resolveEndpoints(
+  deps: CliDeps,
+  client: CliClient,
+  out: ExtractionOutput
+): Promise<{ headId: string; tailId: string }> {
+  // Normalize LLM types to the closed P0 set up front (CR High #2) so the
+  // merge gates and the persisted row agree on the same type value.
+  const headId = await resolveEntity(deps, client, {
+    canonicalName: out.head,
+    type: normalizeEntityType(out.headType),
+    description: out.description,
+  });
+  const tailId = await resolveEntity(
+    deps,
+    client,
+    {
+      canonicalName: out.tail,
+      type: normalizeEntityType(out.tailType),
+      description: out.description,
+    },
+    { excludeIds: [headId] }
+  );
+  return { headId, tailId };
+}
+
+/**
+ * Backstop for the SC6 exclusion above: a triple whose two ends resolved to
+ * the same entity asserts nothing, so it is rejected. Only THAT triple is
+ * skipped — the chunk's remaining outputs and the rest of the batch continue,
+ * same mark-and-continue posture the merge gates take on a gray-zone reject.
+ */
+function logSelfLoopRejection(
+  deps: CliDeps,
+  chunkId: string,
+  out: ExtractionOutput,
+  entityId: string
+): void {
+  deps.logger.warn("triple-self-loop-rejected", {
+    chunkId,
+    entityId,
+    head: out.head,
+    tail: out.tail,
+    relationRaw: out.relationRaw,
+    reason: "head-equals-tail",
+  });
+}
+
+/**
+ * A10 trust policy for the LLM's claimed `relationNorm`.
+ *
+ * The claim is accepted iff it is a case-insensitive member of `ALLOWED`, and
+ * the canonical `ALLOWED` spelling is what gets persisted — `relation_norm` is
+ * the traversal key of the dedup triple `(head_id, relation_norm, tail_id)`,
+ * so one relation must have exactly one spelling. Any other claim is discarded
+ * and re-derived from `relation_raw` through the #4 D5 cascade, whose miss leg
+ * is the legal `UNMAPPED` sentinel — never a silent coerce onto a neighbouring
+ * term. `relation_raw` itself is stored exactly as received (#3 D3 audit
+ * fidelity), which is what `--list-unmapped` groups on.
+ */
+async function vetRelationNorm(
+  deps: CliDeps,
+  out: ExtractionOutput
+): Promise<string> {
+  const claimed = out.relationNorm.trim().toLowerCase();
+  const accepted = ALLOWED.find((term) => term === claimed);
+  if (accepted !== undefined) return accepted;
+  return normalizeRelation(out.relationRaw, {
+    embedder: deps.embedder,
+    threshold: DEFAULT_THRESHOLD,
+  });
 }
 
 /**
  * Resolve the incoming entity via the merge gates, then persist. Merge →
  * reuse the survivor id; created-new / reject → insert a fresh row (the
  * gray-zone log already recorded the rejection via the merge default sink).
+ *
+ * A8 first-write-wins: a merge leaves the survivor's embedding, description
+ * and canonical name alone. The only write a merge makes is the A11 alias row
+ * recording the surface form the survivor was reached by.
+ *
+ * `excludeIds` drops candidates the caller has already ruled out — the SC6
+ * head/tail exclusion. The filter is applied to the loaded `CandidateEntity[]`
+ * before the gates see it, so the merge module keeps its locked signature.
  */
 async function resolveEntity(
   deps: CliDeps,
   client: CliClient,
-  incoming: IncomingEntity
+  incoming: IncomingEntity,
+  opts: { excludeIds?: string[] } = {}
 ): Promise<string> {
-  const live = await loadEntities(client);
+  const excluded = new Set(opts.excludeIds ?? []);
+  const live = (await loadEntities(client)).filter((c) => !excluded.has(c.id));
   const { canonicalId, decision } = await mergeEntitiesWithGating(
     incoming,
     live,
@@ -398,31 +666,75 @@ async function resolveEntity(
     }
   );
   if (decision !== "created-new" && decision.kind === "merge") {
+    const survivor = live.find((c) => c.id === canonicalId);
+    if (survivor && survivor.canonicalName !== incoming.canonicalName) {
+      await insertAlias(client, canonicalId, incoming.canonicalName, "variant");
+    }
     return canonicalId;
   }
   const id = randomUUID();
-  await insertEntity(client, id, incoming);
+  await insertEntity(client, id, incoming, await embedEntity(deps, incoming));
+  await insertAlias(client, id, incoming.canonicalName, "name");
   return id;
 }
 
-/** Load live entities as merge candidates. DB stores no description column. */
-async function loadEntities(client: Queryable): Promise<CandidateEntity[]> {
+/**
+ * Load live entities as merge candidates, carrying the stored embedding and
+ * the `metadata.description` value (A7/A13) so the L2/L3 gates see production
+ * data instead of empty strings.
+ */
+export async function loadEntities(
+  client: Queryable
+): Promise<CandidateEntity[]> {
   const { rows } = await client.query(
-    `SELECT id, canonical_name, type FROM entities WHERE retired = false`,
+    `SELECT id, canonical_name, type, embedding::text AS embedding,
+            coalesce(metadata->>'description', '') AS description
+       FROM entities WHERE retired = false`,
     []
   );
-  return rows.map((r) => ({
-    id: r.id as string,
-    canonicalName: r.canonical_name as string,
-    type: r.type as string,
-    description: "",
-  }));
+  return rows.map((r) => {
+    const embedding = parseVectorLiteral(r.embedding);
+    return {
+      id: r.id as string,
+      canonicalName: r.canonical_name as string,
+      type: r.type as string,
+      description: (r.description as string | null) ?? "",
+      ...(embedding ? { embedding } : {}),
+    };
+  });
+}
+
+/**
+ * #6 Q1 SSOT: the entity vector is embedded from
+ * `canonical_name + " | " + description` via `computeEntityEmbeddingText`,
+ * with the same embedder and dimension as chunks. Computed once, at insert —
+ * or, for a row that predates that write path, once at `--backfill-embeddings`
+ * time, which is why this takes the name/description pair rather than a whole
+ * `IncomingEntity`.
+ */
+async function embedEntity(
+  deps: CliDeps,
+  incoming: { canonicalName: string; description: string }
+): Promise<number[]> {
+  const text = computeEntityEmbeddingText(
+    incoming.canonicalName,
+    incoming.description
+  );
+  const [vector] = await deps.embedder.embed([text]);
+  if (!vector) {
+    throw new GraphragError(
+      `embedder returned no vector for entity "${incoming.canonicalName}"`,
+      "EMBEDDING_FAILED"
+    );
+  }
+  return vector;
 }
 
 async function insertEntity(
   client: Queryable,
   id: string,
-  incoming: IncomingEntity
+  incoming: IncomingEntity,
+  embedding: number[]
 ): Promise<void> {
   // CR High #2: the DDL pins entities.type to a closed 4-value CHECK set
   // (person/concept/system/event). The LLM emits an open-string type, so we
@@ -430,11 +742,52 @@ async function insertEntity(
   // the whole chunk transaction (write-failure → exit 2) on any non-listed
   // raw type (e.g. "Organization", "Location").
   const type = normalizeEntityType(incoming.type);
+  // A7: description rides in the existing metadata JSONB — the spec-1 DDL is
+  // frozen, so there is no description column to write.
   await client.query(
-    `INSERT INTO entities (id, canonical_name, type, metadata, retired)
-     VALUES ($1, $2, $3, '{}', false)`,
-    [id, incoming.canonicalName, type]
+    `INSERT INTO entities (id, canonical_name, type, embedding, metadata, retired)
+     VALUES ($1, $2, $3, $4::vector, $5::jsonb, false)`,
+    [
+      id,
+      incoming.canonicalName,
+      type,
+      toVectorLiteral(embedding),
+      JSON.stringify({ description: incoming.description }),
+    ]
   );
+}
+
+/**
+ * Write one surface form into `entity_aliases` (A11). The UNIQUE
+ * `(entity_id, alias)` index makes a repeat a silent no-op instead of an
+ * error that would roll back the whole chunk transaction.
+ */
+async function insertAlias(
+  client: Queryable,
+  entityId: string,
+  alias: string,
+  aliasType: "name" | "variant"
+): Promise<void> {
+  await client.query(
+    `INSERT INTO entity_aliases (id, entity_id, alias, alias_type)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (entity_id, alias) DO NOTHING`,
+    [randomUUID(), entityId, alias, aliasType]
+  );
+}
+
+/** Serialized pgvector literal: `[0.1,0.2,...]`; the SQL casts it `::vector`. */
+function toVectorLiteral(embedding: number[]): string {
+  return `[${embedding.join(",")}]`;
+}
+
+/** Inverse of `toVectorLiteral`; a NULL or unparseable column yields undefined. */
+function parseVectorLiteral(raw: unknown): number[] | undefined {
+  if (typeof raw !== "string") return undefined;
+  const inner = raw.trim().replace(/^\[/, "").replace(/\]$/, "");
+  if (inner.length === 0) return undefined;
+  const values = inner.split(",").map(Number);
+  return values.some(Number.isNaN) ? undefined : values;
 }
 
 const CANNED_OUTPUT = {
@@ -451,21 +804,31 @@ const CANNED_OUTPUT = {
 
 /**
  * Build the LLM client from env. Real `AnthropicLLMClient` when a key is set;
- * keyless operation is only allowed on non-extraction paths (`--dry-run` and
- * `--list-unmapped`), where a scripted fake gives deterministic output. A real
- * extraction with no key would silently INSERT canned triples into Postgres,
- * so that path throws ConfigError instead (CR High #1) rather than
- * auto-falling back to the fake.
+ * a missing key is tolerated on every non-extraction path (`--dry-run`,
+ * `--list-unmapped`, `--list-failed` and the `--backfill-embeddings` repair
+ * mode), where a scripted fake gives deterministic output. A real extraction
+ * with no key would silently INSERT canned triples into Postgres, so that
+ * path throws ConfigError instead (CR High #1) rather than auto-falling back
+ * to the fake.
+ *
+ * The refusal message names only the read-only flags: `--backfill-embeddings`
+ * needs no LLM key but does need embedding credentials (`buildEmbedder`
+ * below), so it is not a keyless run.
  */
 function buildLlm({ flags }: { flags: CliFlags }): LLMClient {
   const apiKey = process.env.GRAPHRAG_MEMORY_ANTHROPIC_API_KEY?.trim();
   if (!apiKey) {
-    if (!(flags.dryRun || flags.listUnmapped)) {
+    if (!(
+      flags.dryRun ||
+      flags.listUnmapped ||
+      flags.listFailed ||
+      flags.backfillEmbeddings
+    )) {
       throw new ConfigError(
-        "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY; pass --dry-run or --list-unmapped for keyless operation"
+        "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY; pass --dry-run, --list-unmapped or --list-failed for keyless operation"
       );
     }
-    // No key + dry-run/list-unmapped → scripted fake; canned ok so dry-run
+    // No key + a non-extraction path → scripted fake; canned ok so dry-run
     // has deterministic output. The fake never reaches the real write path.
     return new FakeLLMClient({
       scripted: async () => ({ kind: "ok", outputs: [CANNED_OUTPUT] }),
@@ -481,8 +844,30 @@ function buildLlm({ flags }: { flags: CliFlags }): LLMClient {
   return new AnthropicLLMClient({ apiKey, baseUrl, model });
 }
 
-/** Build the embedder from env (mirrors src/index.ts buildDeps). */
-function buildEmbedder(env: GraphragEnv): EmbeddingClient {
+/**
+ * Build the embedder from env — the `buildLlm` key guard above, mirrored for
+ * the embedding half.
+ *
+ * A WRITE embedding path (a real extraction, or the `--backfill-embeddings`
+ * repair mode) persists vectors into `entities.embedding`. Falling back to
+ * `FakeEmbedder` there stores derived-hash vectors that share no space with a
+ * real embedder's, and nothing downstream can tell them apart from genuine
+ * ones — the graph arm's seed similarity is then permanently poisoned, and
+ * `--backfill-embeddings` will not repair it because those rows are no longer
+ * NULL. So missing credentials are a ConfigError (exit 1), never a silent
+ * downgrade.
+ *
+ * `FakeEmbedder` stays legal for the read-only flags (`--dry-run`,
+ * `--list-unmapped`, `--list-failed`), which persist no vector, and for tests
+ * that inject their own `CliDeps` instead of going through env.
+ */
+function buildEmbedder({
+  env,
+  flags,
+}: {
+  env: GraphragEnv;
+  flags: CliFlags;
+}): EmbeddingClient {
   if (env.embedApiKey && env.embedBaseUrl && env.embedModel) {
     return new NineRouterEmbedder({
       baseUrl: env.embedBaseUrl,
@@ -491,7 +876,22 @@ function buildEmbedder(env: GraphragEnv): EmbeddingClient {
       dimensions: env.embedDimensions,
     });
   }
+  if (persistsEmbeddings(flags)) {
+    throw new ConfigError(
+      "refusing to persist embeddings without embedding credentials; " +
+        "GRAPHRAG_MEMORY_EMBED_API_KEY (or GRAPHRAG_MEMORY_EMBED_API_KEY_ENV), " +
+        "GRAPHRAG_MEMORY_EMBED_BASE_URL and GRAPHRAG_MEMORY_EMBED_MODEL are " +
+        "required for a real extraction and for --backfill-embeddings; pass " +
+        "--dry-run, --list-unmapped or --list-failed for keyless operation"
+    );
+  }
   return new FakeEmbedder(env.embedDimensions);
+}
+
+/** True when the invocation writes a vector into `entities.embedding`. */
+function persistsEmbeddings(flags: CliFlags): boolean {
+  if (flags.backfillEmbeddings) return true;
+  return !(flags.dryRun || flags.listUnmapped || flags.listFailed);
 }
 
 /** Wire real deps from env and run; used by main(). */
@@ -522,7 +922,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     const deps: CliDeps = {
       pool,
       llm: buildLlm({ flags: parsed.flags }),
-      embedder: buildEmbedder(env),
+      embedder: buildEmbedder({ env, flags: parsed.flags }),
       dims: env.embedDimensions,
       logger: createLogger(env.logLevel),
     };

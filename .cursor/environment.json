@@ -1,0 +1,5 @@
+{
+  "install": "bash <(curl -fsSL https://raw.githubusercontent.com/winter6205/dotfiles/main/bootstrap.sh)",
+  "start": "",
+  "terminals": []
+}

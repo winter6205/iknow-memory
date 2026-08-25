@@ -1,14 +1,14 @@
 /**
  * Graph-arm pure orchestration (spec-3 p0-integration T3).
  *
- * Runs the graph retrieval pipeline: embed the query → top-K seed entities →
- * one-hop triples → chunks. Honors `entityLinkTopK` / `candidateCap` and the
+ * Runs the graph retrieval pipeline: top-K seed entities → one-hop triples →
+ * chunks. The query embedding is supplied by the T5 orchestrator, which
+ * embeds once for both arms (G5 lever (a), spec p0-wiring-closure A12) — the
+ * arm never embeds. Honors `entityLinkTopK` / `candidateCap` and the
  * `graphArmFloor` under-floor gate. Fail-open by design: any storage error
  * degrades to `belowFloor=true` with a `failureReason`, never a throw; the
  * T5 orchestrator decides whether the whole retrieve call degrades.
  */
-import { RetrievalArmError } from "./types.js";
-import type { EmbeddingClient } from "../embedder.js";
 import type {
   ArmHit,
   ArmResult,
@@ -18,25 +18,23 @@ import type {
 
 /** Runtime deps injected by the retrieve orchestrator (T5). */
 export interface GraphArmDeps {
-  embedder: EmbeddingClient;
   storage: GraphArmStorage;
   config: RetrieveConfig;
 }
 
 /**
- * Run the graph arm for a query. Returns an `ArmResult`; throws only on
- * fatal embed failure wrapped as `RetrievalArmError`. Storage failures are
- * swallowed into a degraded `ArmResult` per the fail-open contract.
+ * Run the graph arm for an already-embedded query. Returns an `ArmResult`;
+ * storage failures are swallowed into a degraded `ArmResult` per the
+ * fail-open contract.
  */
 export async function runGraphArm(
-  query: string,
+  queryEmbedding: number[],
   deps: GraphArmDeps,
   now: Date
 ): Promise<ArmResult> {
-  const embedding = await embedQuery(deps, query);
   let seeds: Array<{ id: string; canonical_name: string }>;
   try {
-    seeds = await getSeedEntities(deps, embedding);
+    seeds = await getSeedEntities(deps, queryEmbedding);
   } catch (err) {
     return armResultWithError(err);
   }
@@ -70,33 +68,6 @@ export async function runGraphArm(
     };
   }
   return { arm: "graph", hits: mapChunksToHits(rows), belowFloor: false };
-}
-
-/**
- * Embed the query into a single vector. Embed failures are fatal (no
- * fallback) and are wrapped as `RetrievalArmError` for the T5 orchestrator.
- */
-async function embedQuery(
-  deps: GraphArmDeps,
-  query: string
-): Promise<number[]> {
-  try {
-    const vectors = await deps.embedder.embed([query]);
-    const vec = vectors[0];
-    if (!vec) {
-      throw new RetrievalArmError(
-        "graph-arm embed returned no vector",
-        "graph"
-      );
-    }
-    return vec;
-  } catch (err) {
-    if (err instanceof RetrievalArmError) throw err;
-    throw new RetrievalArmError(
-      `graph-arm embed failed: ${(err as Error).message}`,
-      "graph"
-    );
-  }
 }
 
 /** Top-K seed entities by embedding similarity (soft-merge survivors). */

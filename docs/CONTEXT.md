@@ -22,16 +22,16 @@ _Avoid_: "client" (too generic); "consumer" (implies passive reading, hosts acti
 **chunk**: a fixed-window text slice produced by the chunker during ingest. Identified by UUID, carries `embedding`, `source_ref`, `metadata`, `valid_from`, `valid_until`, `created_at`. The atomic unit of vector storage and retrieval in stage 1.
 _Avoid_: "document" (a chunk is a slice, not a whole document); "passage" (implies semantic completeness); "segment" (ambiguous with context segments)
 
-**entity**: a canonical real-world referent extracted from chunks (person, concept, system, event). Identified by UUID, carries `canonical_name`, `type`, `embedding`, `metadata`. Multiple surface forms (aliases) resolve to one entity. _Stage: P0 (not yet implemented)._
+**entity**: a canonical real-world referent extracted from chunks (person, concept, system, event). Identified by UUID, carries `canonical_name`, `type`, `embedding`, `metadata`. Multiple surface forms (aliases) resolve to one entity. _Stage: P0 (implemented)._
 _Avoid_: "node" (graph-generic, use only when discussing Neo4j topology); "concept" (one entity type, not the general term); "mention" (a mention is an occurrence, not the canonical entity)
 
-**triple**: a directed typed edge `(head_entity, relation, tail_entity)` extracted from a chunk. Carries `confidence`, `source_chunk_id`, `valid_window`, `created_at`. The atomic unit of graph knowledge. _Stage: P0 (not yet implemented)._
+**triple**: a directed typed edge `(head_entity, relation, tail_entity)` extracted from a chunk. Carries `confidence`, `source_chunk_id`, `valid_window`, `created_at`. The atomic unit of graph knowledge. _Stage: P0 (implemented)._
 _Avoid_: "fact" (too ambiguous in retrieval context; use "graph fact" / "temporal fact" if needed); "edge" (graph-generic, use only in Neo4j context); "link" (rule-based linkers do not produce typed edges)
 
-**alias**: a surface-form string that resolves to a canonical entity (name variant, abbreviation, spelling). Stored in `entity_aliases` with `entity_id` foreign key. _Stage: P0 (not yet implemented)._
+**alias**: a surface-form string that resolves to a canonical entity (name variant, abbreviation, spelling). Stored in `entity_aliases` with `entity_id` foreign key. _Stage: P0 (implemented)._
 _Avoid_: "synonym" (implies bidirectional equivalence); "variant" (one alias type, not the general term)
 
-**canonical entity**: the merged, deduplicated entity that multiple aliases and mentions resolve to. P0 merging uses rule + embedding hybrid with hierarchical gating (zero LLM in P0; an LLM judge interface is reserved but not implemented — issue #6 Q3). The merge is the P0 "canonical entity resolution" deliverable. _Stage: P0 (not yet implemented)._
+**canonical entity**: the merged, deduplicated entity that multiple aliases and mentions resolve to. P0 merging uses rule + embedding hybrid with hierarchical gating (zero LLM in P0; an LLM judge interface is reserved but not implemented — issue #6 Q3). The merge is the P0 "canonical entity resolution" deliverable. _Stage: P0 (implemented)._
 _Avoid_: "master entity" (implies hierarchy); "root entity" (implies tree structure)
 
 ### Retrieval
@@ -44,6 +44,18 @@ _Avoid_: "keyword search" (BM25 is ranked, not boolean); "lexical search" (accep
 
 **hybrid retrieval**: multi-arm recall (vector + BM25 + graph traversal) fused by Reciprocal Rank Fusion (RRF, k=60) with weighted arms (vector 0.8, BM25 0.2), followed by cosine re-score blend (0.7 normRRF + 0.3 cosine). _Stage: P1._
 _Avoid_: "fusion search" (ambiguous); "multi-signal search" (too vague)
+
+**graph arm**: the read-side recall path that converts the query embedding into a seed set of entities, follows one-hop triples filtered by `valid_window @> valid_at`, and joins back to chunks via `source_chunk_id` — a read-only Postgres JOIN, no writes. Best-effort and fail-open: an arm failure or a floor miss sets `degraded=true` instead of erroring. _Stage: P0 (implemented; fires on the production path — stored entities carry embeddings per `specs/p0-wiring-closure.md`)._
+_Avoid_: "graph search" (too broad); "graph traversal" (multi-hop/PPR is P1; the arm is one-hop); "knowledge-graph retrieval" (grandiose)
+
+**RRF fusion (k=60)**: Reciprocal Rank Fusion with constant k=60 combining the vector and graph arms at weight 1:1 (`wVec = wGraph = 1`) in P0; rank-based by design — no cross-arm score calibration (MinMax / z-score / sigmoid). P1 hybrid retrieval extends the arm set, not the algorithm. _Stage: P0._
+_Avoid_: "score fusion" (RRF is rank-based, not score-based); "ensemble" (ML model terminology); "merging results" (ambiguous with entity merge)
+
+**degraded=true**: the additive-optional envelope flag on the `retrieve` JSON payload, set when the graph arm yields fewer than `graphArmFloor` chunks (default 3) or throws; the vector arm's chunks are still returned. Absent on the vector-only path — the stage-1 shape `{ chunks: [...] }` stays exact. _Stage: P0._
+_Avoid_: "error flag" (a degraded response is a valid response, not an error); "fallback flag" (the vector arm always runs; it is not a fallback)
+
+**RetrieveConfig**: the frozen-on-read retrieval config object `{wVec, wGraph, entityLinkTopK, candidateCap, graphArmFloor}` (defaults 1 / 1 / 8 / 50 / 3), loaded via the existing `GraphragEnv` loader and validated at startup (`ConfigError` on invalid values). Changing defaults post-Bootstrap is Ask-first. _Stage: P0._
+_Avoid_: "retrieval settings" (vague); "tuning knobs" (colloquial); "mode bundle" (P1 preset concept, distinct)
 
 **rerank**: a post-fusion reordering step that promotes authoritative/fresh/relevant chunks. Options to evaluate: cross-encoder (e.g. zerank-class models), LLM rerank, or feature-based heuristics. iknow-memory: TBD (feature-based prototype validated, real cross-encoder or LLM rerank pending). Fail-open: rerank failure returns fused order unchanged.
 _Avoid_: "re-sort" (implies trivial ordering); "refinement" (too vague)
@@ -84,8 +96,34 @@ _Avoid_: "index" (implies search-index building, not knowledge extraction); "imp
 **retrieve**: the read pipeline: embed query → vector search with valid_window filter → return ranked chunks. Exposed as MCP tool `retrieve(input: {query, valid_at?, filters?, limit?}) → {chunks[]}`. Stage 1: vector-only. P1 adds: BM25 arm + graph traversal arm + hybrid fusion + rerank.
 _Avoid_: "search" (too broad); "query" (the input is a query, the operation is retrieve); "recall" (one stage of retrieval, not the whole pipeline)
 
-**extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. Not yet an MCP tool (may be internal to ingest, or a separate async tool — TBD in P0 spec). _Stage: P0._
+**extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. Not an MCP tool — it runs as the `extract` CLI batch pipeline, separate from `ingest`. _Stage: P0 (implemented)._
 _Avoid_: "parse" (implies deterministic grammar, extraction is LLM-based); "NER" (NER is one sub-step, not the whole pipeline)
+
+**embedding backfill**: the idempotent NULL-embedding repair mode (CLI flag `--backfill-embeddings`) that embeds and UPDATEs every live entity row `WHERE embedding IS NULL` using the stored description; an immediate second run updates 0 rows. Never runs automatically inside a normal extraction run. _Stage: P0 (implemented per `specs/p0-wiring-closure.md`)._
+_Avoid_: "re-embed" (backfill never overwrites an existing embedding); "migration" (repeatable repair, not a one-shot schema change)
+
+### Extraction & merge
+
+**relation_norm**: the normalized relation string used as the graph traversal key, produced by the #4 D5 cascade (exact → synonym → embedding → `UNMAPPED`) over the git-managed vocabulary; `UNMAPPED` is a legal sentinel, never a silent coerce. `relation_raw` is always stored alongside for audit fidelity. _Stage: P0 (implemented; cascade wired into the production upsert path per `specs/p0-wiring-closure.md`)._
+_Avoid_: "relation" alone (ambiguous with `relation_raw`); "predicate" (RDF terminology, not used here); "edge type" (Neo4j projection detail)
+
+**vocabulary**: the git-managed TS module (`src/core/extraction/vocabulary.ts`) holding the `ALLOWED` relation set, the `ALIASES` synonym map, and `PROMPT_HINT` for LLM prompt construction. Growth is human-review only — no automation in P0 (#4 D7). _Stage: P0._
+_Avoid_: "ontology" (implies formal class hierarchy); "taxonomy" (implies tree structure); "schema" (ambiguous with the DB schema)
+
+**extraction_records**: the per-chunk extraction status table (`pending → succeeded | failed`) carrying `error_code`, `error_msg`, `triples_count`, `unmapped_count`, and `batch_id` for aggregation. The visibility surface for mark-and-continue, queried via `listFailed()`. _Stage: P0._
+_Avoid_: "log table" (records are queryable state, not append-only logs); "audit table" (audit is a side benefit, not the purpose)
+
+**merged_into**: the soft-merge pointer on `entities` (nullable FK → `entities.id`, `ON DELETE SET NULL`) from a losing entity to its survivor. Roll-backable — deleting the survivor nulls the pointer; `resolveCanonicalId` walks the chain with cycle detection (maxChainDepth 16). _Stage: P0._
+_Avoid_: "parent" (implies hierarchy); "redirect" (web terminology); "tombstone" (the loser row is not deleted)
+
+**L0/L1/L2/L3 gate**: the hierarchical merge gates: L0 rule-exact (normalized name + same type → merge), L1 type mismatch → reject, L2 description-cosine floor (0.30; skipped when description < 8 chars) → reject, L3 name+description cosine ≥ 0.5 → merge, else gray-zone reject. _Stage: P0._
+_Avoid_: "merge levels" (vague); "thresholds" (L0/L1 are rules, not thresholds)
+
+**mark-and-continue**: the batch policy where a failed chunk does not abort the extraction batch; the failure is recorded as `extraction_records.status='failed'` and stays visible via `listFailed()`. _Stage: P0._
+_Avoid_: "skip" (implies silent loss; the failure is recorded); "best-effort" (too vague)
+
+**gray zone**: the L3 cosine band where merge-vs-reject is ambiguous; default behavior is reject plus a structured log on every gray-zone rejection (#6 Q5). The LLM-judge escalation is reserved, not implemented (#6 Q3). _Stage: P0._
+_Avoid_: "uncertain match" (vague); "borderline" (colloquial)
 
 ### Evaluation
 

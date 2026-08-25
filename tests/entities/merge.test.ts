@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  CandidateSetNotWiredError,
   mergeEntitiesWithGating,
   normalizeAlias,
   type CandidateEntity,
@@ -8,6 +9,7 @@ import {
 } from "../../src/core/entities/merge.js";
 import { DEFAULT_MERGE_CONFIG } from "../../src/core/entities/types.js";
 import { cosineSimilarity } from "../../src/core/cosine.js";
+import { GraphragError } from "../../src/core/errors.js";
 
 /**
  * Deterministic test embedder: hashes each input to a fixed-length vector.
@@ -47,6 +49,25 @@ function makeFakeEmbedder(overrides: Record<string, number[]> = {}): Embedder {
       return texts.map((t) => overrides[t] ?? hashVec(t));
     },
   };
+}
+
+/**
+ * Counting variant of the fake embedder: records every `embed` call and the
+ * texts it received, so a test can prove which side of an L3 comparison was
+ * embedded. The shared `FakeEmbedder` carries no counter, hence the local one.
+ */
+function makeCountingEmbedder(overrides: Record<string, number[]> = {}) {
+  const calls: string[][] = [];
+  const embedder: Embedder = {
+    async embed(texts: string[]): Promise<number[][]> {
+      calls.push([...texts]);
+      return texts.map((t) => overrides[t] ?? hashVec(t));
+    },
+  };
+  const embeddedTexts = (): string[] => calls.flat();
+  const countOf = (text: string): number =>
+    embeddedTexts().filter((t) => t === text).length;
+  return { embedder, calls, embeddedTexts, countOf };
 }
 
 function candidate(over: Partial<CandidateEntity>): CandidateEntity {
@@ -255,6 +276,301 @@ describe("mergeEntitiesWithGating — created-new", () => {
       { embedder, config: DEFAULT_MERGE_CONFIG }
     );
     expect(out.decision).toBe("created-new");
+  });
+});
+
+describe('mergeEntitiesWithGating — candidateSet "all" (SC10)', () => {
+  const incoming = {
+    canonicalName: "Alice",
+    type: "person",
+    description: "a software engineer at Acme corp",
+  };
+
+  it('rejects with the CandidateSetNotWiredError class when candidateSet is "all"', async () => {
+    const embedder = makeFakeEmbedder();
+    const err = await mergeEntitiesWithGating(incoming, "all", {
+      embedder,
+      config: DEFAULT_MERGE_CONFIG,
+    }).then(
+      (out) => out,
+      (e: unknown) => e
+    );
+    // Asserted by class / name, never by message text.
+    expect(err).toBeInstanceOf(CandidateSetNotWiredError);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).name).toBe("CandidateSetNotWiredError");
+  });
+
+  it('never returns created-new for candidateSet "all" and never touches the embedder', async () => {
+    const counting = makeCountingEmbedder();
+    await expect(
+      mergeEntitiesWithGating(incoming, "all", {
+        embedder: counting.embedder,
+        config: DEFAULT_MERGE_CONFIG,
+      })
+    ).rejects.toBeInstanceOf(CandidateSetNotWiredError);
+    expect(counting.calls).toHaveLength(0);
+  });
+});
+
+describe("mergeEntitiesWithGating — L3 stored candidate embedding reuse (SC10)", () => {
+  it("does not re-embed a candidate that carries a stored embedding, and embeds the incoming entity once", async () => {
+    // Short descriptions → L2 skips, so every embed observed here is L3's.
+    const incomingText = "Alicia | tiny";
+    const candidateText = "Alice | short";
+    const counting = makeCountingEmbedder({
+      [incomingText]: basisVector(0),
+    });
+    const out = await mergeEntitiesWithGating(
+      { canonicalName: "Alicia", type: "person", description: "tiny" },
+      [
+        candidate({
+          id: "cand-1",
+          canonicalName: "Alice",
+          type: "person",
+          description: "short",
+          embedding: basisVector(0),
+        }),
+      ],
+      { embedder: counting.embedder, config: DEFAULT_MERGE_CONFIG }
+    );
+    expect(counting.countOf(candidateText)).toBe(0);
+    expect(counting.countOf(incomingText)).toBe(1);
+    expect(counting.embeddedTexts()).toEqual([incomingText]);
+    expect(out.decision).toEqual({
+      kind: "merge",
+      into: "cand-1",
+      via: "L3",
+      observedCosine: 1,
+    });
+  });
+
+  it("embeds the incoming entity once per L3 batch and only the candidates missing a stored embedding", async () => {
+    const incomingText = "Alicia | tiny";
+    const storedText = "Alice | short";
+    const unstoredText = "Alison | brief";
+    const counting = makeCountingEmbedder({
+      [incomingText]: basisVector(0),
+      [unstoredText]: basisVector(1), // orthogonal → gray-zone reject, loop continues
+    });
+    const spy = graySpy();
+    const out = await mergeEntitiesWithGating(
+      { canonicalName: "Alicia", type: "person", description: "tiny" },
+      [
+        candidate({
+          id: "cand-unstored",
+          canonicalName: "Alison",
+          type: "person",
+          description: "brief",
+        }),
+        candidate({
+          id: "cand-stored",
+          canonicalName: "Alice",
+          type: "person",
+          description: "short",
+          embedding: basisVector(0),
+        }),
+      ],
+      {
+        embedder: counting.embedder,
+        config: DEFAULT_MERGE_CONFIG,
+        logGrayZone: spy.fn,
+      }
+    );
+    expect(counting.countOf(incomingText)).toBe(1);
+    expect(counting.countOf(unstoredText)).toBe(1);
+    expect(counting.countOf(storedText)).toBe(0);
+    expect(out.decision.kind).toBe("merge");
+    if (out.decision.kind !== "merge") return;
+    expect(out.decision.into).toBe("cand-stored");
+    expect(out.decision.via).toBe("L3");
+  });
+
+  it("skips a candidate whose stored embedding has a mismatched dimension instead of throwing", async () => {
+    const incomingText = "Alicia | tiny";
+    const counting = makeCountingEmbedder({
+      [incomingText]: basisVector(0),
+    });
+    const spy = graySpy();
+    const out = await mergeEntitiesWithGating(
+      { canonicalName: "Alicia", type: "person", description: "tiny" },
+      [
+        candidate({
+          id: "cand-bad-dim",
+          canonicalName: "Alice",
+          type: "person",
+          description: "short",
+          embedding: [1, 0, 0], // 3 dims vs the embedder's 8
+        }),
+      ],
+      {
+        embedder: counting.embedder,
+        config: DEFAULT_MERGE_CONFIG,
+        logGrayZone: spy.fn,
+      }
+    );
+    expect(out.decision).toBe("created-new");
+    expect(spy.entries.some((e) => e.level === "L3")).toBe(true);
+  });
+
+  it("leaves L2 unchanged: description-only embeddings stay transient for a candidate that carries a stored embedding", async () => {
+    const descA =
+      "completely unrelated topic about rocket manufacturing plants";
+    const descB =
+      "totally different subject about fine dining and cooking schools";
+    const counting = makeCountingEmbedder({
+      [descA]: basisVector(0),
+      [descB]: basisVector(1),
+    });
+    const out = await mergeEntitiesWithGating(
+      { canonicalName: "rocket-co", type: "company", description: descA },
+      [
+        candidate({
+          id: "cand-1",
+          canonicalName: "rocket-inc",
+          type: "company",
+          description: descB,
+          embedding: basisVector(0),
+        }),
+      ],
+      { embedder: counting.embedder, config: DEFAULT_MERGE_CONFIG }
+    );
+    expect(counting.countOf(descA)).toBe(1);
+    expect(counting.countOf(descB)).toBe(1);
+    expect(out.decision.kind).toBe("reject");
+    if (out.decision.kind !== "reject") return;
+    expect(out.decision.level).toBe("L2");
+  });
+});
+
+/**
+ * The gates absorb exactly two failure classes — GraphragError (every
+ * production embedder failure leg) and RangeError (cosineSimilarity's
+ * dimension mismatch) — because both mean "this cosine cannot be proven".
+ * Every other class is an unexpected fault and must surface to the caller
+ * instead of being laundered into a skipped candidate.
+ */
+describe("mergeEntitiesWithGating — embed/cosine failure narrowing", () => {
+  function throwingEmbedder(err: unknown): Embedder {
+    return {
+      async embed(): Promise<number[][]> {
+        throw err;
+      },
+    };
+  }
+
+  const longDescA =
+    "completely unrelated topic about rocket manufacturing plants";
+  const longDescB =
+    "totally different subject about fine dining and cooking schools";
+
+  /** Long descriptions on both sides ⇒ L2 runs and calls `embedCosine`. */
+  function l2Call(embedder: Embedder, logGrayZone?: (e: GrayZoneLog) => void) {
+    return mergeEntitiesWithGating(
+      { canonicalName: "rocket-co", type: "company", description: longDescA },
+      [
+        candidate({
+          id: "cand-1",
+          canonicalName: "rocket-inc",
+          type: "company",
+          description: longDescB,
+        }),
+      ],
+      { embedder, config: DEFAULT_MERGE_CONFIG, logGrayZone }
+    );
+  }
+
+  /**
+   * Short descriptions ⇒ L2 skips, and the stored candidate embedding means
+   * the only embed call is L3's `embedOne` for the incoming entity.
+   */
+  function l3EmbedOneCall(
+    embedder: Embedder,
+    logGrayZone?: (e: GrayZoneLog) => void
+  ) {
+    return mergeEntitiesWithGating(
+      { canonicalName: "Alicia", type: "person", description: "tiny" },
+      [
+        candidate({
+          id: "cand-1",
+          canonicalName: "Alice",
+          type: "person",
+          description: "short",
+          embedding: basisVector(0),
+        }),
+      ],
+      { embedder, config: DEFAULT_MERGE_CONFIG, logGrayZone }
+    );
+  }
+
+  it("L2 skips the candidate when the embedder reports a GraphragError", async () => {
+    const spy = graySpy();
+    const out = await l2Call(
+      throwingEmbedder(new GraphragError("provider down", "EMBEDDING_FAILED")),
+      spy.fn
+    );
+    expect(
+      spy.entries.some((e) => e.level === "L2" && e.reason === "embed-failure")
+    ).toBe(true);
+    expect(out.decision).toBe("created-new");
+  });
+
+  it("L2 propagates a non-GraphragError from the embedder", async () => {
+    const spy = graySpy();
+    await expect(
+      l2Call(throwingEmbedder(new TypeError("embed is not a function")), spy.fn)
+    ).rejects.toBeInstanceOf(TypeError);
+    expect(spy.entries).toEqual([]);
+  });
+
+  it("L3 skips the candidate when embedding the incoming entity reports a GraphragError", async () => {
+    const spy = graySpy();
+    const out = await l3EmbedOneCall(
+      throwingEmbedder(
+        new GraphragError("dim mismatch", "EMBEDDING_DIM_MISMATCH")
+      ),
+      spy.fn
+    );
+    expect(
+      spy.entries.some((e) => e.level === "L3" && e.reason === "embed-failure")
+    ).toBe(true);
+    expect(out.decision).toBe("created-new");
+  });
+
+  it("L3 propagates a non-GraphragError raised while embedding the incoming entity", async () => {
+    const spy = graySpy();
+    await expect(
+      l3EmbedOneCall(throwingEmbedder(new RangeError("stack overflow")), spy.fn)
+    ).rejects.toBeInstanceOf(RangeError);
+    expect(spy.entries).toEqual([]);
+  });
+
+  it("L3 propagates a non-RangeError raised by the cosine call itself", async () => {
+    // A stored embedding whose `length` read throws is the only way to make
+    // cosineSimilarity fail with something other than its own RangeError.
+    const hostileEmbedding = {
+      get length(): number {
+        throw new TypeError("hostile stored embedding");
+      },
+    } as unknown as number[];
+    const embedder = makeFakeEmbedder({
+      "Alicia | tiny": basisVector(0),
+    });
+    await expect(
+      mergeEntitiesWithGating(
+        { canonicalName: "Alicia", type: "person", description: "tiny" },
+        [
+          candidate({
+            id: "cand-1",
+            canonicalName: "Alice",
+            type: "person",
+            description: "short",
+            embedding: hostileEmbedding,
+          }),
+        ],
+        { embedder, config: DEFAULT_MERGE_CONFIG }
+      )
+    ).rejects.toBeInstanceOf(TypeError);
   });
 });
 

@@ -14,6 +14,17 @@
  * graphArmSeed survivor-only + two-sided valid_window; latency probe recorded
  * to /tmp/retrieval-pg-latency.json.
  *
+ * Case 9 is the p0-wiring-closure T8 closure probe (SC4): a fresh schema runs
+ * the whole live path — ingest three chunks through the ingest tool, extract
+ * them through the CLI with a FakeLLMClient + FakeEmbedder, then retrieve at
+ * the LOCKED default `CFG` and require graph-arm-contributed chunks and NO
+ * `degraded` key. The three triples share one head entity, so one-hop from
+ * that seed reaches three distinct chunks and `graphArmFloor: 3` is cleared
+ * on merit — the probe carries no config override. It is the end-to-end check
+ * that T1's entity embeddings, T2's vetted `relation_norm` and T7's concurrent
+ * arms actually fire together; ADR-0001 holds throughout (Postgres only, no
+ * Neo4j).
+ *
  * The isolated chunks fixture adds a GENERATED valid_window column so the
  * production one-hop SQL (c.valid_window @> $validAt) runs against real PG;
  * PgvectorBackend ensureTable() CREATEs IF NOT EXISTS (no-op), so no src
@@ -31,6 +42,9 @@ import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
 import type { RetrieveConfig } from "../../src/core/retrieval/types.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js";
+import { createIngestHandler } from "../../src/tools/ingest.js";
+import { runCli, type CliDeps } from "../../src/cli/extract.js";
+import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 
 const DIM = 1536;
 const DB_URL =
@@ -251,6 +265,100 @@ async function bulkTriples(
   );
 }
 
+// ---------------------------------------------------------------------------
+// SC4 closure-probe fixtures (specs/p0-wiring-closure.md Success Criterion 4)
+// ---------------------------------------------------------------------------
+
+/** A source_ref no ingested chunk carries — suppresses the vector arm. */
+const SC4_ABSENT_SOURCE_REF = "sc4/no-such-source";
+
+/** The two entities every probe triple hangs off — head is the one-hop seed. */
+const SC4_HEAD = "Alice Smith";
+const SC4_TAIL = "Acme Corp";
+
+/**
+ * SC4 closure-probe corpus: one chunk + one FakeLLMClient output each.
+ *
+ * `graphArmFloor` counts one-hop CHUNKS, so a one-chunk corpus can only clear
+ * the locked default floor of 3 with a config override. The corpus is sized
+ * to the floor instead: all three triples hang off the same head entity, so
+ * one-hop from that seed reaches three distinct chunks and the probe runs at
+ * the locked default `CFG` with no override.
+ *
+ * Three rows survive because the dedup key is
+ * `(head_id, relation_norm, tail_id)` and the three `relationNorm` values are
+ * distinct. Distinct TAILS would not do it: `FakeEmbedder` puts every pair of
+ * texts near cosine 0.75, far above the L3 merge threshold, so a second
+ * `system` entity always merges into the first.
+ *
+ * Every text is short enough that `chunkText` emits exactly one chunk, and
+ * every `relationNorm` is in ALLOWED, so T2's cascade keeps the claim as-is.
+ * Head/tail types stay person/system, as in the single-chunk probe.
+ */
+const SC4_CORPUS = [
+  {
+    text: "Alice Smith works at Acme Corp on the billing platform.",
+    description: "Alice Smith works at Acme Corp on the billing platform",
+    relationRaw: "works at",
+    relationNorm: "member_of",
+  },
+  {
+    text: "Alice Smith owns a founding stake in Acme Corp.",
+    description: "Alice Smith owns a founding stake in Acme Corp",
+    relationRaw: "owns",
+    relationNorm: "owns",
+  },
+  {
+    text: "Alice Smith uses the Acme Corp deployment pipeline daily.",
+    description: "Alice Smith uses the Acme Corp deployment pipeline daily",
+    relationRaw: "uses",
+    relationNorm: "uses",
+  },
+].map((entry, i) => ({
+  text: entry.text,
+  sourceRef: `sc4/closure-probe-${i}`,
+  output: {
+    head: SC4_HEAD,
+    headType: "person",
+    relationRaw: entry.relationRaw,
+    relationNorm: entry.relationNorm,
+    tail: SC4_TAIL,
+    tailType: "system",
+    description: entry.description,
+    evidenceSpan: entry.description,
+    confidence: 0.9,
+  },
+}));
+
+/**
+ * The #6 Q1 embedding text of the head entity the CLI run creates. The head
+ * is inserted from the FIRST output's description and the later two L0-merge
+ * into it (A8 first-write-wins), so that description is the head's SSOT.
+ */
+const SC4_QUERY = computeEntityEmbeddingText(
+  SC4_HEAD,
+  SC4_CORPUS[0]!.output.description
+);
+
+function silentLogger() {
+  return {
+    level: "error" as const,
+    debug: () => {},
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  };
+}
+
+/** Read the `chunk_ids` payload back out of the ingest tool's text result. */
+function chunkIdsOf(result: { content: unknown }): string[] {
+  const text = (result.content as Array<{ type: string; text?: string }>)
+    .filter((b) => b.type === "text")
+    .map((b) => b.text ?? "")
+    .join("");
+  return (JSON.parse(text) as { chunk_ids: string[] }).chunk_ids;
+}
+
 function percentile(values: number[], p: number): number {
   const sorted = [...values].sort((x, y) => x - y);
   const idx = Math.min(sorted.length - 1, Math.ceil(p * sorted.length) - 1);
@@ -278,6 +386,47 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
       await client.end();
     }
   });
+
+  /**
+   * The write half of the SC4 pipeline: the extraction CLI over the isolated
+   * schema. Real extraction refuses to run keyless (CR High #1), so the run
+   * goes through `runCli` with an injected FakeLLMClient and a real `pg.Pool`
+   * — the documented env-injection fallback from tests/cli/extract.test.ts.
+   * `now` is pinned to COVER_START so the triple's `valid_window` opens before
+   * the `validAt` the retrieve half asks for.
+   */
+  async function runExtractCli(): Promise<number> {
+    const pool = new pg.Pool({ connectionString: SCHEMA_URL });
+    const deps: CliDeps = {
+      pool,
+      llm: new FakeLLMClient({
+        queue: SC4_CORPUS.map((entry) => ({
+          kind: "ok" as const,
+          outputs: [entry.output],
+        })),
+      }),
+      embedder,
+      dims: DIM,
+      logger: silentLogger(),
+      now: () => COVER_START,
+    };
+    try {
+      return await runCli(["--batch-size", String(SC4_CORPUS.length)], deps);
+    } finally {
+      await pool.end();
+    }
+  }
+
+  /** Real ingest path: chunk -> embed -> upsert through the ingest tool. */
+  async function ingestOneChunk(
+    content: string,
+    sourceRef: string
+  ): Promise<string[]> {
+    const ingest = createIngestHandler({ embedder, storage: backend! });
+    return chunkIdsOf(
+      await ingest({ content, source_ref: sourceRef, valid_from: COVER_START })
+    );
+  }
 
   it("1. graph arm returns a chunk via seed entity -> one-hop triple", async () => {
     const c = client!;
@@ -468,6 +617,67 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
     const ids = rows.map((r) => r.id);
     expect(ids).toContain(live);
     expect(ids).not.toContain(past); // past chunk's valid_window excludes now
+  });
+
+  it("9. SC4: fresh PG -> ingest the probe corpus -> CLI extract -> graph arm clears the default floor without degraded", async () => {
+    const c = client!;
+    await resetSchema(c);
+
+    const chunkIds: string[] = [];
+    for (const entry of SC4_CORPUS) {
+      const ids = await ingestOneChunk(entry.text, entry.sourceRef);
+      expect(ids).toHaveLength(1);
+      chunkIds.push(ids[0]!);
+    }
+    // The corpus is sized to the locked floor, so the probe below proves the
+    // graph arm clears `graphArmFloor: 3` rather than a lowered override.
+    expect(chunkIds).toHaveLength(CFG.graphArmFloor);
+    expect(await runExtractCli()).toBe(0);
+
+    const validAt = new Date().toISOString();
+    const seeds = await backend!.graphArmSeed!.seedEntitiesByEmbedding(
+      await embedVec(SC4_QUERY),
+      CFG.entityLinkTopK
+    );
+    const graphChunkIds = (
+      await backend!.graphArmSeed!.chunksByOneHopFromEntities(
+        seeds.map((s) => s.id),
+        validAt,
+        CFG.candidateCap
+      )
+    ).map((r) => r.id);
+    // One-hop from the shared head entity reaches every ingested chunk.
+    for (const id of chunkIds) expect(graphChunkIds).toContain(id);
+
+    const out = await assembleRetrievalResult(
+      { query: SC4_QUERY, validAt, limit: 10 },
+      { embedder, storage: backend!, graphConfig: CFG, debug: true }
+    );
+    expect(out.debug?.graphBelowFloor).toBe(false);
+    expect(out.debug?.graphHits as number).toBeGreaterThanOrEqual(
+      CFG.graphArmFloor
+    );
+    expect(Object.hasOwn(out, "degraded")).toBe(false);
+    expect(out.chunks.some((ch) => graphChunkIds.includes(ch.id))).toBe(true);
+
+    // Provenance: prove the graph arm is what put the chunks in the envelope.
+    // `filters` reaches the vector arm ONLY (the graph arm does its own seed /
+    // one-hop filtering), so an absent source_ref empties the vector arm and
+    // every surviving chunk is a graph-arm contribution.
+    const graphOnly = await assembleRetrievalResult(
+      {
+        query: SC4_QUERY,
+        validAt,
+        limit: 10,
+        filters: { source_ref: SC4_ABSENT_SOURCE_REF },
+      },
+      { embedder, storage: backend!, graphConfig: CFG, debug: true }
+    );
+    expect(graphOnly.debug?.vectorHits).toBe(0);
+    expect(Object.hasOwn(graphOnly, "degraded")).toBe(false);
+    expect([...graphOnly.chunks.map((ch) => ch.id)].sort()).toEqual(
+      [...chunkIds].sort()
+    );
   });
 
   // Latency probe (Success Criterion #17) — soft-record, no assert (CI noise).

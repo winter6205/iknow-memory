@@ -15,12 +15,11 @@
  *                within a reasonable time budget" using FakeEmbedder.
  *   concurrent → two parallel mergeEntitiesWithGating calls with identical
  *                inputs + embedder ⇒ identical results (deterministic).
- *   exception  → embedder throws mid-merge ⇒ BUG: merge.ts has no try/catch
- *                around the embedder call, so a rejecting embedder
- *                propagates out of mergeEntitiesWithGating. The spec
- *                description for the exception boundary expects the
- *                function to catch and return a sealed outcome. Pinning
- *                current behavior for the coordinator.
+ *   exception  → embedder throws a declared embedding failure (GraphragError)
+ *                mid-merge ⇒ the gate cannot prove a cosine, skips the
+ *                candidate and seals the outcome as "created-new". Any other
+ *                error class is not a declared embedding failure and
+ *                propagates out of mergeEntitiesWithGating unchanged.
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -30,6 +29,7 @@ import {
 } from "../../src/core/entities/merge.js";
 import { DEFAULT_MERGE_CONFIG } from "../../src/core/entities/types.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
+import { GraphragError } from "../../src/core/errors.js";
 
 /** Deterministic embedder: returns an orthonormal-ish vector per unique text. */
 function makeDeterministicEmbedder(dim = 8): Embedder {
@@ -164,28 +164,58 @@ describe("mergeEntitiesWithGating — concurrent boundary", () => {
 });
 
 describe("mergeEntitiesWithGating — exception boundary (embedder throws)", () => {
-  it("does not throw on an embedder exception; returns a sealed outcome (created-new) when the embedder cannot compute any cosine, so the batch can mark-and-continue", async () => {
-    const throwingEmbedder: Embedder = {
+  function throwingEmbedder(err: unknown): Embedder {
+    return {
       embed: async (): Promise<number[][]> => {
-        throw new Error("embedder exploded");
+        throw err;
       },
     };
-    const candidates = [
-      candidate({
-        id: "c-1",
-        canonicalName: "Different Name",
-        type: "person",
-        description:
-          "a long description that would force L2 or L3 to call the embedder",
-      }),
-    ];
-    const out = await mergeEntitiesWithGating(
-      { canonicalName: "Alice", type: "person", description: "engineer" },
-      candidates,
-      { embedder: throwingEmbedder, config: DEFAULT_MERGE_CONFIG }
-    );
+  }
+
+  const candidates = [
+    candidate({
+      id: "c-1",
+      canonicalName: "Different Name",
+      type: "person",
+      description:
+        "a long description that would force L2 or L3 to call the embedder",
+    }),
+  ];
+  const incoming = {
+    canonicalName: "Alice",
+    type: "person",
+    description: "engineer",
+  };
+
+  it("does not throw on a declared embedding failure (GraphragError); returns a sealed outcome (created-new) when the embedder cannot compute any cosine, so the batch can mark-and-continue", async () => {
+    const out = await mergeEntitiesWithGating(incoming, candidates, {
+      embedder: throwingEmbedder(
+        new GraphragError("embedder exploded", "EMBEDDING_FAILED")
+      ),
+      config: DEFAULT_MERGE_CONFIG,
+    });
     // L0/L1 miss, L2 skips (short incoming desc), L3 skip-on-embed-failure → created-new.
     expect(out.decision).toBe("created-new");
     expect(out.canonicalId).toBe("");
+  });
+
+  it("propagates a plain Error: it is not a declared embedding failure, so it must not be read as an unprovable cosine", async () => {
+    await expect(
+      mergeEntitiesWithGating(incoming, candidates, {
+        embedder: throwingEmbedder(new Error("embedder exploded")),
+        config: DEFAULT_MERGE_CONFIG,
+      })
+    ).rejects.toThrow("embedder exploded");
+  });
+
+  it("propagates a TypeError (programming fault in the embedder) instead of degrading to created-new", async () => {
+    const err = await mergeEntitiesWithGating(incoming, candidates, {
+      embedder: throwingEmbedder(new TypeError("not a function")),
+      config: DEFAULT_MERGE_CONFIG,
+    }).then(
+      (out) => out,
+      (e: unknown) => e
+    );
+    expect(err).toBeInstanceOf(TypeError);
   });
 });

@@ -13,6 +13,7 @@ import { createRetrieveHandler } from "../../src/tools/retrieve.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
 import { loadEnv, ConfigError } from "../../src/config.js";
+import type { EmbeddingClient } from "../../src/core/embedder.js";
 import type {
   GraphArmStorage,
   RetrieveConfig,
@@ -269,6 +270,38 @@ describe("retrieve graph-arm envelope (T5)", () => {
     expect(dbg.vectorHits).toBe(1);
     expect(dbg.graphHits).toBe(3);
     expect(dbg.graphBelowFloor).toBe(false);
+  });
+});
+
+/** Counting embedder local to this suite — records every embed batch. */
+class CountingEmbedder implements EmbeddingClient {
+  readonly batches: string[][] = [];
+
+  async embed(texts: string[]): Promise<number[][]> {
+    this.batches.push([...texts]);
+    return texts.map(() => new Array<number>(TEST_DIM).fill(0.02));
+  }
+}
+
+describe("retrieve embed budget (T7 G5)", () => {
+  it("SC12a: exactly one embedder call per retrieve invocation when the graph arm is active", async () => {
+    const backend = new FakeGraphBackend();
+    backend.searchResults = [vecChunk("v1")];
+    backend.seeds = [
+      { id: "e1", canonical_name: "E1" },
+      { id: "e2", canonical_name: "E2" },
+      { id: "e3", canonical_name: "E3" },
+    ];
+    backend.oneHopRows = [graphRow("g1"), graphRow("g2"), graphRow("g3")];
+    const embedder = new CountingEmbedder();
+    const handler = createRetrieveHandler({
+      embedder,
+      storage: backend,
+      graphConfig: CFG,
+    });
+    const body = parseBody(await handler({ query: "q" }));
+    expect(embedder.batches).toEqual([["q"]]);
+    expect(body).not.toHaveProperty("degraded");
   });
 });
 

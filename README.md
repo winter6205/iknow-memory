@@ -43,7 +43,9 @@ npm run typecheck  # tsc --noEmit
       "args": ["path/to/iknow-memory/dist/index.js"],
       "env": {
         "GRAPHRAG_MEMORY_STORAGE": "memory",
-        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048"
+        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048",
+        "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
+        "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3"
       }
     }
   }
@@ -62,17 +64,17 @@ pgvector 模式：
         "GRAPHRAG_MEMORY_STORAGE": "pgvector",
         "GRAPHRAG_MEMORY_DB_URL": "postgresql://...",
         "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048",
-        "GRAPHRAG_MEMORY_EMBED_MODEL": "zhipueb/embedding-3",
-        "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV": "ANTHROPIC_AUTH_TOKEN"
+        "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
+        "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3"
       }
     }
   }
 }
 ```
 
-> **Base URL**：`GRAPHRAG_MEMORY_EMBED_BASE_URL` 不写死在 `.mcp.json` 里。
-> 优先从进程环境继承（`~/.bashrc` 动态网关探测），fallback 到项目根
-> `.env.local`（gitignored）。WSL 环境下网关 IP 会变，写死会失效。
+> **Embedding key**：`GRAPHRAG_MEMORY_EMBED_API_KEY` 只放在进程环境 / `.env.local` /
+> Cursor Cloud Secret，**不要**写进 git 跟踪的 `.mcp.json`。MCP 子进程一般会继承
+> host 环境；Cloud start 会 setdefault URL / model / dims。
 
 ## MCP Tools
 

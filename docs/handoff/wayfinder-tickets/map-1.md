@@ -9,20 +9,22 @@
 
 ## Live 进度（2026-08-26 · 路线重置）
 
-| 项                             | 状态           | 本地路径 / 证据                                                                                          |
-| ------------------------------ | -------------- | -------------------------------------------------------------------------------------------------------- |
-| P0 决策 #3/#4/#5/#6/#7         | 闭环           | `docs/CONTEXT.md`；GitHub 票已关                                                                         |
-| SPEC 1–3 + G1–G8 wiring        | MERGED on main | PR #11 / #27 / #28 / #54                                                                                 |
-| 路线重置 grilling              | **CLOSED**     | [#57](https://github.com/winter6205/iknow-memory/issues/57)：关 SQL 图臂 → BM25 → Neo4j                  |
-| BM25 形态 grilling             | **CLOSED**     | [#59](https://github.com/winter6205/iknow-memory/issues/59)：vector+BM25 RRF；tsvector；默认开 fail-open |
-| SQL 图臂过渡 / PR #56 融合优先 | **作废**       | 意见书可留史料；不以之为 NEXT                                                                            |
-| SPEC 4 / T-P0-eval #15         | **后置**       | 非 frontier；子票 #40–#48 勿开工                                                                         |
-| Map #1                         | OPEN（chart）  | 2026-08-26 #59 闭环已回写                                                                                |
+| 项                             | 状态           | 本地路径 / 证据                                                                                                                           |
+| ------------------------------ | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| P0 决策 #3/#4/#5/#6/#7         | 闭环           | `docs/CONTEXT.md`；GitHub 票已关                                                                                                          |
+| SPEC 1–3 + G1–G8 wiring        | MERGED on main | PR #11 / #27 / #28 / #54                                                                                                                  |
+| 路线重置 grilling              | **CLOSED**     | [#57](https://github.com/winter6205/iknow-memory/issues/57)：关 SQL 图臂 → BM25 → Neo4j                                                   |
+| BM25 形态 grilling             | **CLOSED**     | [#59](https://github.com/winter6205/iknow-memory/issues/59)：vector+BM25 RRF；tsvector；默认开 fail-open                                  |
+| SQL 图臂过渡 / PR #56 融合优先 | **作废**       | 意见书可留史料；不以之为 NEXT                                                                                                             |
+| SQL 图臂关闭（#58）            | **已实施**     | [PR #68](https://github.com/winter6205/iknow-memory/pull/68)：默认 wiring 不再传 `graphConfig`；`docs/runbooks/sql-graph-arm-archived.md` |
+| BM25 双臂 RRF（#62）           | **已实施**     | [PR #68](https://github.com/winter6205/iknow-memory/pull/68)：`src/core/retrieval/index.ts` + `pgvector-backend.searchLexical`            |
+| SPEC 4 / T-P0-eval #15         | **后置**       | 非 frontier；子票 #40–#48 勿开工                                                                                                          |
+| Map #1                         | OPEN（chart）  | 2026-08-26 #59 闭环 + #62 实施已回写                                                                                                      |
 
 **Frontier（实施）：**
 
-1. [#62 BM25 + SQL 图臂归档](https://github.com/winter6205/iknow-memory/issues/62) — spec/plan：`specs/bm25-retrieve.md` / `plans/bm25-retrieve.md`（**T1=#63 含 #58 清理**；T2–T5 = #64–#67）
-2. Neo4j 真图臂 — 仍在 fog，待 #62 实施完成后再开票
+1. [#62 BM25 + SQL 图臂归档](https://github.com/winter6205/iknow-memory/issues/62) — **已实施，待 [PR #68](https://github.com/winter6205/iknow-memory/pull/68) 合并**；spec/plan：`specs/bm25-retrieve.md` / `plans/bm25-retrieve.md`（T1=#63 含 #58 清理；T2–T5 = #64–#67）
+2. Neo4j 真图臂 — 仍在 fog，待 PR #68 合并后再开票
 
 ## Research（已闭环，供下会话）
 
@@ -40,8 +42,6 @@
 
 ## 明确未做（勿当成已关）
 
-- SQL 图臂尚未在代码里关掉（决策已定，实施 = #58）
-- BM25 形态已定（#59）；尚未实施（#62）
 - Neo4j 投影 / 真图臂
 - `merged_into` 指针落盘；T-P0-eval 代码；多粒度切分
 - T-007 Claude Code 完整 Host 验收

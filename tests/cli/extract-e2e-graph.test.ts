@@ -358,15 +358,17 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         const result = await mcp.callTool({
           name: "retrieve",
           arguments: {
-            query: "anything",
+            // Nonsense token: must not BM25-hit "graph-reachable chunk *"
+            // even if lexical search ignores source_ref (separate gap).
+            query: "zzzxqv9nonexistenttoken",
             filters: { source_ref: "case4/no-such-source" },
           },
         });
         expect(result.isError).not.toBe(true);
         const payload = JSON.parse(textOf(result)) as Record<string, unknown>;
-        // Both live arms were filtered to nothing and the graph arm never
-        // ran, so no chunk survives — none of the seeded graph chunks can
-        // have reached the envelope.
+        // Both live arms found nothing and the graph arm never ran, so no
+        // chunk survives — none of the seeded graph chunks can have reached
+        // the envelope.
         expect(payload.chunks).toEqual([]);
         // Neither arm failed, and an arm that is simply not wired is not
         // a degradation.

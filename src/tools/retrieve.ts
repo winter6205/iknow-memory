@@ -18,7 +18,7 @@ import {
 } from "./registry.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { SearchOptions, StorageBackend } from "../core/types.js";
-import type { RetrieveConfig } from "../core/retrieval/types.js";
+import type { GraphRanker, RetrieveConfig } from "../core/retrieval/types.js";
 import { assembleRetrievalResult } from "../core/retrieval/index.js";
 
 const DEFAULT_LIMIT = 10;
@@ -48,6 +48,13 @@ export interface RetrieveDeps {
    * server path never supplies it (#58); only tests that want the arm do.
    */
   graphConfig?: RetrieveConfig;
+  /**
+   * Neo4j PPR ranker for the production graph arm (#70). Wired from
+   * `loadEnv().neo4j` at the server assembly layer, and absent when no
+   * sidecar URI is configured — which skips the arm without degrading the
+   * envelope (spec SC7).
+   */
+  graphRanker?: GraphRanker;
   /** Debug gate; wired to `DEBUG=1` by the caller. */
   debug?: boolean;
 }
@@ -76,6 +83,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         storage: deps.storage,
         retrieveConfig: deps.retrieveConfig,
         graphConfig: deps.graphConfig,
+        graphRanker: deps.graphRanker,
         debug: deps.debug,
       }
     );

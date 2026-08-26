@@ -10,9 +10,13 @@
  *   - **vector** always runs, and its failure is the caller's failure.
  *   - **BM25** runs when `retrieveConfig.bm25Enabled` is set and the backend
  *     implements the lexical seam. This is the production partner arm (#59).
- *   - **graph** runs only when a caller passes `graphConfig` explicitly. The
- *     default server wiring never does — the SQL one-hop arm is archived
- *     (#58, `docs/runbooks/sql-graph-arm-archived.md`).
+ *   - **graph** runs when `retrieveConfig.graphEnabled` is set, a
+ *     `graphRanker` was wired (i.e. a Neo4j sidecar is configured) and the
+ *     backend implements the `neo4jArmSeed` seam. That is the production
+ *     third arm (#70). The ARCHIVED SQL one-hop arm answers to the same
+ *     name and runs only when a caller passes `graphConfig` explicitly and
+ *     the Neo4j arm is not active — the default server wiring passes no
+ *     `graphConfig` (#58, `docs/runbooks/sql-graph-arm-archived.md`).
  *
  * When no optional arm is active the envelope is EXACTLY
  * `{ chunks: RetrievedChunk[] }` — no `degraded`, no `debug`, even under the
@@ -30,18 +34,21 @@
  */
 import { rrfFuse } from "./rrf.js";
 import { runGraphArm, type GraphArmDeps } from "./graph-arm.js";
+import { runNeo4jGraphArm, type Neo4jGraphArmDeps } from "./neo4j-graph-arm.js";
 import type {
   ArmHit,
   ArmName,
   ArmResult,
   FusedHit,
   GraphArmStorage,
+  GraphRanker,
   RetrieveConfig,
   RetrieveOutputEnvelope,
 } from "./types.js";
 import type { RetrievedChunk, StorageBackend } from "../types.js";
 import {
   supportsLexicalSearch,
+  supportsNeo4jArm,
   type GraphRagStorageBackend,
   type LexicalStorageBackend,
 } from "../storage/backend.js";
@@ -53,8 +60,8 @@ import { GraphragError } from "../errors.js";
  *
  * Fetching only `limit` per arm would make the lexical arm nearly inert:
  * a chunk the vector arm ranks below the cut could reach fusion only as a
- * BM25-only hit worth `w_bm25 / (k + 1)` ≈ 0.0033, which cannot outrank a
- * vector-only hit at `w_vec / (k + 1)` ≈ 0.013. Drawing deeper lets the
+ * BM25-only hit worth `w_bm25 / (k + 1)` ≈ 0.0025, which cannot outrank a
+ * vector-only hit at `w_vec / (k + 1)` ≈ 0.011. Drawing deeper lets the
  * two arms actually agree on a chunk, and agreement is the signal RRF
  * exists to reward. Only the FUSED list is cut to `limit`.
  *
@@ -95,6 +102,13 @@ export interface AssembleDeps {
   retrieveConfig?: RetrieveConfig;
   /** Opt-in archived graph arm; absent on the production path. */
   graphConfig?: RetrieveConfig;
+  /**
+   * Neo4j PPR ranker, wired only when a sidecar URI is configured. Absent
+   * is the SC7 case: the arm is not attempted and the envelope carries no
+   * `degraded` — an operator who configured no graph engine has not
+   * suffered a failed graph call.
+   */
+  graphRanker?: GraphRanker;
   /** Injectable debug gate; wired to `DEBUG=1` by the tool. */
   debug?: boolean;
 }
@@ -115,8 +129,13 @@ export async function assembleRetrievalResult(
   // can never switch the lexical arm on behind the operator's back.
   const weights = deps.retrieveConfig ?? deps.graphConfig;
   const lexical = getLexicalArm(deps);
-  const graph = getGraphSeed(deps);
-  const fusing = lexical !== undefined || graph !== undefined;
+  const neo4jGraph = getNeo4jGraphArm(deps);
+  // At most ONE graph arm per call: both answer to the arm name "graph",
+  // so running the pair would double-weight the same chunk and collide in
+  // the debug payload. Production wins over the archive.
+  const graph = neo4jGraph === undefined ? getGraphSeed(deps) : undefined;
+  const fusing =
+    lexical !== undefined || graph !== undefined || neo4jGraph !== undefined;
 
   const searchOpts = {
     limit: fusing ? Math.max(args.limit, ARM_CANDIDATE_POOL) : args.limit,
@@ -151,6 +170,9 @@ export async function assembleRetrievalResult(
         new Date(args.validAt)
       )
     );
+  }
+  if (neo4jGraph !== undefined) {
+    pending.push(runNeo4jGraphArm(queryEmbedding, neo4jGraph, args.validAt));
   }
 
   const [retrieved, optional] = await Promise.all([
@@ -218,6 +240,31 @@ function getGraphSeed(
   const rag = deps.storage as GraphRagStorageBackend;
   if (rag.graphArmSeed === undefined) return undefined;
   return { seed: rag.graphArmSeed, config: deps.graphConfig };
+}
+
+/**
+ * Resolve the production Neo4j graph arm. Returns undefined — "do not run
+ * it", NOT "it failed" — when any of the three prerequisites is missing:
+ *
+ *   - no `retrieveConfig`, or the operator set `graphEnabled=false` (SC9);
+ *   - no `graphRanker`, which is how "no Neo4j URI configured" reaches
+ *     this layer (SC7). The distinction the spec insists on lives here:
+ *     cannot attempt ≠ failed attempt, so neither case sets `degraded`;
+ *   - the backend has no `neo4jArmSeed` seam (MemoryBackend).
+ *
+ * The gate reads `deps.retrieveConfig` only, never `graphConfig`: opting
+ * into the archived SQL arm must not switch the production arm on.
+ */
+function getNeo4jGraphArm(deps: AssembleDeps): Neo4jGraphArmDeps | undefined {
+  const config = deps.retrieveConfig;
+  if (config === undefined || !config.graphEnabled) return undefined;
+  if (deps.graphRanker === undefined) return undefined;
+  if (!supportsNeo4jArm(deps.storage)) return undefined;
+  return {
+    storage: deps.storage.neo4jArmSeed,
+    ranker: deps.graphRanker,
+    config,
+  };
 }
 
 /**

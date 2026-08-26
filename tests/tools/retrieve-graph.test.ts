@@ -30,6 +30,7 @@ const CFG: RetrieveConfig = {
   w_bm25: 1,
   w_graph: 1,
   bm25Enabled: false,
+  graphEnabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
@@ -349,20 +350,20 @@ function withRetrievalEnv(
 }
 
 describe("retrieve config boundary validation (T5)", () => {
-  it("defaults to the production hybrid plus the archived graph knobs when unset", () => {
+  it("defaults to the three-arm production hybrid plus the seed knobs when unset", () => {
     withRetrievalEnv({}, () => {
       const env = loadEnv();
       expect(env.retrieval).toEqual({
-        // Production hybrid (#59): vector 0.8 / BM25 0.2, BM25 on. The
-        // per-knob assertions live in tests/config.test.ts; this case
-        // pins the exact field SET so a new knob cannot appear without
-        // the graph-arm suite noticing.
-        w_vec: 0.8,
-        w_bm25: 0.2,
+        // Production hybrid (#69/#70): vector 0.7 / BM25 0.15 / graph
+        // 0.15, both partner arms on. The per-knob assertions live in
+        // tests/config.test.ts; this case pins the exact field SET so a
+        // new knob cannot appear without the graph-arm suite noticing.
+        w_vec: 0.7,
+        w_bm25: 0.15,
+        w_graph: 0.15,
         bm25Enabled: true,
-        // Graph knobs keep their P0 values but no longer steer the
-        // default path — the arm is archived (#58).
-        w_graph: 1,
+        graphEnabled: true,
+        // Seed / traversal knobs keep their P0 values.
         entityLinkTopK: 8,
         candidateCap: 50,
         graphArmFloor: 3,

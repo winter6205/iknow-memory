@@ -138,6 +138,33 @@ describe("assembleRetrievalResult — BM25 arm enabled (SC10)", () => {
     expect(both.score).toBeGreaterThan(vectorOnly.score);
   });
 
+  // The whole point of a lexical arm is recall the vector arm does not
+  // have. If each arm only ever fetched `limit` rows, a chunk the vector
+  // arm ranks below the cut could never be fused at all: BM25 would
+  // contribute it as a lexical-only hit worth w_bm25/(k+1) = 0.0033,
+  // which cannot outrank a vector-only hit at w_vec/(k+1) = 0.013. The
+  // arms therefore draw from a deeper candidate pool and only the FUSED
+  // list is cut to `limit`.
+  it("surfaces a chunk the vector arm ranks below the limit", async () => {
+    // Identical embeddings ⇒ the vector arm ranks by insertion order,
+    // so seeding the target last puts it out of reach of a limit-2
+    // vector fetch. Only BM25 knows it is the right answer.
+    const storage = await seeded(
+      ...Array.from({ length: 8 }, (_, i) =>
+        makeChunk(`filler-${i}`, `unrelated note number ${i}`)
+      ),
+      makeChunk("target", "the zubrowka runbook")
+    );
+
+    const out = await assembleRetrievalResult(
+      { query: "zubrowka", validAt: NOW, limit: 2 },
+      { embedder, storage, retrieveConfig: CFG, debug: true }
+    );
+    expect(out.chunks).toHaveLength(2);
+    expect(out.chunks.map((c) => c.id)).toContain("target");
+    expect(out.debug?.vectorHits).toBeGreaterThan(2);
+  });
+
   it("truncates the fused list to the requested limit", async () => {
     const storage = await seeded(
       makeChunk("a", "zubrowka one"),

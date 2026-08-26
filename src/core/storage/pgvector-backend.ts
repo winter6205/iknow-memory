@@ -25,7 +25,11 @@ import type {
   GraphRagStorageBackend,
   LexicalStorageBackend,
 } from "./backend.js";
-import type { GraphArmStorage } from "../retrieval/types.js";
+import type {
+  EntityChunkRow,
+  GraphArmStorage,
+  Neo4jArmStorage,
+} from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
 import { upSchemaP0 } from "./schema-p0.js";
@@ -79,6 +83,37 @@ const ONE_HOP_CHUNKS_SQL =
   "AND c.valid_window @> $2::timestamptz " +
   "ORDER BY c.id " +
   "LIMIT $3";
+
+/**
+ * Chunks behind a set of ranked entities (Neo4j graph arm, #70 T4).
+ *
+ * The graph engine ranks ENTITIES; chunks never enter Neo4j (ADR-0001), so
+ * this is the hop back. `triples.source_chunk_id` is the provenance link
+ * the extract path already writes, and one row per (entity, chunk) pair is
+ * returned so the arm can give a chunk the rank of the best entity that
+ * reached it.
+ *
+ * Temporal filtering is two-sided but asymmetric on purpose: `triples`
+ * carries a real `tstzrange`, while `chunks` carries the `valid_from` /
+ * `valid_until` pair every other read path in this file filters on. (The
+ * archived one-hop SQL above assumes a GENERATED `chunks.valid_window`
+ * that only the P0 test fixtures ever created — one more reason it is
+ * archived.)
+ *
+ * `array_position` orders by the caller's ranking so the `LIMIT` keeps the
+ * chunks of the most relevant entities rather than an arbitrary slice.
+ */
+const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_ref,
+          c.valid_from, c.valid_until
+     FROM triples t
+     JOIN chunks c ON t.source_chunk_id = c.id
+     CROSS JOIN LATERAL (VALUES (t.head_id), (t.tail_id)) AS ranked(entity_id)
+    WHERE ranked.entity_id = ANY($1::uuid[])
+      AND t.valid_window @> $2::timestamptz
+      AND c.valid_from <= $2::timestamptz
+      AND (c.valid_until IS NULL OR c.valid_until > $2::timestamptz)
+    ORDER BY array_position($1::uuid[], ranked.entity_id), c.id
+    LIMIT $3`;
 
 /**
  * Text-search configuration for the lexical arm. `simple` deliberately,
@@ -556,6 +591,55 @@ export class PgvectorBackend
       } catch (err) {
         throw new GraphragError(
           `PgvectorBackend.graphArmSeed.chunksByOneHopFromEntities failed: ${(err as Error).message}`,
+          "STORAGE_ERROR"
+        );
+      }
+    },
+  };
+
+  /**
+   * Neo4j graph-arm storage seam (#70 T4) — the Postgres half of the PPR
+   * arm. Seeding is the same survivor-only embedding query the archived arm
+   * uses (spec A7 keeps the entity-linking idea); the traversal is NOT, it
+   * now happens in the graph engine, and this seam only maps the entities
+   * it ranked back onto chunks.
+   */
+  readonly neo4jArmSeed: Neo4jArmStorage = {
+    seedEntitiesByEmbedding: (embedding, topK) =>
+      this.graphArmSeed.seedEntitiesByEmbedding(embedding, topK),
+
+    chunksByEntityIds: async (entityIds, validAt, limit) => {
+      // Same empty-array short-circuit as the one-hop query: ANY over an
+      // empty JS array leaves Postgres without a type to infer.
+      if (entityIds.length === 0) return [];
+      try {
+        const pool = await this.ensureReady();
+        const result = await pool.query(ENTITY_CHUNKS_SQL, [
+          [...entityIds],
+          validAt,
+          limit,
+        ]);
+        return result.rows.map((r) => {
+          const row = r as {
+            entity_id: string;
+            id: string;
+            content: string;
+            source_ref: string;
+            valid_from: Date;
+            valid_until: Date | null;
+          };
+          return {
+            entity_id: row.entity_id,
+            id: row.id,
+            content: row.content,
+            source_ref: row.source_ref,
+            valid_from: row.valid_from.toISOString(),
+            valid_until: row.valid_until?.toISOString() ?? null,
+          } satisfies EntityChunkRow;
+        });
+      } catch (err) {
+        throw new GraphragError(
+          `PgvectorBackend.neo4jArmSeed.chunksByEntityIds failed: ${(err as Error).message}`,
           "STORAGE_ERROR"
         );
       }

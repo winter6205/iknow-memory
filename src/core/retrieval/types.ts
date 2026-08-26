@@ -9,10 +9,14 @@
 /**
  * A retrieval arm the fusion layer understands.
  *
- * `vector` + `bm25` are the production hybrid (#59). `graph` is the P0 SQL
- * one-hop arm, archived off the default path (#58) but still fusable when
- * a caller injects a `graphConfig` explicitly — see
- * `docs/runbooks/sql-graph-arm-archived.md`.
+ * `vector` + `bm25` + `graph` are the production hybrid (#59/#70). `graph`
+ * names the ARM, not its engine: on production it is the Neo4j PPR arm
+ * (`neo4j-graph-arm.ts`), and it is still the name the archived SQL
+ * one-hop arm answers to when a caller injects a `graphConfig` explicitly
+ * (#58, `docs/runbooks/sql-graph-arm-archived.md`). Only one of the two
+ * ever runs in a given call, so one name and one `w_graph` weight cover
+ * both — a fourth arm name would fork the weight table for an arm that is
+ * off the default path.
  */
 export type ArmName = "vector" | "bm25" | "graph";
 
@@ -88,6 +92,70 @@ export interface RetrieveConfig {
   candidateCap: number;
   /** Minimum number of graph-arm hits before degraded flips to false. */
   graphArmFloor: number;
+}
+
+/** One entity ranked by the graph engine, with the engine's own score. */
+export interface RankedEntity {
+  /** Ledger entity id — the same uuid Postgres and Neo4j both key on. */
+  id: string;
+  /**
+   * Engine relevance (PPR mass). Comparable only within one ranking, and
+   * NOT the arm's fusion key: RRF fuses on rank. Carried so an operator
+   * can see why an entity surfaced (#57 — a score may be projected, it
+   * must not become the ranking algorithm).
+   */
+  score: number;
+}
+
+/**
+ * Port: query-anchored ranking over the projected graph.
+ *
+ * Implemented by the Neo4j GDS PPR adapter (`src/core/graph/neo4j-ppr.ts`),
+ * which this context deliberately does not import — retrieval declares the
+ * shape it needs and the server wires an implementation in. `undefined` at
+ * the wiring point means "no sidecar configured", which is a SKIP, never a
+ * failure (spec SC7).
+ */
+export interface GraphRanker {
+  rankEntities(
+    seedEntityIds: readonly string[],
+    limit: number
+  ): Promise<RankedEntity[]>;
+}
+
+/**
+ * A chunk reached from a ranked entity through `triples.source_chunk_id`.
+ *
+ * `entity_id` is what makes the hop back into Postgres rank-preserving:
+ * chunks never enter Neo4j (ADR-0001), so the arm re-attaches the graph's
+ * ordering to the rows itself.
+ */
+export interface EntityChunkRow {
+  entity_id: string;
+  id: string;
+  content: string;
+  source_ref: string;
+  valid_from: string;
+  valid_until: string | null;
+}
+
+/**
+ * Postgres side of the Neo4j graph arm: entity seeds in, their chunks out.
+ *
+ * Shares `seedEntitiesByEmbedding` with the archived SQL arm's seam by
+ * shape (spec A7 allows reusing the entity-linking idea), but not the
+ * one-hop JOIN — the traversal moved to the graph engine.
+ */
+export interface Neo4jArmStorage {
+  seedEntitiesByEmbedding(
+    embedding: number[],
+    topK: number
+  ): Promise<Array<{ id: string; canonical_name: string }>>;
+  chunksByEntityIds(
+    entityIds: readonly string[],
+    validAt: string,
+    limit: number
+  ): Promise<EntityChunkRow[]>;
 }
 
 /** Storage seam for the graph arm; implemented optionally by StorageBackend. */

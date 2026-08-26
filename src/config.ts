@@ -170,7 +170,9 @@ function parseEmbedDimensions(raw: string | undefined): number {
 // --- Retrieval config (spec-3 p0-integration T5) ---
 
 const RETRIEVAL_W_VEC_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC";
+const RETRIEVAL_W_BM25_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25";
 const RETRIEVAL_W_GRAPH_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH";
+const RETRIEVAL_BM25_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED";
 const RETRIEVAL_ENTITY_LINK_TOP_K_VAR =
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K";
 const RETRIEVAL_CANDIDATE_CAP_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP";
@@ -219,10 +221,36 @@ function parseFinitePositive(
 }
 
 /**
+ * Parse a boolean env var. `fallback` is used when the var is unset or
+ * blank. Accepts only true/false/1/0 (trimmed, case-insensitive) — no
+ * truthiness coercion, because a mistyped "on" or "yes" silently reading
+ * as `false` would leave an operator running a retrieval mode they did
+ * not choose. Anything else is a ConfigError naming the var.
+ */
+function parseBoolean(
+  name: string,
+  raw: string | undefined,
+  fallback: boolean
+): boolean {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = raw.trim().toLowerCase();
+  if (value === "true" || value === "1") return true;
+  if (value === "false" || value === "0") return false;
+  throw new ConfigError(
+    `${name} must be one of true | false | 1 | 0, got "${raw}"`
+  );
+}
+
+/**
  * Load + validate the GRAPHRAG_MEMORY_RETRIEVAL_* family into a RetrieveConfig.
- * Defaults: w_vec=1, w_graph=1, entityLinkTopK=8, candidateCap=50,
- * graphArmFloor=3 — matching the spec glossary. Enforces the spec
- * §Boundaries: finite positive weights; entityLinkTopK > 0;
+ *
+ * Defaults: w_vec=0.8, w_bm25=0.2, BM25 enabled — the production hybrid
+ * locked by #59. `w_graph`, entityLinkTopK, candidateCap and graphArmFloor
+ * keep their P0 defaults but no longer steer the default path: the SQL
+ * graph arm is archived (#58) and only runs for a caller that injects a
+ * `graphConfig` itself.
+ *
+ * Enforces the spec §Boundaries: finite positive weights; entityLinkTopK > 0;
  * candidateCap >= entityLinkTopK; graphArmFloor > 0.
  */
 function parseRetrievalConfig(): RetrieveConfig {
@@ -245,12 +273,22 @@ function parseRetrievalConfig(): RetrieveConfig {
     w_vec: parseFinitePositive(
       RETRIEVAL_W_VEC_VAR,
       readEnv(RETRIEVAL_W_VEC_VAR),
-      1
+      0.8
+    ),
+    w_bm25: parseFinitePositive(
+      RETRIEVAL_W_BM25_VAR,
+      readEnv(RETRIEVAL_W_BM25_VAR),
+      0.2
     ),
     w_graph: parseFinitePositive(
       RETRIEVAL_W_GRAPH_VAR,
       readEnv(RETRIEVAL_W_GRAPH_VAR),
       1
+    ),
+    bm25Enabled: parseBoolean(
+      RETRIEVAL_BM25_ENABLED_VAR,
+      readEnv(RETRIEVAL_BM25_ENABLED_VAR),
+      true
     ),
     entityLinkTopK,
     candidateCap,

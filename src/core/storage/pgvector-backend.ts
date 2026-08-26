@@ -21,7 +21,10 @@
  * src/index.ts:buildDeps.
  */
 import type { ChunkRecord, RetrievedChunk, SearchOptions } from "../types.js";
-import type { GraphRagStorageBackend } from "./backend.js";
+import type {
+  GraphRagStorageBackend,
+  LexicalStorageBackend,
+} from "./backend.js";
 import type { GraphArmStorage } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
@@ -77,6 +80,30 @@ const ONE_HOP_CHUNKS_SQL =
   "ORDER BY c.id " +
   "LIMIT $3";
 
+/**
+ * Text-search configuration for the lexical arm. `simple` deliberately,
+ * not `english`: it lowercases and nothing else, so no stemmer or
+ * stop-word list is baked into stored `content_tsv` values. Choosing a
+ * language here would be a one-way door — the column is generated, so
+ * changing the config later rewrites the whole table.
+ */
+const TEXT_SEARCH_CONFIG = "simple";
+
+/**
+ * Build the lexical query with OR semantics over the query's terms.
+ *
+ * `plainto_tsquery` does the lexing and escaping (so the raw user string
+ * never becomes tsquery syntax), but joins terms with `&`. AND is wrong
+ * for a recall arm: a natural-language question shares only a word or two
+ * with the chunk that answers it, and requiring every term would return
+ * nothing far more often than not. Swapping the operator on the already
+ * sanitized output is the standard way to get OR without hand-parsing.
+ *
+ * A query with no lexemes yields an empty tsquery, which matches no rows
+ * — the empty-input boundary needs no special case.
+ */
+const LEXICAL_TSQUERY = `replace(plainto_tsquery('${TEXT_SEARCH_CONFIG}', $1)::text, ' & ', ' | ')::tsquery`;
+
 /** Cast for the row shape we expect from our SELECT/UPSERT queries. */
 interface ChunkRow {
   id: string;
@@ -87,7 +114,7 @@ interface ChunkRow {
   distance: number;
 }
 
-function rowToRetrievedChunk(row: ChunkRow): RetrievedChunk {
+function rowToRetrievedChunk(row: ChunkRow, score: number): RetrievedChunk {
   return {
     id: row.id,
     content: row.content,
@@ -96,11 +123,47 @@ function rowToRetrievedChunk(row: ChunkRow): RetrievedChunk {
       row.valid_from.toISOString(),
       row.valid_until?.toISOString() ?? null,
     ],
-    // pgvector `<=>` returns cosine *distance* (1 - similarity). Flip so
-    // the public score field matches MemoryBackend's cosine similarity
-    // convention (1 = perfect match, 0 = orthogonal).
-    score: 1 - row.distance,
+    score,
   };
+}
+
+/**
+ * The two-sided temporal predicate every read path shares. Both search
+ * paths bind `$2` to `validAt`, so the clause text is identical.
+ */
+const VALID_WINDOW_CLAUSES: readonly string[] = [
+  "valid_from <= $2::timestamptz",
+  "(valid_until IS NULL OR valid_until > $2::timestamptz)",
+];
+
+/**
+ * Append exact-match `source_ref` / `metadata.*` clauses, extending
+ * `where` and `params` in step so the `$N` placeholders stay in sync.
+ * Callers must have already pushed the two shared positional arguments
+ * ($1 arm input, $2 validAt).
+ *
+ * Unknown top-level filter keys are ignored — they cannot match anything
+ * on a chunk row, and MemoryBackend is permissive the same way so caller
+ * code stays portable across backends.
+ */
+function appendFilterClauses(
+  filters: Record<string, string>,
+  where: string[],
+  params: unknown[]
+): void {
+  if (filters["source_ref"] !== undefined) {
+    params.push(filters["source_ref"]);
+    where.push(`source_ref = $${params.length}`);
+  }
+  for (const [key, value] of Object.entries(filters)) {
+    if (key === "source_ref") continue;
+    if (!key.startsWith("metadata.")) continue;
+    // JSONB text extraction via `->>` is the canonical exact-match
+    // pattern; it casts the value to text so `=` works for any JSON
+    // scalar (string, number, bool) without operator juggling.
+    params.push(key.slice("metadata.".length), value);
+    where.push(`metadata ->> $${params.length - 1} = $${params.length}`);
+  }
 }
 
 /**
@@ -115,7 +178,9 @@ function rowToRetrievedChunk(row: ChunkRow): RetrievedChunk {
  * CREATE EXTENSION + CREATE TABLE IF NOT EXISTS), so a fresh database
  * works out of the box.
  */
-export class PgvectorBackend implements GraphRagStorageBackend {
+export class PgvectorBackend
+  implements GraphRagStorageBackend, LexicalStorageBackend
+{
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
 
@@ -202,6 +267,28 @@ export class PgvectorBackend implements GraphRagStorageBackend {
              metadata jsonb NOT NULL,
              created_at timestamptz NOT NULL
            )`,
+          []
+        );
+        // Lexical index for the BM25 arm. Kept as a separate ALTER rather
+        // than a column in the CREATE above because the CREATE is
+        // IF NOT EXISTS and no-ops on every existing deployment — an
+        // operator upgrading into BM25 would never get the column.
+        //
+        // GENERATED ... STORED means Postgres maintains the vector on
+        // every insert and update, so `upsert` needs no new SQL and no
+        // trigger can drift from it. Adding the column rewrites the table
+        // once, which backfills every pre-existing row: starting the
+        // backend IS the migration (SC6).
+        await client.query(
+          `ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector
+             GENERATED ALWAYS AS (to_tsvector('${TEXT_SEARCH_CONFIG}', content)) STORED`,
+          []
+        );
+        // Without this the lexical predicate would re-tokenize the table
+        // on every retrieve.
+        await client.query(
+          `CREATE INDEX IF NOT EXISTS chunks_content_tsv_gin
+             ON chunks USING GIN (content_tsv)`,
           []
         );
         // P0 schema: entities + entity_aliases + triples + extraction_records.
@@ -296,39 +383,11 @@ export class PgvectorBackend implements GraphRagStorageBackend {
     }
     const pool = await this.ensureReady();
 
-    // Build dynamic WHERE clauses for source_ref and metadata filters.
-    // We collect parameters in order so the $N placeholders stay in sync
-    // with the values array.
-    const where: string[] = [
-      "valid_from <= $2::timestamptz",
-      "(valid_until IS NULL OR valid_until > $2::timestamptz)",
-    ];
+    // Parameters are collected in order so the $N placeholders stay in
+    // sync with the values array.
+    const where = [...VALID_WINDOW_CLAUSES];
     const params: unknown[] = [toVectorLiteral(queryEmbedding), opts.validAt];
-    let p = params.length;
-
-    const filters = opts.filters ?? {};
-    if (filters["source_ref"] !== undefined) {
-      p += 1;
-      where.push(`source_ref = $${p}`);
-      params.push(filters["source_ref"]);
-    }
-    for (const [key, value] of Object.entries(filters)) {
-      if (key === "source_ref") continue;
-      if (key.startsWith("metadata.")) {
-        const metaKey = key.slice("metadata.".length);
-        p += 1;
-        // JSONB text extraction via `->>` is the canonical exact-match
-        // pattern; it casts the value to text so `=` works for any JSON
-        // scalar (string, number, bool) without operator juggling.
-        where.push(`metadata ->> $${p} = $${p + 1}`);
-        params.push(metaKey, value);
-        p += 1;
-      }
-      // Unknown top-level keys are ignored — mirrors MemoryBackend's
-      // permissive filter parsing so caller code is portable.
-    }
-    p += 1;
-    const limitPlaceholder = `$${p}`;
+    appendFilterClauses(opts.filters ?? {}, where, params);
     params.push(opts.limit);
 
     const sql = `
@@ -337,7 +396,7 @@ export class PgvectorBackend implements GraphRagStorageBackend {
       FROM chunks
       WHERE ${where.join(" AND ")}
       ORDER BY embedding <=> $1::vector ASC
-      LIMIT ${limitPlaceholder}
+      LIMIT $${params.length}
     `;
 
     let rows: unknown[];
@@ -351,7 +410,64 @@ export class PgvectorBackend implements GraphRagStorageBackend {
       );
     }
 
-    return rows.map((r) => rowToRetrievedChunk(r as ChunkRow));
+    return rows.map((r) => {
+      const row = r as ChunkRow;
+      // pgvector `<=>` returns cosine *distance* (1 - similarity). Flip
+      // so the public score matches MemoryBackend's cosine similarity
+      // convention (1 = perfect match, 0 = orthogonal).
+      return rowToRetrievedChunk(row, 1 - row.distance);
+    });
+  }
+
+  /**
+   * BM25-style lexical search over `content_tsv` (the BM25 arm, #65).
+   *
+   * Ranking is `ts_rank_cd`, not literal Okapi BM25 with k1=1.2 / b=0.75
+   * — Postgres exposes no BM25 scorer and adding a dependency for one is
+   * out of scope (SC11). The approximation is acceptable here precisely
+   * because RRF fuses on RANK: only the ORDER of these hits reaches the
+   * fused result, never the score's scale. `ts_rank_cd` is preferred over
+   * `ts_rank` for its cover-density term, which rewards chunks where the
+   * query's terms appear near each other.
+   */
+  async searchLexical(
+    query: string,
+    opts: SearchOptions
+  ): Promise<RetrievedChunk[]> {
+    const pool = await this.ensureReady();
+
+    const where = [
+      ...VALID_WINDOW_CLAUSES,
+      `content_tsv @@ ${LEXICAL_TSQUERY}`,
+    ];
+    const params: unknown[] = [query, opts.validAt];
+    appendFilterClauses(opts.filters ?? {}, where, params);
+    params.push(opts.limit);
+
+    const sql = `
+      SELECT id, content, source_ref, valid_from, valid_until,
+             ts_rank_cd(content_tsv, ${LEXICAL_TSQUERY}) AS rank
+      FROM chunks
+      WHERE ${where.join(" AND ")}
+      ORDER BY rank DESC, id ASC
+      LIMIT $${params.length}
+    `;
+
+    let rows: unknown[];
+    try {
+      const result = await pool.query(sql, params);
+      rows = result.rows;
+    } catch (err) {
+      throw new GraphragError(
+        `PgvectorBackend.searchLexical failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+
+    return rows.map((r) => {
+      const row = r as ChunkRow & { rank: number };
+      return rowToRetrievedChunk(row, row.rank);
+    });
   }
 
   async close(): Promise<void> {

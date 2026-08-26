@@ -27,7 +27,9 @@ const TEST_DIM = 1536;
 /** Default RetrieveConfig the handler tests run under. */
 const CFG: RetrieveConfig = {
   w_vec: 1,
+  w_bm25: 1,
   w_graph: 1,
+  bm25Enabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
@@ -309,7 +311,9 @@ describe("retrieve embed budget (T7 G5)", () => {
 
 const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC",
+  "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25",
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
+  "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
@@ -345,11 +349,19 @@ function withRetrievalEnv(
 }
 
 describe("retrieve config boundary validation (T5)", () => {
-  it("defaults to w_vec=1, w_graph=1, topK=8, cap=50, floor=3 when unset", () => {
+  it("defaults to the production hybrid plus the archived graph knobs when unset", () => {
     withRetrievalEnv({}, () => {
       const env = loadEnv();
       expect(env.retrieval).toEqual({
-        w_vec: 1,
+        // Production hybrid (#59): vector 0.8 / BM25 0.2, BM25 on. The
+        // per-knob assertions live in tests/config.test.ts; this case
+        // pins the exact field SET so a new knob cannot appear without
+        // the graph-arm suite noticing.
+        w_vec: 0.8,
+        w_bm25: 0.2,
+        bm25Enabled: true,
+        // Graph knobs keep their P0 values but no longer steer the
+        // default path — the arm is archived (#58).
         w_graph: 1,
         entityLinkTopK: 8,
         candidateCap: 50,

@@ -26,6 +26,7 @@
     "start": "node dist/index.js",
     "extract": "node dist/cli/extract.js",
     "graph:backfill": "node dist/cli/graph-backfill.js",
+    "graph:drain": "node dist/cli/graph-drain.js",
     "prepare": "husky"
   },
   "dependencies": {

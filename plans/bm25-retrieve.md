@@ -58,7 +58,7 @@ OVERALL: PASS — proceed with tracer bullets.
    - **Inherits:** SC5–SC6; A3–A5; #59 production = tsvector+rank; `simple` config; no new BM25 npm dep (SC11).
    - **Surface:** `PgvectorBackend` / schema helpers; real-Postgres integration suite (loud skip if unreachable).
    - **Acceptance:** SC5 distinctive-token retrieve hit; SC6 new upserts maintain tsv and backfill makes old rows searchable; SC11 `package.json` free of wink/lunr/minisearch/flexsearch.
-   - Status: [ ] pending
+   - Status: [x] done — `chunks.content_tsv` generated over `simple` + GIN, added by `ensureTable` so startup backfills old rows; `PgvectorBackend.searchLexical` ranks with `ts_rank_cd`; proof in `tests/integration/bm25-pg.test.ts` (12 cases, loud skip)
    - [blocks: T2] — needs config weights/types available for search limit wiring if shared
    - Tracker: https://github.com/winter6205/iknow-memory/issues/65
 

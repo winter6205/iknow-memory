@@ -1,0 +1,80 @@
+name: test
+
+# Two-tier CI:
+#
+#   test-fast  — PR gate (required check). Fast vitest subset without Postgres.
+#   test-full  — nightly cron + manual dispatch. Full suite with Postgres service.
+#
+# Local WSL `npm test` is ground truth; excludes only affect CI runners.
+# Do not delete tests — use --exclude to express CI policy.
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  test-fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - name: Check test excludes (CI guard)
+        run: npx tsx scripts/ci-check-test-excludes.ts
+      - name: Vitest fast subset (bail-10 + retry-1)
+        # slow-path (fast-only): tests/integration/** glob, plus postgres-dependent
+        #   files outside that directory (taxonomy: directory-outside append).
+        # assembly / physical bwrap / TUI flake: none in this repo (guard still
+        #   scans assembly call-forms; hits would need both jobs).
+        # Local WSL `npm test` runs the full suite; CI only shortens PR feedback.
+        run: |
+          npx vitest run --retry 1 --bail=10 \
+            --exclude 'tests/integration/**' \
+            --exclude tests/cli/extract-relation-pg.test.ts \
+            --exclude tests/cli/extract-list-failed.test.ts \
+            --exclude tests/cli/extract.test.ts \
+            --exclude tests/cli/extract-e2e-graph.test.ts \
+            --exclude tests/schema-p0.test.ts
+
+  test-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      GRAPHRAG_MEMORY_DB_URL: postgresql://postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run typecheck
+      - name: Check test excludes (CI guard)
+        run: npx tsx scripts/ci-check-test-excludes.ts
+      - name: Vitest full suite (retry-1)
+        run: npx vitest run --retry 1

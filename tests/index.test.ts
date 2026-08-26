@@ -323,3 +323,46 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
     });
   });
 });
+
+/**
+ * Neo4j PPR arm wiring (#70 T4) — the mirror image of the archive above.
+ *
+ * The Neo4j arm IS production, so the ranker travels whenever one was
+ * built. Whether one was built is decided by `loadEnv().neo4j`, i.e. by
+ * whether the operator configured a sidecar URI; withholding the key is
+ * exactly how `assembleRetrievalResult` learns to SKIP the arm instead of
+ * degrading the envelope (spec SC7).
+ */
+describe("buildRetrieveDeps — Neo4j graph arm wiring (#70)", () => {
+  const embedder = new FakeEmbedder(1536);
+  const storage = new MemoryBackend(1536);
+  const retrieval = {
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    w_graph: 0.15,
+    bm25Enabled: true,
+    graphEnabled: true,
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    graphArmFloor: 3,
+  };
+  const graphRanker = {
+    rankEntities: async () => [],
+    close: async () => {},
+  };
+
+  it("omits graphRanker entirely when no sidecar is configured", () => {
+    const deps = buildRetrieveDeps({ embedder, storage, retrieval }, false);
+    // An explicit `graphRanker: undefined` would read as "wired, currently
+    // empty"; absence is the wire signal for "no Neo4j here".
+    expect(Object.hasOwn(deps, "graphRanker")).toBe(false);
+  });
+
+  it("passes the ranker through when one was built", () => {
+    const deps = buildRetrieveDeps(
+      { embedder, storage, retrieval, graphRanker },
+      false
+    );
+    expect(deps.graphRanker).toBe(graphRanker);
+  });
+});

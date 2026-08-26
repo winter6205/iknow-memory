@@ -27,12 +27,13 @@ import { GraphragError } from "../../src/core/errors.js";
 const DIM = 4;
 const NOW = "2024-06-01T00:00:00Z";
 
-/** Production defaults: vector 0.8 / BM25 0.2, BM25 on. */
+/** Production defaults (#69/#70): vector 0.7 / BM25 0.15 / graph 0.15. */
 const CFG: RetrieveConfig = {
-  w_vec: 0.8,
-  w_bm25: 0.2,
-  w_graph: 1,
+  w_vec: 0.7,
+  w_bm25: 0.15,
+  w_graph: 0.15,
   bm25Enabled: true,
+  graphEnabled: true,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
@@ -141,8 +142,8 @@ describe("assembleRetrievalResult — BM25 arm enabled (SC10)", () => {
   // The whole point of a lexical arm is recall the vector arm does not
   // have. If each arm only ever fetched `limit` rows, a chunk the vector
   // arm ranks below the cut could never be fused at all: BM25 would
-  // contribute it as a lexical-only hit worth w_bm25/(k+1) = 0.0033,
-  // which cannot outrank a vector-only hit at w_vec/(k+1) = 0.013. The
+  // contribute it as a lexical-only hit worth w_bm25/(k+1) = 0.0025,
+  // which cannot outrank a vector-only hit at w_vec/(k+1) = 0.011. The
   // arms therefore draw from a deeper candidate pool and only the FUSED
   // list is cut to `limit`.
   it("surfaces a chunk the vector arm ranks below the limit", async () => {

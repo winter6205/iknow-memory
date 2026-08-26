@@ -53,8 +53,8 @@ import { GraphragError } from "../errors.js";
  *
  * Fetching only `limit` per arm would make the lexical arm nearly inert:
  * a chunk the vector arm ranks below the cut could reach fusion only as a
- * BM25-only hit worth `w_bm25 / (k + 1)` ≈ 0.0033, which cannot outrank a
- * vector-only hit at `w_vec / (k + 1)` ≈ 0.013. Drawing deeper lets the
+ * BM25-only hit worth `w_bm25 / (k + 1)` ≈ 0.0025, which cannot outrank a
+ * vector-only hit at `w_vec / (k + 1)` ≈ 0.011. Drawing deeper lets the
  * two arms actually agree on a chunk, and agreement is the signal RRF
  * exists to reward. Only the FUSED list is cut to `limit`.
  *

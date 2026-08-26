@@ -71,10 +71,17 @@ export interface RetrieveConfig {
   w_vec: number;
   /** Weight for the BM25 lexical arm in RRF. */
   w_bm25: number;
-  /** Weight for the archived graph arm in RRF (unused on the default path). */
+  /** Weight for the graph arm in RRF. */
   w_graph: number;
   /** Whether the BM25 arm runs at all. Off → vector-only, and NOT degraded. */
   bm25Enabled: boolean;
+  /**
+   * Whether the Neo4j graph arm runs at all. Off → vector (+BM25) only,
+   * and NOT degraded: an operator switching an arm off is a choice, the
+   * same contract `bm25Enabled` carries. Absent Neo4j config is a
+   * separate, equally non-degrading reason to skip the arm.
+   */
+  graphEnabled: boolean;
   /** Top-K seed entities from the embedding seed query. */
   entityLinkTopK: number;
   /** Hard cap on total candidates pulled from the graph arm. */

@@ -1,6 +1,14 @@
 /**
  * Graph-arm pure orchestration (spec-3 p0-integration T3).
  *
+ * **ARCHIVED off the production path (#58 / #62).** The default server
+ * wiring supplies no `graphConfig`, so `assembleRetrievalResult` never
+ * reaches this module: nothing here runs for an operator on the stock
+ * server. It is kept compiling, and kept reachable from tests that inject
+ * `graphConfig` explicitly, rather than deleted — a one-hop SQL JOIN over
+ * `triples` was never a real graph arm, and Neo4j is the future home for
+ * one. See `docs/runbooks/sql-graph-arm-archived.md`.
+ *
  * Runs the graph retrieval pipeline: top-K seed entities → one-hop triples →
  * chunks. The query embedding is supplied by the T5 orchestrator, which
  * embeds once for both arms (G5 lever (a), spec p0-wiring-closure A12) — the

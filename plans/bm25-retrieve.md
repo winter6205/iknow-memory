@@ -43,7 +43,7 @@ OVERALL: PASS — proceed with tracer bullets.
    - **Inherits:** Spec Boundaries Does §1; SC1–SC3; A12; research #61 — minimal off = stop passing `graphConfig` from default server wiring; ledger tables retained; archive-in-place (do not hard-delete `graph-arm.ts` without Ask-first); #57 route reset.
    - **Surface:** `src/index.ts` / retrieve tool wiring; retrieval regression tests; short archive note under `docs/` (runbook or handoff pointer).
    - **Acceptance:** SC1 — default `createServer` path never supplies `graphConfig` (regression test); SC2 — schema-p0 ledger tables untouched; SC3 — archive note committed; closes #58 intent when merged.
-   - Status: [ ] pending
+   - Status: [x] done — `buildRetrieveDeps` withholds `graphConfig`; guards in `tests/index.test.ts` (no PG) + `extract-e2e-graph` Case 4 (real PG, ledger preserved); note at `docs/runbooks/sql-graph-arm-archived.md`
    - Tracker: https://github.com/winter6205/iknow-memory/issues/63
 
 2. **N-arm RRF + RetrieveConfig BM25 defaults** — tag: `[implementation]`

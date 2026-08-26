@@ -48,6 +48,21 @@ import {
 import type { EmbeddingClient } from "../embedder.js";
 import { GraphragError } from "../errors.js";
 
+/**
+ * How many candidates each arm draws when its results will be fused.
+ *
+ * Fetching only `limit` per arm would make the lexical arm nearly inert:
+ * a chunk the vector arm ranks below the cut could reach fusion only as a
+ * BM25-only hit worth `w_bm25 / (k + 1)` ≈ 0.0033, which cannot outrank a
+ * vector-only hit at `w_vec / (k + 1)` ≈ 0.013. Drawing deeper lets the
+ * two arms actually agree on a chunk, and agreement is the signal RRF
+ * exists to reward. Only the FUSED list is cut to `limit`.
+ *
+ * 50 matches `candidateCap`'s default order of magnitude without
+ * borrowing that knob, which belongs to the archived graph arm.
+ */
+const ARM_CANDIDATE_POOL = 50;
+
 /** Inputs — what the orchestrator needs from the retrieve tool. */
 export interface AssembleArgs {
   query: string;
@@ -92,12 +107,6 @@ export async function assembleRetrievalResult(
   // the graph arm's seed lookup. Embed failure propagates before any arm
   // starts.
   const queryEmbedding = await embedQuery(deps.embedder, args.query);
-  const searchOpts = {
-    limit: args.limit,
-    validAt: args.validAt,
-    ...(args.filters !== undefined ? { filters: args.filters } : {}),
-  };
-  const vectorSearch = deps.storage.search(queryEmbedding, searchOpts);
 
   // Fusion weights come from whichever config the caller supplied. Legacy
   // graph-arm callers pass only `graphConfig`; production passes only
@@ -105,8 +114,16 @@ export async function assembleRetrievalResult(
   const config = deps.retrieveConfig ?? deps.graphConfig;
   const lexical = getLexicalArm(deps, config);
   const graph = getGraphSeed(deps);
+  const fusing = lexical !== undefined || graph !== undefined;
 
-  if (lexical === undefined && graph === undefined) {
+  const searchOpts = {
+    limit: fusing ? Math.max(args.limit, ARM_CANDIDATE_POOL) : args.limit,
+    validAt: args.validAt,
+    ...(args.filters !== undefined ? { filters: args.filters } : {}),
+  };
+  const vectorSearch = deps.storage.search(queryEmbedding, searchOpts);
+
+  if (!fusing) {
     // Vector-only: chunks flow through unchanged. RetrievedChunk is
     // already structurally identical to the envelope chunk shape, so no
     // projection is needed for the empty-extra-keys contract.

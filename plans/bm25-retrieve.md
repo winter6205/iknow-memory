@@ -50,7 +50,7 @@ OVERALL: PASS — proceed with tracer bullets.
    - **Inherits:** SC4, SC7; A6–A7; #59 weights 0.8/0.2; RRF k=60 algorithm unchanged; extend arm union with `"bm25"`; enable flag default on; invalid env → `ConfigError`.
    - **Surface:** `src/core/retrieval` types + `rrf.ts`; `src/config.ts` + config unit tests.
    - **Acceptance:** SC4 unit tests green for N-arm fusion; SC7 fresh env asserts `w_vec=0.8`, `w_bm25=0.2`, BM25 enabled; negative env cases throw `ConfigError`.
-   - Status: [ ] pending
+   - Status: [x] done — `rrfFuse(arms[], cfg, limit)` is N-arm at k=60; `RetrieveConfig` gains `w_bm25` + `bm25Enabled`; defaults 0.8 / 0.2 / on with `ConfigError` on bad weight or flag
    - [parallel] with T1 on outcome graph; same-branch sequence T1 then T2 if both touch config comments only — prefer T1 first.
    - Tracker: https://github.com/winter6205/iknow-memory/issues/64
 

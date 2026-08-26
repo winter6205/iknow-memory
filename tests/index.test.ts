@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import assert from "node:assert/strict";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
-import { createServer } from "../src/index.ts";
+import { buildRetrieveDeps, createServer } from "../src/index.ts";
+import { FakeEmbedder } from "../src/core/embedder.ts";
+import { MemoryBackend } from "../src/core/storage/memory-backend.ts";
 
 /**
  * Construct a server with the stage 1 env vars forced to their defaults.
@@ -254,5 +256,41 @@ describe("createServer — registered tool set (T7)", () => {
     } finally {
       await close();
     }
+  });
+});
+
+/**
+ * SQL one-hop graph arm archived off the production path (#58 / #62).
+ *
+ * `assembleRetrievalResult` runs the graph arm only when the retrieve tool
+ * is handed BOTH a backend exposing `graphArmSeed` (PgvectorBackend does)
+ * and a `graphConfig`. Server wiring owns the second half, so withholding
+ * `graphConfig` is the whole archive: no code is deleted, and a test that
+ * injects `graphConfig` explicitly still exercises the arm.
+ *
+ * This asserts the wiring directly so the guard runs without Postgres and
+ * lands in the fast CI tier. `tests/cli/extract-e2e-graph.test.ts` Case 4
+ * carries the end-to-end proof against a real pgvector backend holding
+ * traversable graph data.
+ */
+describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
+  const embedder = new FakeEmbedder(1536);
+  const storage = new MemoryBackend(1536);
+
+  it("omits graphConfig entirely from the default retrieve deps", () => {
+    const deps = buildRetrieveDeps({ embedder, storage }, false);
+    // `Object.hasOwn` rather than `=== undefined`: an explicit
+    // `graphConfig: undefined` would read as "wired, currently empty" and
+    // would let a later refactor fill it in without tripping this guard.
+    expect(Object.hasOwn(deps, "graphConfig")).toBe(false);
+    expect(deps.graphConfig).toBeUndefined();
+  });
+
+  it("still threads the embedder, storage, and debug gate through", () => {
+    expect(buildRetrieveDeps({ embedder, storage }, true)).toEqual({
+      embedder,
+      storage,
+      debug: true,
+    });
   });
 });

@@ -333,7 +333,11 @@ function parseRetrievalConfig(): RetrieveConfig {
 
 // --- Neo4j sidecar config (#70) ---
 
-const NEO4J_URI_VAR = "GRAPHRAG_MEMORY_NEO4J_URI";
+/**
+ * Exported because the projection CLI names it in its own "you asked me to
+ * project but gave me no target" ConfigError. The var is spelled once, here.
+ */
+export const NEO4J_URI_VAR = "GRAPHRAG_MEMORY_NEO4J_URI";
 const NEO4J_USER_VAR = "GRAPHRAG_MEMORY_NEO4J_USER";
 const NEO4J_PASSWORD_VAR = "GRAPHRAG_MEMORY_NEO4J_PASSWORD";
 

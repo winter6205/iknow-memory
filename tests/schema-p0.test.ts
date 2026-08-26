@@ -33,11 +33,22 @@ const P0_TABLES = [
 ] as const;
 
 /**
- * The five table names we count via pg_tables: four P0 tables + `chunks`.
- * Filtering on this set keeps the count independent of any other tables
- * that may exist in the database (e.g. test leftovers).
+ * The projection tables `upSchemaP0` also bootstraps (specs/neo4j-graph-arm.md
+ * T2). Not a P0 table — it carries the ledger→Neo4j sync intent log — but it
+ * rides the same idempotent bootstrap, so the drop/count/presence invariants
+ * below cover it too.
  */
-const COUNTED_TABLES = [...P0_TABLES, "chunks"] as const;
+const PROJECTION_TABLES = ["projection_outbox"] as const;
+
+/** Every table the bootstrap owns; dropped and re-created by the first test. */
+const BOOTSTRAP_TABLES = [...P0_TABLES, ...PROJECTION_TABLES] as const;
+
+/**
+ * The table names we count via pg_tables: everything the bootstrap owns +
+ * `chunks`. Filtering on this set keeps the count independent of any other
+ * tables that may exist in the database (e.g. test leftovers).
+ */
+const COUNTED_TABLES = [...BOOTSTRAP_TABLES, "chunks"] as const;
 
 const DB_URL = "postgresql://postgres@localhost/postgres";
 
@@ -77,10 +88,10 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     }
     const c = client;
 
-    // Drop pre-existing P0 tables so the test starts from a known-empty
-    // state. Cascade is required because triples / entity_aliases /
-    // extraction_records carry FKs to entities / chunks.
-    for (const t of P0_TABLES) {
+    // Drop pre-existing bootstrap tables so the test starts from a
+    // known-empty state. Cascade is required because triples /
+    // entity_aliases / extraction_records carry FKs to entities / chunks.
+    for (const t of BOOTSTRAP_TABLES) {
       await c.query(`DROP TABLE IF EXISTS "${t}" CASCADE`);
     }
     // Also drop `chunks` so the entity FK that references chunks doesn't
@@ -102,9 +113,11 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     const secondCount = await countPgTables(c);
 
     expect(secondCount).toBe(firstCount);
-    // Sanity: every P0 table we own is present after first invocation.
+    // Sanity: every table the bootstrap owns is present after the first
+    // invocation — including `projection_outbox`, which the extract emit
+    // path writes into inside its per-chunk transaction.
     const tableNames = await listTableNames(c);
-    for (const t of P0_TABLES) {
+    for (const t of BOOTSTRAP_TABLES) {
       expect(tableNames).toContain(t);
     }
   });
@@ -832,6 +845,189 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       expect(after.rows[0].chunk_id).toBeNull();
     });
   });
+
+  // -------------------------------------------------------------------
+  // Neo4j graph arm T2: DDL contract lock for projection_outbox
+  // (specs/neo4j-graph-arm.md SC3/SC4, ADR-0001).
+  //
+  // Runs after the idempotency test which drops + recreates everything the
+  // bootstrap owns. The pins below are the ones later tickets depend on:
+  // the `status` lifecycle T3's drain transitions, the subject CHECK that
+  // makes "chunks never enter Neo4j" a database invariant rather than a
+  // convention, and the partial UNIQUE index that keeps a re-run backfill
+  // from piling up duplicate pending intents.
+  // -------------------------------------------------------------------
+  describe("projection_outbox DDL contract", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    async function readColumns(
+      c: pg.Client,
+      tableName: string
+    ): Promise<Set<string>> {
+      const res = await c.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_name = $1 AND table_schema = 'public'`,
+        [tableName]
+      );
+      return new Set(res.rows.map((r) => r.column_name));
+    }
+
+    /** Index name → indexdef for the table's own indexes. */
+    async function readOutboxIndexes(
+      c: pg.Client
+    ): Promise<Map<string, string>> {
+      const res = await c.query<{ indexname: string; indexdef: string }>(
+        `SELECT indexname, indexdef FROM pg_indexes
+           WHERE schemaname = 'public' AND tablename = 'projection_outbox'`
+      );
+      return new Map(res.rows.map((r) => [r.indexname, r.indexdef]));
+    }
+
+    /** Insert one intent row; returns the minted id. */
+    async function insertIntent(
+      c: pg.Client,
+      over: {
+        subjectKind?: string;
+        subjectId?: string;
+        status?: string;
+      } = {}
+    ): Promise<string> {
+      const id = crypto.randomUUID();
+      const columns = ["id", "subject_kind", "subject_id"];
+      const values: unknown[] = [
+        id,
+        over.subjectKind ?? "entity",
+        over.subjectId ?? crypto.randomUUID(),
+      ];
+      if (over.status !== undefined) {
+        columns.push("status");
+        values.push(over.status);
+      }
+      const placeholders = columns.map((_, i) => `$${i + 1}`).join(", ");
+      await c.query(
+        `INSERT INTO projection_outbox (${columns.join(", ")})
+           VALUES (${placeholders})`,
+        values
+      );
+      return id;
+    }
+
+    it("projection_outbox exposes every column pinned in the DDL contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "projection_outbox");
+      const expected = [
+        "id",
+        "subject_kind",
+        "subject_id",
+        "status",
+        "attempts",
+        "last_error",
+        "created_at",
+        "processed_at",
+      ];
+      for (const col of expected) {
+        expect(cols, `projection_outbox.${col} missing`).toContain(col);
+      }
+    });
+
+    it("a freshly emitted intent defaults to status 'pending' with zero attempts", async () => {
+      const c = requireClient();
+      const id = await insertIntent(c);
+      const res = await c.query<{
+        status: string;
+        attempts: number;
+        processed_at: string | null;
+      }>(
+        `SELECT status, attempts, processed_at FROM projection_outbox
+           WHERE id = $1`,
+        [id]
+      );
+      expect(res.rows[0]).toMatchObject({
+        status: "pending",
+        attempts: 0,
+        processed_at: null,
+      });
+    });
+
+    it("status accepts exactly pending / done / failed (T3 drain lifecycle)", async () => {
+      const c = requireClient();
+      for (const status of ["pending", "done", "failed"]) {
+        await expect(insertIntent(c, { status })).resolves.toBeTypeOf("string");
+      }
+      await expect(insertIntent(c, { status: "draining" })).rejects.toThrow();
+    });
+
+    it("CHECK rejects a chunk subject — chunks never enter the projection", async () => {
+      const c = requireClient();
+      await expect(insertIntent(c, { subjectKind: "chunk" })).rejects.toThrow();
+      for (const subjectKind of ["entity", "triple"]) {
+        await expect(insertIntent(c, { subjectKind })).resolves.toBeTypeOf(
+          "string"
+        );
+      }
+    });
+
+    it("has the drain-scan and subject-lookup indexes", async () => {
+      const c = requireClient();
+      const idx = await readOutboxIndexes(c);
+      const scan = idx.get("projection_outbox_status_created_at_idx");
+      expect(
+        scan,
+        "projection_outbox_status_created_at_idx missing"
+      ).toBeDefined();
+      expect(scan!).toMatch(/\(status, created_at\)/);
+      const subject = idx.get("projection_outbox_subject_idx");
+      expect(subject, "projection_outbox_subject_idx missing").toBeDefined();
+      expect(subject!).toMatch(/\(subject_kind, subject_id\)/);
+    });
+
+    it("a partial UNIQUE index collapses duplicate pending intents for one subject", async () => {
+      const c = requireClient();
+      const idx = await readOutboxIndexes(c);
+      const uniq = idx.get("projection_outbox_pending_subject_idx");
+      expect(
+        uniq,
+        "projection_outbox_pending_subject_idx missing"
+      ).toBeDefined();
+      expect(uniq!).toMatch(/^CREATE UNIQUE INDEX/i);
+      expect(uniq!).toMatch(/WHERE \(status = 'pending'/);
+
+      // Same subject twice while pending → rejected; once the first intent
+      // is drained the subject can be re-enqueued, which is what keeps a
+      // re-run backfill idempotent without blocking later changes.
+      const subjectId = crypto.randomUUID();
+      const first = await insertIntent(c, { subjectId });
+      await expect(insertIntent(c, { subjectId })).rejects.toThrow();
+      await c.query(
+        `UPDATE projection_outbox SET status = 'done', processed_at = now()
+           WHERE id = $1`,
+        [first]
+      );
+      await expect(insertIntent(c, { subjectId })).resolves.toBeTypeOf(
+        "string"
+      );
+    });
+
+    it("carries no FK to entities or triples so an intent outlives its ledger row", async () => {
+      // A CASCADE from the ledger would silently delete the very intent that
+      // tells the projector to remove the node from Neo4j.
+      const c = requireClient();
+      const res = await c.query<{ n: string }>(
+        `SELECT count(*)::text AS n FROM information_schema.table_constraints
+           WHERE table_schema = 'public'
+             AND table_name = 'projection_outbox'
+             AND constraint_type = 'FOREIGN KEY'`
+      );
+      expect(Number(res.rows[0]!.n)).toBe(0);
+    });
+  });
 });
 
 /**
@@ -866,27 +1062,33 @@ function tstzrangeAll(c: pg.Client): unknown {
 }
 
 /**
- * Count rows in pg_tables filtered to the four P0 tables + chunks. Used as
+ * Count rows in pg_tables filtered to the bootstrap tables + chunks. Used as
  * the idempotency invariant: a no-op second up() must leave the count
  * unchanged.
+ *
+ * Qualified to `public` for the same reason the embedding-column probe above
+ * is: the integration suites each bootstrap the SAME table names inside their
+ * own throwaway schema, so an unqualified count moves whenever a parallel
+ * vitest worker happens to create one between the two invocations.
  */
 async function countPgTables(c: pg.Client): Promise<number> {
   const res = await c.query<{ count: string }>(
     `SELECT count(*)::text AS count FROM pg_tables
-       WHERE tablename = ANY ($1::text[])`,
+       WHERE schemaname = 'public' AND tablename = ANY ($1::text[])`,
     [COUNTED_TABLES as unknown as string[]]
   );
   return Number(res.rows[0]?.count ?? "0");
 }
 
 /**
- * Return the set of table names we count on. Used to assert the four P0
+ * Return the set of table names we count on. Used to assert the bootstrap
  * tables actually exist after the first up() (idempotency alone wouldn't
  * distinguish "did nothing" from "created everything").
  */
 async function listTableNames(c: pg.Client): Promise<string[]> {
   const res = await c.query<{ tablename: string }>(
-    `SELECT tablename FROM pg_tables WHERE tablename = ANY ($1::text[])`,
+    `SELECT tablename FROM pg_tables
+       WHERE schemaname = 'public' AND tablename = ANY ($1::text[])`,
     [COUNTED_TABLES as unknown as string[]]
   );
   return res.rows.map((r) => r.tablename);

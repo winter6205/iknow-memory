@@ -34,6 +34,10 @@ import { Pool, type PoolClient } from "pg";
 import { loadEnv, ConfigError, type GraphragEnv } from "../config.js";
 import { createLogger, type Logger } from "../logging.js";
 import { upSchemaP0 } from "../core/storage/schema-p0.js";
+import {
+  emitProjectionIntents,
+  type ProjectionSubject,
+} from "../core/storage/projection-outbox.js";
 import { extractChunk, type ChunkInput } from "../core/extraction/extract.js";
 import type { ExtractionOutput } from "../core/extraction/types.js";
 import {
@@ -505,6 +509,12 @@ async function processChunk(
       outcome.outputs,
       startedAt
     );
+    // Same transaction as the ledger rows it describes (SC3): a projection
+    // intent that outlived a rolled-back chunk would tell the projector to
+    // sync a row Postgres never kept, and a chunk that committed without one
+    // would leave Neo4j permanently behind. A throw here lands in the catch
+    // below, which rolls the whole chunk back.
+    await emitProjectionIntents(client, counts.projected);
     await markSucceeded(client, recordId, {
       triplesCount: counts.triples,
       unmappedCount: counts.unmapped,
@@ -521,6 +531,17 @@ async function processChunk(
   }
 }
 
+interface PersistCounts {
+  triples: number;
+  unmapped: number;
+  /**
+   * Ledger subjects this chunk touched, in write order — the projection
+   * intents the caller emits before committing. Chunks are never listed:
+   * they do not enter the graph (ADR-0001).
+   */
+  projected: ProjectionSubject[];
+}
+
 /** Resolve/create entities and upsert triples for one chunk's outputs. */
 async function persistOutputs(
   deps: CliDeps,
@@ -528,17 +549,25 @@ async function persistOutputs(
   chunkId: string,
   outputs: ExtractionOutput[],
   startedAt: string
-): Promise<{ triples: number; unmapped: number }> {
+): Promise<PersistCounts> {
   let triples = 0;
   let unmapped = 0;
+  const projected: ProjectionSubject[] = [];
   for (const out of outputs) {
     const { headId, tailId } = await resolveEndpoints(deps, client, out);
+    // Both endpoints are projectable nodes even when the triple below is
+    // rejected — an entity with no edge is still a node the graph arm can
+    // seed on.
+    projected.push({ kind: "entity", id: headId });
     if (headId === tailId) {
       logSelfLoopRejection(deps, chunkId, out, headId);
       continue;
     }
+    projected.push({ kind: "entity", id: tailId });
     const relationNorm = await vetRelationNorm(deps, out);
-    await upsertTriple(client, {
+    // A merge returns the surviving row's id: its confidence just moved, so
+    // the edge still needs re-projecting.
+    const { tripleId } = await upsertTriple(client, {
       headId,
       tailId,
       relationRaw: out.relationRaw,
@@ -547,10 +576,11 @@ async function persistOutputs(
       sourceChunkId: chunkId,
       validWindow: { start: startedAt, end: null },
     });
+    projected.push({ kind: "triple", id: tripleId });
     triples += 1;
     if (relationNorm === UNMAPPED) unmapped += 1;
   }
-  return { triples, unmapped };
+  return { triples, unmapped, projected };
 }
 
 /**

@@ -201,13 +201,20 @@ describe("createServer — registered tool set (T7)", () => {
 
       expect(chunks.length).toBeGreaterThan(0);
       // FakeEmbedder is deterministic, so embedding the same text twice
-      // yields the same vector — the ingested chunk must be the top hit
-      // with a cosine of ~1.
+      // yields the same vector — the ingested chunk must be the top hit.
       expect(chunks[0]!.content).toBe(content);
       expect(chunks[0]!.source_ref).toBe("test://e2e");
       expect(chunk_ids).toContain(chunks[0]!.id);
-      expect(chunks[0]!.score).toBeGreaterThan(0.99);
       expect(chunks[0]!.valid_window[1]).toBeNull();
+
+      // The stock server now fuses vector ∥ BM25 (#66), so `score` is the
+      // RRF score, not the cosine it used to be. Both arms rank this sole
+      // chunk first, so the fused score is exactly
+      // (w_vec + w_bm25) / (k + 1) = 1.0 / 61 at the production defaults.
+      // Asserting the value rather than "> 0" is what makes this the
+      // end-to-end proof that the BM25 arm really runs on the default
+      // wiring: with BM25 off the score would be the cosine ~1 instead.
+      expect(chunks[0]!.score).toBeCloseTo(1 / 61, 10);
     } finally {
       await close();
     }
@@ -276,9 +283,18 @@ describe("createServer — registered tool set (T7)", () => {
 describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
   const embedder = new FakeEmbedder(1536);
   const storage = new MemoryBackend(1536);
+  const retrieval = {
+    w_vec: 0.8,
+    w_bm25: 0.2,
+    w_graph: 1,
+    bm25Enabled: true,
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    graphArmFloor: 3,
+  };
 
   it("omits graphConfig entirely from the default retrieve deps", () => {
-    const deps = buildRetrieveDeps({ embedder, storage }, false);
+    const deps = buildRetrieveDeps({ embedder, storage, retrieval }, false);
     // `Object.hasOwn` rather than `=== undefined`: an explicit
     // `graphConfig: undefined` would read as "wired, currently empty" and
     // would let a later refactor fill it in without tripping this guard.
@@ -286,10 +302,20 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
     expect(deps.graphConfig).toBeUndefined();
   });
 
+  // The same config object that used to arrive as `graphConfig` now
+  // arrives as `retrieveConfig`, which is what turns the BM25 arm on for
+  // the stock server (#66). Losing this key would silently ship a
+  // vector-only server that still passes every arm-level unit test.
+  it("supplies the loaded retrieval config as retrieveConfig", () => {
+    const deps = buildRetrieveDeps({ embedder, storage, retrieval }, false);
+    expect(deps.retrieveConfig).toBe(retrieval);
+  });
+
   it("still threads the embedder, storage, and debug gate through", () => {
-    expect(buildRetrieveDeps({ embedder, storage }, true)).toEqual({
+    expect(buildRetrieveDeps({ embedder, storage, retrieval }, true)).toEqual({
       embedder,
       storage,
+      retrieveConfig: retrieval,
       debug: true,
     });
   });

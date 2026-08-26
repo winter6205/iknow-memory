@@ -73,7 +73,8 @@ interface ServerDeps {
    * src/core/retrieval/* (the isolation guard in
    * tests/cli/isolation-retrieval.test.ts enforces that).
    *
-   * No longer reaches the retrieve tool: see `buildRetrieveDeps`.
+   * Reaches the retrieve tool as `retrieveConfig`, never as `graphConfig`:
+   * see `buildRetrieveDeps`.
    */
   retrieval: GraphragEnv["retrieval"];
 }
@@ -81,23 +82,33 @@ interface ServerDeps {
 /**
  * Assemble the retrieve tool's dependencies for the default server path.
  *
- * The SQL one-hop graph arm is **archived off production** (#58 / #62).
+ * The loaded retrieval config travels as `retrieveConfig`, which is what
+ * arms BM25 alongside the vector arm on the stock server (#59 / #66).
+ *
+ * It deliberately does NOT travel as `graphConfig`: the SQL one-hop graph
+ * arm is **archived off production** (#58 / #62), and
  * `assembleRetrievalResult` gates that arm on receiving a `graphConfig`,
- * so the archive is expressed here as an absence: this function never
+ * so the archive is expressed here as an absence — this function never
  * builds the key. PgvectorBackend still exposes `graphArmSeed` and
  * `graph-arm.ts` still compiles — tests that want the arm inject
  * `graphConfig` themselves — but no operator gets one-hop JOIN results
  * from the stock server. Neo4j remains the future home for a real graph
  * arm; see `docs/runbooks/sql-graph-arm-archived.md`.
  *
- * Exported so the archive is directly assertable without a live Postgres
- * (tests/index.test.ts); reintroducing `graphConfig` here fails that test.
+ * Exported so both halves are directly assertable without a live Postgres
+ * (tests/index.test.ts); reintroducing `graphConfig` here, or dropping
+ * `retrieveConfig`, fails that test.
  */
 export function buildRetrieveDeps(
-  deps: Pick<ServerDeps, "embedder" | "storage">,
+  deps: Pick<ServerDeps, "embedder" | "storage" | "retrieval">,
   debug: boolean
 ): RetrieveDeps {
-  return { embedder: deps.embedder, storage: deps.storage, debug };
+  return {
+    embedder: deps.embedder,
+    storage: deps.storage,
+    retrieveConfig: deps.retrieval,
+    debug,
+  };
 }
 
 /**

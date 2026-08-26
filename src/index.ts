@@ -38,6 +38,10 @@ import {
   type EmbeddingClient,
 } from "./core/embedder.js";
 import { MemoryBackend } from "./core/storage/memory-backend.js";
+import {
+  createNeo4jPprRanker,
+  type PprRanker,
+} from "./core/graph/neo4j-ppr.js";
 import type { StorageBackend } from "./core/types.js";
 
 const SERVER_NAME = "iknow-memory";
@@ -77,6 +81,12 @@ interface ServerDeps {
    * see `buildRetrieveDeps`.
    */
   retrieval: GraphragEnv["retrieval"];
+  /**
+   * Neo4j PPR ranker for the production graph arm, built only when a
+   * sidecar URI is configured. Undefined is the SC7 case and is passed on
+   * as an ABSENT key, not an empty one — see `buildRetrieveDeps`.
+   */
+  graphRanker?: PprRanker;
 }
 
 /**
@@ -95,18 +105,28 @@ interface ServerDeps {
  * from the stock server. A real graph arm belongs on a native graph
  * engine; see `docs/runbooks/sql-graph-arm-archived.md`.
  *
+ * The Neo4j PPR arm (#70) is wired the opposite way round: it IS the
+ * production third arm, so the ranker travels whenever one was built —
+ * that is, whenever the operator configured a sidecar URI. No URI means no
+ * key at all, which is how `assembleRetrievalResult` tells "no graph
+ * engine here" (skip, stay non-degraded) from "the graph call failed"
+ * (fail open, `degraded: true`).
+ *
  * Exported so both halves are directly assertable without a live Postgres
  * (tests/index.test.ts); reintroducing `graphConfig` here, or dropping
  * `retrieveConfig`, fails that test.
  */
 export function buildRetrieveDeps(
-  deps: Pick<ServerDeps, "embedder" | "storage" | "retrieval">,
+  deps: Pick<ServerDeps, "embedder" | "storage" | "retrieval" | "graphRanker">,
   debug: boolean
 ): RetrieveDeps {
   return {
     embedder: deps.embedder,
     storage: deps.storage,
     retrieveConfig: deps.retrieval,
+    ...(deps.graphRanker !== undefined
+      ? { graphRanker: deps.graphRanker }
+      : {}),
     debug,
   };
 }
@@ -171,7 +191,18 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
 
   // T7 wiring: thread the validated retrieval config into the server deps so
   // createServer() can pass it as graphConfig to retrieveTool.
-  return { embedder, storage, retrieval: env.retrieval };
+  //
+  // The ranker is constructed, not connected: `createNeo4jPprRanker` dials
+  // Neo4j on the first ranking, so an unreachable sidecar degrades one
+  // retrieve instead of stopping the server from starting.
+  return {
+    embedder,
+    storage,
+    retrieval: env.retrieval,
+    ...(env.neo4j !== undefined
+      ? { graphRanker: createNeo4jPprRanker(env.neo4j) }
+      : {}),
+  };
 }
 
 export async function createServer(): Promise<McpServer> {

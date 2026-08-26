@@ -17,6 +17,8 @@
  */
 import type { PoolClient } from "pg";
 
+import { upSchemaProjection } from "./schema-projection.js";
+
 /**
  * entities: canonical entity rows (+ soft-merge columns, #6 Q1-Q2).
  *
@@ -130,9 +132,10 @@ async function createExtractionRecords(client: PoolClient): Promise<void> {
 }
 
 /**
- * Create all four P0 tables + indexes, atomically. Idempotent: safe to call
- * repeatedly (each statement is IF NOT EXISTS). On any failure the whole
- * transaction rolls back so a partial schema can never be left behind.
+ * Create all four P0 tables + indexes (plus the projection outbox that rides
+ * the same bootstrap — see schema-projection.ts), atomically. Idempotent: safe
+ * to call repeatedly (each statement is IF NOT EXISTS). On any failure the
+ * whole transaction rolls back so a partial schema can never be left behind.
  *
  * Why CREATE EXTENSION here (and not at the caller's bootstrap): mirrors
  * PgvectorBackend.ensureTable() — the module is self-contained and a fresh
@@ -151,6 +154,7 @@ export async function upSchemaP0(
     await createEntityAliases(client);
     await createTriples(client);
     await createExtractionRecords(client);
+    await upSchemaProjection(client);
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");

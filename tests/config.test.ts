@@ -924,6 +924,15 @@ describe("loadEnv — Neo4j sidecar config", () => {
     );
   });
 
+  it("trims padding off the URI rather than handing it to the driver", () => {
+    withNeo4jEnv(
+      { GRAPHRAG_MEMORY_NEO4J_URI: "  neo4j://localhost:7687  " },
+      () => {
+        expect(loadEnv().neo4j?.uri).toBe("neo4j://localhost:7687");
+      }
+    );
+  });
+
   const GOOD_SCHEMES = [
     "bolt://localhost:7687",
     "bolt+s://graph.invalid:7687",
@@ -970,15 +979,16 @@ describe("loadEnv — Neo4j sidecar config", () => {
     );
   });
 
-  it("rejects a password with no user", () => {
+  it("rejects a password with no user, naming the var and not the secret", () => {
     withNeo4jEnv(
       {
         GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
-        GRAPHRAG_MEMORY_NEO4J_PASSWORD: "not-a-real-secret",
+        GRAPHRAG_MEMORY_NEO4J_PASSWORD: "hunter2",
       },
       () => {
         expect(() => loadEnv()).toThrow(ConfigError);
         expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_NEO4J_USER/);
+        expect(() => loadEnv()).not.toThrow(/hunter2/);
       }
     );
   });

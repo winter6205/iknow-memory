@@ -40,11 +40,11 @@ commit):
 | --------------------------------------------- | ---------------------------------------------- |
 | `GRAPHRAG_MEMORY_DB_URL`                      | Postgres DSN (`postgresql://...`)              |
 | `GRAPHRAG_MEMORY_STORAGE`                     | `pgvector` (the graph arm reads the P0 tables) |
-| `GRAPHRAG_MEMORY_EMBED_DIMENSIONS`            | embedder dims (e.g. `1536`, or whatever yours) |
-| `GRAPHRAG_MEMORY_EMBED_BASE_URL`              | embed endpoint base URL                        |
-| `GRAPHRAG_MEMORY_EMBED_MODEL`                 | embed model id                                 |
-| `GRAPHRAG_MEMORY_EMBED_API_KEY`               | embed key, **or** …                            |
-| `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV`           | name of the env var holding the embed key      |
+| `GRAPHRAG_MEMORY_EMBED_DIMENSIONS`            | `2048` for Zhipu embedding-3                   |
+| `GRAPHRAG_MEMORY_EMBED_BASE_URL`              | `https://open.bigmodel.cn/api/paas/v4`         |
+| `GRAPHRAG_MEMORY_EMBED_MODEL`                 | `embedding-3`                                  |
+| `GRAPHRAG_MEMORY_EMBED_API_KEY`               | Zhipu embedding key (dedicated; not MiniMax)   |
+| `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV`           | optional: NAME of another env var holding key  |
 | `GRAPHRAG_MEMORY_LOG_LEVEL`                   | optional: `info` (default) or `debug`          |
 | `DEBUG`                                       | optional: `1` exposes the retrieve debug keys  |
 | `GRAPHRAG_MEMORY_RETRIEVAL_W_VEC`             | optional: vector weight (default `1`)          |

@@ -83,7 +83,7 @@ export interface GraphragEnv {
    */
   embedBaseUrl: string | undefined;
   /**
-   * Embedding model id (provider-specific, e.g. "zhipueb/embedding-3").
+   * Embedding model id (provider-specific, e.g. "embedding-3").
    * Undefined when no embedding API key is configured.
    */
   embedModel: string | undefined;

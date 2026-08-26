@@ -1,28 +1,39 @@
 /**
- * Pure-function tests for Reciprocal Rank Fusion (spec-3 p0-integration T2).
+ * Pure-function tests for Reciprocal Rank Fusion.
  *
- * Covers every fusion branch required by the plan's acceptance:
- * vec-only / graph-only / both-arms / same-id double-count / empty-vec /
- * empty-graph / limit-truncation. Also verifies the k=60 math, the 1:1
- * default weights, and the deterministic tie-break (rrfScore desc, then
- * arms vec-first, then chunk.id ascending).
+ * `rrfFuse` takes a list of arms rather than a fixed (vector, graph) pair
+ * (#64): production fuses vector + BM25, the SQL graph arm is archived off
+ * that path (#58), and the algorithm itself is unchanged at k=60. Covers
+ * every fusion branch: single-arm, dual-arm, same-id soft merge, per-arm
+ * weighting, empty input, limit truncation, invalid ranks, and the
+ * deterministic tie-break (rrfScore desc, then arm order, then chunk id).
  */
 import { describe, it, expect } from "vitest";
 import { rrfFuse, __RRF_K } from "../../src/core/retrieval/rrf.js";
 import type {
   ArmHit,
+  ArmName,
   ArmResult,
   RetrieveConfig,
 } from "../../src/core/retrieval/types.js";
 
-/** Default config: k=60, w_vec=w_graph=1, typical pipeline knobs. */
+/**
+ * Equal weights across arms. Most cases assert the k=60 rank math, which
+ * is easiest to read when the weight is 1; the weighting cases below
+ * override w_vec / w_bm25 explicitly.
+ */
 const CFG: RetrieveConfig = {
   w_vec: 1,
+  w_bm25: 1,
   w_graph: 1,
+  bm25Enabled: true,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
 };
+
+/** The shipped production weights (#59): vector 0.8 / BM25 0.2. */
+const PROD_CFG: RetrieveConfig = { ...CFG, w_vec: 0.8, w_bm25: 0.2 };
 
 /** Build a single ArmHit with sensible defaults; override via patch. */
 function hit(patch: Partial<ArmHit> & { id: string }): ArmHit {
@@ -38,7 +49,7 @@ function hit(patch: Partial<ArmHit> & { id: string }): ArmHit {
 }
 
 /** Build an ArmResult for a given arm over a list of hits. */
-function result(arm: "vector" | "graph", hits: ArmHit[]): ArmResult {
+function result(arm: ArmName, hits: ArmHit[]): ArmResult {
   return { arm, hits, belowFloor: false };
 }
 
@@ -47,115 +58,185 @@ describe("rrfFuse", () => {
     expect(__RRF_K).toBe(60);
   });
 
-  it("produces only vector-arm hits when the graph arm is empty (vec-only)", () => {
+  it("ranks a single vector arm by 1/(k+rank)", () => {
     const out = rrfFuse(
-      result("vector", [hit({ id: "a", rank: 1 }), hit({ id: "b", rank: 2 })]),
-      result("graph", []),
+      [
+        result("vector", [
+          hit({ id: "a", rank: 1 }),
+          hit({ id: "b", rank: 2 }),
+        ]),
+      ],
       CFG,
       10
     );
-    expect(out).toHaveLength(2);
     expect(out.map((f) => f.id)).toEqual(["a", "b"]);
     expect(out[0]?.arms).toEqual(["vector"]);
-    // score = w / (k + rank) = 1 / (60 + 1)
     expect(out[0]?.rrfScore).toBeCloseTo(1 / 61, 10);
     expect(out[1]?.rrfScore).toBeCloseTo(1 / 62, 10);
   });
 
-  it("produces only graph-arm hits when the vector arm is empty (graph-only)", () => {
+  it("ranks BM25-only hits into the fusion (no vector contribution)", () => {
     const out = rrfFuse(
-      result("vector", []),
-      result("graph", [hit({ id: "x", rank: 3, arm: "graph" })]),
+      [
+        result("vector", []),
+        result("bm25", [
+          hit({ id: "lex-1", rank: 1, arm: "bm25" }),
+          hit({ id: "lex-2", rank: 2, arm: "bm25" }),
+        ]),
+      ],
       CFG,
       10
     );
-    expect(out).toHaveLength(1);
-    expect(out[0]?.id).toBe("x");
-    expect(out[0]?.arms).toEqual(["graph"]);
-    expect(out[0]?.rrfScore).toBeCloseTo(1 / 63, 10);
+    expect(out.map((f) => f.id)).toEqual(["lex-1", "lex-2"]);
+    expect(out[0]?.arms).toEqual(["bm25"]);
+    expect(out[0]?.rrfScore).toBeCloseTo(1 / 61, 10);
   });
 
-  it("fuses both arms, ranking higher rrfScore first (both-arms)", () => {
+  it("soft-merges a chunk found by both vector and BM25 into one summed hit", () => {
     const out = rrfFuse(
-      // rank 1  => 1/61
-      result("vector", [hit({ id: "a", rank: 1, content: "vec-a" })]),
-      // rank 1  => 1/61
-      result("graph", [hit({ id: "g", rank: 1, arm: "graph" })]),
-      CFG,
-      10
-    );
-    expect(out).toHaveLength(2);
-    // Equal scores: deterministic tie-break requires stable order.
-    expect(out.map((f) => f.id)).toEqual(["a", "g"]);
-  });
-
-  it("double-counts the same chunk.id across both arms (sum of both scores)", () => {
-    const out = rrfFuse(
-      result("vector", [hit({ id: "same", rank: 1, content: "v" })]),
-      result("graph", [
-        hit({ id: "same", rank: 2, arm: "graph", content: "g" }),
-      ]),
+      [
+        result("vector", [hit({ id: "same", rank: 1, content: "v" })]),
+        result("bm25", [
+          hit({ id: "same", rank: 2, arm: "bm25", content: "b" }),
+        ]),
+      ],
       CFG,
       10
     );
     expect(out).toHaveLength(1);
     const fused = out[0]!;
-    expect(fused.id).toBe("same");
-    // 1/(60+1) + 1/(60+2)
     expect(fused.rrfScore).toBeCloseTo(1 / 61 + 1 / 62, 10);
-    // Both arms contributed; order is vec-first then graph.
-    expect(fused.arms).toEqual(["vector", "graph"]);
-    // Fused score strictly beats either arm alone (Success Criterion #9).
+    expect(fused.arms).toEqual(["vector", "bm25"]);
+    // Agreement across arms must beat either arm alone.
     expect(fused.rrfScore).toBeGreaterThan(1 / 61);
   });
 
-  it("returns [] when the vector arm is empty (empty-vec)", () => {
-    const out = rrfFuse(result("vector", []), result("graph", []), CFG, 10);
-    expect(out).toEqual([]);
+  it("weights each arm by its own config knob", () => {
+    const out = rrfFuse(
+      [
+        result("vector", [hit({ id: "v", rank: 1 })]),
+        result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
+      ],
+      PROD_CFG,
+      10
+    );
+    // Same rank in both arms, so the 0.8 / 0.2 split is the only thing
+    // separating them — the vector hit must come first.
+    expect(out.map((f) => f.id)).toEqual(["v", "b"]);
+    expect(out[0]?.rrfScore).toBeCloseTo(0.8 / 61, 10);
+    expect(out[1]?.rrfScore).toBeCloseTo(0.2 / 61, 10);
   });
 
-  it("returns [] when the graph arm is empty (empty-graph)", () => {
-    const out = rrfFuse(result("vector", []), result("graph", []), CFG, 10);
-    expect(out).toEqual([]);
+  it("lets a strong BM25 hit outrank a weak vector hit despite the lower weight", () => {
+    const out = rrfFuse(
+      [
+        // 0.8 / (60 + 40) = 0.008
+        result("vector", [hit({ id: "v", rank: 40 })]),
+        // 0.2 / (60 + 1)  ≈ 0.00328 — still behind
+        // 0.2 / (60 + 1) with vector pushed to rank 200 flips it below.
+        result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
+      ],
+      PROD_CFG,
+      10
+    );
+    expect(out.map((f) => f.id)).toEqual(["v", "b"]);
+
+    const flipped = rrfFuse(
+      [
+        // 0.8 / (60 + 500) ≈ 0.00143
+        result("vector", [hit({ id: "v", rank: 500 })]),
+        // 0.2 / 61 ≈ 0.00328 — lexical wins on rank quality
+        result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
+      ],
+      PROD_CFG,
+      10
+    );
+    expect(flipped.map((f) => f.id)).toEqual(["b", "v"]);
   });
 
-  it("truncates to the top `limit` fused hits by score (limit-truncation)", () => {
-    const vec = result("vector", [
-      hit({ id: "a", rank: 1 }),
-      hit({ id: "b", rank: 2 }),
-      hit({ id: "c", rank: 3 }),
-    ]);
-    const out = rrfFuse(vec, result("graph", []), CFG, 2);
-    expect(out).toHaveLength(2);
-    // Highest two scores win: rank 1 (1/61) then rank 2 (1/62).
+  it("fuses three arms when an archived graph arm is explicitly supplied", () => {
+    // The graph arm no longer runs by default (#58), but the fusion
+    // function stays N-arm so injected-config tests keep working.
+    const out = rrfFuse(
+      [
+        result("vector", [hit({ id: "v", rank: 1 })]),
+        result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
+        result("graph", [hit({ id: "g", rank: 1, arm: "graph" })]),
+      ],
+      CFG,
+      10
+    );
+    expect(out.map((f) => f.id)).toEqual(["v", "b", "g"]);
+  });
+
+  it("returns [] for no arms at all", () => {
+    expect(rrfFuse([], CFG, 10)).toEqual([]);
+  });
+
+  it("returns [] when every arm is empty", () => {
+    expect(
+      rrfFuse([result("vector", []), result("bm25", [])], CFG, 10)
+    ).toEqual([]);
+  });
+
+  it("truncates to the top `limit` fused hits by score", () => {
+    const out = rrfFuse(
+      [
+        result("vector", [
+          hit({ id: "a", rank: 1 }),
+          hit({ id: "b", rank: 2 }),
+          hit({ id: "c", rank: 3 }),
+        ]),
+      ],
+      CFG,
+      2
+    );
     expect(out.map((f) => f.id)).toEqual(["a", "b"]);
   });
 
   it("returns [] when limit is <= 0", () => {
-    const vec = result("vector", [hit({ id: "a", rank: 1 })]);
-    expect(rrfFuse(vec, result("graph", []), CFG, 0)).toEqual([]);
-    expect(rrfFuse(vec, result("graph", []), CFG, -1)).toEqual([]);
+    const arms = [result("vector", [hit({ id: "a", rank: 1 })])];
+    expect(rrfFuse(arms, CFG, 0)).toEqual([]);
+    expect(rrfFuse(arms, CFG, -1)).toEqual([]);
   });
 
   it("skips hits with rank < 1 (boundary: invalid rank ignored)", () => {
-    const vec = result("vector", [
-      hit({ id: "bad", rank: 0 }),
-      hit({ id: "neg", rank: -5 }),
-      hit({ id: "ok", rank: 1 }),
-    ]);
-    const out = rrfFuse(vec, result("graph", []), CFG, 10);
-    expect(out.map((f) => f.id)).toEqual(["ok"]);
-  });
-
-  it("breaks equal-score ties deterministically: vec-first, then id ascending", () => {
     const out = rrfFuse(
-      result("vector", [hit({ id: "b", rank: 1 }), hit({ id: "a", rank: 1 })]),
-      result("graph", [hit({ id: "c", rank: 1, arm: "graph" })]),
+      [
+        result("vector", [
+          hit({ id: "bad", rank: 0 }),
+          hit({ id: "neg", rank: -5 }),
+          hit({ id: "ok", rank: 1 }),
+        ]),
+      ],
       CFG,
       10
     );
-    // All three have score 1/61. Tie-break: vector arm first (a, b), then
-    // graph (c); within vector, id ascending (a before b).
+    expect(out.map((f) => f.id)).toEqual(["ok"]);
+  });
+
+  it("breaks equal-score ties deterministically: arm order, then id ascending", () => {
+    const out = rrfFuse(
+      [
+        result("vector", [
+          hit({ id: "b", rank: 1 }),
+          hit({ id: "a", rank: 1 }),
+        ]),
+        result("bm25", [hit({ id: "c", rank: 1, arm: "bm25" })]),
+      ],
+      CFG,
+      10
+    );
+    // All three score 1/61 under equal weights. Vector arm first (a, b),
+    // then bm25 (c); within an arm, id ascending.
     expect(out.map((f) => f.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("is insensitive to the order arms are passed in", () => {
+    const vector = result("vector", [hit({ id: "v", rank: 2 })]);
+    const bm25 = result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]);
+    expect(rrfFuse([vector, bm25], PROD_CFG, 10).map((f) => f.id)).toEqual(
+      rrfFuse([bm25, vector], PROD_CFG, 10).map((f) => f.id)
+    );
   });
 });

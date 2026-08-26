@@ -6,15 +6,29 @@
  * *Error suffix convention from src/core/errors.ts.
  */
 
-/** A single hit produced by either retrieval arm (vector or graph). */
+/**
+ * A retrieval arm the fusion layer understands.
+ *
+ * `vector` + `bm25` are the production hybrid (#59). `graph` is the P0 SQL
+ * one-hop arm, archived off the default path (#58) but still fusable when
+ * a caller injects a `graphConfig` explicitly — see
+ * `docs/runbooks/sql-graph-arm-archived.md`.
+ */
+export type ArmName = "vector" | "bm25" | "graph";
+
+/** A single hit produced by one retrieval arm. */
 export interface ArmHit {
   /** Chunk id (UUID string); the RRF fuse key. */
   id: string;
   /** Origin arm: which pipeline produced this hit. */
-  arm: "vector" | "graph";
+  arm: ArmName;
   /** 1-based rank within the producing arm. */
   rank: number;
-  /** Optional pre-fusion score (cosine similarity 0-1, or graph-arm relevance). */
+  /**
+   * Optional pre-fusion score: cosine similarity 0-1 for the vector arm,
+   * `ts_rank` output for BM25, graph-arm relevance for graph. Scales are
+   * NOT comparable across arms — RRF fuses on rank, not on this value.
+   */
   score: number;
   /** Pre-rendered chunk content for downstream projection. */
   content: string;
@@ -26,9 +40,15 @@ export interface ArmHit {
 
 /** Result of one retrieval arm. */
 export interface ArmResult {
-  arm: "vector" | "graph";
+  arm: ArmName;
   hits: ArmHit[];
-  /** True if this arm could not satisfy the floor (graph arm only). */
+  /**
+   * True when this arm was attempted and could not deliver — any optional
+   * arm, not just graph. The graph arm sets it on a throw OR on missing
+   * `graphArmFloor`; the BM25 arm sets it on a throw. It is what flips
+   * `degraded` on the envelope, so an arm that merely found nothing leaves
+   * it false.
+   */
   belowFloor: boolean;
   /** Human-readable failure reason when the arm is unavailable. */
   failureReason?: string;
@@ -42,15 +62,19 @@ export interface FusedHit {
   valid_window: [string, string | null];
   rrfScore: number;
   /** Which arm(s) contributed to this hit. */
-  arms: Array<"vector" | "graph">;
+  arms: ArmName[];
 }
 
-/** Configuration for the retrieval pipeline (loaded from env, see src/core/config.ts). */
+/** Configuration for the retrieval pipeline (loaded from env, see src/config.ts). */
 export interface RetrieveConfig {
   /** Weight for the vector arm in RRF. */
   w_vec: number;
-  /** Weight for the graph arm in RRF. */
+  /** Weight for the BM25 lexical arm in RRF. */
+  w_bm25: number;
+  /** Weight for the archived graph arm in RRF (unused on the default path). */
   w_graph: number;
+  /** Whether the BM25 arm runs at all. Off → vector-only, and NOT degraded. */
+  bm25Enabled: boolean;
   /** Top-K seed entities from the embedding seed query. */
   entityLinkTopK: number;
   /** Hard cap on total candidates pulled from the graph arm. */
@@ -89,7 +113,12 @@ export interface RetrieveOutputEnvelope {
     valid_window: [string, string | null];
     score: number;
   }>;
-  /** Optional: present (true) when the graph arm under-floors or errors. */
+  /**
+   * Optional: present (true) when an optional arm was ATTEMPTED and could
+   * not deliver — the graph arm under-flooring or erroring, or the BM25
+   * arm throwing. Deliberately absent when BM25 is simply disabled by
+   * config: "you turned it off" is not a degradation.
+   */
   degraded?: true;
   /** Optional debug payload, only present when DEBUG=1 is set. */
   debug?: Record<string, unknown>;
@@ -107,7 +136,7 @@ export class RetrieveConfigError extends Error {
 export class RetrievalArmError extends Error {
   constructor(
     message: string,
-    public readonly arm: "vector" | "graph"
+    public readonly arm: ArmName
   ) {
     super(message);
     this.name = "RetrievalArmError";

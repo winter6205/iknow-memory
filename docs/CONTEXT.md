@@ -39,16 +39,16 @@ _Avoid_: "master entity" (implies hierarchy); "root entity" (implies tree struct
 **vector search**: brute-force cosine similarity over chunk embeddings (stage 1) or HNSW index (future). Returns ranked chunks by cosine score. The only retrieval arm in stage 1.
 _Avoid_: "semantic search" (too broad, includes BM25); "embedding search" (the search is over embeddings, not for them)
 
-**BM25**: Okapi BM25 lexical ranking (k1=1.2, b=0.75) over tokenized chunk text. A retrieval arm that complements vector search by matching exact terms. _Stage: not yet in product retrieve (algorithm validated in prototype)._
+**BM25**: Okapi BM25 lexical ranking (k1=1.2, b=0.75) over tokenized chunk text. A retrieval arm that complements vector search by matching exact terms (query↔chunk lexical relevance — not chunker head/tail overlap). Production shape locked in issue #59: Postgres `tsvector`+rank at ingest; MemoryBackend keeps a same-contract lightweight inverted index for tests; default on, configurable off, fail-open to vector-only. _Stage: decided (#59); not yet implemented (task #62)._
 _Avoid_: "keyword search" (BM25 is ranked, not boolean); "lexical search" (acceptable alias but BM25 is more precise)
 
-**hybrid retrieval**: multi-arm recall (vector + BM25 + graph traversal) fused by Reciprocal Rank Fusion (RRF, k=60) with weighted arms (vector 0.8, BM25 0.2), followed by cosine re-score blend (0.7 normRRF + 0.3 cosine). _Stage: P1._
+**hybrid retrieval**: multi-arm recall fused by Reciprocal Rank Fusion (RRF, k=60). Near-term production path after SQL graph-arm off (#58) and BM25 land (#62): vector + BM25 at weights 0.8 / 0.2 (Ask-first to change defaults). True graph traversal arm moves to Neo4j later; cosine re-score blend (0.7 normRRF + 0.3 cosine) remains a later polish. _Stage: decided for vector+BM25 (#59); implementation pending (#62)._
 _Avoid_: "fusion search" (ambiguous); "multi-signal search" (too vague)
 
 **graph arm**: the read-side recall path that converts the query embedding into a seed set of entities, follows one-hop triples filtered by `valid_window @> valid_at`, and joins back to chunks via `source_chunk_id` — a read-only Postgres JOIN, no writes. Best-effort and fail-open: an arm failure or a floor miss sets `degraded=true` instead of erroring. _Stage: P0 (implemented; fires on the production path — stored entities carry embeddings per `specs/p0-wiring-closure.md`)._
 _Avoid_: "graph search" (too broad); "graph traversal" (multi-hop/PPR is P1; the arm is one-hop); "knowledge-graph retrieval" (grandiose)
 
-**RRF fusion (k=60)**: Reciprocal Rank Fusion with constant k=60 combining the vector and graph arms at weight 1:1 (`wVec = wGraph = 1`) in P0; rank-based by design — no cross-arm score calibration (MinMax / z-score / sigmoid). P1 hybrid retrieval extends the arm set, not the algorithm. _Stage: P0._
+**RRF fusion (k=60)**: Reciprocal Rank Fusion with constant k=60; rank-based by design — no cross-arm score calibration (MinMax / z-score / sigmoid). P0 code path fused vector + graph at weight 1:1; #59 extends the arm set (not the algorithm) so production hybrid becomes vector + BM25 (graph slot unused after #58). _Stage: P0 (N-arm extension pending #62)._
 _Avoid_: "score fusion" (RRF is rank-based, not score-based); "ensemble" (ML model terminology); "merging results" (ambiguous with entity merge)
 
 **degraded=true**: the additive-optional envelope flag on the `retrieve` JSON payload, set when the graph arm yields fewer than `graphArmFloor` chunks (default 3) or throws; the vector arm's chunks are still returned. Absent on the vector-only path — the stage-1 shape `{ chunks: [...] }` stays exact. _Stage: P0._

@@ -46,16 +46,23 @@ const pkgRoot = path.resolve(here, "..");
 const distEntry = path.join(pkgRoot, "dist", "index.js");
 
 /**
- * Env-var keys whose presence can switch the spawned server to a mode that
- * is unsafe for the host-smoke harness (pgvector needs a live Postgres,
- * NINE_ROUTER_KEY triggers paid network calls). The host-smoke suite must
- * always run in memory + FakeEmbedder mode.
+ * Env-var keys deleted from the child's environment so the spawned server
+ * can never leave memory + FakeEmbedder mode: `GRAPHRAG_MEMORY_DB_URL`
+ * would need a live Postgres, and any resolvable embedding key sends the
+ * `a4` ingest -> retrieve round-trip to a paid provider over the network.
+ *
+ * All three key knobs count. `GRAPHRAG_MEMORY_EMBED_API_KEY` carries the
+ * secret value directly, `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV` names the var
+ * holding it, and `NINE_ROUTER_KEY` is the conventional target of that
+ * name — scrubbing only the last one leaves a CI-injected key live.
+ *
+ * `GRAPHRAG_MEMORY_STORAGE` is not listed because `hostSmokeEnv` overwrites
+ * it with "memory" rather than deleting it.
  */
-const HOST_SMOKE_ENV_KEYS = [
-  "GRAPHRAG_MEMORY_STORAGE",
+const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "GRAPHRAG_MEMORY_DB_URL",
-  "GRAPHRAG_MEMORY_EMBED_BASE_URL",
-  "GRAPHRAG_MEMORY_EMBED_MODEL",
+  "GRAPHRAG_MEMORY_EMBED_API_KEY",
+  "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
   "NINE_ROUTER_KEY",
 ] as const;
 
@@ -70,10 +77,9 @@ function hostSmokeEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   env["GRAPHRAG_MEMORY_STORAGE"] = "memory";
   // GRAPHRAG_MEMORY_EMBED_DIMENSIONS is always required; the smoke suite
-  // runs FakeEmbedder (key scrubbed below), so any positive integer works.
+  // runs FakeEmbedder (keys scrubbed below), so any positive integer works.
   env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
-  delete env["GRAPHRAG_MEMORY_DB_URL"];
-  delete env["NINE_ROUTER_KEY"];
+  for (const key of HOST_SMOKE_SCRUBBED_ENV_KEYS) delete env[key];
   // Keep BASE_URL / MODEL if the parent set them — they are inert without
   // a key, and a custom value shouldn't surprise the operator by being
   // silently overridden during smoke tests.
@@ -307,6 +313,60 @@ describe("host-smoke: real stdio MCP client against built server", () => {
       expect(allContent).toMatch(/公司A|张三/);
       expect(topHit.score).toBeGreaterThan(0);
       expect(topHit.source_ref).toBe(sourceRef);
+    }
+  );
+
+  test(
+    "spawned server selects FakeEmbedder even when the parent env carries an embedding key",
+    { timeout: 30_000 },
+    async () => {
+      // The `a4` round-trip below actually embeds. If a host or CI runner
+      // exports an embedding key, the child would build the real provider
+      // client and `npm test` would silently make paid network calls — the
+      // exact false signal `hostSmokeEnv` exists to prevent. Planting a key
+      // in the parent makes the check deterministic instead of depending on
+      // whatever the ambient environment happens to carry.
+      const planted = {
+        GRAPHRAG_MEMORY_EMBED_API_KEY: "planted-not-a-real-secret",
+        GRAPHRAG_MEMORY_EMBED_API_KEY_ENV: "NINE_ROUTER_KEY",
+        NINE_ROUTER_KEY: "planted-not-a-real-secret",
+        GRAPHRAG_MEMORY_EMBED_BASE_URL: "https://example.invalid/v1",
+        GRAPHRAG_MEMORY_EMBED_MODEL: "planted-model",
+      };
+      const saved = new Map<string, string | undefined>();
+      for (const [k, v] of Object.entries(planted)) {
+        saved.set(k, process.env[k]);
+        process.env[k] = v;
+      }
+
+      // The server announces its embedder choice on stderr at construction
+      // ("server constructed ... embedder: fake | 9router"). stdout is the
+      // JSON-RPC transport, so stderr is the only observation seam.
+      let stderrText = "";
+      try {
+        const transport = new StdioClientTransport(serverParams());
+        const client = new Client(
+          { name: "host-smoke-embedder", version: "0.0.0" },
+          { capabilities: {} }
+        );
+        await client.connect(transport);
+        clients.push(client);
+        transport.stderr?.on("data", (buf: Buffer) => {
+          stderrText += buf.toString("utf8");
+        });
+        // The construction line is emitted before connect() resolves, but
+        // the stderr pipe is only drained once a listener attaches; one
+        // echo round-trip is enough to flush it.
+        await client.callTool({ name: "echo", arguments: { message: "x" } });
+      } finally {
+        for (const [k, v] of saved) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+
+      expect(stderrText).toMatch(/"embedder":"fake"/);
+      expect(stderrText).not.toMatch(/"embedder":"9router"/);
     }
   );
 

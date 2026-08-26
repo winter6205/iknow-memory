@@ -7,11 +7,17 @@ import { createServer } from "../src/index.ts";
  * Construct a server with the stage 1 env vars forced to their defaults.
  *
  * Why: `loadEnv()` reads `process.env` at construction time, and a developer
- * machine (or CI secret) may well have a real `NINE_ROUTER_KEY` exported. If
- * we let that through, `createServer()` builds a NineRouterEmbedder and these
+ * machine (or CI secret) may well have a real embedding key exported. If we
+ * let that through, `createServer()` builds a NineRouterEmbedder and these
  * tests silently start making paid network calls — which is both slow and a
  * false signal. Clearing the vars for the duration of the call pins the
  * memory + FakeEmbedder path these tests are written against.
+ *
+ * Both key knobs must be scrubbed, not just the legacy `NINE_ROUTER_KEY`:
+ * `GRAPHRAG_MEMORY_EMBED_API_KEY` carries the secret value directly and
+ * `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV` names the var holding it. Leaving
+ * either in place also drags in the key-coupled BASE_URL / MODEL required
+ * check, so `createServer()` throws ConfigError instead of running offline.
  */
 const ENV_KEYS = [
   "GRAPHRAG_MEMORY_STORAGE",
@@ -19,6 +25,8 @@ const ENV_KEYS = [
   "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
   "GRAPHRAG_MEMORY_EMBED_BASE_URL",
   "GRAPHRAG_MEMORY_EMBED_MODEL",
+  "GRAPHRAG_MEMORY_EMBED_API_KEY",
+  "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
   "NINE_ROUTER_KEY",
 ] as const;
 

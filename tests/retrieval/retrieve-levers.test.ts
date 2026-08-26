@@ -23,7 +23,9 @@ import type { RetrievedChunk, SearchOptions } from "../../src/core/types.js";
 /** Default RetrieveConfig these tests run under (floor 3). */
 const CFG: RetrieveConfig = {
   w_vec: 1,
+  w_bm25: 1,
   w_graph: 1,
+  bm25Enabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,

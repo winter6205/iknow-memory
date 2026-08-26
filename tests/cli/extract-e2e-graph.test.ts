@@ -167,6 +167,10 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
     // dist/index.js spawn (which reads source_ref/valid_window via its
     // own CREATE TABLE IF NOT EXISTS, idempotent) work against the same
     // schema. Matches src/core/storage/pgvector-backend.ts ensureTable().
+    // The GENERATED valid_window mirrors tests/integration/retrieval-pg.ts:
+    // the one-hop SQL filters on `c.valid_window @> $validAt`, so without
+    // it the graph arm errors out and fail-opens — which would make Case 4
+    // pass for the wrong reason (arm broken, not arm archived).
     await c.query(`
       CREATE TABLE IF NOT EXISTS chunks (
         id uuid PRIMARY KEY,
@@ -176,10 +180,63 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         valid_until timestamptz NULL,
         source_ref text NOT NULL DEFAULT '',
         metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
-        created_at timestamptz NOT NULL DEFAULT now()
+        created_at timestamptz NOT NULL DEFAULT now(),
+        valid_window tstzrange GENERATED ALWAYS AS (
+          tstzrange(valid_from, valid_until, '[)')
+        ) STORED
       )
     `);
     await upSchemaP0(c, DIM);
+  }
+
+  /**
+   * Seed the minimum graph the SQL one-hop arm would traverse: three
+   * embedded entities and three triples, each hanging a distinct chunk off
+   * a shared head. Three is the default `graphArmFloor`, so a live arm
+   * would clear the floor and contribute all three chunks un-degraded.
+   *
+   * Returns the seeded chunk ids. Every chunk carries the same source_ref,
+   * which Case 4's filter deliberately misses so the vector arm is empty.
+   */
+  async function seedTraversableGraph(c: PgClient): Promise<string[]> {
+    const embedder = new FakeEmbedder(DIM);
+    const chunkIds: string[] = [];
+    const entityIds: string[] = [];
+
+    for (let i = 0; i < 3; i += 1) {
+      const chunkId = randomUUID();
+      const content = `graph-reachable chunk ${i}`;
+      const [vec] = await embedder.embed([content]);
+      await c.query(
+        `INSERT INTO chunks (id, content, embedding, valid_from, source_ref)
+         VALUES ($1, $2, $3::vector, now() - interval '1 day', 'case4/graph')`,
+        [chunkId, content, `[${vec!.join(",")}]`]
+      );
+      chunkIds.push(chunkId);
+
+      const entityId = randomUUID();
+      const [entityVec] = await embedder.embed([`entity-${i}`]);
+      await c.query(
+        `INSERT INTO entities (id, canonical_name, type, embedding)
+         VALUES ($1, $2, 'concept', $3::vector)`,
+        [entityId, `case4-entity-${i}`, `[${entityVec!.join(",")}]`]
+      );
+      entityIds.push(entityId);
+    }
+
+    // All three triples share entity 0 as head, so a single seed reaches
+    // every chunk in one hop.
+    for (let i = 0; i < 3; i += 1) {
+      await c.query(
+        `INSERT INTO triples
+           (id, head_id, tail_id, relation_raw, relation_norm, confidence,
+            source_chunk_id, valid_window)
+         VALUES ($1, $2, $3, 'rel', 'rel', 1.0, $4,
+                 tstzrange(now() - interval '1 day', null, '[)'))`,
+        [randomUUID(), entityIds[0], entityIds[i], chunkIds[i]]
+      );
+    }
+    return chunkIds;
   }
 
   async function countRows(
@@ -264,16 +321,29 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   });
 
   // ============================================================
-  // Case 4: DEBUG=1 spawn activates graph arm + surfaces debug key.
-  // pgvector mode + empty DB → graph arm belowFloor → degraded:true;
-  // DEBUG=1 adds the debug key (Success Criterion #4).
+  // Case 4: the SQL one-hop graph arm is archived off the default
+  // production path (#58 / #62, Success Criterion 1).
+  //
+  // The schema below holds graph data the arm WOULD traverse: three
+  // entities carrying embeddings, and three triples hanging chunks off
+  // them, which is exactly the default `graphArmFloor` of 3. Retrieving
+  // under a source_ref no chunk carries empties the vector arm, so any
+  // chunk in the envelope could only have come from the graph arm.
+  //
+  // Before the archive this returned three graph-arm chunks plus
+  // `degraded` / `debug`; the default wiring now withholds `graphConfig`,
+  // so `assembleRetrievalResult` takes the vector-only early return and
+  // the envelope is exactly `{ chunks: [] }`.
   // ============================================================
   it(
-    "Case 4: DEBUG=1 spawn of dist/index.js (pgvector) → retrieve envelope carries debug key + degraded:true",
+    "Case 4: DEBUG=1 spawn of dist/index.js (pgvector) → default path runs no SQL graph arm",
     { timeout: 30_000 },
     async () => {
       const c = requireClient();
       await resetSchema(c);
+      const graphChunkIds = await seedTraversableGraph(c);
+      expect(graphChunkIds).toHaveLength(3);
+
       const { client: mcp, close } = await connectServer({
         GRAPHRAG_MEMORY_STORAGE: "pgvector",
         DEBUG: "1",
@@ -281,23 +351,39 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
       try {
         const result = await mcp.callTool({
           name: "retrieve",
-          arguments: { query: "anything" },
+          arguments: {
+            query: "anything",
+            filters: { source_ref: "case4/no-such-source" },
+          },
         });
         expect(result.isError).not.toBe(true);
         const payload = JSON.parse(textOf(result)) as Record<string, unknown>;
-        expect(payload).toHaveProperty("chunks");
-        expect(Array.isArray(payload.chunks)).toBe(true);
-        // Graph arm active, empty DB → belowFloor.
-        expect(payload.degraded).toBe(true);
-        // DEBUG=1 surfaces the debug key with arm hit counts.
-        expect(payload).toHaveProperty("debug");
-        const dbg = payload.debug as Record<string, unknown>;
-        expect(dbg).toHaveProperty("vectorHits");
-        expect(dbg).toHaveProperty("graphHits");
-        expect(dbg).toHaveProperty("graphBelowFloor");
-        expect(dbg.graphBelowFloor).toBe(true);
+        // Vector arm filtered to nothing and the graph arm never ran, so
+        // the whole envelope is the empty chunk list — no graph-arm hits.
+        expect(payload).toEqual({ chunks: [] });
+        // Spelled out separately so a failure names the archived arm
+        // rather than just diffing an object.
+        expect(payload).not.toHaveProperty("degraded");
+        expect(payload).not.toHaveProperty("debug");
       } finally {
         await close();
+      }
+
+      // SC2: archiving the arm must not touch the ledger. The rows the
+      // graph arm would have traversed are still queryable afterwards.
+      expect(await countRows(c, "entities")).toBe(3);
+      expect(await countRows(c, "triples")).toBe(3);
+      for (const table of [
+        "entities",
+        "entity_aliases",
+        "triples",
+        "extraction_records",
+      ]) {
+        const exists = await c.query<{ present: boolean }>(
+          `SELECT to_regclass($1) IS NOT NULL AS present`,
+          [`"${SCHEMA}".${table}`]
+        );
+        expect(exists.rows[0]?.present).toBe(true);
       }
     }
   );

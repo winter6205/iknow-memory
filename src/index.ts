@@ -31,7 +31,7 @@ import {
 } from "./tools/registry.js";
 import { echoTool } from "./tools/echo.js";
 import { ingestTool } from "./tools/ingest.js";
-import { retrieveTool } from "./tools/retrieve.js";
+import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
 import {
   FakeEmbedder,
   NineRouterEmbedder,
@@ -68,12 +68,36 @@ interface ServerDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
   /**
-   * Retrieval pipeline config (T7). Always present — loadEnv() always
-   * returns it. Structural type from GraphragEnv so createServer can pass
-   * it as retrieveTool's graphConfig without importing src/core/retrieval/*
-   * (preserves the isolation guard in tests/cli/isolation-retrieval.test.ts).
+   * Retrieval pipeline config. Always present — loadEnv() always returns
+   * it. Structural type from GraphragEnv so this file never imports
+   * src/core/retrieval/* (the isolation guard in
+   * tests/cli/isolation-retrieval.test.ts enforces that).
+   *
+   * No longer reaches the retrieve tool: see `buildRetrieveDeps`.
    */
   retrieval: GraphragEnv["retrieval"];
+}
+
+/**
+ * Assemble the retrieve tool's dependencies for the default server path.
+ *
+ * The SQL one-hop graph arm is **archived off production** (#58 / #62).
+ * `assembleRetrievalResult` gates that arm on receiving a `graphConfig`,
+ * so the archive is expressed here as an absence: this function never
+ * builds the key. PgvectorBackend still exposes `graphArmSeed` and
+ * `graph-arm.ts` still compiles — tests that want the arm inject
+ * `graphConfig` themselves — but no operator gets one-hop JOIN results
+ * from the stock server. Neo4j remains the future home for a real graph
+ * arm; see `docs/runbooks/sql-graph-arm-archived.md`.
+ *
+ * Exported so the archive is directly assertable without a live Postgres
+ * (tests/index.test.ts); reintroducing `graphConfig` here fails that test.
+ */
+export function buildRetrieveDeps(
+  deps: Pick<ServerDeps, "embedder" | "storage">,
+  debug: boolean
+): RetrieveDeps {
+  return { embedder: deps.embedder, storage: deps.storage, debug };
 }
 
 /**
@@ -143,16 +167,13 @@ export async function createServer(): Promise<McpServer> {
   const env = loadEnv();
   const logger = createLogger(env.logLevel);
   const deps = await buildDeps(env);
-  // T7 debug gate: DEBUG=1 surfaces the retrieve envelope's `debug` payload
-  // (Success Criterion #4). Absent → no debug key.
+  // Debug gate: DEBUG=1 surfaces the retrieve envelope's `debug` payload.
+  // Absent → no debug key.
   const debug = process.env.DEBUG === "1";
   const registry = buildRegistry([
     echoTool,
     ingestTool(deps),
-    // T7: wire the graph config + debug gate into the retrieve tool. The
-    // graph arm activates only when storage exposes graphArmSeed (pgvector);
-    // memory mode stays vector-only and the envelope stays `{ chunks }`.
-    retrieveTool({ ...deps, graphConfig: deps.retrieval, debug }),
+    retrieveTool(buildRetrieveDeps(deps, debug)),
   ]);
 
   const server = new McpServer(

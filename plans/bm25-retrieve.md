@@ -66,7 +66,7 @@ OVERALL: PASS — proceed with tracer bullets.
    - **Inherits:** SC8–SC10; A8–A9; concurrent arms; disable → exact `{ chunks[] }`; BM25 throw → `degraded: true`; embed failure still hard-fail.
    - **Surface:** `MemoryBackend`; `assembleRetrievalResult` / retrieve tool; retrieval unit tests.
    - **Acceptance:** SC8–SC10 green; Testing Strategy concurrent + exception rows covered; production path uses BM25 when enabled and graph remains off (SC1 still holds).
-   - Status: [ ] pending
+   - Status: [x] done — `MemoryBackend` keeps an incremental inverted index and scores Okapi BM25 (k1=1.2, b=0.75); `assembleRetrievalResult` launches vector ∥ BM25 and wraps the lexical arm fail-open; `buildRetrieveDeps` hands the loaded config over as `retrieveConfig`; proof in `tests/storage/memory-lexical.test.ts` + `tests/retrieval/hybrid-arms.test.ts`
    - [blocks: T1, T2, T3]
    - Tracker: https://github.com/winter6205/iknow-memory/issues/66
 

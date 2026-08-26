@@ -32,15 +32,20 @@ export const RetrieveInputSchema = z.object({
 
 export type RetrieveInput = z.infer<typeof RetrieveInputSchema>;
 
-/** Dependencies injected at wiring time (T7). */
+/** Dependencies injected at wiring time. */
 export interface RetrieveDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
   /**
-   * Optional retrieval config. When undefined, the graph arm is skipped and
-   * the tool returns vector-only results (keeps the pre-T5 shape for hosts
-   * that wire embedder/storage only). Wired from `loadEnv().retrieval` at
-   * the server assembly layer (T6/T7).
+   * Hybrid retrieval config — BM25 weight and enable switch. Wired from
+   * `loadEnv().retrieval` at the server assembly layer. When undefined the
+   * tool returns vector-only results, which keeps the pre-hybrid shape for
+   * hosts that wire embedder/storage only.
+   */
+  retrieveConfig?: RetrieveConfig;
+  /**
+   * Opt-in config for the ARCHIVED SQL one-hop graph arm. The default
+   * server path never supplies it (#58); only tests that want the arm do.
    */
   graphConfig?: RetrieveConfig;
   /** Debug gate; wired to `DEBUG=1` by the caller. */
@@ -69,6 +74,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
       {
         embedder: deps.embedder,
         storage: deps.storage,
+        retrieveConfig: deps.retrieveConfig,
         graphConfig: deps.graphConfig,
         debug: deps.debug,
       }

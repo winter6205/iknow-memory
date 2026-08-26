@@ -32,9 +32,21 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25",
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
+] as const;
+
+/**
+ * The GRAPHRAG_MEMORY_NEO4J_* family (#70 T1). Scrubbed wherever the
+ * Neo4j block is under assertion so an operator's live sidecar
+ * credentials cannot turn a "not configured" case into a configured one.
+ */
+const NEO4J_VARS = [
+  "GRAPHRAG_MEMORY_NEO4J_URI",
+  "GRAPHRAG_MEMORY_NEO4J_USER",
+  "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
 ] as const;
 
 describe("loadEnv — stage 0 stdio-only contract", () => {
@@ -53,6 +65,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     // Retrieval pipeline knobs (spec-3 T5) — scrub so a developer's real
     // values don't trip the boundary validation or leak into assertions.
     ...RETRIEVAL_VARS,
+    ...NEO4J_VARS,
   ];
   const saved = new Map<string, string | undefined>();
   beforeAll(() => {
@@ -79,6 +92,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "embedDimensions",
       "embedModel",
       "logLevel",
+      "neo4j",
       "retrieval",
       "storage",
     ]);
@@ -614,16 +628,17 @@ describe("loadEnv — embedding API key resolution", () => {
 });
 
 /**
- * Hybrid retrieval knobs (#59 / #64).
+ * Hybrid retrieval knobs (#59 / #64 / #70).
  *
- * Production retrieve fuses vector + BM25 at 0.8 / 0.2 with BM25 on by
- * default; the graph weight stays parsed but no longer drives the default
- * path (#58). Every invalid value must abort at startup with a
- * `ConfigError` naming the offending var rather than silently falling back
- * to a default — an operator who typo'd a weight would otherwise run a
- * ranking they never asked for and have no way to notice.
+ * Production retrieve fuses vector + BM25 + the Neo4j graph arm at
+ * 0.7 / 0.15 / 0.15, with both partner arms on by default (#69/#70 —
+ * `w_graph` steers production again). Every invalid value must abort at
+ * startup with a `ConfigError` naming the offending var rather than
+ * silently falling back to a default — an operator who typo'd a weight
+ * would otherwise run a ranking they never asked for and have no way to
+ * notice.
  */
-describe("loadEnv — hybrid retrieval weights + BM25 switch", () => {
+describe("loadEnv — hybrid retrieval weights + arm switches", () => {
   function withRetrievalEnv(
     patch: Record<string, string | undefined>,
     fn: () => void
@@ -650,19 +665,29 @@ describe("loadEnv — hybrid retrieval weights + BM25 switch", () => {
     }
   }
 
-  it("defaults a fresh env to the production hybrid: w_vec 0.8, w_bm25 0.2, BM25 enabled", () => {
+  // SC6 — the three-arm defaults #69 locked. A fresh env must produce
+  // exactly these numbers; anything else means an operator's ranking
+  // silently drifted from the spec.
+  it("defaults a fresh env to the three-arm hybrid: w_vec 0.7, w_bm25 0.15, w_graph 0.15", () => {
     withRetrievalEnv({}, () => {
       const { retrieval } = loadEnv();
-      expect(retrieval.w_vec).toBe(0.8);
-      expect(retrieval.w_bm25).toBe(0.2);
-      expect(retrieval.bm25Enabled).toBe(true);
+      expect(retrieval.w_vec).toBe(0.7);
+      expect(retrieval.w_bm25).toBe(0.15);
+      expect(retrieval.w_graph).toBe(0.15);
     });
   });
 
-  it("leaves the archived graph weight and its knobs at their prior defaults", () => {
+  it("SC6: both partner arms are enabled on a fresh env", () => {
     withRetrievalEnv({}, () => {
       const { retrieval } = loadEnv();
-      expect(retrieval.w_graph).toBe(1);
+      expect(retrieval.bm25Enabled).toBe(true);
+      expect(retrieval.graphEnabled).toBe(true);
+    });
+  });
+
+  it("leaves the seed / traversal knobs at their prior defaults", () => {
+    withRetrievalEnv({}, () => {
+      const { retrieval } = loadEnv();
       expect(retrieval.entityLinkTopK).toBe(8);
       expect(retrieval.candidateCap).toBe(50);
       expect(retrieval.graphArmFloor).toBe(3);
@@ -743,4 +768,263 @@ describe("loadEnv — hybrid retrieval weights + BM25 switch", () => {
       );
     });
   }
+
+  it("reads an operator override for w_graph", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.4" }, () => {
+      expect(loadEnv().retrieval.w_graph).toBe(0.4);
+    });
+  });
+
+  for (const [label, value] of BAD_WEIGHTS) {
+    it(`rejects w_graph = "${value}" (${label}) with ConfigError`, () => {
+      withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: value }, () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH/);
+      });
+    });
+  }
+
+  // SC9 at the config layer: switching the graph arm off is a choice, not
+  // a degradation. Config must record the choice and leave every other
+  // arm exactly as it was — nothing here may hint at a failed attempt.
+  it("SC9: turning the graph arm off leaves the remaining arms untouched", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false" },
+      () => {
+        const { retrieval } = loadEnv();
+        expect(retrieval.graphEnabled).toBe(false);
+        expect(retrieval.bm25Enabled).toBe(true);
+        expect(retrieval.w_vec).toBe(0.7);
+        expect(retrieval.w_bm25).toBe(0.15);
+      }
+    );
+  });
+
+  it("SC9: the graph arm can be disabled without any Neo4j config present", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "0" }, () => {
+      expect(() => loadEnv()).not.toThrow();
+      expect(loadEnv().retrieval.graphEnabled).toBe(false);
+    });
+  });
+
+  it("accepts 1 / mixed case / padding for the graph enable flag", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "1" }, () => {
+      expect(loadEnv().retrieval.graphEnabled).toBe(true);
+    });
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "FALSE" },
+      () => {
+        expect(loadEnv().retrieval.graphEnabled).toBe(false);
+      }
+    );
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: " true " },
+      () => {
+        expect(loadEnv().retrieval.graphEnabled).toBe(true);
+      }
+    );
+  });
+
+  it("treats a blank graph enable flag as unset and keeps the arm on", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "   " }, () => {
+      expect(loadEnv().retrieval.graphEnabled).toBe(true);
+    });
+  });
+
+  for (const value of BAD_FLAGS) {
+    it(`rejects an unparseable graph enable flag "${value}" instead of guessing`, () => {
+      withRetrievalEnv(
+        { GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: value },
+        () => {
+          expect(() => loadEnv()).toThrow(ConfigError);
+          expect(() => loadEnv()).toThrow(
+            /GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED/
+          );
+        }
+      );
+    });
+  }
+});
+
+/**
+ * Neo4j sidecar connection block (#70 T1).
+ *
+ * The block is `undefined` when no URI is configured, which is the config
+ * half of SC7: the graph arm cannot even be attempted, so retrieve skips
+ * it and the envelope stays non-degraded. Everything an operator DID
+ * declare must either be usable or refuse to start — a URI with an
+ * unusable scheme, or half a credential pair, is a typo the server must
+ * not paper over by connecting anonymously or by ignoring the value.
+ */
+describe("loadEnv — Neo4j sidecar config", () => {
+  function withNeo4jEnv(
+    patch: Record<string, string | undefined>,
+    fn: () => void
+  ) {
+    const keys = [...NEO4J_VARS, "GRAPHRAG_MEMORY_EMBED_DIMENSIONS"];
+    const saved = new Map<string, string | undefined>();
+    for (const k of keys) {
+      saved.set(k, process.env[k]);
+      delete process.env[k];
+    }
+    process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+    for (const [k, v] of Object.entries(patch)) {
+      if (!saved.has(k)) saved.set(k, process.env[k]);
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      fn();
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  it("leaves the block undefined on a fresh env (nothing to attempt)", () => {
+    withNeo4jEnv({}, () => {
+      expect(loadEnv().neo4j).toBeUndefined();
+    });
+  });
+
+  it("treats a blank URI as unset", () => {
+    withNeo4jEnv({ GRAPHRAG_MEMORY_NEO4J_URI: "   " }, () => {
+      expect(loadEnv().neo4j).toBeUndefined();
+    });
+  });
+
+  it("reads an unauthenticated URI with no credentials", () => {
+    withNeo4jEnv({ GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687" }, () => {
+      expect(loadEnv().neo4j).toEqual({
+        uri: "bolt://localhost:7687",
+        user: undefined,
+        password: undefined,
+      });
+    });
+  });
+
+  it("reads the full URI + user + password triple", () => {
+    withNeo4jEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "neo4j://graph.invalid:7687",
+        GRAPHRAG_MEMORY_NEO4J_USER: "neo4j",
+        GRAPHRAG_MEMORY_NEO4J_PASSWORD: "  not-a-real-secret  ",
+      },
+      () => {
+        expect(loadEnv().neo4j).toEqual({
+          uri: "neo4j://graph.invalid:7687",
+          user: "neo4j",
+          // Trimmed like every other string field, so a stray newline in a
+          // shell export cannot become part of the credential.
+          password: "not-a-real-secret",
+        });
+      }
+    );
+  });
+
+  it("trims padding off the URI rather than handing it to the driver", () => {
+    withNeo4jEnv(
+      { GRAPHRAG_MEMORY_NEO4J_URI: "  neo4j://localhost:7687  " },
+      () => {
+        expect(loadEnv().neo4j?.uri).toBe("neo4j://localhost:7687");
+      }
+    );
+  });
+
+  const GOOD_SCHEMES = [
+    "bolt://localhost:7687",
+    "bolt+s://graph.invalid:7687",
+    "bolt+ssc://graph.invalid:7687",
+    "neo4j://localhost:7687",
+    "neo4j+s://graph.invalid:7687",
+    "neo4j+ssc://graph.invalid:7687",
+  ];
+
+  for (const uri of GOOD_SCHEMES) {
+    it(`accepts the driver scheme in "${uri}"`, () => {
+      withNeo4jEnv({ GRAPHRAG_MEMORY_NEO4J_URI: uri }, () => {
+        expect(loadEnv().neo4j?.uri).toBe(uri);
+      });
+    });
+  }
+
+  const BAD_URIS: Array<readonly [string, string]> = [
+    ["http scheme", "http://localhost:7687"],
+    ["postgres scheme", "postgres://localhost:5432/graphrag"],
+    ["no scheme", "localhost:7687"],
+    ["not a URI at all", "definitely not a uri"],
+  ];
+
+  for (const [label, uri] of BAD_URIS) {
+    it(`rejects "${uri}" (${label}) with ConfigError`, () => {
+      withNeo4jEnv({ GRAPHRAG_MEMORY_NEO4J_URI: uri }, () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_NEO4J_URI/);
+      });
+    });
+  }
+
+  it("rejects a user with no password", () => {
+    withNeo4jEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
+        GRAPHRAG_MEMORY_NEO4J_USER: "neo4j",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_NEO4J_PASSWORD/);
+      }
+    );
+  });
+
+  it("rejects a password with no user, naming the var and not the secret", () => {
+    withNeo4jEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
+        GRAPHRAG_MEMORY_NEO4J_PASSWORD: "hunter2",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_NEO4J_USER/);
+        expect(() => loadEnv()).not.toThrow(/hunter2/);
+      }
+    );
+  });
+
+  it("rejects credentials declared without a URI (nothing to connect to)", () => {
+    withNeo4jEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_USER: "neo4j",
+        GRAPHRAG_MEMORY_NEO4J_PASSWORD: "not-a-real-secret",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_NEO4J_URI/);
+      }
+    );
+  });
+
+  it("never puts the password in the ConfigError message", () => {
+    withNeo4jEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "http://localhost:7687",
+        GRAPHRAG_MEMORY_NEO4J_USER: "neo4j",
+        GRAPHRAG_MEMORY_NEO4J_PASSWORD: "super-secret-value",
+      },
+      () => {
+        const err = (() => {
+          try {
+            loadEnv();
+            return undefined;
+          } catch (e) {
+            return e as Error;
+          }
+        })();
+        expect(err).toBeInstanceOf(ConfigError);
+        expect(err?.message).not.toContain("super-secret-value");
+      }
+    );
+  });
 });

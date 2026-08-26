@@ -70,6 +70,24 @@ export class ConfigError extends Error {
   }
 }
 
+/**
+ * Neo4j sidecar connection settings (#70).
+ *
+ * Present only when a URI is configured. Absence is the operator saying
+ * "no sidecar here": the graph arm is skipped rather than attempted, so
+ * retrieve stays non-degraded (spec SC7 — cannot attempt ≠ failed
+ * attempt). Credentials are optional because a local Neo4j may run with
+ * auth disabled, but a half-declared pair is rejected at startup.
+ */
+export interface Neo4jConfig {
+  /** Driver URI; scheme restricted to the bolt / neo4j family. */
+  uri: string;
+  /** Basic-auth user; undefined together with `password` = anonymous. */
+  user: string | undefined;
+  /** Basic-auth password. Never logged, never echoed into an error. */
+  password: string | undefined;
+}
+
 export interface GraphragEnv {
   logLevel: LogLevel;
   /** Which StorageBackend to construct. */
@@ -100,6 +118,12 @@ export interface GraphragEnv {
    * config source of truth for the RRF fusion + graph-arm floor behavior.
    */
   retrieval: RetrieveConfig;
+  /**
+   * Neo4j sidecar connection block, or undefined when no URI is
+   * configured. Undefined means "skip the graph arm", not "the graph arm
+   * failed" — see Neo4jConfig.
+   */
+  neo4j: Neo4jConfig | undefined;
 }
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -173,6 +197,7 @@ const RETRIEVAL_W_VEC_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC";
 const RETRIEVAL_W_BM25_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25";
 const RETRIEVAL_W_GRAPH_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH";
 const RETRIEVAL_BM25_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED";
+const RETRIEVAL_GRAPH_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED";
 const RETRIEVAL_ENTITY_LINK_TOP_K_VAR =
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K";
 const RETRIEVAL_CANDIDATE_CAP_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP";
@@ -244,11 +269,12 @@ function parseBoolean(
 /**
  * Load + validate the GRAPHRAG_MEMORY_RETRIEVAL_* family into a RetrieveConfig.
  *
- * Defaults: w_vec=0.8, w_bm25=0.2, BM25 enabled — the production hybrid
- * locked by #59. `w_graph`, entityLinkTopK, candidateCap and graphArmFloor
- * keep their P0 defaults but no longer steer the default path: the SQL
- * graph arm is archived (#58) and only runs for a caller that injects a
- * `graphConfig` itself.
+ * Defaults: w_vec=0.7, w_bm25=0.15, w_graph=0.15, both partner arms enabled
+ * — the three-arm production hybrid locked by #69/#70. `w_graph` steers
+ * production again: it now weights the Neo4j graph arm, not the archived
+ * SQL one-hop arm (#58), which still only runs for a caller that injects a
+ * `graphConfig` itself. entityLinkTopK, candidateCap and graphArmFloor keep
+ * their P0 defaults.
  *
  * Enforces the spec §Boundaries: finite positive weights; entityLinkTopK > 0;
  * candidateCap >= entityLinkTopK; graphArmFloor > 0.
@@ -273,21 +299,26 @@ function parseRetrievalConfig(): RetrieveConfig {
     w_vec: parseFinitePositive(
       RETRIEVAL_W_VEC_VAR,
       readEnv(RETRIEVAL_W_VEC_VAR),
-      0.8
+      0.7
     ),
     w_bm25: parseFinitePositive(
       RETRIEVAL_W_BM25_VAR,
       readEnv(RETRIEVAL_W_BM25_VAR),
-      0.2
+      0.15
     ),
     w_graph: parseFinitePositive(
       RETRIEVAL_W_GRAPH_VAR,
       readEnv(RETRIEVAL_W_GRAPH_VAR),
-      1
+      0.15
     ),
     bm25Enabled: parseBoolean(
       RETRIEVAL_BM25_ENABLED_VAR,
       readEnv(RETRIEVAL_BM25_ENABLED_VAR),
+      true
+    ),
+    graphEnabled: parseBoolean(
+      RETRIEVAL_GRAPH_ENABLED_VAR,
+      readEnv(RETRIEVAL_GRAPH_ENABLED_VAR),
       true
     ),
     entityLinkTopK,
@@ -298,6 +329,75 @@ function parseRetrievalConfig(): RetrieveConfig {
       { min: 1, fallback: 3 }
     ),
   };
+}
+
+// --- Neo4j sidecar config (#70) ---
+
+/**
+ * Exported because the projection CLI names it in its own "you asked me to
+ * project but gave me no target" ConfigError. The var is spelled once, here.
+ */
+export const NEO4J_URI_VAR = "GRAPHRAG_MEMORY_NEO4J_URI";
+const NEO4J_USER_VAR = "GRAPHRAG_MEMORY_NEO4J_USER";
+const NEO4J_PASSWORD_VAR = "GRAPHRAG_MEMORY_NEO4J_PASSWORD";
+
+/** URI schemes the Neo4j driver can dial. */
+const NEO4J_URI_SCHEMES: readonly string[] = [
+  "bolt:",
+  "bolt+s:",
+  "bolt+ssc:",
+  "neo4j:",
+  "neo4j+s:",
+  "neo4j+ssc:",
+];
+
+/**
+ * Load + validate the GRAPHRAG_MEMORY_NEO4J_* family.
+ *
+ * No URI → undefined, and the graph arm is skipped without degrading the
+ * envelope (spec SC7). Anything the operator DID declare must be usable:
+ * a URI the driver cannot dial, credentials with nothing to connect to,
+ * or half a credential pair all abort at startup. Silently ignoring them
+ * would hand an operator a server they believe is graph-backed while it
+ * quietly answers from two arms.
+ */
+function parseNeo4jConfig(): Neo4jConfig | undefined {
+  const uri = readTrimmed(NEO4J_URI_VAR);
+  const user = readTrimmed(NEO4J_USER_VAR);
+  const password = readTrimmed(NEO4J_PASSWORD_VAR);
+
+  if (uri === undefined) {
+    if (user === undefined && password === undefined) return undefined;
+    throw new ConfigError(
+      `${NEO4J_URI_VAR} is required when ${NEO4J_USER_VAR} or ${NEO4J_PASSWORD_VAR} is set`
+    );
+  }
+  if (!NEO4J_URI_SCHEMES.includes(uriScheme(uri) ?? "")) {
+    throw new ConfigError(
+      `${NEO4J_URI_VAR} must use one of ${NEO4J_URI_SCHEMES.map((s) => `${s}//`).join(" | ")}, got "${uri}"`
+    );
+  }
+  if (user !== undefined && password === undefined) {
+    throw new ConfigError(
+      `${NEO4J_PASSWORD_VAR} is required when ${NEO4J_USER_VAR} is set`
+    );
+  }
+  if (password !== undefined && user === undefined) {
+    throw new ConfigError(
+      `${NEO4J_USER_VAR} is required when ${NEO4J_PASSWORD_VAR} is set`
+    );
+  }
+  return { uri, user, password };
+}
+
+/** Scheme of `uri` including the colon, or undefined if it is not a URI. */
+function uriScheme(uri: string): string | undefined {
+  try {
+    return new URL(uri).protocol;
+  } catch {
+    // EXIT: undefined 上行给 parseNeo4jConfig，由它抛出点名该 env var 的 ConfigError
+    return undefined;
+  }
 }
 
 /**
@@ -355,6 +455,7 @@ export function loadEnv(): GraphragEnv {
   }
 
   const retrieval = parseRetrievalConfig();
+  const neo4j = parseNeo4jConfig();
 
   return {
     logLevel,
@@ -367,6 +468,7 @@ export function loadEnv(): GraphragEnv {
     // environment, never in this file or in any log line.
     embedApiKey,
     retrieval,
+    neo4j,
   };
 }
 

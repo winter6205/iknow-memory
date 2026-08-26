@@ -210,11 +210,13 @@ describe("createServer — registered tool set (T7)", () => {
       // The stock server now fuses vector ∥ BM25 (#66), so `score` is the
       // RRF score, not the cosine it used to be. Both arms rank this sole
       // chunk first, so the fused score is exactly
-      // (w_vec + w_bm25) / (k + 1) = 1.0 / 61 at the production defaults.
+      // (w_vec + w_bm25) / (k + 1) = 0.85 / 61 at the production defaults
+      // (#69/#70 rebalanced them to 0.7 / 0.15; the graph arm is not wired
+      // into the stock server yet, so it contributes nothing here).
       // Asserting the value rather than "> 0" is what makes this the
       // end-to-end proof that the BM25 arm really runs on the default
       // wiring: with BM25 off the score would be the cosine ~1 instead.
-      expect(chunks[0]!.score).toBeCloseTo(1 / 61, 10);
+      expect(chunks[0]!.score).toBeCloseTo(0.85 / 61, 10);
     } finally {
       await close();
     }
@@ -284,10 +286,11 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
   const embedder = new FakeEmbedder(1536);
   const storage = new MemoryBackend(1536);
   const retrieval = {
-    w_vec: 0.8,
-    w_bm25: 0.2,
-    w_graph: 1,
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    w_graph: 0.15,
     bm25Enabled: true,
+    graphEnabled: true,
     entityLinkTopK: 8,
     candidateCap: 50,
     graphArmFloor: 3,
@@ -318,5 +321,48 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
       retrieveConfig: retrieval,
       debug: true,
     });
+  });
+});
+
+/**
+ * Neo4j PPR arm wiring (#70 T4) — the mirror image of the archive above.
+ *
+ * The Neo4j arm IS production, so the ranker travels whenever one was
+ * built. Whether one was built is decided by `loadEnv().neo4j`, i.e. by
+ * whether the operator configured a sidecar URI; withholding the key is
+ * exactly how `assembleRetrievalResult` learns to SKIP the arm instead of
+ * degrading the envelope (spec SC7).
+ */
+describe("buildRetrieveDeps — Neo4j graph arm wiring (#70)", () => {
+  const embedder = new FakeEmbedder(1536);
+  const storage = new MemoryBackend(1536);
+  const retrieval = {
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    w_graph: 0.15,
+    bm25Enabled: true,
+    graphEnabled: true,
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    graphArmFloor: 3,
+  };
+  const graphRanker = {
+    rankEntities: async () => [],
+    close: async () => {},
+  };
+
+  it("omits graphRanker entirely when no sidecar is configured", () => {
+    const deps = buildRetrieveDeps({ embedder, storage, retrieval }, false);
+    // An explicit `graphRanker: undefined` would read as "wired, currently
+    // empty"; absence is the wire signal for "no Neo4j here".
+    expect(Object.hasOwn(deps, "graphRanker")).toBe(false);
+  });
+
+  it("passes the ranker through when one was built", () => {
+    const deps = buildRetrieveDeps(
+      { embedder, storage, retrieval, graphRanker },
+      false
+    );
+    expect(deps.graphRanker).toBe(graphRanker);
   });
 });

@@ -105,8 +105,7 @@ export async function assembleRetrievalResult(
   ]);
 
   const fused = rrfFuse(
-    toVectorResult(retrieved),
-    graphResult,
+    [toVectorResult(retrieved), graphResult],
     graph.config,
     args.limit
   );

@@ -21,7 +21,9 @@ import type {
 /** Fixed config: k seeds, cap candidates, floor g. */
 const CFG: RetrieveConfig = {
   w_vec: 1,
+  w_bm25: 1,
   w_graph: 1,
+  bm25Enabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,

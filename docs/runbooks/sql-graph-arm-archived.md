@@ -24,7 +24,7 @@ The arm was a single JOIN from seed entities through `triples` to
 multi-hop, no PPR, no community structure — so it gave operators a
 "dual-arm GraphRAG" story the implementation did not back. Worse, it was
 load-bearing on the default path: with the ledger populated it could be
-the *only* contributor to a retrieve response, and an empty ledger set
+the _only_ contributor to a retrieve response, and an empty ledger set
 `degraded: true` on every call.
 
 Real graph retrieval is a Neo4j projection concern (ADR: Postgres

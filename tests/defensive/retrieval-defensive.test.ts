@@ -45,7 +45,9 @@ const QUERY_VEC = [0.1, 0.2, 0.3];
 /** Default RetrieveConfig the defensive tests run under. */
 const CFG: RetrieveConfig = {
   w_vec: 1,
+  w_bm25: 1,
   w_graph: 1,
+  bm25Enabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
@@ -331,8 +333,7 @@ describe("runGraphArm — exception boundary (storage throws)", () => {
 describe("rrfFuse — empty boundary (limit<=0)", () => {
   it("limit=0 → returns []", () => {
     const out = rrfFuse(
-      armResult("vector", [hit({ id: "a" })]),
-      armResult("graph", []),
+      [armResult("vector", [hit({ id: "a" })]), armResult("graph", [])],
       CFG,
       0
     );
@@ -341,7 +342,7 @@ describe("rrfFuse — empty boundary (limit<=0)", () => {
 
   it("empty-vec + empty-graph + limit=10 → returns []", () => {
     expect(
-      rrfFuse(armResult("vector", []), armResult("graph", []), CFG, 10)
+      rrfFuse([armResult("vector", []), armResult("graph", [])], CFG, 10)
     ).toEqual([]);
   });
 });
@@ -349,8 +350,10 @@ describe("rrfFuse — empty boundary (limit<=0)", () => {
 describe("rrfFuse — negative boundary (limit=-1)", () => {
   it("limit=-1 → returns [], never throws", () => {
     const out = rrfFuse(
-      armResult("vector", [hit({ id: "a" })]),
-      armResult("graph", [hit({ id: "b", arm: "graph" })]),
+      [
+        armResult("vector", [hit({ id: "a" })]),
+        armResult("graph", [hit({ id: "b", arm: "graph" })]),
+      ],
       CFG,
       -1
     );
@@ -361,11 +364,13 @@ describe("rrfFuse — negative boundary (limit=-1)", () => {
 describe("rrfFuse — overflow boundary (limit=1e9)", () => {
   it("limit=1e9 against a small input → returns all hits, no slice crash", () => {
     const out = rrfFuse(
-      armResult("vector", [
-        hit({ id: "a", rank: 1 }),
-        hit({ id: "b", rank: 2 }),
-      ]),
-      armResult("graph", [hit({ id: "c", rank: 1, arm: "graph" })]),
+      [
+        armResult("vector", [
+          hit({ id: "a", rank: 1 }),
+          hit({ id: "b", rank: 2 }),
+        ]),
+        armResult("graph", [hit({ id: "c", rank: 1, arm: "graph" })]),
+      ],
       CFG,
       1e9
     );
@@ -380,9 +385,9 @@ describe("rrfFuse — concurrent boundary", () => {
     const vecB = armResult("vector", [hit({ id: "b", rank: 1 })]);
     const vecC = armResult("vector", [hit({ id: "c", rank: 1 })]);
     const [oa, ob, oc] = await Promise.all([
-      Promise.resolve(rrfFuse(vecA, armResult("graph", []), CFG, 10)),
-      Promise.resolve(rrfFuse(vecB, armResult("graph", []), CFG, 10)),
-      Promise.resolve(rrfFuse(vecC, armResult("graph", []), CFG, 10)),
+      Promise.resolve(rrfFuse([vecA, armResult("graph", [])], CFG, 10)),
+      Promise.resolve(rrfFuse([vecB, armResult("graph", [])], CFG, 10)),
+      Promise.resolve(rrfFuse([vecC, armResult("graph", [])], CFG, 10)),
     ]);
     expect(oa.map((f) => f.id)).toEqual(["a"]);
     expect(ob.map((f) => f.id)).toEqual(["b"]);
@@ -393,12 +398,14 @@ describe("rrfFuse — concurrent boundary", () => {
 describe("rrfFuse — exception boundary (pure function)", () => {
   it("skips hits with rank<1 (boundary invalid input ignored, no throw)", () => {
     const out = rrfFuse(
-      armResult("vector", [
-        hit({ id: "bad", rank: 0 }),
-        hit({ id: "neg", rank: -5 }),
-        hit({ id: "ok", rank: 1 }),
-      ]),
-      armResult("graph", []),
+      [
+        armResult("vector", [
+          hit({ id: "bad", rank: 0 }),
+          hit({ id: "neg", rank: -5 }),
+          hit({ id: "ok", rank: 1 }),
+        ]),
+        armResult("graph", []),
+      ],
       CFG,
       10
     );

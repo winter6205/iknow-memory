@@ -1,32 +1,38 @@
 /**
- * T5 retrieval orchestrator — vector arm + graph arm + RRF fusion + envelope.
+ * Retrieval orchestrator — vector arm ∥ optional arms + RRF fusion + envelope.
  *
  * Public entry point: `assembleRetrievalResult(args, deps)`. The function is
  * the single wire between the retrieve tool (`src/tools/retrieve.ts`) and the
  * retrieval bounded context (`src/core/retrieval/*`). It does NOT own any
- * state and does NOT mutate `deps`; both arms are pure with respect to the
- * caller.
+ * state and does NOT mutate `deps`.
  *
- * Boundary contract (spec-3 p0-integration):
- *   - storage with `graphArmSeed?: GraphArmStorage` (the one PgvectorBackend
- *     implements; MemoryBackend stays plain) → RRF fusion path.
- *   - storage without `graphArmSeed` → vector-only path → envelope is
- *     EXACTLY `{ chunks: RetrievedChunk[] }` with no `degraded` / `debug`
- *     keys (Success Criterion #4).
+ * Arms:
+ *   - **vector** always runs, and its failure is the caller's failure.
+ *   - **BM25** runs when `retrieveConfig.bm25Enabled` is set and the backend
+ *     implements the lexical seam. This is the production partner arm (#59).
+ *   - **graph** runs only when a caller passes `graphConfig` explicitly. The
+ *     default server wiring never does — the SQL one-hop arm is archived
+ *     (#58, `docs/runbooks/sql-graph-arm-archived.md`).
  *
- * The query is embedded once here and the vector is passed into both arms,
- * which then run concurrently (G5 levers, spec p0-wiring-closure A12). An
- * embedder that yields no usable vector raises `GraphragError`
- * ("EMBEDDING_FAILED") before either arm starts — it is never fail-open.
+ * When no optional arm is active the envelope is EXACTLY
+ * `{ chunks: RetrievedChunk[] }` — no `degraded`, no `debug`, even under the
+ * debug gate. That covers a chunk-only backend AND an operator who switched
+ * BM25 off: turning an arm off is a choice, not a degradation, so it must
+ * not show up as one on the wire.
  *
- * The graph arm is fail-open: storage errors become `belowFloor: true` with
- * a `failureReason`, and `runGraphArmSafe` catches anything unexpected so a
- * graph failure can never reject the fused call.
+ * The query is embedded once and the vector feeds every arm that needs it.
+ * An embedder that yields no usable vector raises `GraphragError`
+ * ("EMBEDDING_FAILED") before any arm starts — never fail-open.
+ *
+ * Optional arms are fail-open: each is wrapped so a throw becomes an empty
+ * `ArmResult` carrying a `failureReason`, which surfaces as `degraded: true`
+ * on the envelope while the vector results still reach the caller.
  */
 import { rrfFuse } from "./rrf.js";
 import { runGraphArm, type GraphArmDeps } from "./graph-arm.js";
 import type {
   ArmHit,
+  ArmName,
   ArmResult,
   FusedHit,
   GraphArmStorage,
@@ -34,9 +40,28 @@ import type {
   RetrieveOutputEnvelope,
 } from "./types.js";
 import type { RetrievedChunk, StorageBackend } from "../types.js";
-import type { GraphRagStorageBackend } from "../storage/backend.js";
+import {
+  supportsLexicalSearch,
+  type GraphRagStorageBackend,
+  type LexicalStorageBackend,
+} from "../storage/backend.js";
 import type { EmbeddingClient } from "../embedder.js";
 import { GraphragError } from "../errors.js";
+
+/**
+ * How many candidates each arm draws when its results will be fused.
+ *
+ * Fetching only `limit` per arm would make the lexical arm nearly inert:
+ * a chunk the vector arm ranks below the cut could reach fusion only as a
+ * BM25-only hit worth `w_bm25 / (k + 1)` ≈ 0.0033, which cannot outrank a
+ * vector-only hit at `w_vec / (k + 1)` ≈ 0.013. Drawing deeper lets the
+ * two arms actually agree on a chunk, and agreement is the signal RRF
+ * exists to reward. Only the FUSED list is cut to `limit`.
+ *
+ * 50 matches `candidateCap`'s default order of magnitude without
+ * borrowing that knob, which belongs to the archived graph arm.
+ */
+const ARM_CANDIDATE_POOL = 50;
 
 /** Inputs — what the orchestrator needs from the retrieve tool. */
 export interface AssembleArgs {
@@ -57,15 +82,18 @@ export interface AssembleArgs {
 /**
  * Deps injected by the retrieve tool.
  *
- * `graphConfig` is optional so the tool can defer wiring to a future
- * ticket (T6/T7). When omitted, the orchestrator skips the graph arm
- * regardless of whether `storage.graphArmSeed` exists (no graph config =
- * no fusion).
+ * `retrieveConfig` carries the production hybrid knobs (BM25 weight and
+ * enable switch). `graphConfig` is separate and opt-in: supplying it is
+ * the only way to run the archived SQL graph arm, which is why the
+ * default server wiring omits it (#58).
  */
 export interface AssembleDeps {
   embedder: EmbeddingClient;
-  /** May or may not carry `graphArmSeed` (see `GraphRagStorageBackend`). */
+  /** May implement the lexical and/or graph seams; neither is required. */
   storage: StorageBackend;
+  /** Hybrid retrieval config. Absent → vector-only. */
+  retrieveConfig?: RetrieveConfig;
+  /** Opt-in archived graph arm; absent on the production path. */
   graphConfig?: RetrieveConfig;
   /** Injectable debug gate; wired to `DEBUG=1` by the tool. */
   debug?: boolean;
@@ -75,44 +103,78 @@ export async function assembleRetrievalResult(
   args: AssembleArgs,
   deps: AssembleDeps
 ): Promise<RetrieveOutputEnvelope> {
-  // One embed per retrieve (G5 lever (a)): the same vector feeds the vector
-  // search and the graph arm's seed lookup. Embed failure keeps its
-  // pre-lever behavior — it propagates before either arm starts.
+  // One embed per retrieve: the same vector feeds the vector search and
+  // the graph arm's seed lookup. Embed failure propagates before any arm
+  // starts.
   const queryEmbedding = await embedQuery(deps.embedder, args.query);
-  const vectorSearch = deps.storage.search(queryEmbedding, {
-    limit: args.limit,
+
+  // Fusion WEIGHTS may fall back: a legacy graph-arm caller passes only
+  // `graphConfig`, production passes only `retrieveConfig`, and RRF needs
+  // weights either way. The BM25 GATE must NOT fall back — `getLexicalArm`
+  // reads `deps.retrieveConfig` alone, so injecting the archived graph arm
+  // can never switch the lexical arm on behind the operator's back.
+  const weights = deps.retrieveConfig ?? deps.graphConfig;
+  const lexical = getLexicalArm(deps);
+  const graph = getGraphSeed(deps);
+  const fusing = lexical !== undefined || graph !== undefined;
+
+  const searchOpts = {
+    limit: fusing ? Math.max(args.limit, ARM_CANDIDATE_POOL) : args.limit,
     validAt: args.validAt,
     ...(args.filters !== undefined ? { filters: args.filters } : {}),
-  });
+  };
+  const vectorSearch = deps.storage.search(queryEmbedding, searchOpts);
 
-  const graph = getGraphSeed(deps);
-  if (graph === undefined) {
+  // An active arm always implies its own config — the lexical arm implies
+  // `retrieveConfig`, the graph arm implies `graphConfig` — so the
+  // `weights === undefined` half is unreachable at runtime. It is what
+  // narrows `weights` for the `rrfFuse` call below.
+  if (!fusing || weights === undefined) {
     // Vector-only: chunks flow through unchanged. RetrievedChunk is
     // already structurally identical to the envelope chunk shape, so no
     // projection is needed for the empty-extra-keys contract.
     return { chunks: await vectorSearch };
   }
 
-  // Concurrent arms (G5 lever (b)). The graph arm is wrapped fail-open, so
-  // it never rejects and can never take the vector results down with it.
-  const [retrieved, graphResult] = await Promise.all([
+  // Every optional arm is launched before the first await so they overlap
+  // rather than run in series. Each is wrapped fail-open, so none can
+  // reject and take the vector results down with it.
+  const pending: Array<Promise<ArmResult>> = [];
+  if (lexical !== undefined) {
+    pending.push(runLexicalArmSafe(lexical, args.query, searchOpts));
+  }
+  if (graph !== undefined) {
+    pending.push(
+      runGraphArmSafe(
+        queryEmbedding,
+        { storage: graph.seed, config: graph.config },
+        new Date(args.validAt)
+      )
+    );
+  }
+
+  const [retrieved, optional] = await Promise.all([
     vectorSearch,
-    runGraphArmSafe(
-      queryEmbedding,
-      { storage: graph.seed, config: graph.config },
-      new Date(args.validAt)
-    ),
+    Promise.all(pending),
   ]);
 
-  const fused = rrfFuse(
-    toVectorResult(retrieved),
-    graphResult,
-    graph.config,
-    args.limit
+  const arms = [toVectorResult(retrieved), ...optional];
+  const fused = rrfFuse(arms, weights, args.limit);
+  return buildEnvelope(
+    fused,
+    degradedFlag(optional),
+    buildDebug(deps.debug, retrieved.length, optional)
   );
-  const degraded = graphResult.belowFloor ? (true as const) : undefined;
-  const debug = buildDebug(deps.debug, retrieved.length, graphResult);
-  return buildEnvelope(fused, degraded, debug);
+}
+
+/**
+ * `degraded` marks an arm that was ATTEMPTED and could not deliver: a
+ * lexical arm that threw, or a graph arm that threw or under-floored. An
+ * arm that simply found nothing has not degraded, and neither has one the
+ * operator turned off — those never reach this function.
+ */
+function degradedFlag(optional: ArmResult[]): true | undefined {
+  return optional.some((arm) => arm.belowFloor) ? true : undefined;
 }
 
 /**
@@ -159,6 +221,52 @@ function getGraphSeed(
 }
 
 /**
+ * Resolve the BM25 arm. Returns undefined — meaning "do not run it", NOT
+ * "it failed" — when any prerequisite is missing: no `retrieveConfig`, the
+ * operator disabled it, or the backend has no lexical seam. None of those
+ * set `degraded`, because none of them is an attempt.
+ *
+ * The gate reads `deps.retrieveConfig` and nothing else. Falling back to
+ * `graphConfig` would let a caller who only opted into the archived graph
+ * arm (#58) turn on a lexical arm it never asked for, and `graphConfig`
+ * carries a `bm25Enabled` field purely because both share `RetrieveConfig`.
+ */
+function getLexicalArm(deps: AssembleDeps): LexicalStorageBackend | undefined {
+  const config = deps.retrieveConfig;
+  if (config === undefined || !config.bm25Enabled) return undefined;
+  if (!supportsLexicalSearch(deps.storage)) return undefined;
+  return deps.storage;
+}
+
+/**
+ * Run the BM25 arm, converting a throw into a degraded empty result.
+ * Ranks are 1-based positions in the arm's own output — RRF fuses on
+ * those, never on the backend-specific lexical score.
+ */
+async function runLexicalArmSafe(
+  storage: LexicalStorageBackend,
+  query: string,
+  opts: { limit: number; validAt: string; filters?: Record<string, string> }
+): Promise<ArmResult> {
+  try {
+    const hits = await storage.searchLexical(query, opts);
+    return {
+      arm: "bm25",
+      hits: hits.map((hit, i) => toArmHit(hit, "bm25", i)),
+      belowFloor: false,
+    };
+  } catch (err) {
+    // EXIT: degraded:true + failureReason 上行 envelope，调用方可见
+    return {
+      arm: "bm25",
+      hits: [],
+      belowFloor: true,
+      failureReason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
  * Wrap `runGraphArm` so an unexpected throw degrades instead of rejecting.
  * This is what keeps `Promise.all` fail-open: the vector arm's results
  * survive any graph-arm failure.
@@ -171,6 +279,7 @@ async function runGraphArmSafe(
   try {
     return await runGraphArm(queryEmbedding, deps, now);
   } catch (err) {
+    // EXIT: degraded:true + failureReason 上行 envelope，调用方可见
     return {
       arm: "graph",
       hits: [],
@@ -184,16 +293,16 @@ async function runGraphArmSafe(
 function toVectorResult(retrieved: RetrievedChunk[]): ArmResult {
   return {
     arm: "vector",
-    hits: retrieved.map((r, i) => toVectorHit(r, i)),
+    hits: retrieved.map((r, i) => toArmHit(r, "vector", i)),
     belowFloor: false,
   };
 }
 
-/** Single vector hit — rank is 1-based position in the search output. */
-function toVectorHit(r: RetrievedChunk, i: number): ArmHit {
+/** Single arm hit — rank is the 1-based position in that arm's output. */
+function toArmHit(r: RetrievedChunk, arm: ArmName, i: number): ArmHit {
   return {
     id: r.id,
-    arm: "vector",
+    arm,
     rank: i + 1,
     score: r.score,
     content: r.content,
@@ -231,21 +340,29 @@ function buildEnvelope(
 
 /**
  * Build the debug payload gated on `DEBUG=1`. Shape is intentionally
- * loose (Record<string, unknown>) so future arms can add fields without
+ * loose (Record<string, unknown>) so a new arm can add fields without
  * breaking the envelope type.
+ *
+ * Only arms that actually ran get keys, so an operator reading the
+ * payload can tell "the BM25 arm found nothing" (`bm25Hits: 0`) apart
+ * from "the BM25 arm never ran" (no `bm25Hits` key at all).
  */
 function buildDebug(
   enabled: boolean | undefined,
   vectorHits: number,
-  graph: ArmResult
+  optional: ArmResult[]
 ): Record<string, unknown> | undefined {
   if (!enabled) return undefined;
-  const debug: Record<string, unknown> = {
-    vectorHits,
-    graphHits: graph.hits.length,
-    graphBelowFloor: graph.belowFloor,
-  };
-  if (graph.failureReason !== undefined)
-    debug["failureReason"] = graph.failureReason;
+  const debug: Record<string, unknown> = { vectorHits };
+  for (const arm of optional) {
+    debug[`${arm.arm}Hits`] = arm.hits.length;
+    if (arm.arm === "graph") debug["graphBelowFloor"] = arm.belowFloor;
+    if (arm.failureReason !== undefined) {
+      debug[`${arm.arm}FailureReason`] = arm.failureReason;
+      // Retained under its legacy key: the graph-arm e2e suites and the
+      // p0 runbooks both read `failureReason`.
+      if (arm.arm === "graph") debug["failureReason"] = arm.failureReason;
+    }
+  }
   return debug;
 }

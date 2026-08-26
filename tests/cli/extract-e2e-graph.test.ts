@@ -9,8 +9,9 @@
  *   Case 2  dist/cli/extract.js --since <ts> exit-code matrix 0/1/2
  *   Case 3  dist/index.js stdio server, retrieve → exactly `{ chunks: [] }`
  *           (memory mode → vector-only → Success Criterion #4)
- *   Case 4  DEBUG=1 spawn of dist/index.js (pgvector + graph arm) → retrieve
- *           envelope carries a `debug` key (Success Criterion #4)
+ *   Case 4  DEBUG=1 spawn of dist/index.js (pgvector, graph data seeded) →
+ *           the debug payload shows vector ∥ BM25 ran and the archived SQL
+ *           graph arm did not (#58 / #62)
  *   Case 5  Concurrent two-CLI runCli-direct (Success Criterion #12):
  *           two distinct batch_ids appear in extraction_records, no duplicate
  *           triples. Uses `runCli` with injected FakeLLMClient + real pg.Pool
@@ -331,9 +332,14 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   // chunk in the envelope could only have come from the graph arm.
   //
   // Before the archive this returned three graph-arm chunks plus
-  // `degraded` / `debug`; the default wiring now withholds `graphConfig`,
-  // so `assembleRetrievalResult` takes the vector-only early return and
-  // the envelope is exactly `{ chunks: [] }`.
+  // `degraded`; the default wiring now withholds `graphConfig`, so the
+  // chunk list stays empty.
+  //
+  // The DEBUG payload is what makes this a two-sided proof rather than a
+  // "nothing ran" tautology. Only arms that actually executed get keys,
+  // so `bm25Hits` present with no `graphHits` / `graphBelowFloor` says
+  // the stock server ran vector ∥ BM25 (#66) and skipped the archived
+  // arm — an all-quiet server would show no arm keys at all.
   // ============================================================
   it(
     "Case 4: DEBUG=1 spawn of dist/index.js (pgvector) → default path runs no SQL graph arm",
@@ -358,13 +364,19 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         });
         expect(result.isError).not.toBe(true);
         const payload = JSON.parse(textOf(result)) as Record<string, unknown>;
-        // Vector arm filtered to nothing and the graph arm never ran, so
-        // the whole envelope is the empty chunk list — no graph-arm hits.
-        expect(payload).toEqual({ chunks: [] });
+        // Both live arms were filtered to nothing and the graph arm never
+        // ran, so no chunk survives — none of the seeded graph chunks can
+        // have reached the envelope.
+        expect(payload.chunks).toEqual([]);
+        // Neither arm failed, and an arm that is simply not wired is not
+        // a degradation.
+        expect(payload).not.toHaveProperty("degraded");
         // Spelled out separately so a failure names the archived arm
         // rather than just diffing an object.
-        expect(payload).not.toHaveProperty("degraded");
-        expect(payload).not.toHaveProperty("debug");
+        expect(payload.debug).toEqual({ vectorHits: 0, bm25Hits: 0 });
+        expect(payload.debug).not.toHaveProperty("graphHits");
+        expect(payload.debug).not.toHaveProperty("graphBelowFloor");
+        expect(payload.debug).not.toHaveProperty("failureReason");
       } finally {
         await close();
       }

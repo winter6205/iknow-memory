@@ -92,8 +92,8 @@ interface ServerDeps {
  * builds the key. PgvectorBackend still exposes `graphArmSeed` and
  * `graph-arm.ts` still compiles — tests that want the arm inject
  * `graphConfig` themselves — but no operator gets one-hop JOIN results
- * from the stock server. Neo4j remains the future home for a real graph
- * arm; see `docs/runbooks/sql-graph-arm-archived.md`.
+ * from the stock server. A real graph arm belongs on a native graph
+ * engine; see `docs/runbooks/sql-graph-arm-archived.md`.
  *
  * Exported so both halves are directly assertable without a live Postgres
  * (tests/index.test.ts); reintroducing `graphConfig` here, or dropping

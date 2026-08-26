@@ -36,25 +36,25 @@ _Avoid_: "master entity" (implies hierarchy); "root entity" (implies tree struct
 
 ### Retrieval
 
-**vector search**: brute-force cosine similarity over chunk embeddings (stage 1) or HNSW index (future). Returns ranked chunks by cosine score. The only retrieval arm in stage 1.
+**vector search**: brute-force cosine similarity over chunk embeddings (stage 1) or HNSW index (future). Returns ranked chunks by cosine score. The always-on arm: every retrieve runs it, and its failure is the caller's failure.
 _Avoid_: "semantic search" (too broad, includes BM25); "embedding search" (the search is over embeddings, not for them)
 
-**BM25**: Okapi BM25 lexical ranking (k1=1.2, b=0.75) over tokenized chunk text. A retrieval arm that complements vector search by matching exact terms (query↔chunk lexical relevance — not chunker head/tail overlap). Production shape locked in issue #59: Postgres `tsvector`+rank at ingest; MemoryBackend keeps a same-contract lightweight inverted index for tests; default on, configurable off, fail-open to vector-only. _Stage: decided (#59); not yet implemented (task #62)._
+**BM25**: Okapi BM25 lexical ranking (k1=1.2, b=0.75) over tokenized chunk text. A retrieval arm that complements vector search by matching exact terms (query↔chunk lexical relevance — not chunker head/tail overlap). Production shape locked in issue #59: Postgres holds a generated `content_tsv` (`simple` config) with a GIN index and ranks with `ts_rank_cd`; MemoryBackend keeps a same-contract lightweight inverted index scoring true k1/b for tests. Scores are NOT comparable across the two backends — RRF fuses on rank, so they need not be. Default on, configurable off via `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED`, fail-open to vector-only. _Stage: implemented (#62); the production partner arm._
 _Avoid_: "keyword search" (BM25 is ranked, not boolean); "lexical search" (acceptable alias but BM25 is more precise)
 
-**hybrid retrieval**: multi-arm recall fused by Reciprocal Rank Fusion (RRF, k=60). Near-term production path after SQL graph-arm off (#58) and BM25 land (#62): vector + BM25 at weights 0.8 / 0.2 (Ask-first to change defaults). True graph traversal arm moves to Neo4j later; cosine re-score blend (0.7 normRRF + 0.3 cosine) remains a later polish. _Stage: decided for vector+BM25 (#59); implementation pending (#62)._
+**hybrid retrieval**: multi-arm recall fused by Reciprocal Rank Fusion (RRF, k=60). Production path is vector + BM25 at weights 0.8 / 0.2, run concurrently (Ask-first to change defaults). True graph traversal arm moves to Neo4j later; cosine re-score blend (0.7 normRRF + 0.3 cosine) remains a later polish. _Stage: implemented for vector+BM25 (#59 decided, #62 shipped)._
 _Avoid_: "fusion search" (ambiguous); "multi-signal search" (too vague)
 
-**graph arm**: the read-side recall path that converts the query embedding into a seed set of entities, follows one-hop triples filtered by `valid_window @> valid_at`, and joins back to chunks via `source_chunk_id` — a read-only Postgres JOIN, no writes. Best-effort and fail-open: an arm failure or a floor miss sets `degraded=true` instead of erroring. _Stage: P0 (implemented; fires on the production path — stored entities carry embeddings per `specs/p0-wiring-closure.md`)._
-_Avoid_: "graph search" (too broad); "graph traversal" (multi-hop/PPR is P1; the arm is one-hop); "knowledge-graph retrieval" (grandiose)
+**graph arm**: the read-side recall path that converts the query embedding into a seed set of entities, follows one-hop triples filtered by `valid_window @> valid_at`, and joins back to chunks via `source_chunk_id` — a read-only Postgres JOIN, no writes. Best-effort and fail-open: an arm failure or a floor miss sets `degraded=true` instead of erroring. _Stage: **archived off production** (#58 / #62). The code and its tests are retained and still compile, and the entity/triple ledger is untouched, but the server never supplies the `graphConfig` that would arm it — only a caller that injects one gets one-hop results. A real graph arm is Neo4j's job later; see `docs/runbooks/sql-graph-arm-archived.md`._
+_Avoid_: "graph search" (too broad); "graph traversal" (multi-hop/PPR is P1; the arm is one-hop); "knowledge-graph retrieval" (grandiose); "deleted" / "removed" (it is archived, not deleted)
 
-**RRF fusion (k=60)**: Reciprocal Rank Fusion with constant k=60; rank-based by design — no cross-arm score calibration (MinMax / z-score / sigmoid). P0 code path fused vector + graph at weight 1:1; #59 extends the arm set (not the algorithm) so production hybrid becomes vector + BM25 (graph slot unused after #58). _Stage: P0 (N-arm extension pending #62)._
+**RRF fusion (k=60)**: Reciprocal Rank Fusion with constant k=60; rank-based by design — no cross-arm score calibration (MinMax / z-score / sigmoid). N-arm: it takes an arm list rather than a fixed pair, so the arm set can change without touching the algorithm. Ties break by arm order (vector, then bm25, then graph) and then by id, so fused output is deterministic. _Stage: implemented (#62); production fuses vector + BM25._
 _Avoid_: "score fusion" (RRF is rank-based, not score-based); "ensemble" (ML model terminology); "merging results" (ambiguous with entity merge)
 
-**degraded=true**: the additive-optional envelope flag on the `retrieve` JSON payload, set when the graph arm yields fewer than `graphArmFloor` chunks (default 3) or throws; the vector arm's chunks are still returned. Absent on the vector-only path — the stage-1 shape `{ chunks: [...] }` stays exact. _Stage: P0._
+**degraded=true**: the additive-optional envelope flag on the `retrieve` JSON payload, set when an optional arm was ATTEMPTED and could not deliver — BM25 threw, or the graph arm threw or fell below `graphArmFloor`. The vector arm's chunks are still returned. An arm that simply found nothing has not degraded, and neither has one the operator switched off: BM25 disabled leaves the shape EXACTLY `{ chunks: [...] }`, because turning an arm off is a choice rather than a failure. _Stage: P0, extended to BM25 in #62._
 _Avoid_: "error flag" (a degraded response is a valid response, not an error); "fallback flag" (the vector arm always runs; it is not a fallback)
 
-**RetrieveConfig**: the frozen-on-read retrieval config object `{wVec, wGraph, entityLinkTopK, candidateCap, graphArmFloor}` (defaults 1 / 1 / 8 / 50 / 3), loaded via the existing `GraphragEnv` loader and validated at startup (`ConfigError` on invalid values). Changing defaults post-Bootstrap is Ask-first. _Stage: P0._
+**RetrieveConfig**: the frozen-on-read retrieval config object `{w_vec, w_bm25, w_graph, bm25Enabled, entityLinkTopK, candidateCap, graphArmFloor}` (defaults 0.8 / 0.2 / 1 / true / 8 / 50 / 3), loaded via the existing `GraphragEnv` loader and validated at startup (`ConfigError` on invalid values). `w_graph` and `graphArmFloor` survive for the archived graph arm and do not steer the production path. Changing defaults post-Bootstrap is Ask-first. _Stage: P0, extended in #62._
 _Avoid_: "retrieval settings" (vague); "tuning knobs" (colloquial); "mode bundle" (P1 preset concept, distinct)
 
 **rerank**: a post-fusion reordering step that promotes authoritative/fresh/relevant chunks. Options to evaluate: cross-encoder (e.g. zerank-class models), LLM rerank, or feature-based heuristics. iknow-memory: TBD (feature-based prototype validated, real cross-encoder or LLM rerank pending). Fail-open: rerank failure returns fused order unchanged.
@@ -93,7 +93,7 @@ _Avoid_: "cluster" (too generic, used in embedding clustering too); "topic group
 **ingest**: the write pipeline: validate → size check → chunk → embed → store. Exposed as MCP tool `ingest(input: {content, source_ref, metadata?, valid_from?, valid_until?}) → {chunk_ids}`. Stage 1: chunks-only. P0 adds: → extract triples → resolve entities → store graph.
 _Avoid_: "index" (implies search-index building, not knowledge extraction); "import" (implies bulk file loading)
 
-**retrieve**: the read pipeline: embed query → vector search with valid_window filter → return ranked chunks. Exposed as MCP tool `retrieve(input: {query, valid_at?, filters?, limit?}) → {chunks[]}`. Stage 1: vector-only. P1 adds: BM25 arm + graph traversal arm + hybrid fusion + rerank.
+**retrieve**: the read pipeline: embed query once → vector search ∥ BM25, both with valid_window filter → RRF fusion → return ranked chunks. Exposed as MCP tool `retrieve(input: {query, valid_at?, filters?, limit?}) → {chunks[]}`. The wire shape is unchanged from stage 1; only `chunks[].score` differs, carrying the fused RRF score once more than one arm runs. P1 adds: graph traversal arm (Neo4j) + rerank.
 _Avoid_: "search" (too broad); "query" (the input is a query, the operation is retrieve); "recall" (one stage of retrieval, not the whole pipeline)
 
 **extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. Not an MCP tool — it runs as the `extract` CLI batch pipeline, separate from `ingest`. _Stage: P0 (implemented)._
@@ -139,8 +139,8 @@ _Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified)
 - **chunk → embedder → embedding**: each chunk gets a dense vector (real API or FakeEmbedder for dev/test)
 - **chunk + LLM → extract_triples → triple[]**: P0 extraction produces (head, relation, tail) from chunk text
 - **triple → entity resolution → canonical entity**: aliases and mentions merge into deduplicated entities
-- **query → embedder → vector search → ranked chunks**: stage 1 retrieve path
-- **query → hybrid retrieval (vector + BM25 + graph) → RRF fusion → rerank → top-K**: P1 retrieve path
+- **query → embedder → vector search ∥ BM25 → RRF fusion → top-K**: current production retrieve path
+- **query → hybrid retrieval (vector + BM25 + Neo4j graph) → RRF fusion → rerank → top-K**: P1 retrieve path
 - **valid_window + valid_at → temporal filter**: chunks/triples outside the query's time window are excluded
 - **entity → Neo4j node; triple → Neo4j edge**: read-only projection of Postgres (P1 onward; P0 has no Neo4j connection — issue #3 D1, #7 Q3b)
 - **community → Louvain → hierarchical summary**: P3 global QA path

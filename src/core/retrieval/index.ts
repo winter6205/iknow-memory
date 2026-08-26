@@ -108,11 +108,13 @@ export async function assembleRetrievalResult(
   // starts.
   const queryEmbedding = await embedQuery(deps.embedder, args.query);
 
-  // Fusion weights come from whichever config the caller supplied. Legacy
-  // graph-arm callers pass only `graphConfig`; production passes only
-  // `retrieveConfig`.
-  const config = deps.retrieveConfig ?? deps.graphConfig;
-  const lexical = getLexicalArm(deps, config);
+  // Fusion WEIGHTS may fall back: a legacy graph-arm caller passes only
+  // `graphConfig`, production passes only `retrieveConfig`, and RRF needs
+  // weights either way. The BM25 GATE must NOT fall back — `getLexicalArm`
+  // reads `deps.retrieveConfig` alone, so injecting the archived graph arm
+  // can never switch the lexical arm on behind the operator's back.
+  const weights = deps.retrieveConfig ?? deps.graphConfig;
+  const lexical = getLexicalArm(deps);
   const graph = getGraphSeed(deps);
   const fusing = lexical !== undefined || graph !== undefined;
 
@@ -123,7 +125,11 @@ export async function assembleRetrievalResult(
   };
   const vectorSearch = deps.storage.search(queryEmbedding, searchOpts);
 
-  if (!fusing) {
+  // An active arm always implies its own config — the lexical arm implies
+  // `retrieveConfig`, the graph arm implies `graphConfig` — so the
+  // `weights === undefined` half is unreachable at runtime. It is what
+  // narrows `weights` for the `rrfFuse` call below.
+  if (!fusing || weights === undefined) {
     // Vector-only: chunks flow through unchanged. RetrievedChunk is
     // already structurally identical to the envelope chunk shape, so no
     // projection is needed for the empty-extra-keys contract.
@@ -152,9 +158,6 @@ export async function assembleRetrievalResult(
     Promise.all(pending),
   ]);
 
-  // `config` is defined whenever an arm ran: the lexical arm needs it to
-  // be enabled, and the graph arm implies `graphConfig`.
-  const weights = config ?? graph!.config;
   const arms = [toVectorResult(retrieved), ...optional];
   const fused = rrfFuse(arms, weights, args.limit);
   return buildEnvelope(
@@ -219,14 +222,17 @@ function getGraphSeed(
 
 /**
  * Resolve the BM25 arm. Returns undefined — meaning "do not run it", NOT
- * "it failed" — when any prerequisite is missing: no config, the operator
- * disabled it, or the backend has no lexical seam. None of those set
- * `degraded`, because none of them is an attempt.
+ * "it failed" — when any prerequisite is missing: no `retrieveConfig`, the
+ * operator disabled it, or the backend has no lexical seam. None of those
+ * set `degraded`, because none of them is an attempt.
+ *
+ * The gate reads `deps.retrieveConfig` and nothing else. Falling back to
+ * `graphConfig` would let a caller who only opted into the archived graph
+ * arm (#58) turn on a lexical arm it never asked for, and `graphConfig`
+ * carries a `bm25Enabled` field purely because both share `RetrieveConfig`.
  */
-function getLexicalArm(
-  deps: AssembleDeps,
-  config: RetrieveConfig | undefined
-): LexicalStorageBackend | undefined {
+function getLexicalArm(deps: AssembleDeps): LexicalStorageBackend | undefined {
+  const config = deps.retrieveConfig;
   if (config === undefined || !config.bm25Enabled) return undefined;
   if (!supportsLexicalSearch(deps.storage)) return undefined;
   return deps.storage;
@@ -250,6 +256,7 @@ async function runLexicalArmSafe(
       belowFloor: false,
     };
   } catch (err) {
+    // EXIT: degraded:true + failureReason 上行 envelope，调用方可见
     return {
       arm: "bm25",
       hits: [],
@@ -272,6 +279,7 @@ async function runGraphArmSafe(
   try {
     return await runGraphArm(queryEmbedding, deps, now);
   } catch (err) {
+    // EXIT: degraded:true + failureReason 上行 envelope，调用方可见
     return {
       arm: "graph",
       hits: [],

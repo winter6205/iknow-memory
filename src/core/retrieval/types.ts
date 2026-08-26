@@ -42,7 +42,13 @@ export interface ArmHit {
 export interface ArmResult {
   arm: ArmName;
   hits: ArmHit[];
-  /** True if this arm could not satisfy the floor (graph arm only). */
+  /**
+   * True when this arm was attempted and could not deliver — any optional
+   * arm, not just graph. The graph arm sets it on a throw OR on missing
+   * `graphArmFloor`; the BM25 arm sets it on a throw. It is what flips
+   * `degraded` on the envelope, so an arm that merely found nothing leaves
+   * it false.
+   */
   belowFloor: boolean;
   /** Human-readable failure reason when the arm is unavailable. */
   failureReason?: string;

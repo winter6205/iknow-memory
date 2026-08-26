@@ -72,7 +72,10 @@ describe("MemoryBackend — lexical (BM25) arm", () => {
 
   it("is case-insensitive and splits on punctuation", async () => {
     await backend.upsert([
-      makeChunk({ id: "a", content: "Rollback/Restore: the ZUBROWKA runbook." }),
+      makeChunk({
+        id: "a",
+        content: "Rollback/Restore: the ZUBROWKA runbook.",
+      }),
     ]);
     const hits = await backend.searchLexical("zubrowka restore", {
       limit: 10,
@@ -84,8 +87,14 @@ describe("MemoryBackend — lexical (BM25) arm", () => {
   it("ranks a rare term above a term that appears in every chunk", async () => {
     await backend.upsert([
       makeChunk({ id: "common-1", content: "deployment notes for the system" }),
-      makeChunk({ id: "common-2", content: "deployment notes for the network" }),
-      makeChunk({ id: "common-3", content: "deployment notes for the database" }),
+      makeChunk({
+        id: "common-2",
+        content: "deployment notes for the network",
+      }),
+      makeChunk({
+        id: "common-3",
+        content: "deployment notes for the database",
+      }),
       makeChunk({ id: "rare", content: "deployment blocked by zubrowka" }),
     ]);
     // "deployment" is in every chunk so it carries almost no signal;
@@ -128,9 +137,9 @@ describe("MemoryBackend — lexical (BM25) arm", () => {
 
   it("returns [] for a query with no usable terms", async () => {
     await backend.upsert([makeChunk({ id: "a", content: "some content" })]);
-    expect(await backend.searchLexical("", { limit: 10, validAt: NOW })).toEqual(
-      []
-    );
+    expect(
+      await backend.searchLexical("", { limit: 10, validAt: NOW })
+    ).toEqual([]);
     expect(
       await backend.searchLexical("   ", { limit: 10, validAt: NOW })
     ).toEqual([]);
@@ -231,8 +240,12 @@ describe("MemoryBackend — lexical (BM25) arm", () => {
   });
 
   it("re-indexes on re-upsert so stale text stops matching", async () => {
-    await backend.upsert([makeChunk({ id: "a", content: "zubrowka original" })]);
-    await backend.upsert([makeChunk({ id: "a", content: "entirely replaced" })]);
+    await backend.upsert([
+      makeChunk({ id: "a", content: "zubrowka original" }),
+    ]);
+    await backend.upsert([
+      makeChunk({ id: "a", content: "entirely replaced" }),
+    ]);
 
     expect(
       await backend.searchLexical("zubrowka", { limit: 10, validAt: NOW })

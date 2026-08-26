@@ -350,9 +350,8 @@ describe("assembleRetrievalResult — BM25 fail-open (SC9)", () => {
 
 describe("retrieve tool — BM25 wiring", () => {
   it("passes its retrieveConfig through to the orchestrator", async () => {
-    const { createRetrieveHandler } = await import(
-      "../../src/tools/retrieve.js"
-    );
+    const { createRetrieveHandler } =
+      await import("../../src/tools/retrieve.js");
     const storage = await seeded(
       makeChunk("lex", "zubrowka protocol"),
       makeChunk("other", "unrelated")

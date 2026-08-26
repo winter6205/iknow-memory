@@ -162,7 +162,12 @@ export class MemoryBackend implements StorageBackend, LexicalStorageBackend {
     const scored: RetrievedChunk[] = [];
     for (const chunk of this.store.values()) {
       if (!admits(chunk)) continue;
-      scored.push(toRetrievedChunk(chunk, cosineSimilarity(queryEmbedding, chunk.embedding)));
+      scored.push(
+        toRetrievedChunk(
+          chunk,
+          cosineSimilarity(queryEmbedding, chunk.embedding)
+        )
+      );
     }
 
     // Sort descending by score. Ties keep insertion order
@@ -226,7 +231,7 @@ export class MemoryBackend implements StorageBackend, LexicalStorageBackend {
     }
 
     return [...scores.entries()]
-      .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : (a[0] < b[0] ? -1 : 1)))
+      .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0] < b[0] ? -1 : 1))
       .slice(0, opts.limit)
       .map(([id, score]) => toRetrievedChunk(this.store.get(id)!, score));
   }

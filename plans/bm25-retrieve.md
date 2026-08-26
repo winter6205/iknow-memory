@@ -34,7 +34,7 @@ OVERALL: PASS — proceed with tracer bullets.
 
 ## 待写入
 
-- After impl: CONTEXT **graph arm** stage → archived off production retrieve (if still “fires on production”).
+- ~~After impl: CONTEXT **graph arm** stage → archived off production retrieve (if still “fires on production”).~~ Flushed in T5: the stage line now reads archived off production (#58 / #62) and points at `docs/runbooks/sql-graph-arm-archived.md`.
 - No ADR open/reopen from this plan.
 
 ## Tasks (ordered by dependency)
@@ -74,6 +74,6 @@ OVERALL: PASS — proceed with tracer bullets.
    - **Inherits:** SC12–SC13; persist note in spec 待写入; isolation / no Neo4j fence.
    - **Surface:** full `npm test` / `npm run build`; `docs/CONTEXT.md` graph-arm stage line; map/handoff one-line frontier pointer if needed.
    - **Acceptance:** SC12–SC13; CONTEXT no longer claims SQL graph arm fires on production retrieve.
-   - Status: [ ] pending
+   - Status: [x] done — `docs/CONTEXT.md` retrieval section refreshed (graph arm archived off production; BM25 / hybrid / RRF / degraded / RetrieveConfig moved to implemented); `npm test` 548/548 across 44 files with real Postgres, `npm run build` clean, `rg -il neo4j dist/` empty
    - [blocks: T4]
    - Tracker: https://github.com/winter6205/iknow-memory/issues/67

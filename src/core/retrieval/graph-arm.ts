@@ -6,8 +6,9 @@
  * reaches this module: nothing here runs for an operator on the stock
  * server. It is kept compiling, and kept reachable from tests that inject
  * `graphConfig` explicitly, rather than deleted — a one-hop SQL JOIN over
- * `triples` was never a real graph arm, and Neo4j is the future home for
- * one. See `docs/runbooks/sql-graph-arm-archived.md`.
+ * `triples` was never a real graph arm, and a native graph engine is the
+ * future home for one. See `docs/runbooks/sql-graph-arm-archived.md` for
+ * the rationale and the successor.
  *
  * Runs the graph retrieval pipeline: top-K seed entities → one-hop triples →
  * chunks. The query embedding is supplied by the T5 orchestrator, which

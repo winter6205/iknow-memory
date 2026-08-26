@@ -1,6 +1,7 @@
 /**
  * graph-neo4j: the projection against a real Neo4j (specs/neo4j-graph-arm.md
- * SC2 — "idempotently (re-run safe). Loud-skip if Neo4j unreachable").
+ * SC2 — "idempotently (re-run safe). Loud-skip if Neo4j unreachable" — and
+ * SC4, where the outbox drain applies intents to the same live graph).
  *
  * This is the one file in the suite that needs a live graph. It LOUD-SKIPS
  * with the documented Validation block when `GRAPHRAG_MEMORY_NEO4J_URI` is
@@ -32,6 +33,11 @@ import {
   type BackfillDeps,
   type BackfillPool,
 } from "../../src/cli/graph-backfill.js";
+import {
+  runCli as runDrainCli,
+  type DrainDeps,
+  type DrainPool,
+} from "../../src/cli/graph-drain.js";
 import { connectNeo4j } from "../../src/core/graph/neo4j-writer.js";
 import { NEO4J_URI_VAR, loadEnv, type Neo4jConfig } from "../../src/config.js";
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
@@ -184,6 +190,21 @@ describeGraph("graph-neo4j: idempotent projection into a live graph", () => {
     }
   }
 
+  /** Run the drain CLI against real Postgres AND the real graph. */
+  async function drain(argv: string[] = []): Promise<number> {
+    const pool = new pg.Pool({ connectionString: schemaDbUrl() });
+    const deps: DrainDeps = {
+      pool: pool as unknown as DrainPool,
+      logger: silentLogger(),
+      connectGraph: () => connectNeo4j(SETTINGS!),
+    };
+    try {
+      return await runDrainCli(argv, deps);
+    } finally {
+      await pool.end();
+    }
+  }
+
   async function fixtureCounts(): Promise<{ nodes: number; edges: number }> {
     const rows = await run(
       `MATCH (e:Entity) WHERE e.id IN $ids
@@ -264,4 +285,32 @@ describeGraph("graph-neo4j: idempotent projection into a live graph", () => {
     const labels = await run(`CALL db.labels() YIELD label RETURN label`);
     expect(labels.map((r) => r.label)).not.toContain("Chunk");
   });
+
+  it("drains outbox intents into the graph and re-drains as a no-op (SC4)", async () => {
+    // Start from an empty graph so what lands here is the drain's work and
+    // not a leftover from the backfill cases above.
+    await run(`MATCH (e:Entity) WHERE e.id IN $ids DETACH DELETE e`, {
+      ids: [ALICE, ACME],
+    });
+    await pgClient.query(`DELETE FROM projection_outbox`);
+    expect(await backfill(["--reconcile"])).toBe(0);
+
+    expect(await drain()).toBe(0);
+
+    expect(await fixtureCounts()).toEqual({ nodes: 2, edges: 1 });
+    expect(await intentStatuses()).toEqual({ done: 3 });
+
+    // SC4 re-drain safe: nothing is pending, so nothing is re-projected.
+    expect(await drain()).toBe(0);
+    expect(await fixtureCounts()).toEqual({ nodes: 2, edges: 1 });
+    expect(await intentStatuses()).toEqual({ done: 3 });
+  });
+
+  async function intentStatuses(): Promise<Record<string, number>> {
+    const res = await pgClient.query<{ status: string; count: number }>(
+      `SELECT status, count(*)::int AS count
+         FROM projection_outbox GROUP BY status`
+    );
+    return Object.fromEntries(res.rows.map((r) => [r.status, r.count]));
+  }
 });

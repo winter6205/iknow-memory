@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { loadEnv } from "../src/config.ts";
+import { ConfigError, loadEnv } from "../src/config.ts";
 
 /**
  * Config contract — stage 0 is stdio-only.
@@ -22,6 +22,21 @@ import { loadEnv } from "../src/config.ts";
  *   - parseEnvFile read-throw paths (.env.local fallback; stage 0 has
  *     no .env.local shipped)
  */
+/**
+ * The GRAPHRAG_MEMORY_RETRIEVAL_* family. Every describe block below
+ * scrubs all of them so a developer's real values can neither trip the
+ * boundary validation nor leak into a default assertion.
+ */
+const RETRIEVAL_VARS = [
+  "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC",
+  "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25",
+  "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
+  "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
+  "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
+  "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
+] as const;
+
 describe("loadEnv — stage 0 stdio-only contract", () => {
   // GRAPHRAG_MEMORY_EMBED_DIMENSIONS is now always required; scrub
   // NINE_ROUTER_KEY (and the now-coupled BASE_URL/MODEL fields) for the
@@ -37,11 +52,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     "NINE_ROUTER_KEY",
     // Retrieval pipeline knobs (spec-3 T5) — scrub so a developer's real
     // values don't trip the boundary validation or leak into assertions.
-    "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC",
-    "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
-    "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
-    "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
-    "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
+    ...RETRIEVAL_VARS,
   ];
   const saved = new Map<string, string | undefined>();
   beforeAll(() => {
@@ -600,4 +611,136 @@ describe("loadEnv — embedding API key resolution", () => {
       }
     );
   });
+});
+
+/**
+ * Hybrid retrieval knobs (#59 / #64).
+ *
+ * Production retrieve fuses vector + BM25 at 0.8 / 0.2 with BM25 on by
+ * default; the graph weight stays parsed but no longer drives the default
+ * path (#58). Every invalid value must abort at startup with a
+ * `ConfigError` naming the offending var rather than silently falling back
+ * to a default — an operator who typo'd a weight would otherwise run a
+ * ranking they never asked for and have no way to notice.
+ */
+describe("loadEnv — hybrid retrieval weights + BM25 switch", () => {
+  function withRetrievalEnv(
+    patch: Record<string, string | undefined>,
+    fn: () => void
+  ) {
+    const keys = [...RETRIEVAL_VARS, "GRAPHRAG_MEMORY_EMBED_DIMENSIONS"];
+    const saved = new Map<string, string | undefined>();
+    for (const k of keys) {
+      saved.set(k, process.env[k]);
+      delete process.env[k];
+    }
+    process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+    for (const [k, v] of Object.entries(patch)) {
+      if (!saved.has(k)) saved.set(k, process.env[k]);
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      fn();
+    } finally {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  it("defaults a fresh env to the production hybrid: w_vec 0.8, w_bm25 0.2, BM25 enabled", () => {
+    withRetrievalEnv({}, () => {
+      const { retrieval } = loadEnv();
+      expect(retrieval.w_vec).toBe(0.8);
+      expect(retrieval.w_bm25).toBe(0.2);
+      expect(retrieval.bm25Enabled).toBe(true);
+    });
+  });
+
+  it("leaves the archived graph weight and its knobs at their prior defaults", () => {
+    withRetrievalEnv({}, () => {
+      const { retrieval } = loadEnv();
+      expect(retrieval.w_graph).toBe(1);
+      expect(retrieval.entityLinkTopK).toBe(8);
+      expect(retrieval.candidateCap).toBe(50);
+      expect(retrieval.graphArmFloor).toBe(3);
+    });
+  });
+
+  it("reads an operator override for w_bm25", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.5" }, () => {
+      expect(loadEnv().retrieval.w_bm25).toBe(0.5);
+    });
+  });
+
+  const BAD_WEIGHTS: Array<readonly [string, string]> = [
+    ["negative", "-0.2"],
+    ["zero", "0"],
+    ["non-numeric", "heavy"],
+    ["NaN", "NaN"],
+    ["infinite", "Infinity"],
+  ];
+
+  for (const [label, value] of BAD_WEIGHTS) {
+    it(`rejects w_bm25 = "${value}" (${label}) with ConfigError`, () => {
+      withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: value }, () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_RETRIEVAL_W_BM25/);
+      });
+    });
+  }
+
+  it("turns BM25 off when the enable flag is false", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false" },
+      () => {
+        expect(loadEnv().retrieval.bm25Enabled).toBe(false);
+      }
+    );
+  });
+
+  it("accepts 1 / 0 and mixed case for the enable flag", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "0" }, () => {
+      expect(loadEnv().retrieval.bm25Enabled).toBe(false);
+    });
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "1" }, () => {
+      expect(loadEnv().retrieval.bm25Enabled).toBe(true);
+    });
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "FALSE" },
+      () => {
+        expect(loadEnv().retrieval.bm25Enabled).toBe(false);
+      }
+    );
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: " true " },
+      () => {
+        expect(loadEnv().retrieval.bm25Enabled).toBe(true);
+      }
+    );
+  });
+
+  it("treats a blank enable flag as unset and keeps BM25 on", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "   " }, () => {
+      expect(loadEnv().retrieval.bm25Enabled).toBe(true);
+    });
+  });
+
+  const BAD_FLAGS = ["maybe", "2", "on", "yes", "-1"];
+
+  for (const value of BAD_FLAGS) {
+    it(`rejects an unparseable enable flag "${value}" instead of guessing`, () => {
+      withRetrievalEnv(
+        { GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: value },
+        () => {
+          expect(() => loadEnv()).toThrow(ConfigError);
+          expect(() => loadEnv()).toThrow(
+            /GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED/
+          );
+        }
+      );
+    });
+  }
 });

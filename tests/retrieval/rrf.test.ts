@@ -27,13 +27,22 @@ const CFG: RetrieveConfig = {
   w_bm25: 1,
   w_graph: 1,
   bm25Enabled: true,
+  graphEnabled: true,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
 };
 
-/** The shipped production weights (#59): vector 0.8 / BM25 0.2. */
-const PROD_CFG: RetrieveConfig = { ...CFG, w_vec: 0.8, w_bm25: 0.2 };
+/**
+ * The shipped production weights (#69/#70): vector 0.7 / BM25 0.15 /
+ * graph 0.15.
+ */
+const PROD_CFG: RetrieveConfig = {
+  ...CFG,
+  w_vec: 0.7,
+  w_bm25: 0.15,
+  w_graph: 0.15,
+};
 
 /** Build a single ArmHit with sensible defaults; override via patch. */
 function hit(patch: Partial<ArmHit> & { id: string }): ArmHit {
@@ -120,20 +129,19 @@ describe("rrfFuse", () => {
       PROD_CFG,
       10
     );
-    // Same rank in both arms, so the 0.8 / 0.2 split is the only thing
+    // Same rank in both arms, so the 0.7 / 0.15 split is the only thing
     // separating them — the vector hit must come first.
     expect(out.map((f) => f.id)).toEqual(["v", "b"]);
-    expect(out[0]?.rrfScore).toBeCloseTo(0.8 / 61, 10);
-    expect(out[1]?.rrfScore).toBeCloseTo(0.2 / 61, 10);
+    expect(out[0]?.rrfScore).toBeCloseTo(0.7 / 61, 10);
+    expect(out[1]?.rrfScore).toBeCloseTo(0.15 / 61, 10);
   });
 
   it("lets a strong BM25 hit outrank a weak vector hit despite the lower weight", () => {
     const out = rrfFuse(
       [
-        // 0.8 / (60 + 40) = 0.008
+        // 0.7 / (60 + 40) = 0.007
         result("vector", [hit({ id: "v", rank: 40 })]),
-        // 0.2 / (60 + 1)  ≈ 0.00328 — still behind
-        // 0.2 / (60 + 1) with vector pushed to rank 200 flips it below.
+        // 0.15 / (60 + 1) ≈ 0.00246 — still behind
         result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
       ],
       PROD_CFG,
@@ -143,9 +151,9 @@ describe("rrfFuse", () => {
 
     const flipped = rrfFuse(
       [
-        // 0.8 / (60 + 500) ≈ 0.00143
+        // 0.7 / (60 + 500) = 0.00125
         result("vector", [hit({ id: "v", rank: 500 })]),
-        // 0.2 / 61 ≈ 0.00328 — lexical wins on rank quality
+        // 0.15 / 61 ≈ 0.00246 — lexical wins on rank quality
         result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
       ],
       PROD_CFG,
@@ -167,6 +175,46 @@ describe("rrfFuse", () => {
       10
     );
     expect(out.map((f) => f.id)).toEqual(["v", "b", "g"]);
+  });
+
+  // SC10 (partial, config half): the weight table must read `w_graph`
+  // from the SAME production config the server loads, so the graph arm
+  // fuses as a first-class weighted arm rather than at some hardcoded
+  // value. k stays 60.
+  it("SC10: weights the graph arm by w_graph under the production defaults", () => {
+    const out = rrfFuse(
+      [
+        result("vector", [hit({ id: "v", rank: 1 })]),
+        result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
+        result("graph", [hit({ id: "g", rank: 1, arm: "graph" })]),
+      ],
+      PROD_CFG,
+      10
+    );
+    expect(out.map((f) => f.id)).toEqual(["v", "b", "g"]);
+    expect(out[0]?.rrfScore).toBeCloseTo(0.7 / 61, 10);
+    // BM25 and graph carry the same 0.15, so an equal rank must yield an
+    // equal score — the graph arm is not discounted anywhere in fusion.
+    expect(out[1]?.rrfScore).toBeCloseTo(0.15 / 61, 10);
+    expect(out[2]?.rrfScore).toBeCloseTo(0.15 / 61, 10);
+  });
+
+  it("SC10: soft-merges one chunk found by all three arms into a single hit", () => {
+    const out = rrfFuse(
+      [
+        result("vector", [hit({ id: "same", rank: 1 })]),
+        result("bm25", [hit({ id: "same", rank: 2, arm: "bm25" })]),
+        result("graph", [hit({ id: "same", rank: 3, arm: "graph" })]),
+      ],
+      PROD_CFG,
+      10
+    );
+    expect(out).toHaveLength(1);
+    const fused = out[0]!;
+    expect(fused.arms).toEqual(["vector", "bm25", "graph"]);
+    expect(fused.rrfScore).toBeCloseTo(0.7 / 61 + 0.15 / 62 + 0.15 / 63, 10);
+    // Three-arm agreement must beat what the vector arm alone would give.
+    expect(fused.rrfScore).toBeGreaterThan(0.7 / 61);
   });
 
   it("returns [] for no arms at all", () => {

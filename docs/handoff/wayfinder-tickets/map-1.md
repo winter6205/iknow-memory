@@ -29,6 +29,14 @@
 
 **Frontier：** 上两项；grilling #88/#89 不再当下一刀。
 
+**#91+#92 之后（[#93](https://github.com/winter6205/iknow-memory/issues/93)）：**
+
+1. 专用精排 HTTP（换掉主模型暂代）
+2. 投影删除（账本没了 → 图上删，不是图墓碑）
+3. 自环三元组条级错误值（不强制重抽）
+
+仍后置：#15、`merged_into`、多粒度、Louvain、mode bundle、read-your-writes。
+
 ## 路线要点（#57 + #78）
 
 - **关掉** SQL 一跳图臂；不做假图过渡建设
@@ -39,7 +47,7 @@
 
 ## 明确未做（勿当成已关）
 
-- 专用 cross-encoder HTTP；图墓碑/投影 GC
+- 专用 cross-encoder HTTP；图投影删除；自环条级 reject — 见 [#93](https://github.com/winter6205/iknow-memory/issues/93)
 - `merged_into` 指针落盘；T-P0-eval 代码；多粒度切分
 - #15 抽取 F1
 
@@ -51,3 +59,4 @@
 - 图优先：`specs/retrieve-graph-priority.md` · `plans/retrieve-graph-priority.md` · `docs/handoff/wayfinder-tickets/retrieve-graph-priority.md`
 - 精排：`specs/retrieve-rerank-llm.md` · `plans/retrieve-rerank-llm.md` · `docs/handoff/wayfinder-tickets/retrieve-rerank-llm.md`
 - 下回合票：[#91](https://github.com/winter6205/iknow-memory/issues/91) · [#92](https://github.com/winter6205/iknow-memory/issues/92)
+- 再下一回合：[#93](https://github.com/winter6205/iknow-memory/issues/93)

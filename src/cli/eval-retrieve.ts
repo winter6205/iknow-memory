@@ -15,7 +15,7 @@
  * score each fused ranking at rank 5, and replace the baseline file
  * atomically.
  *
- * Two contracts worth naming:
+ * Three contracts worth naming:
  *
  *   - **No Neo4j URI is not a failure.** The graph arm is simply not
  *     among the arms that ran; the baseline records `armSet` as
@@ -25,6 +25,14 @@
  *     stops with a typed error naming the query. Recording an empty
  *     top-5 instead would publish a lower P@5 that looks exactly like a
  *     retrieval regression.
+ *   - **A degraded arm fails the run too.** Optional arms are fail-open,
+ *     so an arm that errors comes back as an empty contribution rather
+ *     than a throw — and `armSet` would still name it, because the arm
+ *     did start (specs/retrieve-graph-priority.md SC8). Publishing that
+ *     is the same lie the previous contract refuses: the graph arm leads
+ *     the ranking under graph-priority, so a baseline labelled
+ *     `vector+bm25+graph` whose graph arm never delivered is a
+ *     fallback-RRF baseline wearing a graph-led label.
  *
  * Storage is always the corpus the harness seeded, never an operator's
  * live store: a baseline is only comparable across runs if the searched
@@ -103,10 +111,11 @@ export interface EvalDeps {
   /** Production retrieval knobs; the eval never retunes them (A6). */
   retrieveConfig: RetrieveConfig;
   /**
-   * Graph ranker for the third arm. Absent on the default path — the
-   * seeded corpus is chunks-only, so there is no ledger for a graph arm
-   * to seed from, and "no graph arm ran" is recorded in `armSet` rather
-   * than treated as a degradation (SC5).
+   * Graph ranker for the Neo4j arm — the arm that LEADS the ranking when
+   * it returns anything, rather than voting at `w_graph`. Absent on the
+   * default path: the seeded corpus is chunks-only, so there is no ledger
+   * for a graph arm to seed from, and "no graph arm ran" is recorded in
+   * `armSet` rather than treated as a degradation (SC5).
    */
   graphRanker?: GraphRanker;
   logger: Logger;
@@ -210,6 +219,7 @@ async function runEval(
   let armSet: string | undefined;
   for (const goldQuery of gold.queries) {
     const envelope = await retrieveOne(goldQuery, flags, deps);
+    assertArmsDelivered(envelope, goldQuery.id);
     armSet = reconcileArmSet(armSet, envelope, goldQuery.id);
     const score = scoreAtFive(
       envelope.chunks.map((chunk) => chunk.id),
@@ -276,6 +286,50 @@ async function retrieveOne(
       goldQuery.id
     );
   }
+}
+
+/**
+ * Stop the run when an arm was attempted and could not deliver.
+ *
+ * `armSet` reads arm PARTICIPATION off the debug payload, so a fail-open
+ * arm that errored is still named there — correctly, since it did start.
+ * That label is only honest about the ranking when the arm also finished:
+ * under graph-priority the graph arm owns the head of every list, so a
+ * baseline stamped `vector+bm25+graph` whose graph arm errored records a
+ * pure vector+BM25 fallback under a graph-led name, and the P@5 gap
+ * against the previous baseline reads as a retrieval regression instead
+ * of the outage it is.
+ */
+function assertArmsDelivered(
+  envelope: RetrieveOutputEnvelope,
+  queryId: string
+): void {
+  if (envelope.degraded !== true) return;
+  // EXIT: typed EvalRunError → 退出码 1；baseline 不写入，旧文件保持原样
+  throw new EvalRunError(
+    `retrieval degraded for gold query "${queryId}": ${describeArmFailures(envelope.debug)}; scoring a degraded arm set would publish a baseline naming an arm that never contributed`,
+    queryId
+  );
+}
+
+/**
+ * Name the arms behind a `degraded` envelope, from the per-arm reasons
+ * the orchestrator emits as `<arm>FailureReason`. The legacy bare
+ * `failureReason` alias is skipped by the same pattern, so the graph arm
+ * is reported once. An arm can also degrade without a reason (the
+ * archived SQL arm under-flooring), hence the fallback.
+ */
+function describeArmFailures(
+  debug: Record<string, unknown> | undefined
+): string {
+  const reasons: string[] = [];
+  for (const [key, value] of Object.entries(debug ?? {})) {
+    const arm = /^(.+)FailureReason$/.exec(key)?.[1];
+    if (arm !== undefined) reasons.push(`${arm} arm failed: ${String(value)}`);
+  }
+  return reasons.length > 0
+    ? reasons.join("; ")
+    : "an optional arm returned below-floor results";
 }
 
 /**

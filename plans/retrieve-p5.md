@@ -43,14 +43,19 @@ OVERALL: PASS — proceed with tracer bullets.
    - **Inherits:** Spec SC1–SC3, SC9 (empty / negative / overflow of those); A2–A3; denominator of P@5 is always 5; empty gold relevant set is a typed error not a score of 1.0; gold v1 size 8–15 queries inclusive.
    - **Surface:** evaluation capability (scorer + gold load) plus unit tests; no retrieve I/O in this bullet.
    - **Acceptance:** SC1–SC3 hold in tests with no network; empty gold file / empty relevant set / gold size outside 8–15 fail typed; P@5 uses fixed denominator 5 when fused list is shorter than 5.
-   - Status: [ ] pending
+   - Status: [x] done — `src/core/eval/{score,gold,corpus,errors,paths,fixture-io}.ts`
+     plus frozen `eval/gold/retrieve-v1.json` (12 queries) and
+     `eval/corpus/retrieve-v1.json` (18 chunks); `tests/eval/{score,gold}.test.ts`.
    - Tracker: https://github.com/winter6205/iknow-memory/issues/83
 
 2. **Eval CLI on production fusion + baseline JSON + no-URI skip** — tag: `[implementation]`
    - **Inherits:** Spec SC4–SC8, SC11; A4–A7, A9–A10; same assembler MCP `retrieve` uses; skip-without-URI is success (`armSet` two-arm); no new MCP tool; no new IR runtime dependency; concurrent two runs must not tear the baseline file.
    - **Surface:** existing `cli` + retrieve assembler (`assembleRetrievalResult` / retrieve handler with injected deps — implementer headroom); `package.json` script `eval:retrieve`.
    - **Acceptance:** `npm run eval:retrieve` exit 0 with Neo4j URI unset; baseline JSON has per-query top-5 ids, P@5, R@5, armSet; second frozen-fixture run is byte-stable; `tools/list` still echo+ingest+retrieve; assembler throw is typed with non-empty message and no silent `[]`.
-   - Status: [ ] pending
+   - Status: [x] done — `src/cli/eval-retrieve.ts` on `assembleRetrievalResult`,
+     `src/core/eval/{baseline,seed,index}.ts`, `npm run eval:retrieve`, baseline at
+     `eval/baseline/retrieve-p5.json`; `tests/cli/eval-retrieve.unit.test.ts` +
+     `tests/eval/baseline.test.ts`.
    - [blocks: T1]
    - Tracker: https://github.com/winter6205/iknow-memory/issues/84
 
@@ -58,7 +63,9 @@ OVERALL: PASS — proceed with tracer bullets.
    - **Inherits:** Spec SC9–SC11; persist list above; A11–A13 (this round is spec/plan first; this bullet is last impl).
    - **Surface:** full `npm test` / `npm run build`; `docs/CONTEXT.md` **P@5 / R@5** stage line.
    - **Acceptance:** SC9–SC11; five boundary classes covered; CONTEXT `_Stage:` no longer says `not implemented`; eval CLI does not import iknow runtime.
-   - Status: [ ] pending
+   - Status: [x] done — full `npm test` / `npm run build` / `npm run typecheck`
+     green (Neo4j-tagged files loud-skip), `tests/eval/isolation.test.ts` binds
+     SC4 / SC7 / SC8 / SC11, CONTEXT **P@5 / R@5** `_Stage:` refreshed.
    - [blocks: T2]
    - Tracker: https://github.com/winter6205/iknow-memory/issues/85
 

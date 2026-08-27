@@ -148,8 +148,16 @@ function parseEnvFile(path: string): Record<string, string> {
 }
 
 function readEnv(key: string): string | undefined {
-  const fromProcess = process.env[key];
-  if (fromProcess !== undefined) return fromProcess;
+  // A key *present* on process.env (even blank) is an explicit process
+  // value: it must not fall through to `.env.local`. Host-smoke and
+  // Cursor MCP pin secrets to "" so a developer file cannot select
+  // 9router / Neo4j / pgvector. Absent keys still read the file.
+  if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+    const fromProcess = process.env[key];
+    if (fromProcess === undefined) return undefined;
+    const trimmed = fromProcess.trim();
+    return trimmed === "" ? undefined : fromProcess;
+  }
   const file = parseEnvFile(join(process.cwd(), ".env.local"));
   return file[key];
 }

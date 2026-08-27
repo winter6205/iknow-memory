@@ -1,11 +1,11 @@
 /**
  * #49 host-smoke: a real MCP Host over stdio.
  *
- * Proves (per wayfinder map #33 / ticket #49, partial):
+ * Proves (per wayfinder map #1 / T-007 task #79, stdio Host):
  *   (a) stdio JSON-RPC handshake: initialize / initialized under a real
  *       MCP client (v2 @modelcontextprotocol/client's Client +
  *       StdioClientTransport spawning our dist/index.js).
- *   (b) tool discovery: tools/list returns the registered MVP tool set.
+ *   (b) tool discovery: tools/list returns echo + ingest + retrieve.
  *   (c) tool call: tools/call round-trips the documented text shape.
  *   (d) negative input: empty message -> isError:true result (v2 wraps
  *       input-validation failures as a tool result, not a JSON-RPC error).
@@ -46,24 +46,24 @@ const pkgRoot = path.resolve(here, "..");
 const distEntry = path.join(pkgRoot, "dist", "index.js");
 
 /**
- * Env-var keys deleted from the child's environment so the spawned server
- * can never leave memory + FakeEmbedder mode: `GRAPHRAG_MEMORY_DB_URL`
- * would need a live Postgres, and any resolvable embedding key sends the
- * `a4` ingest -> retrieve round-trip to a paid provider over the network.
+ * Env-var keys pinned to empty string in the child's environment so
+ * `readEnv` (process.env > `.env.local`) cannot fall through to a developer
+ * `.env.local` and silently select 9router / Postgres / Neo4j.
  *
- * All three key knobs count. `GRAPHRAG_MEMORY_EMBED_API_KEY` carries the
- * secret value directly, `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV` names the var
- * holding it, and `NINE_ROUTER_KEY` is the conventional target of that
- * name — scrubbing only the last one leaves a CI-injected key live.
- *
- * `GRAPHRAG_MEMORY_STORAGE` is not listed because `hostSmokeEnv` overwrites
- * it with "memory" rather than deleting it.
+ * Blank values collapse to "absent" in `readTrimmed` / FakeEmbedder / skip
+ * Neo4j. Deleting the keys is not enough: missing keys read the file.
  */
 const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "GRAPHRAG_MEMORY_DB_URL",
   "GRAPHRAG_MEMORY_EMBED_API_KEY",
   "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
   "NINE_ROUTER_KEY",
+  // A parent Neo4j URI would make the child attempt the production graph
+  // arm; this suite pins the Host-acceptance skip path (no URI → no
+  // `degraded`). Operator sidecar smoke is the runbook, not CI.
+  "GRAPHRAG_MEMORY_NEO4J_URI",
+  "GRAPHRAG_MEMORY_NEO4J_USER",
+  "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
 ] as const;
 
 /**
@@ -73,16 +73,16 @@ const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
  * during `npm test`, and an accidental `GRAPHRAG_MEMORY_STORAGE=pgvector`
  * would crash with "no Postgres available" instead of running deterministically.
  */
-function hostSmokeEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+function hostSmokeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string") env[k] = v;
+  }
   env["GRAPHRAG_MEMORY_STORAGE"] = "memory";
   // GRAPHRAG_MEMORY_EMBED_DIMENSIONS is always required; the smoke suite
-  // runs FakeEmbedder (keys scrubbed below), so any positive integer works.
+  // runs FakeEmbedder (keys blanked below), so any positive integer works.
   env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
-  for (const key of HOST_SMOKE_SCRUBBED_ENV_KEYS) delete env[key];
-  // Keep BASE_URL / MODEL if the parent set them — they are inert without
-  // a key, and a custom value shouldn't surprise the operator by being
-  // silently overridden during smoke tests.
+  for (const key of HOST_SMOKE_SCRUBBED_ENV_KEYS) env[key] = "";
   return env;
 }
 
@@ -144,19 +144,24 @@ describe("host-smoke: real stdio MCP client against built server", () => {
   );
 
   test(
-    "tools/list returns echo with an object inputSchema",
+    "tools/list returns echo, ingest, and retrieve with object inputSchemas",
     { timeout: 30_000 },
     async () => {
       const client = await connectClient();
       clients.push(client);
 
       const { tools } = await client.listTools();
-      const names = tools.map((t) => t.name);
-      expect(names).toContain("echo");
+      expect(tools.map((t) => t.name).sort()).toEqual([
+        "echo",
+        "ingest",
+        "retrieve",
+      ]);
 
       const echo = tools.find((t) => t.name === "echo")!;
       expect(echo.description).toMatch(/placeholder|stage/i);
-      expect((echo.inputSchema as { type?: string }).type).toBe("object");
+      for (const tool of tools) {
+        expect((tool.inputSchema as { type?: string }).type).toBe("object");
+      }
     }
   );
 
@@ -313,6 +318,65 @@ describe("host-smoke: real stdio MCP client against built server", () => {
       expect(allContent).toMatch(/公司A|张三/);
       expect(topHit.score).toBeGreaterThan(0);
       expect(topHit.source_ref).toBe(sourceRef);
+      // T-007 / spec SC7: Host with no Neo4j URI skips the graph arm.
+      // `degraded` is only for an attempted failure, never for skip.
+      expect(
+        Object.prototype.hasOwnProperty.call(retrievePayload, "degraded")
+      ).toBe(false);
+    }
+  );
+
+  test(
+    "planted Neo4j URI on the parent does not degrade retrieve on the child",
+    { timeout: 60_000 },
+    async () => {
+      const planted = {
+        GRAPHRAG_MEMORY_NEO4J_URI: "bolt://127.0.0.1:1",
+        GRAPHRAG_MEMORY_NEO4J_USER: "neo4j",
+        GRAPHRAG_MEMORY_NEO4J_PASSWORD: "planted-not-a-real-secret",
+      };
+      const saved = new Map<string, string | undefined>();
+      for (const [k, v] of Object.entries(planted)) {
+        saved.set(k, process.env[k]);
+        process.env[k] = v;
+      }
+
+      try {
+        const client = await connectClient();
+        clients.push(client);
+
+        const ingested = await client.callTool({
+          name: "ingest",
+          arguments: {
+            content: "Host-smoke planted-URI marker sentence.",
+            source_ref: "host-smoke-neo4j-scrub.md",
+          },
+        });
+        expect(ingested.isError).not.toBe(true);
+
+        const retrieved = await client.callTool({
+          name: "retrieve",
+          arguments: { query: "planted-URI marker" },
+        });
+        expect(retrieved.isError).not.toBe(true);
+        const retrieveBody = (
+          retrieved.content as Array<{ type: string; text?: string }>
+        )
+          .filter((c) => c.type === "text")
+          .map((c) => c.text ?? "")
+          .join("");
+        const retrievePayload = JSON.parse(retrieveBody) as {
+          degraded?: true;
+        };
+        expect(
+          Object.prototype.hasOwnProperty.call(retrievePayload, "degraded")
+        ).toBe(false);
+      } finally {
+        for (const [k, v] of saved) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
     }
   );
 

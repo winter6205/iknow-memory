@@ -18,12 +18,16 @@
 | T-007 Host 验收         | **CLOSED**     | [#79](https://github.com/winter6205/iknow-memory/issues/79)：Cursor MCP echo+ingest+retrieve；无 URI 不 `degraded`                    |
 | P@5 harness             | **CLOSED**     | [#80](https://github.com/winter6205/iknow-memory/issues/80) / [#82](https://github.com/winter6205/iknow-memory/issues/82)；PR #86+#87 |
 | SPEC 4 / T-P0-eval #15  | **后置**       | 子票 #40–#48 勿开工                                                                                                                   |
-| Map #1                  | OPEN（chart）  | 图优先 spec + 精排计划见 Frontier；本地 `docs/handoff/wayfinder-tickets/`                                                             |
+| Map #1                  | OPEN（chart）  | 下回合实施 [#91](https://github.com/winter6205/iknow-memory/issues/91) → [#92](https://github.com/winter6205/iknow-memory/issues/92)  |
 
-**Frontier（决策）：**
+**下回合（实施，按序）：**
 
-1. 精排 — **计划已写（本地）**：`specs/retrieve-rerank-llm.md` + `plans/retrieve-rerank-llm.md`；暂用抽取 Anthropic 主模型，默关。GitHub #88 远端可能不可见。
-2. 图优先排序 — **spec + 计划已写**：`specs/retrieve-graph-priority.md` + `plans/retrieve-graph-priority.md`（T1 done；T2–T3 未实施）
+1. [#91](https://github.com/winter6205/iknow-memory/issues/91) 图优先 T2→T3 — `plans/retrieve-graph-priority.md` — 分支 `feat/retrieve-graph-priority`
+2. [#92](https://github.com/winter6205/iknow-memory/issues/92) 精排 T2→T3 — `plans/retrieve-rerank-llm.md` — 分支 `feat/retrieve-rerank-llm`（等 #91）
+
+文档已在 [PR #90](https://github.com/winter6205/iknow-memory/pull/90)（`docs/retrieve-ranking-plans`）。
+
+**Frontier：** 上两项；grilling #88/#89 不再当下一刀。
 
 ## 路线要点（#57 + #78）
 
@@ -35,9 +39,9 @@
 
 ## 明确未做（勿当成已关）
 
-- 精排 T2–T3 实现；图优先计划 T2–T3（`assembleRetrievalResult` 改序 + eval）
 - 专用 cross-encoder HTTP；图墓碑/投影 GC
 - `merged_into` 指针落盘；T-P0-eval 代码；多粒度切分
+- #15 抽取 F1
 
 ## 云端 / 无 issue 怎么读
 
@@ -46,3 +50,4 @@
 - 地图：`docs/handoff/wayfinder-tickets/map-1.md`
 - 图优先：`specs/retrieve-graph-priority.md` · `plans/retrieve-graph-priority.md` · `docs/handoff/wayfinder-tickets/retrieve-graph-priority.md`
 - 精排：`specs/retrieve-rerank-llm.md` · `plans/retrieve-rerank-llm.md` · `docs/handoff/wayfinder-tickets/retrieve-rerank-llm.md`
+- 下回合票：[#91](https://github.com/winter6205/iknow-memory/issues/91) · [#92](https://github.com/winter6205/iknow-memory/issues/92)

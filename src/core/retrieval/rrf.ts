@@ -22,7 +22,12 @@ import type {
   RetrieveConfig,
 } from "./types.js";
 
-const K = 60;
+/**
+ * The RRF denominator constant. Exported because the graph-priority
+ * assembler scores its lead segment on the same curve — a second literal
+ * there would let the two drift apart.
+ */
+export const RRF_K = 60;
 
 /** Per-arm weight lookup. Exhaustive over ArmName by construction. */
 const ARM_WEIGHT: Record<ArmName, (cfg: RetrieveConfig) => number> = {
@@ -44,7 +49,7 @@ function armRank(arm: ArmName | undefined): number {
 
 function addHit(acc: Map<string, FusedHit>, hit: ArmHit, weight: number): void {
   if (hit.rank < 1) return;
-  const score = weight / (K + hit.rank);
+  const score = weight / (RRF_K + hit.rank);
   const previous = acc.get(hit.id);
   if (previous) {
     previous.rrfScore += score;
@@ -89,5 +94,3 @@ export function rrfFuse(
   }
   return [...acc.values()].sort(compareFusedHits).slice(0, limit);
 }
-
-export const __RRF_K = K;

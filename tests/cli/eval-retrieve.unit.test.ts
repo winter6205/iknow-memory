@@ -1,6 +1,7 @@
 /**
  * Eval CLI unit tests (specs/retrieve-p5.md T2 — SC4, SC5, SC6, SC9
- * exception/overflow classes, SC11).
+ * exception/overflow classes, SC11; specs/retrieve-graph-priority.md
+ * SC8 — arm set under graph-priority).
  *
  * Everything runs on FakeEmbedder + MemoryBackend, so the suite needs no
  * Postgres, no Neo4j and no network — which is also the configuration
@@ -207,6 +208,99 @@ describe("eval CLI — no-URI run succeeds (SC5)", () => {
 
     expect(code).toBe(0);
     expect(readBaseline(out).armSet).toBe("vector+bm25+graph");
+  });
+});
+
+describe("eval CLI — graph-priority arm set (SC8)", () => {
+  /**
+   * A graph arm that maps one chunk id the seeded corpus does not
+   * contain, so its contribution is unmistakable in the recorded ranking.
+   */
+  function graphWiring(chunkId: string): {
+    storage: MemoryBackend;
+    graphRanker: GraphRanker;
+  } {
+    const storage = new MemoryBackend(DIM) as MemoryBackend & {
+      neo4jArmSeed: Neo4jArmStorage;
+    };
+    storage.neo4jArmSeed = {
+      async seedEntitiesByEmbedding(): Promise<
+        Array<{ id: string; canonical_name: string }>
+      > {
+        return [{ id: "e-1", canonical_name: "fusion" }];
+      },
+      async chunksByEntityIds(): Promise<EntityChunkRow[]> {
+        return [
+          {
+            entity_id: "e-1",
+            id: chunkId,
+            content: "a chunk only the graph arm can reach",
+            source_ref: "notes/graph-priority#lead",
+            valid_from: "2026-01-01T00:00:00.000Z",
+            valid_until: null,
+          },
+        ];
+      },
+    };
+    return {
+      storage,
+      graphRanker: {
+        async rankEntities(): Promise<RankedEntity[]> {
+          return [{ id: "e-1", score: 1 }];
+        },
+      },
+    };
+  }
+
+  it("records the graph arm's own order at the head, with vector+BM25 only filling", async () => {
+    const withGraphOut = join(scratchDir(), "with-graph.json");
+    const withoutGraphOut = join(scratchDir(), "without-graph.json");
+    const { storage, graphRanker } = graphWiring("c-graph-lead");
+
+    await runCli(baseArgv(withGraphOut), makeDeps({ storage, graphRanker }));
+    await runCli(baseArgv(withoutGraphOut), makeDeps());
+
+    const withGraph = readBaseline(withGraphOut);
+    const withoutGraph = readBaseline(withoutGraphOut);
+    expect(withGraph.armSet).toBe("vector+bm25+graph");
+    for (const entry of withGraph.queries) {
+      const fused = withoutGraph.queries.find((q) => q.id === entry.id);
+      // Graph hit leads and the fused list is pushed down one slot
+      // unchanged: the graph arm never re-weighted that fusion, which is
+      // what a 0.7/0.15/0.15 three-arm vote would have done.
+      expect(entry.top5[0]).toBe("c-graph-lead");
+      expect(entry.top5.slice(1)).toEqual(fused?.top5.slice(0, 4));
+    }
+  });
+
+  it("refuses to publish a baseline when the wired graph arm degraded", async () => {
+    const out = join(scratchDir(), "baseline.json");
+    writeFileSync(out, '{"kept":true}\n', "utf8");
+    const { storage } = graphWiring("c-graph-lead");
+    const stderr = captureStderr();
+
+    const code = await runCli(
+      baseArgv(out),
+      makeDeps({
+        storage,
+        graphRanker: {
+          async rankEntities(): Promise<RankedEntity[]> {
+            throw new Error("neo4j sidecar unreachable");
+          },
+        },
+      })
+    );
+    stderr.restore();
+
+    // An arm that was attempted and failed did not run: recording
+    // `vector+bm25+graph` here would label a fallback-RRF baseline as a
+    // graph-led one, and the P@5 drop would read as a retrieval
+    // regression instead of an outage.
+    expect(code).toBe(1);
+    expect(stderr.text()).toContain("eval-retrieve failed:");
+    expect(stderr.text()).toContain("q01-autovacuum");
+    expect(stderr.text()).toContain("neo4j sidecar unreachable");
+    expect(readFileSync(out, "utf8")).toBe('{"kept":true}\n');
   });
 });
 

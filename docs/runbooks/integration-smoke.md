@@ -36,36 +36,38 @@ spec-2 real-LLM extraction path in detail.
 `.env.local`, which is gitignored; never paste real values into this file or any
 commit):
 
-| Env var                                       | Meaning                                        |
-| --------------------------------------------- | ---------------------------------------------- |
-| `GRAPHRAG_MEMORY_DB_URL`                      | Postgres DSN (`postgresql://...`)              |
-| `GRAPHRAG_MEMORY_STORAGE`                     | `pgvector` (the graph arm reads the P0 tables) |
-| `GRAPHRAG_MEMORY_EMBED_DIMENSIONS`            | `2048` for Zhipu embedding-3                   |
-| `GRAPHRAG_MEMORY_EMBED_BASE_URL`              | `https://open.bigmodel.cn/api/paas/v4`         |
-| `GRAPHRAG_MEMORY_EMBED_MODEL`                 | `embedding-3`                                  |
-| `GRAPHRAG_MEMORY_EMBED_API_KEY`               | Zhipu embedding key (dedicated; not MiniMax)   |
-| `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV`           | optional: NAME of another env var holding key  |
-| `GRAPHRAG_MEMORY_LOG_LEVEL`                   | optional: `info` (default) or `debug`          |
-| `DEBUG`                                       | optional: `1` exposes the retrieve debug keys  |
-| `GRAPHRAG_MEMORY_RETRIEVAL_W_VEC`             | optional: vector weight (default `1`)          |
-| `GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH`           | optional: graph weight (default `1`)           |
-| `GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K` | optional: entity link top-K (default `5`)      |
-| `GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP`     | optional: candidate cap (default `20`)         |
-| `GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR`   | optional: graph-arm floor (default `3`)        |
+| Env var                                    | Meaning                                           |
+| ------------------------------------------ | ------------------------------------------------- |
+| `GRAPHRAG_MEMORY_DB_URL`                   | Postgres DSN (`postgresql://...`)                 |
+| `GRAPHRAG_MEMORY_STORAGE`                  | `pgvector` (ledger + vector + BM25 `content_tsv`) |
+| `GRAPHRAG_MEMORY_EMBED_DIMENSIONS`         | `2048` for Zhipu embedding-3                      |
+| `GRAPHRAG_MEMORY_EMBED_BASE_URL`           | `https://open.bigmodel.cn/api/paas/v4`            |
+| `GRAPHRAG_MEMORY_EMBED_MODEL`              | `embedding-3`                                     |
+| `GRAPHRAG_MEMORY_EMBED_API_KEY`            | Zhipu embedding key (dedicated; not MiniMax)      |
+| `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV`        | optional: NAME of another env var holding key     |
+| `GRAPHRAG_MEMORY_LOG_LEVEL`                | optional: `info` (default) or `debug`             |
+| `DEBUG`                                    | optional: `1` exposes the retrieve debug keys     |
+| `GRAPHRAG_MEMORY_RETRIEVAL_W_VEC`          | optional: vector weight (default `0.7`)           |
+| `GRAPHRAG_MEMORY_RETRIEVAL_W_BM25`         | optional: BM25 weight (default `0.15`)            |
+| `GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH`        | optional: Neo4j PPR weight (default `0.15`)       |
+| `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED`   | optional: `false` to switch BM25 off              |
+| `GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED`  | optional: `false` to switch the Neo4j arm off     |
+| `GRAPHRAG_MEMORY_NEO4J_URI`                | optional: Bolt URI; omit to skip the graph arm    |
+| `GRAPHRAG_MEMORY_NEO4J_USER` / `_PASSWORD` | required as a pair when URI is set                |
 
-The five `GRAPHRAG_MEMORY_RETRIEVAL_*` knobs are the graph arm's config. The
-retrieval defaults are `1 / 1 / 8 / 50 / 3`
-(`w_vec` / `w_graph` / `entityLinkTopK` / `candidateCap` / `graphArmFloor`) per
-`src/config.ts`.
+Production retrieve is vector + BM25 + Neo4j PPR at `0.7 / 0.15 / 0.15`
+(`src/config.ts`). No URI → the Neo4j arm is not attempted and the envelope
+must **not** carry `degraded`. A configured but failing sidecar fail-opens
+with `degraded: true`. The archived SQL one-hop path is never wired on the
+server (`graphConfig` is test-only). Sidecar operator steps:
+`docs/runbooks/neo4j-projection.md`.
 
-> **Graph arm activation note.** The orchestrator only runs the graph arm when
-> BOTH the storage backend carries `graphArmSeed` AND a retrieval
-> `graphConfig` is supplied at wiring time. The retrieval knobs above are read
-> from the environment by the CLI / server; the fragment that threads
-> `graphConfig` into `src/index.ts` lands in the T7 wiring commit. Until that
-> commit is merged, the envelope is vector-only (no `degraded` / `debug` graph
-> keys) even when the env vars are set. Do not claim graph-arm activation that
-> is not yet wired.
+> **Host smoke vs this runbook.** `tests/host-smoke.test.ts` spawns
+> `dist/index.js` over stdio (same class of launch as Claude Code) with
+> memory storage and FakeEmbedder. It proves tool discovery + ingest →
+> retrieve and the no-URI skip. This runbook is the operator path against
+> **live Postgres** (and optional Neo4j). Extract remains a CLI, not an MCP
+> tool.
 
 ---
 

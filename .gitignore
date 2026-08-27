@@ -12,6 +12,9 @@ docs/vector-memory-upgrade-archive.html
 # Host-local env (operator secrets + endpoint overrides)
 .env.local
 
+# Machine-local Cursor MCP (absolute `node` path; Cursor spawn PATH is stripped)
+.cursor/mcp.json
+
 # Claude Code 运行时产物（post-push 钩子日志等）
 .claude/scratchpad/
 

@@ -49,6 +49,14 @@ if ! sudo grep -qF '# cursor-cloud trust' "$PG_HBA"; then
   sudo sed -i '1i # cursor-cloud trust (local dev/test only)\nlocal all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust' "$PG_HBA"
 fi
 
+log "neo4j + gds sidecar (graph-arm integration tests need gds.pageRank)"
+# Best-effort: a VM without the sidecar still builds and still runs every
+# suite — the graph tests loud-skip instead, which is their designed
+# behaviour, not a broken environment.
+if ! bash "$REPO_ROOT/scripts/cursor-neo4j.sh" install; then
+  log "neo4j install failed — graph integration tests will loud-skip"
+fi
+
 log "npm ci + build"
 # husky `prepare` is for local git hooks; Cloud snapshot has no need for it
 # and it fails when hook install is skipped or .git is incomplete.

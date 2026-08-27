@@ -1,5 +1,5 @@
 /**
- * Retrieval orchestrator — vector arm ∥ optional arms + RRF fusion + envelope.
+ * Retrieval orchestrator — vector arm ∥ optional arms + ranking + envelope.
  *
  * Public entry point: `assembleRetrievalResult(args, deps)`. The function is
  * the single wire between the retrieve tool (`src/tools/retrieve.ts`) and the
@@ -18,6 +18,13 @@
  *     the Neo4j arm is not active — the default server wiring passes no
  *     `graphConfig` (#58, `docs/runbooks/sql-graph-arm-archived.md`).
  *
+ * Ranking is GRAPH-PRIORITY (`graph-priority.ts`,
+ * specs/retrieve-graph-priority.md): the Neo4j arm's own order leads
+ * `chunks[]` whenever that arm returns anything, and `rrfFuse` over the
+ * remaining arms fills the leftover `limit` slots. Every other case — arm
+ * skipped, empty, or failed — ranks by that same fusion, so an arm that
+ * contributed nothing never votes.
+ *
  * When no optional arm is active the envelope is EXACTLY
  * `{ chunks: RetrievedChunk[] }` — no `degraded`, no `debug`, even under the
  * debug gate. That covers a chunk-only backend AND an operator who switched
@@ -32,7 +39,7 @@
  * `ArmResult` carrying a `failureReason`, which surfaces as `degraded: true`
  * on the envelope while the vector results still reach the caller.
  */
-import { rrfFuse } from "./rrf.js";
+import { assembleGraphPriority } from "./graph-priority.js";
 import { runGraphArm, type GraphArmDeps } from "./graph-arm.js";
 import { runNeo4jGraphArm, type Neo4jGraphArmDeps } from "./neo4j-graph-arm.js";
 import type {
@@ -171,17 +178,28 @@ export async function assembleRetrievalResult(
       )
     );
   }
-  if (neo4jGraph !== undefined) {
-    pending.push(runNeo4jGraphArm(queryEmbedding, neo4jGraph, args.validAt));
-  }
+  // The Neo4j arm is awaited on its own handle, not merged into `pending`:
+  // graph priority is bound to THIS arm's result object, and the archived
+  // SQL arm above answers to the same arm name.
+  const neo4jPending =
+    neo4jGraph !== undefined
+      ? runNeo4jGraphArm(queryEmbedding, neo4jGraph, args.validAt)
+      : undefined;
 
-  const [retrieved, optional] = await Promise.all([
+  const [retrieved, weighted, neo4jResult] = await Promise.all([
     vectorSearch,
     Promise.all(pending),
+    neo4jPending,
   ]);
 
-  const arms = [toVectorResult(retrieved), ...optional];
-  const fused = rrfFuse(arms, weights, args.limit);
+  const optional =
+    neo4jResult === undefined ? weighted : [...weighted, neo4jResult];
+  const fused = assembleGraphPriority(
+    neo4jResult,
+    [toVectorResult(retrieved), ...weighted],
+    weights,
+    args.limit
+  );
   return buildEnvelope(
     fused,
     degradedFlag(optional),

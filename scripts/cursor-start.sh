@@ -29,6 +29,17 @@ if ! pg_isready -h localhost -p 5432 -q; then
 fi
 pg_isready -h localhost -p 5432 -t 30
 
+log "neo4j"
+# Same reconcile as Postgres above: installed into the snapshot, but the
+# process does not survive a boot. GRAPHRAG_MEMORY_NEO4J_URI is printed
+# rather than exported globally — an always-on URI would hide the
+# unset-sidecar path that config.ts and the graph arm are specified around.
+if bash "$REPO_ROOT/scripts/cursor-neo4j.sh" start; then
+  bash "$REPO_ROOT/scripts/cursor-neo4j.sh" env
+else
+  log "neo4j unavailable — graph integration tests will loud-skip"
+fi
+
 test -f "$REPO_ROOT/dist/index.js"
 
 # --------------------------------------------------------------------

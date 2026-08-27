@@ -304,9 +304,16 @@ describeGraph(
       expect(Object.hasOwn(off.debug ?? {}, "graphHits")).toBe(false);
 
       const on = await retrieve(CFG);
-      // PPR reached `widget` two hops from the only seed, and its provenance
-      // chunk overtakes the chunk the vector arm liked better.
-      expect(on.chunks.map((c) => c.id)).toEqual([C_ALICE, C_WIDGET, C_MID]);
+      // PPR reached `widget` two hops from the only seed. Graph priority
+      // puts both graph-mapped chunks in front, and the chunk the vector
+      // arm liked better fills the one slot they leave.
+      expect(
+        on.chunks
+          .slice(0, 2)
+          .map((c) => c.id)
+          .sort()
+      ).toEqual([C_ALICE, C_WIDGET].sort());
+      expect(on.chunks[2]?.id).toBe(C_MID);
       expect(on.debug?.graphHits).toBe(2);
       expect(Object.hasOwn(on, "degraded")).toBe(false);
     });
@@ -315,8 +322,8 @@ describeGraph(
       const on = await retrieve(CFG);
       const widget = on.chunks.find((c) => c.id === C_WIDGET)!;
       const mid = on.chunks.find((c) => c.id === C_MID)!;
-      // c-widget: vector rank 3 + graph → 0.7/63 + 0.15/(60+r).
-      // c-mid:    vector rank 2 only    → 0.7/62.
+      // c-widget leads on the graph segment; c-mid only reaches the list
+      // as remainder fill, at its plain vector RRF score w_vec/(k+2).
       expect(widget.score).toBeGreaterThan(mid.score);
       expect(mid.score).toBeCloseTo(0.7 / 62, 12);
     });

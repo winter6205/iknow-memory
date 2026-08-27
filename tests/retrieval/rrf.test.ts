@@ -9,7 +9,7 @@
  * deterministic tie-break (rrfScore desc, then arm order, then chunk id).
  */
 import { describe, it, expect } from "vitest";
-import { rrfFuse, __RRF_K } from "../../src/core/retrieval/rrf.js";
+import { rrfFuse, RRF_K } from "../../src/core/retrieval/rrf.js";
 import type {
   ArmHit,
   ArmName,
@@ -64,7 +64,7 @@ function result(arm: ArmName, hits: ArmHit[]): ArmResult {
 
 describe("rrfFuse", () => {
   it("uses k=60 as the RRF denominator constant (exported)", () => {
-    expect(__RRF_K).toBe(60);
+    expect(RRF_K).toBe(60);
   });
 
   it("ranks a single vector arm by 1/(k+rank)", () => {

@@ -28,14 +28,14 @@ minimal-change-verifier: yes — one logical task (Host ranking graph-priority);
    - **Inherits:** spec SC1–SC7, SC9–SC10: non-empty graph arm order occupies the front of `chunks[]`; leftover `limit` slots from vector+BM25 `rrfFuse` (k=60), deduped by chunk id; empty graph (no seeds / empty PPR / no mapped chunks, not thrown) equals vector+BM25 RRF with **no** graph vote and **no** `degraded`; skip URI / `graphEnabled=false` unchanged (not degraded); graph throw → `degraded` + fallback RRF; envelope still `{ chunks[] }` (+ optional `degraded`); `w_graph` does not vote against vector when graph hits exist; SQL arm stays archived; levers `entityLinkTopK` / `candidateCap` / default `limit` unchanged.
    - **Surface:** retrieval orchestrator (`assembleRetrievalResult`); existing `rrfFuse` for vector+BM25 only; tests under retrieval / retrieve-graph / defensive retrieval that currently lock three-arm Host order.
    - **Acceptance:** unit tests on the assembler demonstrate SC1 (graph order beats vector), SC2 (fill + dedupe), SC3 (empty graph = dual RRF, not degraded), SC4–SC6 (skip / fail-open / disable), SC7 (envelope keys); `limit` ≤ 0 still empty; graph list longer than `limit` is truncated before fill so output length ≤ `limit`; vector ∥ BM25 ∥ graph still start together when enabled; `npm test` and `npm run build` exit 0 without live Neo4j.
-   - Status: [ ] pending
+   - Status: [x] done (graph-priority assembler shipped 2026-08-27)
    - [blocks: T1]
 
 3. **Eval harness records arm set, not a three-arm vote** — tag: `[implementation]`
    - **Inherits:** spec SC8: `npm run eval:retrieve` still scores through `assembleRetrievalResult`; gold shape unchanged; CLI records which arms ran without requiring graph as an RRF voter.
    - **Surface:** eval retrieve CLI / its unit tests (`tests/cli/eval-retrieve.unit.test.ts` and related).
-   - **Acceptance:** eval unit tests pass against graph-priority assembler output; a run with a wired graph ranker is allowed to report graph in `armSet` without asserting 0.7/0.15/0.15 fused order; `npm test` includes those tests green.
-   - Status: [ ] pending
+   - **Acceptance:** eval unit tests pass against graph-priority assembler output; a run with a wired graph ranker is allowed to report graph in `armSet` without asserting 0.7/0.15/0.15 fused order; a `degraded: true` run is refused before publish while skip-without-URI still publishes; `npm test` includes those tests green.
+   - Status: [x] done (eval armSet bound to graph-priority, degraded runs refused, 2026-08-27)
    - [blocks: T2]
 
 ## 待写入 (persist)

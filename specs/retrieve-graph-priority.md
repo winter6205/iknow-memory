@@ -52,7 +52,7 @@ Binary; each maps to a command or measurable check.
 5. **Fail-open:** Injected graph throw → `degraded: true`, vector+BM25 chunks still returned, call does not throw. Existing fail-open tests remain; order is fallback RRF.
 6. **Disable graph:** `graphEnabled=false` → vector+BM25 only; no `degraded` from disable.
 7. **Envelope:** Success JSON has exactly `chunks` plus optional `degraded`; no new Host keys. Existing envelope tests.
-8. **Eval harness:** `npm run eval:retrieve` still writes `eval/baseline/retrieve-p5.json` via `assembleRetrievalResult`; gold shape unchanged. CLI records the arm set that ran (graph present or not) without requiring a three-arm RRF vote.
+8. **Eval harness:** `npm run eval:retrieve` still writes `eval/baseline/retrieve-p5.json` via `assembleRetrievalResult`; gold shape unchanged. CLI records the arm set that ran (graph present or not) without requiring a three-arm RRF vote. A run whose envelope is `degraded: true` — a configured arm was attempted and could not deliver — is refused before publish: no scores, no baseline write, non-zero exit. Under graph-priority the graph arm owns the head of the list, so a baseline labelled `vector+bm25+graph` whose graph arm never delivered describes a pure fallback ranking. A graph arm merely skipped for lack of a URI is not degraded and publishes normally (`specs/retrieve-p5.md` A5, SC5).
 9. **No live Neo4j required for unit:** `npm test` exits 0 without Neo4j. `npm run build` exits 0 after impl.
 10. **No new ranking algorithm:** No cross-encoder, no `confidence`-weighted PPR, no SQL JOIN arm in production wiring.
 
@@ -69,11 +69,13 @@ Binary; each maps to a command or measurable check.
 - `rrfFuse` k=60 for **vector+BM25 only** on fallback and remainder fill.
 - Stack: TypeScript strict ESM, Node ≥20, Vitest, `npm test` / `npm run build`.
 - MCP `retrieve` input/output types in `src/core/types.ts`.
+- `specs/retrieve-p5.md` A5 / SC5: the eval harness treats skip-without-URI as a successful two-arm run and records `armSet` from arm participation.
 
 **Changes:**
 
 - Production Host ranking is **graph-priority**, not vector+BM25+graph RRF at 0.7/0.15/0.15.
 - `w_graph` does not vote against vector when graph hits exist; `w_vec` / `w_bm25` still fuse the fallback/fill list.
+- Eval harness publish rule tightens with the ranking change: a `degraded: true` run (configured arm attempted, could not deliver) is refused — no scores, no baseline. Production stays fail-open; only the harness refuses. Skip-without-URI is unchanged and still publishes.
 - CONTEXT: **hybrid retrieval**, **Neo4j graph arm**, **retrieve**, **RRF fusion**, **RetrieveConfig**, **vector search**, **degraded=true**, **P@5 / R@5**, Relationships retrieve bullets — flushed this turn.
 
 ## Tech Stack

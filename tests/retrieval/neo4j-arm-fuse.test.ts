@@ -1,12 +1,19 @@
 /**
- * Orchestrator-level three-arm retrieval: vector ∥ BM25 ∥ Neo4j PPR
- * (specs/neo4j-graph-arm.md T4 — SC5, SC7–SC10).
+ * Orchestrator-level retrieval with the Neo4j PPR arm: vector ∥ BM25 ∥ graph
+ * (specs/neo4j-graph-arm.md T4 — SC5, SC7–SC10; specs/retrieve-graph-priority.md
+ * SC1–SC7).
  *
  * The arm under test is wired the way production wires it: a `graphRanker`
  * port (the Neo4j GDS adapter in the real server) plus a backend exposing
  * the `neo4jArmSeed` seam. Everything here is a fake, so the suite proves
- * the ORCHESTRATION contract — who runs, who degrades, who fuses — without
+ * the ORCHESTRATION contract — who runs, who degrades, who ranks — without
  * a graph or a database.
+ *
+ * Ranking is GRAPH-PRIORITY, not a weighted three-arm vote: when the Neo4j
+ * arm returns chunks they occupy the front of `chunks[]` in the arm's own
+ * order, and vector+BM25 `rrfFuse` (k=60) only fills whatever `limit` slots
+ * are left, deduped by chunk id. An empty graph arm is not a third voter —
+ * the list is then exactly the vector+BM25 fusion.
  *
  * The three envelope rules the spec separates and this file keeps separate:
  *   SC7  no sidecar configured → the arm is not ATTEMPTED, and the envelope
@@ -61,6 +68,23 @@ function chunk(id: string, score = 1): RetrievedChunk {
     source_ref: `src/${id}`,
     valid_window: ["2026-01-01T00:00:00.000Z", null],
     score,
+  };
+}
+
+/** A one-hop row for the ARCHIVED SQL arm, which carries no entity id. */
+function oneHopRow(chunkId: string): {
+  id: string;
+  content: string;
+  source_ref: string;
+  valid_from: string;
+  valid_until: string | null;
+} {
+  return {
+    id: chunkId,
+    content: `content-${chunkId}`,
+    source_ref: `src/${chunkId}`,
+    valid_from: "2026-01-01T00:00:00.000Z",
+    valid_until: null,
   };
 }
 
@@ -166,8 +190,8 @@ describe("assembleRetrievalResult — Neo4j graph arm contributes (SC5)", () => 
 
   it("changes the ranking versus the same call with the graph arm off (SC5)", async () => {
     const { storage, ranker } = seededGraph();
-    // The graph reaches the chunk the vector arm ranks LAST. Fusing the
-    // two arms must lift it above the chunk only the vector arm knows.
+    // The graph reaches the chunk the vector arm ranks LAST. Graph priority
+    // must lift it above the chunk only the vector arm knows.
     storage.vectorHits = [chunk("top"), chunk("graph-favoured")];
     storage.rows = [row("e1", "graph-favoured")];
 
@@ -231,42 +255,116 @@ describe("assembleRetrievalResult — Neo4j graph arm contributes (SC5)", () => 
   });
 });
 
-describe("assembleRetrievalResult — three-arm RRF soft merge (SC10)", () => {
-  it("sums the three weights on a chunk every arm found, at k=60", async () => {
+describe("assembleRetrievalResult — graph-priority ranking (SC1–SC3)", () => {
+  it("SC1: leads with the graph arm's order, ahead of the vector arm's top hit", async () => {
     const { storage, ranker } = seededGraph();
-    storage.vectorHits = [chunk("shared"), chunk("v-only")];
-    storage.lexicalHits = [chunk("shared")];
-    storage.rows = [row("e1", "shared")];
+    // The vector arm ranks B first and an unrelated C second; the graph
+    // arm ranks A then B. A weighted vote would have kept B on top —
+    // graph priority puts the graph's own order in front instead.
+    storage.vectorHits = [chunk("B"), chunk("C")];
+    storage.rows = [row("e1", "A"), row("e2", "B")];
 
     const out = await assembleRetrievalResult(
       { query: "q", validAt: NOW, limit: 10 },
       { embedder, storage, retrieveConfig: CFG, graphRanker: ranker }
     );
 
-    const shared = out.chunks.find((c) => c.id === "shared")!;
-    // (0.7 + 0.15 + 0.15) / (60 + 1) — the whole weight budget on one hit.
-    expect(shared.score).toBeCloseTo(1 / 61, 12);
-    const vOnly = out.chunks.find((c) => c.id === "v-only")!;
-    expect(vOnly.score).toBeCloseTo(0.7 / 62, 12);
-    expect(out.chunks[0]?.id).toBe("shared");
+    expect(out.chunks.map((c) => c.id)).toEqual(["A", "B", "C"]);
   });
 
-  it("keeps the graph arm a weighted arm, not a re-ranker", async () => {
+  it("SC2: fills the leftover slots from vector+BM25 and lists a shared chunk once", async () => {
     const { storage, ranker } = seededGraph();
-    storage.vectorHits = [chunk("v1")];
-    storage.lexicalHits = [];
-    storage.rows = [row("e1", "g1"), row("e2", "g2")];
+    storage.vectorHits = [chunk("X"), chunk("Y"), chunk("Z")];
+    // Z is reached by both the graph arm and the vector arm; Q only by the
+    // graph. Two graph hits lead, so exactly one fill slot is left at
+    // limit 3 — and Z must not consume both its graph and its vector slot.
+    storage.rows = [row("e1", "Z"), row("e2", "Q")];
+
+    const out = await assembleRetrievalResult(
+      { query: "q", validAt: NOW, limit: 3 },
+      { embedder, storage, retrieveConfig: CFG, graphRanker: ranker }
+    );
+
+    expect(out.chunks.map((c) => c.id)).toEqual(["Z", "Q", "X"]);
+  });
+
+  it("SC3: an empty graph arm ranks exactly as vector+BM25 alone, not degraded", async () => {
+    const { storage, ranker } = seededGraph();
+    storage.vectorHits = [chunk("v1"), chunk("v2")];
+    storage.lexicalHits = [chunk("v2")];
+    // Seeds and a PPR ranking exist, but no chunk hangs off the ranked
+    // entities: an empty contribution, not a failed one.
+    storage.rows = [];
+
+    const withGraph = await assembleRetrievalResult(
+      { query: "q", validAt: NOW, limit: 10 },
+      {
+        embedder,
+        storage,
+        retrieveConfig: CFG,
+        graphRanker: ranker,
+        debug: true,
+      }
+    );
+    const withoutGraph = await assembleRetrievalResult(
+      { query: "q", validAt: NOW, limit: 10 },
+      {
+        embedder,
+        storage,
+        retrieveConfig: { ...CFG, graphEnabled: false },
+        graphRanker: ranker,
+      }
+    );
+
+    expect(withGraph.chunks).toEqual(withoutGraph.chunks);
+    expect(Object.hasOwn(withGraph, "degraded")).toBe(false);
+    // Ran and found nothing — distinguishable from never having run.
+    expect(withGraph.debug?.graphHits).toBe(0);
+  });
+
+  it("scores the graph-led chunk above the remainder, keeping order and score aligned", async () => {
+    const { storage, ranker } = seededGraph();
+    storage.vectorHits = [chunk("v1"), chunk("v2")];
+    storage.lexicalHits = [chunk("v2")];
+    storage.rows = [row("e1", "g1")];
 
     const out = await assembleRetrievalResult(
       { query: "q", validAt: NOW, limit: 10 },
       { embedder, storage, retrieveConfig: CFG, graphRanker: ranker }
     );
 
-    // Graph-only hits are worth w_graph/(k+rank); the vector-only hit at
-    // rank 1 still leads because 0.7/61 > 0.15/61.
-    expect(out.chunks.map((c) => c.id)).toEqual(["v1", "g1", "g2"]);
-    expect(out.chunks[1]?.score).toBeCloseTo(0.15 / 61, 12);
-    expect(out.chunks[2]?.score).toBeCloseTo(0.15 / 62, 12);
+    expect(out.chunks.map((c) => c.id)).toEqual(["g1", "v2", "v1"]);
+    // The remainder is a genuine vector+BM25 fusion at k=60 — v2 is worth
+    // both arms, v1 only the vector arm, and `w_graph` buys no vote here.
+    expect(out.chunks[1]?.score).toBeCloseTo(0.7 / 62 + 0.15 / 61, 12);
+    expect(out.chunks[2]?.score).toBeCloseTo(0.7 / 61, 12);
+    // A Host that re-sorts by score must not undo the graph's lead.
+    const scores = out.chunks.map((c) => c.score);
+    expect([...scores].sort((a, b) => b - a)).toEqual(scores);
+  });
+
+  it("truncates a graph list longer than the limit and adds no fill", async () => {
+    const { storage, ranker } = seededGraph();
+    storage.vectorHits = [chunk("v1")];
+    storage.rows = [row("e1", "g1"), row("e1", "g2"), row("e2", "g3")];
+
+    const out = await assembleRetrievalResult(
+      { query: "q", validAt: NOW, limit: 2 },
+      { embedder, storage, retrieveConfig: CFG, graphRanker: ranker }
+    );
+
+    expect(out.chunks.map((c) => c.id)).toEqual(["g1", "g2"]);
+  });
+
+  it("returns no chunks for a non-positive limit even when the graph arm hit", async () => {
+    const { storage, ranker } = seededGraph();
+
+    const out = await assembleRetrievalResult(
+      { query: "q", validAt: NOW, limit: 0 },
+      { embedder, storage, retrieveConfig: CFG, graphRanker: ranker }
+    );
+
+    expect(out.chunks).toEqual([]);
   });
 });
 
@@ -455,5 +553,34 @@ describe("assembleRetrievalResult — the archived SQL arm stays archived", () =
 
     expect(oneHopCalls).toBe(0);
     expect(out.debug?.graphHits).toBe(2);
+  });
+
+  it("does not hand the archived SQL arm the graph-priority lead", async () => {
+    const storage = new ThreeArmBackend();
+    storage.vectorHits = [chunk("v1")];
+    const sqlOnly = Object.assign(storage, {
+      graphArmSeed: {
+        seedEntitiesByEmbedding: async () => storage.seeds,
+        // Three rows clear `graphArmFloor`, so the archive contributes
+        // without degrading the envelope.
+        chunksByOneHopFromEntities: async () => [
+          oneHopRow("s1"),
+          oneHopRow("s2"),
+          oneHopRow("s3"),
+        ],
+      },
+    });
+
+    const out = await assembleRetrievalResult(
+      { query: "q", validAt: NOW, limit: 10 },
+      // No graphRanker, so the Neo4j arm cannot run and the injected
+      // archive is what answers to the arm name "graph".
+      { embedder, storage: sqlOnly, retrieveConfig: CFG, graphConfig: CFG }
+    );
+
+    // Priority is bound to the NEO4J arm's result, never to the arm NAME:
+    // the archive keeps voting at w_graph, so 0.7/61 still beats 0.15/61.
+    expect(out.chunks.map((c) => c.id)).toEqual(["v1", "s1", "s2", "s3"]);
+    expect(Object.hasOwn(out, "degraded")).toBe(false);
   });
 });

@@ -1,0 +1,67 @@
+{
+  "version": "retrieve-gold-v1",
+  "corpus": "retrieve-corpus-v1",
+  "description": "Frozen gold for the retrieve P@5 baseline harness (specs/retrieve-p5.md A2, A8). Twelve queries over eval/corpus/retrieve-v1.json, inside the frozen 8-15 band. Each entry is query text plus the chunk ids that answer it; relevance is binary and there is no expected ordering, because the metric only asks whether a relevant id landed in the fused top five. Editing this file invalidates every recorded baseline.",
+  "queries": [
+    {
+      "id": "q01-autovacuum",
+      "query": "how do I tune autovacuum so a large table stops bloating",
+      "relevant": ["c-pg-autovacuum"]
+    },
+    {
+      "id": "q02-index-type",
+      "query": "which postgres index type answers a full text search tsquery",
+      "relevant": ["c-pg-index-choice"]
+    },
+    {
+      "id": "q03-hnsw",
+      "query": "pgvector hnsw build parameters m and ef_search recall tradeoff",
+      "relevant": ["c-pgvector-hnsw"]
+    },
+    {
+      "id": "q04-bm25-knobs",
+      "query": "what do the bm25 k1 and b parameters control",
+      "relevant": ["c-bm25-okapi"]
+    },
+    {
+      "id": "q05-rrf",
+      "query": "reciprocal rank fusion constant k sixty combining ranked lists",
+      "relevant": ["c-rrf-fusion"]
+    },
+    {
+      "id": "q06-ppr",
+      "query": "personalized pagerank seed nodes damping factor graph data science",
+      "relevant": ["c-neo4j-ppr"]
+    },
+    {
+      "id": "q07-bolt-pool",
+      "query": "neo4j bolt driver connection pool size and acquisition timeout",
+      "relevant": ["c-neo4j-bolt-pool"]
+    },
+    {
+      "id": "q08-mcp",
+      "query": "mcp stdio transport framing and the tools list handshake",
+      "relevant": ["c-mcp-stdio-framing", "c-mcp-tools-list"]
+    },
+    {
+      "id": "q09-vectors",
+      "query": "embedding dimensionality storage cost and l2 normalized cosine",
+      "relevant": ["c-embedding-dimensions", "c-cosine-normalization"]
+    },
+    {
+      "id": "q10-chunking",
+      "query": "overlapping fixed window chunking for long documents",
+      "relevant": ["c-chunk-window"]
+    },
+    {
+      "id": "q11-outbox",
+      "query": "transactional outbox drain with idempotent merge writes",
+      "relevant": ["c-transactional-outbox", "c-idempotent-merge"]
+    },
+    {
+      "id": "q12-extraction",
+      "query": "extracting head relation tail triples and resolving entity aliases",
+      "relevant": ["c-triple-extraction", "c-entity-resolution"]
+    }
+  ]
+}

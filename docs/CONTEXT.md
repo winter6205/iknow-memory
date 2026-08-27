@@ -136,7 +136,7 @@ _Avoid_: "uncertain match" (vague); "borderline" (colloquial)
 **extraction F1**: fact-level precision and recall for triple extraction, evaluated against human-annotated ground truth. Separate metrics for entity recognition and relation classification. The quality gate for P0. _Stage: P0._
 _Avoid_: "accuracy" (F1 is more informative for imbalanced extraction); "quality score" (too vague)
 
-**P@5 / R@5**: precision and recall at rank 5 over the Host-visible fused `chunks[]` (vector + BM25, plus Neo4j PPR when a URI is configured); gold is query → relevant chunk ids, Bootstrap records numbers only (no CI gate), and a missing Neo4j URI is skip not a failed run. A retrieve-eval arm separate from **extraction F1** (#5 / #15 stay postponed). _Stage: morphology locked (#80); not implemented._
+**P@5 / R@5**: precision and recall at rank 5 over the Host-visible fused `chunks[]` (vector + BM25, plus Neo4j PPR when a URI is configured); gold is query → relevant chunk ids, Bootstrap records numbers only (no CI gate), and a missing Neo4j URI is skip not a failed run. A retrieve-eval arm separate from **extraction F1** (#5 / #15 stay postponed). Operated by `npm run eval:retrieve`, which scores a frozen 8–15 query gold set over a frozen in-repo seed corpus through the same `assembleRetrievalResult` fusion the MCP `retrieve` tool calls, and rewrites the git-tracked baseline at `eval/baseline/retrieve-p5.json` (per-query `top5` / `pAt5` / `rAt5`, run-level means, and the `armSet` that actually ran). _Stage: morphology locked (#80); harness implemented on the #82 branch, pending merge to main._
 _Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified); "extraction F1" (different layer)
 
 ## Relationships

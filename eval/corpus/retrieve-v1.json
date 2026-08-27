@@ -1,0 +1,150 @@
+{
+  "version": "retrieve-corpus-v1",
+  "description": "Frozen seed corpus for the retrieve P@5 baseline harness (specs/retrieve-p5.md A8). Eighteen short chunks on deliberately distinct topics so a gold query has one obviously-right answer and seventeen plausible distractors. Hand-written in-repo: no crawl, no LLM expansion. Editing any chunk invalidates every recorded baseline, so bump the version when you do.",
+  "chunks": [
+    {
+      "id": "c-pg-autovacuum",
+      "content": "Postgres autovacuum tuning starts with autovacuum_vacuum_scale_factor. On a large append-heavy table the default 0.2 means the table must grow by twenty percent of its rows before autovacuum wakes up, which lets dead tuples and table bloat accumulate for hours. Lower the scale factor per table and raise autovacuum_vacuum_cost_limit so the vacuum worker is not throttled mid-pass.",
+      "source_ref": "runbook/postgres-maintenance#autovacuum",
+      "metadata": { "topic": "postgres" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-pg-index-choice",
+      "content": "Choosing a Postgres index type for full text search: a B-tree index cannot answer a tsquery at all, so a full text search column needs a GIN index over its tsvector. GIN is slower to update and larger on disk than GiST but answers containment queries far faster, which is the right trade for a read-heavy search table.",
+      "source_ref": "runbook/postgres-maintenance#indexes",
+      "metadata": { "topic": "postgres" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-pgvector-hnsw",
+      "content": "The pgvector HNSW index takes two build parameters, m and ef_construction, and one query parameter, hnsw.ef_search. Raising m widens each graph layer and improves recall at the cost of index size; raising ef_search trades query latency for recall at read time without a rebuild. Build the index after bulk loading, never before.",
+      "source_ref": "runbook/pgvector#hnsw",
+      "metadata": { "topic": "vector-index" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-bm25-okapi",
+      "content": "Okapi BM25 has two knobs. The k1 parameter controls term frequency saturation: a low k1 makes the tenth occurrence of a term worth almost nothing more than the second. The b parameter controls length normalization, where b equal to one fully penalizes long documents and b equal to zero ignores document length entirely. Common defaults are k1 of 1.2 and b of 0.75.",
+      "source_ref": "notes/lexical-retrieval#bm25",
+      "metadata": { "topic": "lexical" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-rrf-fusion",
+      "content": "Reciprocal rank fusion combines several ranked lists without needing their scores to be comparable. Each list contributes one over the quantity k plus rank for every document it returns, and the constant k of sixty damps the influence of the very top ranks so that agreement between arms matters more than any single arm's confidence.",
+      "source_ref": "notes/hybrid-retrieval#rrf",
+      "metadata": { "topic": "fusion" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-neo4j-ppr",
+      "content": "Personalized PageRank in the Neo4j Graph Data Science library ranks nodes by how often a random walk restarted from a chosen source set lands on them. Pass the seed entities as sourceNodes, set the dampingFactor, and read the resulting score per node. It is the graph arm's answer to which entities are near the query's anchors.",
+      "source_ref": "runbook/neo4j-graph-arm#ppr",
+      "metadata": { "topic": "graph" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-neo4j-bolt-pool",
+      "content": "The Neo4j bolt driver keeps a connection pool per server address. maxConnectionPoolSize caps concurrent sessions, connectionAcquisitionTimeout bounds how long a caller waits for a free connection, and maxConnectionLifetime forces periodic recycling so a rolling cluster upgrade does not strand old sockets. Create one driver per process and share it.",
+      "source_ref": "runbook/neo4j-graph-arm#driver",
+      "metadata": { "topic": "graph" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-mcp-stdio-framing",
+      "content": "The MCP stdio transport frames each JSON-RPC message as a single newline delimited line on stdout, which is why a server must never print logs to stdout. Diagnostics go to stderr. A stray console.log on the standard output stream corrupts the frame and the host disconnects with a parse error.",
+      "source_ref": "notes/mcp-protocol#stdio",
+      "metadata": { "topic": "mcp" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-mcp-tools-list",
+      "content": "During the MCP handshake the host calls tools/list and the server answers with each tool's name, description, and JSON Schema for its input. A host caches that list for the session, so a tool registered after the handshake is invisible until the client reconnects.",
+      "source_ref": "notes/mcp-protocol#tools",
+      "metadata": { "topic": "mcp" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-embedding-dimensions",
+      "content": "Picking an embedding dimensionality is a storage and recall trade. A 1536 dimension vector costs six kilobytes per chunk before index overhead, while a 384 dimension model stores four times more chunks in the same memory and searches faster. Truncated matryoshka embeddings let one model serve both sizes, but a stored corpus cannot mix dimensions.",
+      "source_ref": "notes/embeddings#dimensionality",
+      "metadata": { "topic": "embeddings" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-cosine-normalization",
+      "content": "Cosine similarity between two vectors is their dot product divided by the product of their L2 norms. If every stored vector is L2 normalized at write time the division collapses and cosine becomes a plain dot product, which is both faster and numerically steadier. Normalize once on ingest rather than on every query.",
+      "source_ref": "notes/embeddings#cosine",
+      "metadata": { "topic": "embeddings" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-chunk-window",
+      "content": "Fixed window chunking splits a long document into overlapping windows so that a sentence straddling a boundary still appears whole in one of them. The overlap is typically ten to twenty percent of the window; too little loses cross boundary context and too much inflates the index with near duplicate chunks that crowd each other out of the top ranks.",
+      "source_ref": "notes/ingestion#chunking",
+      "metadata": { "topic": "ingestion" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-valid-window",
+      "content": "A chunk's valid_window records when the statement it carries was true, not when the row was written. A query supplies valid_at and the store admits a chunk when valid_from is at or before that instant and valid_until is either null or strictly after it. The exclusive upper bound is what stops a superseded chunk and its replacement from both matching the instant of the change.",
+      "source_ref": "docs/CONTEXT.md#valid-window",
+      "metadata": { "topic": "temporal" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-transactional-outbox",
+      "content": "The transactional outbox pattern writes an intent row in the same database transaction as the state change it describes, then a separate drain process reads pending intents and applies them downstream. Because the intent commits with the data, there is no window where the write succeeded and the notification was lost.",
+      "source_ref": "docs/adr/0001-system-of-record.md#outbox",
+      "metadata": { "topic": "consistency" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-idempotent-merge",
+      "content": "A drain must be safe to re-run, so every downstream write is an idempotent MERGE keyed on the ledger identifier rather than an INSERT. Re-applying an intent then costs nothing and cannot duplicate a node, which is what lets a crashed batch simply be replayed instead of reconciled by hand.",
+      "source_ref": "docs/adr/0001-system-of-record.md#idempotence",
+      "metadata": { "topic": "consistency" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-triple-extraction",
+      "content": "Triple extraction asks a language model to turn a passage into head, relation, tail statements against a closed relation vocabulary. Constraining the relation set is what makes the output joinable: free-form relation strings produce a graph where the same edge appears under four spellings and no traversal finds all of them.",
+      "source_ref": "specs/p0-extraction.md#triples",
+      "metadata": { "topic": "extraction" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-entity-resolution",
+      "content": "Entity resolution merges aliases and surface mentions into one canonical entity. The pipeline matches on normalized name first, then on embedding cosine above a high threshold, and rejects anything in the ambiguous gray zone with a structured log rather than guessing. A wrong merge is far more expensive to undo than a missed one.",
+      "source_ref": "specs/p0-merge.md#resolution",
+      "metadata": { "topic": "extraction" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    },
+    {
+      "id": "c-precision-at-k",
+      "content": "Precision at k counts how many of the first k results are relevant and divides by k, always by k, even when the system returned fewer than k results. Holding the denominator fixed is what stops a retriever that answers with two documents from outscoring one that answers with ten.",
+      "source_ref": "specs/retrieve-p5.md#metric",
+      "metadata": { "topic": "evaluation" },
+      "valid_from": "2026-01-01T00:00:00.000Z",
+      "valid_until": null
+    }
+  ]
+}

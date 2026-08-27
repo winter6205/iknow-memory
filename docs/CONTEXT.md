@@ -136,8 +136,8 @@ _Avoid_: "uncertain match" (vague); "borderline" (colloquial)
 **extraction F1**: fact-level precision and recall for triple extraction, evaluated against human-annotated ground truth. Separate metrics for entity recognition and relation classification. The quality gate for P0. _Stage: P0._
 _Avoid_: "accuracy" (F1 is more informative for imbalanced extraction); "quality score" (too vague)
 
-**P@5 / R@5**: precision and recall at rank 5 for retrieval evaluation. Standard IR metric; widely adopted as primary metric in retrieval benchmarks (e.g. BrainBench). iknow-memory will establish its own baseline. _Stage: P1._
-_Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified)
+**P@5 / R@5**: precision and recall at rank 5 over the Host-visible fused `chunks[]` (vector + BM25, plus Neo4j PPR when a URI is configured); gold is query → relevant chunk ids, Bootstrap records numbers only (no CI gate), and a missing Neo4j URI is skip not a failed run. A retrieve-eval arm separate from **extraction F1** (#5 / #15 stay postponed). _Stage: morphology locked (#80); not implemented._
+_Avoid_: "hit rate" (ambiguous); "top-K accuracy" (K must be specified); "extraction F1" (different layer)
 
 ## Relationships
 

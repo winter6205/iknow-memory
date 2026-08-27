@@ -68,9 +68,12 @@ function runCliSubprocess(args: string[]): Promise<ProcResult> {
       env: {
         GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
-        // The run summary rides the structured logger, same as --list-failed.
         GRAPHRAG_MEMORY_LOG_LEVEL: "info",
         PATH: process.env.PATH ?? "",
+        // Present-but-blank beats `.env.local` (same seam as host-smoke).
+        GRAPHRAG_MEMORY_EMBED_API_KEY: "",
+        GRAPHRAG_MEMORY_EMBED_API_KEY_ENV: "",
+        NINE_ROUTER_KEY: "",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

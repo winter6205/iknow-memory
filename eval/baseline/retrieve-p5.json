@@ -1,0 +1,167 @@
+{
+  "schema": "iknow-retrieve-p5/v1",
+  "gold": "retrieve-gold-v1",
+  "corpus": "retrieve-corpus-v1",
+  "armSet": "vector+bm25",
+  "queryCount": 12,
+  "meanPAt5": 0.26666666666666666,
+  "meanRAt5": 1,
+  "queries": [
+    {
+      "id": "q01-autovacuum",
+      "query": "how do I tune autovacuum so a large table stops bloating",
+      "top5": [
+        "c-pg-autovacuum",
+        "c-bm25-okapi",
+        "c-precision-at-k",
+        "c-pgvector-hnsw",
+        "c-embedding-dimensions"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q02-index-type",
+      "query": "which postgres index type answers a full text search tsquery",
+      "top5": [
+        "c-pg-index-choice",
+        "c-pgvector-hnsw",
+        "c-precision-at-k",
+        "c-bm25-okapi",
+        "c-embedding-dimensions"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q03-hnsw",
+      "query": "pgvector hnsw build parameters m and ef_search recall tradeoff",
+      "top5": [
+        "c-pgvector-hnsw",
+        "c-embedding-dimensions",
+        "c-bm25-okapi",
+        "c-precision-at-k",
+        "c-cosine-normalization"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q04-bm25-knobs",
+      "query": "what do the bm25 k1 and b parameters control",
+      "top5": [
+        "c-bm25-okapi",
+        "c-precision-at-k",
+        "c-pgvector-hnsw",
+        "c-rrf-fusion",
+        "c-triple-extraction"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q05-rrf",
+      "query": "reciprocal rank fusion constant k sixty combining ranked lists",
+      "top5": [
+        "c-rrf-fusion",
+        "c-precision-at-k",
+        "c-bm25-okapi",
+        "c-embedding-dimensions",
+        "c-neo4j-ppr"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q06-ppr",
+      "query": "personalized pagerank seed nodes damping factor graph data science",
+      "top5": [
+        "c-neo4j-ppr",
+        "c-pgvector-hnsw",
+        "c-triple-extraction",
+        "c-pg-autovacuum",
+        "c-transactional-outbox"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q07-bolt-pool",
+      "query": "neo4j bolt driver connection pool size and acquisition timeout",
+      "top5": [
+        "c-neo4j-bolt-pool",
+        "c-pgvector-hnsw",
+        "c-neo4j-ppr",
+        "c-mcp-tools-list",
+        "c-bm25-okapi"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q08-mcp",
+      "query": "mcp stdio transport framing and the tools list handshake",
+      "top5": [
+        "c-mcp-tools-list",
+        "c-mcp-stdio-framing",
+        "c-pgvector-hnsw",
+        "c-neo4j-bolt-pool",
+        "c-transactional-outbox"
+      ],
+      "pAt5": 0.4,
+      "rAt5": 1
+    },
+    {
+      "id": "q09-vectors",
+      "query": "embedding dimensionality storage cost and l2 normalized cosine",
+      "top5": [
+        "c-embedding-dimensions",
+        "c-cosine-normalization",
+        "c-pgvector-hnsw",
+        "c-neo4j-ppr",
+        "c-entity-resolution"
+      ],
+      "pAt5": 0.4,
+      "rAt5": 1
+    },
+    {
+      "id": "q10-chunking",
+      "query": "overlapping fixed window chunking for long documents",
+      "top5": [
+        "c-chunk-window",
+        "c-valid-window",
+        "c-bm25-okapi",
+        "c-precision-at-k",
+        "c-pgvector-hnsw"
+      ],
+      "pAt5": 0.2,
+      "rAt5": 1
+    },
+    {
+      "id": "q11-outbox",
+      "query": "transactional outbox drain with idempotent merge writes",
+      "top5": [
+        "c-transactional-outbox",
+        "c-idempotent-merge",
+        "c-entity-resolution",
+        "c-mcp-stdio-framing",
+        "c-chunk-window"
+      ],
+      "pAt5": 0.4,
+      "rAt5": 1
+    },
+    {
+      "id": "q12-extraction",
+      "query": "extracting head relation tail triples and resolving entity aliases",
+      "top5": [
+        "c-triple-extraction",
+        "c-entity-resolution",
+        "c-embedding-dimensions",
+        "c-neo4j-ppr",
+        "c-pgvector-hnsw"
+      ],
+      "pAt5": 0.4,
+      "rAt5": 1
+    }
+  ]
+}

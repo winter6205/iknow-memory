@@ -23,7 +23,7 @@
 **Frontier（决策）：**
 
 1. 精排 — **计划已写（本地）**：`specs/retrieve-rerank-llm.md` + `plans/retrieve-rerank-llm.md`；暂用抽取 Anthropic 主模型，默关。GitHub #88 远端可能不可见。
-2. 图优先排序 — **spec 已写**：`specs/retrieve-graph-priority.md`（#89 grilling CLOSED；代码未改）
+2. 图优先排序 — **spec + 计划已写**：`specs/retrieve-graph-priority.md` + `plans/retrieve-graph-priority.md`（T1 done；T2–T3 未实施）
 
 ## 路线要点（#57 + #78）
 
@@ -35,7 +35,7 @@
 
 ## 明确未做（勿当成已关）
 
-- 精排 T2–T3 实现；图优先 `assembleRetrievalResult` 改序
+- 精排 T2–T3 实现；图优先计划 T2–T3（`assembleRetrievalResult` 改序 + eval）
 - 专用 cross-encoder HTTP；图墓碑/投影 GC
 - `merged_into` 指针落盘；T-P0-eval 代码；多粒度切分
 
@@ -44,5 +44,5 @@
 优先本地（远端不一定能 `gh issue view`）：
 
 - 地图：`docs/handoff/wayfinder-tickets/map-1.md`
-- 图优先：`specs/retrieve-graph-priority.md`
+- 图优先：`specs/retrieve-graph-priority.md` · `plans/retrieve-graph-priority.md` · `docs/handoff/wayfinder-tickets/retrieve-graph-priority.md`
 - 精排：`specs/retrieve-rerank-llm.md` · `plans/retrieve-rerank-llm.md` · `docs/handoff/wayfinder-tickets/retrieve-rerank-llm.md`

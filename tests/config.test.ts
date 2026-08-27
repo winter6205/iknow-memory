@@ -71,7 +71,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
   beforeAll(() => {
     for (const k of SCRUBBED) {
       saved.set(k, process.env[k]);
-      delete process.env[k];
+      process.env[k] = "";
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   });
@@ -156,24 +156,27 @@ const STAGE1_KEYS = [
 ] as const;
 
 /**
- * Run `fn` with STAGE1_KEYS cleared, then patched by `patch`.
- * GRAPHRAG_MEMORY_EMBED_DIMENSIONS defaults to "1536" so existing tests
- * that don't care about dimensions don't need to set it explicitly.
+ * `readEnv` falls through to `.env.local` when a process key is missing.
+ * Blanking beats the file; `delete` does not. Host-smoke hit the same
+ * seam (T-007).
  */
-function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
+function maskDotenvLocal(keys: readonly string[]): void {
+  for (const k of keys) process.env[k] = "";
+}
+
+function withIsolatedEnv(
+  keys: readonly string[],
+  patch: Record<string, string | undefined>,
+  fn: () => void
+): void {
   const saved = new Map<string, string | undefined>();
-  for (const k of STAGE1_KEYS) {
+  for (const k of keys) {
     saved.set(k, process.env[k]);
-    delete process.env[k];
   }
-  const effectivePatch = {
-    GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
-    ...patch,
-  };
-  for (const [k, v] of Object.entries(effectivePatch)) {
+  maskDotenvLocal(keys);
+  for (const [k, v] of Object.entries(patch)) {
     if (!saved.has(k)) saved.set(k, process.env[k]);
-    if (v === undefined) delete process.env[k];
-    else process.env[k] = v;
+    process.env[k] = v === undefined ? "" : v;
   }
   try {
     fn();
@@ -183,6 +186,28 @@ function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
       else process.env[k] = v;
     }
   }
+}
+
+const DOTENV_MASK_KEYS = [
+  ...STAGE1_KEYS,
+  ...RETRIEVAL_VARS,
+  ...NEO4J_VARS,
+] as const;
+
+/**
+ * Run `fn` with STAGE1_KEYS cleared, then patched by `patch`.
+ * GRAPHRAG_MEMORY_EMBED_DIMENSIONS defaults to "1536" so existing tests
+ * that don't care about dimensions don't need to set it explicitly.
+ */
+function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
+  withIsolatedEnv(
+    DOTENV_MASK_KEYS,
+    {
+      GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+      ...patch,
+    },
+    fn
+  );
 }
 
 describe("loadEnv — stage 1 storage + embedding contract", () => {
@@ -306,24 +331,7 @@ describe("loadEnv — embed config boundary cases", () => {
     patch: Record<string, string | undefined>,
     fn: () => void
   ) {
-    const saved = new Map<string, string | undefined>();
-    for (const k of STAGE1_KEYS) {
-      saved.set(k, process.env[k]);
-      delete process.env[k];
-    }
-    for (const [k, v] of Object.entries(patch)) {
-      if (!saved.has(k)) saved.set(k, process.env[k]);
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    try {
-      fn();
-    } finally {
-      for (const [k, v] of saved) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
-      }
-    }
+    withIsolatedEnv(DOTENV_MASK_KEYS, patch, fn);
   }
 
   const DIM_BAD_VALUES: Array<readonly [string, string]> = [
@@ -494,28 +502,14 @@ describe("loadEnv — embedding API key resolution", () => {
     patch: Record<string, string | undefined>,
     fn: () => void
   ) {
-    const saved = new Map<string, string | undefined>();
-    for (const k of [...STAGE1_KEYS, ...KEY_VARS]) {
-      saved.set(k, process.env[k]);
-      delete process.env[k];
-    }
-    const effectivePatch = {
-      GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
-      ...patch,
-    };
-    for (const [k, v] of Object.entries(effectivePatch)) {
-      if (!saved.has(k)) saved.set(k, process.env[k]);
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
-    }
-    try {
-      fn();
-    } finally {
-      for (const [k, v] of saved) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
-      }
-    }
+    withIsolatedEnv(
+      [...DOTENV_MASK_KEYS, ...KEY_VARS],
+      {
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+        ...patch,
+      },
+      fn
+    );
   }
 
   // When a key resolves, loadEnv enforces BASE_URL + MODEL, so every

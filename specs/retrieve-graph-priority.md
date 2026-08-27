@@ -126,5 +126,5 @@ OVERALL: PASS — hand to `writing-plans`.
 ## Hand-off
 
 - Spec path: `specs/retrieve-graph-priority.md`
-- Next: `writing-plans` → `plans/retrieve-graph-priority.md` (not this turn)
-- Tracker: implement as a new `wayfinder:task` under map #1; do not reopen #89 grilling
+- Plan path: `plans/retrieve-graph-priority.md`
+- Tracker: local `docs/handoff/wayfinder-tickets/retrieve-graph-priority.md`; do not reopen #89 grilling

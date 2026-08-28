@@ -190,13 +190,14 @@ async function seedTriple(
     start?: string;
     end?: string | null;
   }
-): Promise<void> {
+): Promise<string> {
+  const id = randomUUID();
   await c.query(
     `INSERT INTO triples (id, head_id, tail_id, relation_raw, relation_norm,
                           confidence, source_chunk_id, valid_window)
      VALUES ($1, $2, $3, 'rel', 'rel', 1.0, $4, tstzrange($5, $6, '[)'))`,
     [
-      randomUUID(),
+      id,
       over.head,
       over.tail,
       over.chunkId,
@@ -204,6 +205,7 @@ async function seedTriple(
       over.end ?? null,
     ]
   );
+  return id;
 }
 
 async function bulkEntities(c: pg.Client, n: number): Promise<string[]> {
@@ -621,6 +623,39 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
     const ids = rows.map((r) => r.id);
     expect(ids).toContain(live);
     expect(ids).not.toContain(past); // past chunk's valid_window excludes now
+  });
+
+  it("10. superseded fact with an expired window is absent from graph-mapped chunks", async () => {
+    const c = client!;
+    await resetSchema(c);
+    const oldChunk = await seedChunk(c, {});
+    const replacementChunk = await seedChunk(c, {});
+    const head = await seedEntity(c, { name: "Alice", desc: "employment" });
+    const oldTail = await seedEntity(c, { name: "Acme", desc: "employer" });
+    const newTail = await seedEntity(c, { name: "Globex", desc: "employer" });
+    const oldFact = await seedTriple(c, {
+      head,
+      tail: oldTail,
+      chunkId: oldChunk,
+      start: PAST_START,
+      end: PAST_END,
+    });
+    const replacementFact = await seedTriple(c, {
+      head,
+      tail: newTail,
+      chunkId: replacementChunk,
+    });
+    await c.query(`UPDATE triples SET superseded_by = $2 WHERE id = $1`, [
+      oldFact,
+      replacementFact,
+    ]);
+
+    const rows = await backend!.graphArmSeed!.chunksByOneHopFromEntities(
+      [head],
+      NOW_ISO,
+      20
+    );
+    expect(rows.map((row) => row.id)).toEqual([replacementChunk]);
   });
 
   it("9. SC4: fresh PG -> ingest the probe corpus -> CLI extract -> graph arm clears the default floor without degraded", async () => {

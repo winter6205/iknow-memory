@@ -42,6 +42,7 @@ jobs:
             --exclude tests/cli/extract-list-failed.test.ts \
             --exclude tests/cli/extract.test.ts \
             --exclude tests/cli/extract-e2e-graph.test.ts \
+            --exclude tests/cli/consolidate-pg.test.ts \
             --exclude tests/schema-p0.test.ts
 
   test-full:

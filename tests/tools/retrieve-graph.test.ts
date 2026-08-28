@@ -31,6 +31,7 @@ const CFG: RetrieveConfig = {
   w_graph: 1,
   bm25Enabled: false,
   graphEnabled: false,
+  rerankEnabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
@@ -363,6 +364,7 @@ describe("retrieve config boundary validation (T5)", () => {
         w_graph: 0.15,
         bm25Enabled: true,
         graphEnabled: true,
+        rerankEnabled: false,
         // Seed / traversal knobs keep their P0 values.
         entityLinkTopK: 8,
         candidateCap: 50,

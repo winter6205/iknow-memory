@@ -34,6 +34,7 @@ const CFG: RetrieveConfig = {
   w_graph: 0.15,
   bm25Enabled: true,
   graphEnabled: true,
+  rerankEnabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,

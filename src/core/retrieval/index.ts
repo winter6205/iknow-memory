@@ -40,12 +40,14 @@
  * on the envelope while the vector results still reach the caller.
  */
 import { assembleGraphPriority } from "./graph-priority.js";
+import { maybeRerank, rerankWindowSize } from "./rerank.js";
 import { runGraphArm, type GraphArmDeps } from "./graph-arm.js";
 import { runNeo4jGraphArm, type Neo4jGraphArmDeps } from "./neo4j-graph-arm.js";
 import type {
   ArmHit,
   ArmName,
   ArmResult,
+  ChunkReranker,
   FusedHit,
   GraphArmStorage,
   GraphRanker,
@@ -116,6 +118,11 @@ export interface AssembleDeps {
    * suffered a failed graph call.
    */
   graphRanker?: GraphRanker;
+  /**
+   * Temporary LLM reranker, wired only when rerank is enabled AND the
+   * Anthropic trio is complete. Absent + enable-on is a skip, not degraded.
+   */
+  reranker?: ChunkReranker;
   /** Injectable debug gate; wired to `DEBUG=1` by the tool. */
   debug?: boolean;
 }
@@ -143,9 +150,18 @@ export async function assembleRetrievalResult(
   const graph = neo4jGraph === undefined ? getGraphSeed(deps) : undefined;
   const fusing =
     lexical !== undefined || graph !== undefined || neo4jGraph !== undefined;
+  const reranker = getReranker(deps);
+  const rerankWindow =
+    reranker !== undefined && deps.retrieveConfig !== undefined
+      ? rerankWindowSize(args.limit, deps.retrieveConfig.candidateCap)
+      : undefined;
 
   const searchOpts = {
-    limit: fusing ? Math.max(args.limit, ARM_CANDIDATE_POOL) : args.limit,
+    limit: Math.max(
+      args.limit,
+      fusing ? ARM_CANDIDATE_POOL : 0,
+      rerankWindow ?? 0
+    ),
     validAt: args.validAt,
     ...(args.filters !== undefined ? { filters: args.filters } : {}),
   };
@@ -156,10 +172,15 @@ export async function assembleRetrievalResult(
   // `weights === undefined` half is unreachable at runtime. It is what
   // narrows `weights` for the `rrfFuse` call below.
   if (!fusing || weights === undefined) {
-    // Vector-only: chunks flow through unchanged. RetrievedChunk is
-    // already structurally identical to the envelope chunk shape, so no
-    // projection is needed for the empty-extra-keys contract.
-    return { chunks: await vectorSearch };
+    // Vector-only: chunks flow through unchanged unless a reranker is wired.
+    const retrieved = await vectorSearch;
+    const reranked = await maybeRerank(
+      toFusedFromRetrieved(retrieved),
+      args,
+      deps.retrieveConfig,
+      reranker
+    );
+    return buildEnvelope(reranked.hits, reranked.degraded, undefined);
   }
 
   // Every optional arm is launched before the first await so they overlap
@@ -198,11 +219,17 @@ export async function assembleRetrievalResult(
     neo4jResult,
     [toVectorResult(retrieved), ...weighted],
     weights,
-    args.limit
+    rerankWindow ?? args.limit
+  );
+  const reranked = await maybeRerank(
+    fused,
+    args,
+    deps.retrieveConfig,
+    reranker
   );
   return buildEnvelope(
-    fused,
-    degradedFlag(optional),
+    reranked.hits,
+    mergeDegraded(degradedFlag(optional), reranked.degraded),
     buildDebug(deps.debug, retrieved.length, optional)
   );
 }
@@ -215,6 +242,30 @@ export async function assembleRetrievalResult(
  */
 function degradedFlag(optional: ArmResult[]): true | undefined {
   return optional.some((arm) => arm.belowFloor) ? true : undefined;
+}
+
+function mergeDegraded(
+  arm: true | undefined,
+  rerank: true | undefined
+): true | undefined {
+  return arm === true || rerank === true ? true : undefined;
+}
+
+/** Enable-on without a wired adapter is a skip, not degraded. */
+function getReranker(deps: AssembleDeps): ChunkReranker | undefined {
+  if (deps.retrieveConfig?.rerankEnabled !== true) return undefined;
+  return deps.reranker;
+}
+
+function toFusedFromRetrieved(retrieved: RetrievedChunk[]): FusedHit[] {
+  return retrieved.map((r) => ({
+    id: r.id,
+    content: r.content,
+    source_ref: r.source_ref,
+    valid_window: r.valid_window,
+    rrfScore: r.score,
+    arms: ["vector"],
+  }));
 }
 
 /**

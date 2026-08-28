@@ -33,6 +33,9 @@ in the PR description.
      or `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV`, `GRAPHRAG_MEMORY_EMBED_BASE_URL`,
      `GRAPHRAG_MEMORY_EMBED_MODEL`)
 
+T10 is skipped when `GRAPHRAG_MEMORY_DB_URL` is unset. Do not treat a skipped
+run as a successful extraction smoke.
+
 ## 2. Set the LLM env vars
 
 Provide these **names** via the environment or `.env.local` (which is
@@ -40,10 +43,12 @@ gitignored). Never put real values in this file or in any commit.
 
 | Env var                              | Meaning                                          | Example                       |
 | ------------------------------------ | ------------------------------------------------ | ----------------------------- |
-| `GRAPHRAG_MEMORY_LLM_PROVIDER`       | Which LLM provider to use                        | `anthropic`                   |
-| `GRAPHRAG_MEMORY_ANTHROPIC_API_KEY`  | Secret key for the Anthropic-compatible endpoint | _(set in env / `.env.local`)_ |
-| `GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL` | Endpoint base URL                                | `https://api.minimaxi.com`    |
-| `GRAPHRAG_MEMORY_ANTHROPIC_MODEL`    | Model identifier for the endpoint                | e.g. a MiniMax M3 model id    |
+| `ANTHROPIC_AUTH_TOKEN`               | LLM secret (extract + retrieve rerank)           | _(set in env / `.env.local`)_ |
+| `GRAPHRAG_MEMORY_EMBED_API_KEY`      | Canonical vector/embedding secret               | _(set in env / `.env.local`)_ |
+| `GRAPHRAG_MEMORY_VECTOR_API_KEY`     | Preferred vector/embedding alias                | _(set in env / `.env.local`)_ |
+| `GRAPHRAG_MEMORY_ANTHROPIC_API_KEY`  | Legacy vector/embedding alias                   | _(set in env / `.env.local`)_ |
+| `GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL` | LLM Anthropic-compatible SDK base (optional)     | `https://api.minimaxi.com/anthropic` (default) |
+| `GRAPHRAG_MEMORY_ANTHROPIC_MODEL`    | LLM model id (optional)                          | `MiniMax-M3` (default)        |
 
 ## 3. Dry-run first
 
@@ -117,11 +122,11 @@ The mapping is a conservative, defensible default — operators can tune it in
 
 ### Common failures
 
-- **401 unauthorized** → `GRAPHRAG_MEMORY_ANTHROPIC_API_KEY` is missing or
+- **401 unauthorized** → `ANTHROPIC_AUTH_TOKEN` is missing or
   wrong. Re-check the key in `.env.local` / env.
 - **Wrong base URL** → request fails to reach the endpoint. Confirm
-  `GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL` matches the provider (e.g.
-  `https://api.minimaxi.com`).
+  `GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL` matches the provider (default:
+  `https://api.minimaxi.com/anthropic`).
 - **No chunks to process** → `--since` filters out every chunk, or every chunk
   already has a `succeeded` record. Widen `--since` or pick a fresh chunk.
 - **Exit `1` on startup with no LLM call** → config error; check the storage /

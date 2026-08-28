@@ -119,9 +119,9 @@ npx vitest run tests/cli/extract.test.ts    # CLI subprocess e2e
 node dist/cli/extract.js --list-unmapped    # prints triples where relation_norm = 'UNMAPPED', grouped by raw, count desc
 
 # Real LLM smoke (NOT in CI; documented manual run)
-GRAPHRAG_MEMORY_LLM_PROVIDER=anthropic \
-GRAPHRAG_MEMORY_ANTHROPIC_API_KEY=... \
-GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL=https://api.minimaxi.com \
+ANTHROPIC_AUTH_TOKEN=<set in the environment> \
+GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic \
+GRAPHRAG_MEMORY_ANTHROPIC_MODEL=MiniMax-M3 \
 node dist/cli/extract.js --batch-size 1 --since <timestamp of one chunk>
 ```
 

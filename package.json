@@ -30,6 +30,7 @@
     "consolidate": "node dist/cli/consolidate.js",
     "graph:backfill": "node dist/cli/graph-backfill.js",
     "graph:drain": "node dist/cli/graph-drain.js",
+    "community:summary": "node dist/cli/community-summary.js",
     "prepare": "husky"
   },
   "dependencies": {

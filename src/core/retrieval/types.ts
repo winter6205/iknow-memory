@@ -18,7 +18,8 @@
  * both — the optional node-embedding arm has its own name so debug output
  * can distinguish direct Postgres ranking from Neo4j graph ranking.
  */
-export type ArmName = "vector" | "bm25" | "graph" | "node-embedding";
+export type ArmName =
+  "vector" | "bm25" | "graph" | "node-embedding" | "community-summary";
 
 /** Named retrieval mode bundles exposed by the retrieve tool. */
 export type RetrievePreset = "conservative" | "balanced" | "tokenmax";
@@ -95,6 +96,10 @@ export interface ArmHit {
   source_ref: string;
   /** Temporal validity window for filtering. */
   valid_window: [string, string | null];
+  metadata?: {
+    kind: "community-summary";
+    communityId: string;
+  };
 }
 
 /** Result of one retrieval arm. */
@@ -122,6 +127,10 @@ export interface FusedHit {
   rrfScore: number;
   /** Which arm(s) contributed to this hit. */
   arms: ArmName[];
+  metadata?: {
+    kind: "community-summary";
+    communityId: string;
+  };
 }
 
 /** Configuration for the retrieval pipeline (loaded from env, see src/config.ts). */
@@ -153,6 +162,11 @@ export interface RetrieveConfig {
    * graph-priority/RRF path exactly.
    */
   nodeEmbeddingEnabled?: boolean;
+  /**
+   * Optional topic-level community summary recall. When omitted, the
+   * tokenmax preset enables it; balanced and conservative stay unchanged.
+   */
+  communitySummaryEnabled?: boolean;
   /** Top-K seed entities from the embedding seed query. */
   entityLinkTopK: number;
   /** Hard cap on total candidates pulled from the graph arm. */
@@ -269,6 +283,22 @@ export interface EntityEmbeddingStorage {
   ): Promise<EntityChunkRow[]>;
 }
 
+/** A ledger-stored community summary exposed as a retrieve candidate. */
+export interface CommunitySummaryRow {
+  id: string;
+  communityId: string;
+  summary: string;
+  score?: number;
+}
+
+/** Postgres seam for optional topic-level summary recall. */
+export interface CommunitySummaryStorage {
+  searchCommunitySummaries(
+    embedding: number[],
+    limit: number
+  ): Promise<CommunitySummaryRow[]>;
+}
+
 /** The Neo4j PPR arm reuses the same Postgres entity read seam. */
 export interface Neo4jArmStorage extends EntityEmbeddingStorage {}
 
@@ -301,6 +331,10 @@ export interface RetrieveOutputEnvelope {
     source_ref: string;
     valid_window: [string, string | null];
     score: number;
+    metadata?: {
+      kind: "community-summary";
+      communityId: string;
+    };
   }>;
   /**
    * Optional: present (true) when an optional arm was ATTEMPTED and could

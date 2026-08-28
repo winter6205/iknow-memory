@@ -37,6 +37,7 @@ const ARM_WEIGHT: Record<ArmName, (cfg: RetrieveConfig) => number> = {
   // Node embedding is a graph-priority lead in the orchestrator. Keeping a
   // weight here makes the ArmResult total and safe if it is ever fused.
   "node-embedding": (cfg) => cfg.w_graph,
+  "community-summary": () => 0,
 };
 
 /**
@@ -48,6 +49,7 @@ const ARM_ORDER: readonly ArmName[] = [
   "bm25",
   "graph",
   "node-embedding",
+  "community-summary",
 ];
 
 function armRank(arm: ArmName | undefined): number {
@@ -71,6 +73,7 @@ function addHit(acc: Map<string, FusedHit>, hit: ArmHit, weight: number): void {
     valid_window: hit.valid_window,
     rrfScore: score,
     arms: [hit.arm],
+    ...(hit.metadata !== undefined ? { metadata: hit.metadata } : {}),
   });
 }
 

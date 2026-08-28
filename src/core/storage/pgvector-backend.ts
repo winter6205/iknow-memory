@@ -32,6 +32,7 @@ import type {
   NeighborChunkRow,
   NeighborChunkStorage,
   Neo4jArmStorage,
+  CommunitySummaryRow,
 } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
@@ -117,6 +118,13 @@ const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_re
       AND (c.valid_until IS NULL OR c.valid_until > $2::timestamptz)
     ORDER BY array_position($1::uuid[], ranked.entity_id), c.id
     LIMIT $3`;
+
+const COMMUNITY_SUMMARIES_SQL = `SELECT id, community_id, summary,
+    1 - (embedding <=> $1::vector) AS score
+  FROM community_summaries
+ WHERE embedding IS NOT NULL
+ ORDER BY embedding <=> $1::vector ASC, id ASC
+ LIMIT $2`;
 
 /**
  * Same-source neighboring chunks around already-ranked anchors.
@@ -740,5 +748,44 @@ export class PgvectorBackend
       this.neo4jArmSeed.seedEntitiesByEmbedding(embedding, topK),
     chunksByEntityIds: (entityIds, validAt, limit) =>
       this.neo4jArmSeed.chunksByEntityIds(entityIds, validAt, limit),
+  };
+
+  /**
+   * Semantic lookup for index-time summaries. Summary rows are kept in
+   * Postgres and are never copied to Neo4j; this is the optional retrieve
+   * seam used only by a summary-enabled preset.
+   */
+  readonly communitySummaries = {
+    searchCommunitySummaries: async (
+      embedding: number[],
+      limit: number
+    ): Promise<CommunitySummaryRow[]> => {
+      try {
+        const pool = await this.ensureReady();
+        const result = await pool.query(COMMUNITY_SUMMARIES_SQL, [
+          toVectorLiteral(embedding),
+          limit,
+        ]);
+        return result.rows.map((r) => {
+          const row = r as {
+            id: string;
+            community_id: string;
+            summary: string;
+            score: number;
+          };
+          return {
+            id: row.id,
+            communityId: row.community_id,
+            summary: row.summary,
+            score: Number(row.score),
+          };
+        });
+      } catch (err) {
+        throw new GraphragError(
+          `PgvectorBackend.communitySummaries.searchCommunitySummaries failed: ${(err as Error).message}`,
+          "STORAGE_ERROR"
+        );
+      }
+    },
   };
 }

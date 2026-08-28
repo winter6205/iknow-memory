@@ -16,6 +16,7 @@ import type {
   ArmHit,
   ArmName,
   ArmResult,
+  CommunitySummaryStorage,
   GraphArmStorage,
   GraphRanker,
   RetrieveConfig,
@@ -27,6 +28,7 @@ import type {
 } from "../types.js";
 import {
   supportsLexicalSearch,
+  supportsCommunitySummaries,
   supportsNeo4jArm,
   type GraphRagStorageBackend,
   type LexicalStorageBackend,
@@ -44,16 +46,19 @@ export interface OptionalArmSet {
   graph?: { seed: GraphArmStorage; config: RetrieveConfig };
   neo4jGraph?: Neo4jGraphArmDeps;
   nodeEmbedding?: NodeEmbeddingArmDeps;
+  communitySummaries?: CommunitySummaryStorage;
 }
 
 export interface OptionalArmResults {
   weighted: ArmResult[];
   neo4j?: ArmResult;
   nodeEmbedding?: ArmResult;
+  communitySummary?: ArmResult;
 }
 
 export interface SelectedRetrievalResults {
   optional: ArmResult[];
+  communityPriority: ArmResult | undefined;
   graphPriority: ArmResult | undefined;
   remainder: ArmResult[];
 }
@@ -66,6 +71,7 @@ export function resolveOptionalArms(deps: OptionalArmDeps): OptionalArmSet {
     graph: neo4jGraph === undefined ? getGraphSeed(deps) : undefined,
     neo4jGraph,
     nodeEmbedding: getNodeEmbeddingArm(deps.retrieveConfig, deps.storage),
+    communitySummaries: getCommunitySummaries(deps),
   };
 }
 
@@ -74,7 +80,8 @@ export function hasOptionalArms(arms: OptionalArmSet): boolean {
     arms.lexical !== undefined ||
     arms.graph !== undefined ||
     arms.neo4jGraph !== undefined ||
-    arms.nodeEmbedding !== undefined
+    arms.nodeEmbedding !== undefined ||
+    arms.communitySummaries !== undefined
   );
 }
 
@@ -112,13 +119,30 @@ export async function runOptionalArms(
     arms.nodeEmbedding,
     query.validAt
   );
-  const [weightedResults, neo4jResult, nodeEmbeddingResult] = await Promise.all(
-    [Promise.all(weighted), neo4j, nodeEmbedding]
-  );
+  const communitySummary =
+    arms.communitySummaries === undefined
+      ? undefined
+      : runCommunitySummarySafe(
+          queryEmbedding,
+          arms.communitySummaries,
+          searchOpts.limit
+        );
+  const [
+    weightedResults,
+    neo4jResult,
+    nodeEmbeddingResult,
+    communitySummaryResult,
+  ] = await Promise.all([
+    Promise.all(weighted),
+    neo4j,
+    nodeEmbedding,
+    communitySummary,
+  ]);
   return {
     weighted: weightedResults,
     neo4j: neo4jResult,
     nodeEmbedding: nodeEmbeddingResult,
+    communitySummary: communitySummaryResult,
   };
 }
 
@@ -135,13 +159,21 @@ export function selectRetrievalResults(
     ...results.weighted,
     ...(results.neo4j === undefined ? [] : [results.neo4j]),
     ...(results.nodeEmbedding === undefined ? [] : [results.nodeEmbedding]),
+    ...(results.communitySummary === undefined
+      ? []
+      : [results.communitySummary]),
   ];
+  const communityPriority =
+    results.communitySummary?.hits.length === 0
+      ? undefined
+      : results.communitySummary;
   const graphPriority = selectGraphPriority(
     results.neo4j,
     results.nodeEmbedding
   );
   return {
     optional,
+    communityPriority,
     graphPriority,
     remainder: [toVectorResult(retrieved), ...results.weighted],
   };
@@ -154,6 +186,55 @@ function selectGraphPriority(
   if (neo4j !== undefined && neo4j.hits.length !== 0) return neo4j;
   if (nodeEmbedding?.hits.length !== 0) return nodeEmbedding;
   return undefined;
+}
+
+function getCommunitySummaries(
+  deps: OptionalArmDeps
+): CommunitySummaryStorage | undefined {
+  const config = deps.retrieveConfig;
+  if (
+    config === undefined ||
+    !(config.communitySummaryEnabled ?? config.preset === "tokenmax")
+  ) {
+    return undefined;
+  }
+  if (!supportsCommunitySummaries(deps.storage)) return undefined;
+  return deps.storage.communitySummaries;
+}
+
+async function runCommunitySummarySafe(
+  queryEmbedding: number[],
+  storage: CommunitySummaryStorage,
+  limit: number
+): Promise<ArmResult> {
+  try {
+    const rows = await storage.searchCommunitySummaries(queryEmbedding, limit);
+    return {
+      arm: "community-summary",
+      hits: rows.map((row, i) => ({
+        id: row.id,
+        arm: "community-summary",
+        rank: i + 1,
+        score: row.score ?? 1 / (i + 1),
+        content: row.summary,
+        source_ref: `community/${row.communityId}`,
+        valid_window: ["1970-01-01T00:00:00.000Z", null],
+        metadata: {
+          kind: "community-summary",
+          communityId: row.communityId,
+        },
+      })),
+      belowFloor: false,
+    };
+  } catch (err) {
+    // EXIT: no summary blocks retrieval; degraded preserves observability.
+    return {
+      arm: "community-summary",
+      hits: [],
+      belowFloor: true,
+      failureReason: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 function getGraphSeed(

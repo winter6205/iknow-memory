@@ -222,6 +222,30 @@ export interface EntityChunkRow {
   valid_until: string | null;
 }
 
+/** A chunk row returned by the same-source neighbor lookup. */
+export interface NeighborChunkRow {
+  id: string;
+  content: string;
+  source_ref: string;
+  valid_from: string;
+  valid_until: string | null;
+}
+
+/**
+ * Postgres chunk ledger seam for neighboring evidence.
+ *
+ * The lookup is intentionally expressed in chunk ids rather than source refs:
+ * the storage layer owns ingest ordering and can select the rows immediately
+ * around the already-ranked anchors.
+ */
+export interface NeighborChunkStorage {
+  chunksByChunkIds(
+    chunkIds: readonly string[],
+    validAt: string,
+    width: number
+  ): Promise<NeighborChunkRow[]>;
+}
+
 /**
  * Postgres side of the Neo4j graph arm: entity seeds in, their chunks out.
  *

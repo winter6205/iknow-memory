@@ -9,13 +9,21 @@
  * `if (storage.graphArmSeed)` before using the graph arm.
  */
 export type { StorageBackend, SearchOptions } from "../types.js";
-export type { GraphArmStorage, Neo4jArmStorage } from "../retrieval/types.js";
+export type {
+  GraphArmStorage,
+  NeighborChunkStorage,
+  Neo4jArmStorage,
+} from "../retrieval/types.js";
 import type {
   RetrievedChunk,
   SearchOptions,
   StorageBackend,
 } from "../types.js";
-import type { GraphArmStorage, Neo4jArmStorage } from "../retrieval/types.js";
+import type {
+  GraphArmStorage,
+  NeighborChunkStorage,
+  Neo4jArmStorage,
+} from "../retrieval/types.js";
 
 /**
  * Graph-rag storage backend: the chunk-store contract plus the OPTIONAL
@@ -77,6 +85,16 @@ export function supportsLexicalSearch(
 ): storage is LexicalStorageBackend {
   return (
     typeof (storage as Partial<LexicalStorageBackend>).searchLexical ===
+    "function"
+  );
+}
+
+/** Runtime narrowing for the optional same-source neighbor seam. */
+export function supportsNeighborChunks(
+  storage: StorageBackend
+): storage is StorageBackend & NeighborChunkStorage {
+  return (
+    typeof (storage as Partial<NeighborChunkStorage>).chunksByChunkIds ===
     "function"
   );
 }

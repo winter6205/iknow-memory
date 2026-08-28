@@ -57,6 +57,7 @@ import type {
 import type { RetrievedChunk, StorageBackend } from "../types.js";
 import {
   supportsLexicalSearch,
+  supportsNeighborChunks,
   supportsNeo4jArm,
   type GraphRagStorageBackend,
   type LexicalStorageBackend,
@@ -180,7 +181,17 @@ export async function assembleRetrievalResult(
       deps.retrieveConfig,
       reranker
     );
-    return buildEnvelope(reranked.hits, reranked.degraded, undefined);
+    const neighbors = await expandNeighborEvidence(
+      reranked.hits,
+      args,
+      deps.retrieveConfig,
+      deps.storage
+    );
+    return buildEnvelope(
+      neighbors.hits,
+      mergeDegraded(reranked.degraded, neighbors.degraded),
+      undefined
+    );
   }
 
   // Every optional arm is launched before the first await so they overlap
@@ -227,9 +238,18 @@ export async function assembleRetrievalResult(
     deps.retrieveConfig,
     reranker
   );
-  return buildEnvelope(
+  const neighbors = await expandNeighborEvidence(
     reranked.hits,
-    mergeDegraded(degradedFlag(optional), reranked.degraded),
+    args,
+    deps.retrieveConfig,
+    deps.storage
+  );
+  return buildEnvelope(
+    neighbors.hits,
+    mergeDegraded(
+      mergeDegraded(degradedFlag(optional), reranked.degraded),
+      neighbors.degraded
+    ),
     buildDebug(deps.debug, retrieved.length, optional)
   );
 }
@@ -249,6 +269,71 @@ function mergeDegraded(
   rerank: true | undefined
 ): true | undefined {
   return arm === true || rerank === true ? true : undefined;
+}
+
+interface NeighborOutcome {
+  hits: FusedHit[];
+  degraded: true | undefined;
+}
+
+/**
+ * Add same-source evidence after all ranking and reranking decisions.
+ *
+ * The ranked hits remain first; neighbors only fill otherwise-unused slots,
+ * so the Host `limit` remains a hard cap. A backend without the optional
+ * ledger seam skips this step, while a failed optional read preserves the
+ * ranked answer and marks it degraded.
+ */
+async function expandNeighborEvidence(
+  hits: readonly FusedHit[],
+  args: AssembleArgs,
+  config: RetrieveConfig | undefined,
+  storage: StorageBackend
+): Promise<NeighborOutcome> {
+  const width = config?.neighborWidth ?? 0;
+  if (width === 0 || hits.length === 0) {
+    return { hits: [...hits], degraded: undefined };
+  }
+  if (!Number.isInteger(width) || width < 0) {
+    throw new GraphragError(
+      `neighborWidth must be a non-negative integer, got ${width}`,
+      "INVALID_INPUT"
+    );
+  }
+  if (!supportsNeighborChunks(storage)) {
+    return { hits: [...hits], degraded: undefined };
+  }
+
+  try {
+    const rows = await storage.chunksByChunkIds(
+      hits.map((hit) => hit.id),
+      args.validAt,
+      width
+    );
+    const rankedIds = new Set(hits.map((hit) => hit.id));
+    const anchorSources = new Set(hits.map((hit) => hit.source_ref));
+    const evidence: FusedHit[] = [];
+    for (const row of rows) {
+      if (rankedIds.has(row.id) || !anchorSources.has(row.source_ref)) {
+        continue;
+      }
+      rankedIds.add(row.id);
+      evidence.push({
+        id: row.id,
+        content: row.content,
+        source_ref: row.source_ref,
+        valid_window: [row.valid_from, row.valid_until],
+        rrfScore: 0,
+        arms: [],
+      });
+    }
+    return {
+      hits: [...hits, ...evidence].slice(0, args.limit),
+      degraded: undefined,
+    };
+  } catch {
+    return { hits: [...hits], degraded: true };
+  }
 }
 
 /** Enable-on without a wired adapter is a skip, not degraded. */

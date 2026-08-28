@@ -133,6 +133,11 @@ describe("neighbor chunk evidence", () => {
       "left",
       "right",
     ]);
+    expect(body.chunks.map((item) => item.valid_window)).toEqual([
+      ["2024-01-01T00:00:00.000Z", null],
+      ["2024-01-01T00:00:00.000Z", null],
+      ["2024-01-01T00:00:00.000Z", null],
+    ]);
     expect(storage.neighborCalls).toEqual([{ ids: ["middle"], width: 1 }]);
     expect(storage.events).toEqual(["rerank", "neighbors"]);
   });

@@ -572,14 +572,17 @@ const SELF_LOOP_OUTPUT = {
   confidence: 0.9,
 };
 
-/** Run the self-loop output against `seed` live rows; returns the fake client. */
-async function runSelfLoopOutput(seed: unknown[] = []): Promise<FakeClient> {
+/** Run one output against `seed` live rows; returns the fake client. */
+async function runOutput(
+  output: typeof SELF_LOOP_OUTPUT,
+  seed: unknown[] = []
+): Promise<FakeClient> {
   const client = new FakeClient();
   serveOwnEntityWrites(client, seed);
   const llm = new FakeLLMClient({
     scripted: async () => ({
       kind: "ok" as const,
-      outputs: [SELF_LOOP_OUTPUT],
+      outputs: [output],
     }),
   });
   const deps: CliDeps = {
@@ -589,6 +592,11 @@ async function runSelfLoopOutput(seed: unknown[] = []): Promise<FakeClient> {
   const code = await runCli(["--batch-size", "1"], deps);
   expect(code).toBe(0);
   return client;
+}
+
+/** Run the self-loop output against `seed` live rows; returns the fake client. */
+async function runSelfLoopOutput(seed: unknown[] = []): Promise<FakeClient> {
+  return runOutput(SELF_LOOP_OUTPUT, seed);
 }
 
 /** `(head_id, tail_id)` of every triple the run upserted. */
@@ -648,6 +656,106 @@ describe("same-output head/tail are mutually exclusive merge candidates (SC6)", 
 
     expect(boundValuesFor(client, /INSERT INTO entities/)).toEqual([]);
     expect(upsertedEndpoints(client)).toEqual([[SURVIVOR_HEAD, SURVIVOR_TAIL]]);
+  });
+});
+
+describe("self-loop outputs are extract rejects (T4)", () => {
+  it("rejects before entity creation, graph writes, or chunk failure", async () => {
+    const client = new FakeClient();
+    scanOneChunk(client);
+    const warnings: LoggedLine[] = [];
+    const llm = new FakeLLMClient({
+      scripted: async () => ({
+        kind: "ok" as const,
+        outputs: [
+          {
+            ...SELF_LOOP_OUTPUT,
+            tail: SELF_LOOP_OUTPUT.head,
+          },
+        ],
+      }),
+    });
+    const deps: CliDeps = {
+      ...makeDeps(client, llm),
+      logger: {
+        ...silentLogger(),
+        warn: (msg, fields) => warnings.push({ msg, fields }),
+      },
+    };
+
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+    expect(boundValuesFor(client, /INSERT INTO entities/)).toEqual([]);
+    expect(boundValuesFor(client, /INSERT INTO triples/)).toEqual([]);
+    expect(boundValuesFor(client, /INSERT INTO projection_outbox/)).toEqual([]);
+    expect(warnings).toContainEqual({
+      msg: "triple-self-loop-rejected",
+      fields: expect.objectContaining({
+        chunkId: "00000000-0000-4000-8000-000000000000",
+        head: SELF_LOOP_OUTPUT.head,
+        tail: SELF_LOOP_OUTPUT.head,
+        reason: "head-equals-tail",
+      }),
+    });
+    expect(boundValuesFor(client, /SET status = 'succeeded'/)).toEqual([
+      expect.arrayContaining([0, 0]),
+    ]);
+  });
+
+  it("persists same-normalized-name endpoints when their types differ", async () => {
+    const client = await runOutput({
+      ...SELF_LOOP_OUTPUT,
+      tail: " alice   smith ",
+      tailType: "system",
+    });
+
+    const inserts = boundValuesFor(client, /INSERT INTO entities/);
+    expect(inserts.map((values) => values[1])).toEqual([
+      SELF_LOOP_OUTPUT.head,
+      " alice   smith ",
+    ]);
+    expect(upsertedEndpoints(client)).toEqual([
+      [inserts[0]![0] as string, inserts[1]![0] as string],
+    ]);
+  });
+
+  it("does not re-extract a self-loop after a successful run with --only-failed", async () => {
+    const client = new FakeClient();
+    let extractCalls = 0;
+    client.rowsOverride = (text) => {
+      if (/FROM chunks c/.test(text)) {
+        const succeeded = client.queries.some((query) =>
+          /SET status = 'succeeded'/.test(query)
+        );
+        return succeeded
+          ? []
+          : [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }];
+      }
+      if (/FROM entities/.test(text)) return [];
+      return [];
+    };
+    const llm = new FakeLLMClient({
+      scripted: async () => {
+        extractCalls += 1;
+        return {
+          kind: "ok" as const,
+          outputs: [{ ...SELF_LOOP_OUTPUT, tail: SELF_LOOP_OUTPUT.head }],
+        };
+      },
+    });
+    const deps = makeDeps(client, llm);
+
+    expect(await runCli(["--batch-size", "1"], deps)).toBe(0);
+    expect(
+      await runCli(["--only-failed", "--batch-size", "1"], deps)
+    ).toBe(0);
+
+    expect(extractCalls).toBe(1);
+    const onlyFailedScan = client.queries.filter((query) =>
+      /FROM chunks c/.test(query)
+    )[1];
+    expect(onlyFailedScan).toContain("status = 'failed'");
   });
 });
 

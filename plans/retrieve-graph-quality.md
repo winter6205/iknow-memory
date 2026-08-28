@@ -1,11 +1,25 @@
 # Plan: Retrieve and graph quality stack
 
-**Goal:** Ship the remaining in-protocol retrieve and graph-quality path as ordered slices: rerank, ledger/projection fidelity, presets, evidence, graph extras — without new MCP tools or Host assembly.
-**Approach:** Slice 0 reuses `plans/retrieve-rerank-llm.md` (do not mix that plan’s commits into later slices). Later slices attach to the same retrieve hook, extract CLI, and drain path. `balanced` copies today’s RetrieveConfig levers; `conservative` / `tokenmax` only change window size and neighbor width relative to that copy — exact integers stay implementer headroom. #15, multi-granularity chunking, Neo4j node embeddings, and SQL graph-arm revival stay out.
+**Goal:** Ship the remaining in-protocol retrieve and graph-quality path as ordered slices — without new MCP tools or Host assembly.
+**Approach:** Slice 0 (temporary LLM rerank) **shipped on main** via `plans/retrieve-rerank-llm.md` / PR #118. Later slices attach to the same retrieve hook, extract CLI, and drain path. `balanced` copies today’s RetrieveConfig levers; `conservative` / `tokenmax` only change window size and neighbor width relative to that copy — exact integers stay implementer headroom. #15, multi-granularity chunking, Neo4j node embeddings, and SQL graph-arm revival stay out.
 **Spec link:** `specs/retrieve-graph-quality.md`
-**Tracker:** **local markdown fallback** — a PR / cloud agent **must not** assume GitHub issues are readable (`gh issue view` may fail). SSOT for bullets is this file; operator index: `docs/handoff/wayfinder-tickets/retrieve-graph-quality.md`. Spec: `specs/retrieve-graph-quality.md`. Optional GitHub numbers (T1–T11 ≈ #106–#116, map #103) are hints only — never required to start a slice.
+**Tracker:** **local markdown only** — do not use GitHub issues (`gh issue view` / `gh issue create` may fail or be invisible to a PR remote). SSOT for bullets is this file; operator index: `docs/handoff/wayfinder-tickets/retrieve-graph-quality.md`. Spec: `specs/retrieve-graph-quality.md`.
 **ACR:** all-yes (copied from spec)
 **Per-ticket loop (all bullets):** tdd → typecheck+tests → code-review → verification-before-completion → one commit on the ticket branch
+
+## Baseline on main (2026-08-29) — do not re-implement
+
+| Capability                                | Evidence                                               |
+| ----------------------------------------- | ------------------------------------------------------ |
+| P0 wiring (extract / merge / G1–G8)       | PR #54                                                 |
+| BM25 + SQL graph arm archived             | PR #68                                                 |
+| Neo4j projection outbox + PPR graph arm   | PR #77                                                 |
+| Host T-007 smoke + P@5 harness            | PR #81 / #87                                           |
+| Graph-priority Host ranking + eval armSet | PR #94 · `plans/retrieve-graph-priority.md` **closed** |
+| Temporary LLM rerank (slice 0 / T1)       | PR #118 · `plans/retrieve-rerank-llm.md` **closed**    |
+| Quality stack contract + this plan        | PR #117 · `specs/retrieve-graph-quality.md`            |
+
+**Current starting point:** graph-priority + temporary LLM rerank (default off) are on `main`. Next work is **T2–T11** below.
 
 ## ACR
 
@@ -13,13 +27,13 @@ bounded-context-guardian: yes — retrieval / extraction / projection stay capab
 defensive-contract-validator: yes — Testing Strategy names empty / negative / overflow / concurrent / exception for the stack; each slice adds tests before code (writing-plans).
 error-handling-enforcer: yes — skip vs fail-open vs `ConfigError` named per slice; embed hard-fail unchanged; EXIT on skip/fail-open.
 complexity-anti-drift: yes — each slice is a helper on the existing assembler or extract/drain CLI, not a god-file rewrite.
-minimal-change-verifier: yes **for this spec as one contract**; implementation **must** be one logical task per tracer bullet (writing-plans). Do not land slices 0–10 in one commit.
+minimal-change-verifier: yes **for this spec as one contract**; implementation **must** be one logical task per tracer bullet (writing-plans). Do not land remaining slices in one commit.
 
 ## Tasks (ordered by dependency)
 
 1. **Temporary LLM rerank (slice 0)** — tag: `[implementation]`
    - **Inherits:** `specs/retrieve-rerank-llm.md` SC1–SC6; spec slice 0; default off; skip without `degraded` when creds absent; LLM throw fail-open + `degraded`; not Host chat model.
-   - **Surface:** `RetrieveConfig` / retrieve orchestrator; extract Anthropic adapter (same trio). Follow `plans/retrieve-rerank-llm.md` T2–T3; do not re-open dedicated HTTP here.
+   - **Surface:** `RetrieveConfig` / retrieve orchestrator; extract Anthropic adapter. Follow `plans/retrieve-rerank-llm.md` (closed).
    - **Acceptance:** those SC pass; `npm test` and `npm run build` exit 0 without live Anthropic; envelope still `{ chunks[] }` (+ optional `degraded`).
    - Status: [x] done (#118 MERGED 2026-08-28)
    - [blocks: none]
@@ -94,10 +108,17 @@ minimal-change-verifier: yes **for this spec as one contract**; implementation *
     - Status: [ ] pending
     - [blocks: T3]
 
+## Frontier (start here)
+
+1. **T2** dedicated HTTP rerank — preferred next product knife (replaces temporary adapter on the same hook).
+2. **T3 / T4 / T5** may run in parallel with each other (and with T2) — projection GC, self-loop reject, `merged_into` persist.
+
+Claim a bullet by flipping **Status** on the feature branch. Do not open or edit GitHub issues for tracking.
+
 ## 待写入 (persist)
 
 (none — CONTEXT flush already landed with the spec)
 
 ## End of round
 
-After T1–T11 land: code-review (Standards + Spec) on the full impl diff vs this plan, then verification-before-completion. Do not mix #15 extraction F1 into these commits.
+After T2–T11 land: code-review (Standards + Spec) on the full impl diff vs this plan, then verification-before-completion. Do not mix #15 extraction F1 into these commits.

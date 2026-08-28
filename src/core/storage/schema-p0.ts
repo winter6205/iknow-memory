@@ -80,8 +80,15 @@ async function createTriples(client: PoolClient): Promise<void> {
       confidence      real NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
       source_chunk_id uuid REFERENCES chunks(id) ON DELETE SET NULL,
       valid_window    tstzrange NOT NULL,
+      superseded_by   uuid REFERENCES triples(id) ON DELETE SET NULL,
       created_at      timestamptz NOT NULL DEFAULT now()
     )`);
+  // Keep existing P0 installations forward-compatible with the supersession
+  // ledger column; CREATE TABLE IF NOT EXISTS does not alter an old table.
+  await client.query(`
+    ALTER TABLE triples
+      ADD COLUMN IF NOT EXISTS superseded_by uuid
+      REFERENCES triples(id) ON DELETE SET NULL`);
   await client.query(`
     CREATE INDEX IF NOT EXISTS triples_valid_window_idx
       ON triples USING gist (valid_window)`);

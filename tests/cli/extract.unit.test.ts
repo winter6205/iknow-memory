@@ -977,6 +977,15 @@ describe("relation_norm is cascade-vetted before upsert (A10 / SC8)", () => {
     ]);
   });
 
+  it("persists typed causal relation_norm values", async () => {
+    const client = await runOneRelation({
+      relationRaw: "prevented",
+      relationNorm: "PREVENTED",
+    });
+
+    expect(upsertedRelations(client)).toEqual([["prevented", "prevented"]]);
+  });
+
   it("relation_raw is stored exactly as received (#3 D3 audit fidelity)", async () => {
     const client = await runOneRelation({
       relationRaw: "  Works At  ",

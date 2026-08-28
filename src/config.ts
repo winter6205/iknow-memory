@@ -10,7 +10,13 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import type { RetrieveConfig } from "./core/retrieval/types.js";
+import {
+  DEFAULT_RETRIEVE_PRESET,
+  RETRIEVE_PRESET_BUNDLES,
+  isRetrievePreset,
+  type RetrieveConfig,
+  type RetrievePreset,
+} from "./core/retrieval/types.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -236,6 +242,7 @@ const RETRIEVAL_BM25_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED";
 const RETRIEVAL_GRAPH_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED";
 const RETRIEVAL_RERANK_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED";
 const RETRIEVAL_RERANK_URL_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL";
+const RETRIEVAL_PRESET_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_PRESET";
 const LLM_AUTH_TOKEN_VAR = "ANTHROPIC_AUTH_TOKEN";
 const ANTHROPIC_MODEL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_MODEL";
 const ANTHROPIC_BASE_URL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL";
@@ -314,26 +321,36 @@ function parseBoolean(
 /**
  * Load + validate the GRAPHRAG_MEMORY_RETRIEVAL_* family into a RetrieveConfig.
  *
- * Defaults: w_vec=0.7, w_bm25=0.15, w_graph=0.15, both partner arms enabled
- * — the three-arm production hybrid locked by #69/#70. `w_graph` steers
- * production again: it now weights the Neo4j graph arm, not the archived
- * SQL one-hop arm (#58), which still only runs for a caller that injects a
- * `graphConfig` itself. entityLinkTopK, candidateCap and graphArmFloor keep
- * their P0 defaults.
+ * The mode bundle defaults to balanced. Its values are the baseline for
+ * weights, seed width, candidate window, and neighbor evidence; explicit
+ * environment knobs still override the bundle's numeric values. `w_graph`
+ * still weights the Neo4j graph arm, not the archived SQL one-hop arm.
  *
  * Enforces the spec §Boundaries: finite positive weights; entityLinkTopK > 0;
  * candidateCap >= entityLinkTopK; graphArmFloor > 0.
  */
+function parseRetrievePreset(raw: string | undefined): RetrievePreset {
+  const value = raw?.trim() || DEFAULT_RETRIEVE_PRESET;
+  if (!isRetrievePreset(value)) {
+    throw new ConfigError(
+      `${RETRIEVAL_PRESET_VAR} must be one of ${Object.keys(RETRIEVE_PRESET_BUNDLES).join(" | ")}, got "${raw}"`
+    );
+  }
+  return value;
+}
+
 function parseRetrievalConfig(): RetrieveConfig {
+  const preset = parseRetrievePreset(readEnv(RETRIEVAL_PRESET_VAR));
+  const bundle = RETRIEVE_PRESET_BUNDLES[preset];
   const entityLinkTopK = parsePositiveInt(
     RETRIEVAL_ENTITY_LINK_TOP_K_VAR,
     readEnv(RETRIEVAL_ENTITY_LINK_TOP_K_VAR),
-    { min: 1, fallback: 8 }
+    { min: 1, fallback: bundle.entityLinkTopK }
   );
   const candidateCap = parsePositiveInt(
     RETRIEVAL_CANDIDATE_CAP_VAR,
     readEnv(RETRIEVAL_CANDIDATE_CAP_VAR),
-    { min: 1, fallback: 50 }
+    { min: 1, fallback: bundle.candidateCap }
   );
   if (candidateCap < entityLinkTopK) {
     throw new ConfigError(
@@ -341,15 +358,16 @@ function parseRetrievalConfig(): RetrieveConfig {
     );
   }
   return {
+    preset,
     w_vec: parseFinitePositive(
       RETRIEVAL_W_VEC_VAR,
       readEnv(RETRIEVAL_W_VEC_VAR),
-      0.7
+      bundle.w_vec
     ),
     w_bm25: parseFinitePositive(
       RETRIEVAL_W_BM25_VAR,
       readEnv(RETRIEVAL_W_BM25_VAR),
-      0.15
+      bundle.w_bm25
     ),
     w_graph: parseFinitePositive(
       RETRIEVAL_W_GRAPH_VAR,
@@ -373,6 +391,7 @@ function parseRetrievalConfig(): RetrieveConfig {
     ),
     entityLinkTopK,
     candidateCap,
+    neighborWidth: bundle.neighborWidth,
     graphArmFloor: parsePositiveInt(
       RETRIEVAL_GRAPH_ARM_FLOOR_VAR,
       readEnv(RETRIEVAL_GRAPH_ARM_FLOOR_VAR),

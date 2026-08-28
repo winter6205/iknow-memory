@@ -20,8 +20,16 @@ import type { EmbeddingClient } from "../core/embedder.js";
 import type { SearchOptions, StorageBackend } from "../core/types.js";
 import type {
   ChunkReranker,
+  RetrievePreset,
   GraphRanker,
   RetrieveConfig,
+} from "../core/retrieval/types.js";
+import {
+  DEFAULT_RETRIEVE_PRESET,
+  RETRIEVE_PRESETS,
+  RETRIEVE_PRESET_BUNDLES,
+  RetrieveConfigError,
+  isRetrievePreset,
 } from "../core/retrieval/types.js";
 import { assembleRetrievalResult } from "../core/retrieval/index.js";
 
@@ -32,6 +40,7 @@ export const RetrieveInputSchema = z.object({
   valid_at: z.string().datetime().optional(),
   filters: z.record(z.string(), z.string()).optional(),
   limit: z.number().int().min(1).max(100).optional(),
+  preset: z.enum(RETRIEVE_PRESETS).optional(),
 });
 
 export type RetrieveInput = z.infer<typeof RetrieveInputSchema>;
@@ -72,6 +81,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
   return async function retrieveHandler(
     input: RetrieveInput
   ): Promise<ToolResult> {
+    const retrieveConfig = applyPreset(deps.retrieveConfig, input.preset);
     // Default valid_at to "now" so time-bounded filtering always has a
     // concrete reference point. Pass through exact-match filters.
     const opts: SearchOptions = {
@@ -90,7 +100,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
       {
         embedder: deps.embedder,
         storage: deps.storage,
-        retrieveConfig: deps.retrieveConfig,
+        retrieveConfig,
         graphConfig: deps.graphConfig,
         graphRanker: deps.graphRanker,
         reranker: deps.reranker,
@@ -99,6 +109,39 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     );
 
     return textResult(JSON.stringify(envelope));
+  };
+}
+
+/**
+ * Apply an input preset without mutating the startup config. Input selection
+ * wins over startup selection for bundle-owned levers; arm switches, rerank
+ * enablement, and graph floor remain operator configuration.
+ */
+function applyPreset(
+  configured: RetrieveConfig | undefined,
+  requested: RetrievePreset | undefined
+): RetrieveConfig | undefined {
+  if (requested === undefined) return configured;
+  if (!isRetrievePreset(requested)) {
+    throw new RetrieveConfigError(
+      `retrieve preset must be one of ${RETRIEVE_PRESETS.join(" | ")}, got "${requested}"`
+    );
+  }
+
+  const bundle = RETRIEVE_PRESET_BUNDLES[requested];
+  const base: RetrieveConfig = configured ?? {
+    ...bundle,
+    preset: DEFAULT_RETRIEVE_PRESET,
+    w_graph: 0.15,
+    bm25Enabled: true,
+    graphEnabled: true,
+    rerankEnabled: false,
+    graphArmFloor: 3,
+  };
+  return {
+    ...base,
+    ...bundle,
+    preset: requested,
   };
 }
 

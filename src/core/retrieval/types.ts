@@ -20,6 +20,61 @@
  */
 export type ArmName = "vector" | "bm25" | "graph";
 
+/** Named retrieval mode bundles exposed by the retrieve tool. */
+export type RetrievePreset = "conservative" | "balanced" | "tokenmax";
+
+export const RETRIEVE_PRESETS = [
+  "conservative",
+  "balanced",
+  "tokenmax",
+] as const satisfies readonly RetrievePreset[];
+
+export const DEFAULT_RETRIEVE_PRESET: RetrievePreset = "balanced";
+
+/** The recall and evidence levers owned by a mode bundle. */
+export interface RetrievePresetBundle {
+  entityLinkTopK: number;
+  candidateCap: number;
+  w_vec: number;
+  w_bm25: number;
+  neighborWidth: number;
+}
+
+/**
+ * Preset values are immutable so concurrent retrieve calls cannot share a
+ * mutable ranking configuration. Conservative and tokenmax deliberately
+ * bracket the balanced defaults without changing the wire envelope.
+ */
+export const RETRIEVE_PRESET_BUNDLES: Readonly<
+  Record<RetrievePreset, RetrievePresetBundle>
+> = {
+  conservative: {
+    entityLinkTopK: 4,
+    candidateCap: 25,
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    neighborWidth: 0,
+  },
+  balanced: {
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    neighborWidth: 1,
+  },
+  tokenmax: {
+    entityLinkTopK: 16,
+    candidateCap: 100,
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    neighborWidth: 2,
+  },
+};
+
+export function isRetrievePreset(value: string): value is RetrievePreset {
+  return (RETRIEVE_PRESETS as readonly string[]).includes(value);
+}
+
 /** A single hit produced by one retrieval arm. */
 export interface ArmHit {
   /** Chunk id (UUID string); the RRF fuse key. */
@@ -71,6 +126,8 @@ export interface FusedHit {
 
 /** Configuration for the retrieval pipeline (loaded from env, see src/config.ts). */
 export interface RetrieveConfig {
+  /** Named mode bundle selected at startup; defaults to balanced. */
+  preset: RetrievePreset;
   /** Weight for the vector arm in RRF. */
   w_vec: number;
   /** Weight for the BM25 lexical arm in RRF. */
@@ -95,6 +152,8 @@ export interface RetrieveConfig {
   entityLinkTopK: number;
   /** Hard cap on total candidates pulled from the graph arm. */
   candidateCap: number;
+  /** Number of same-source neighboring chunks enabled by the bundle. */
+  neighborWidth: number;
   /** Minimum number of graph-arm hits before degraded flips to false. */
   graphArmFloor: number;
 }

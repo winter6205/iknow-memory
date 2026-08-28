@@ -11,6 +11,7 @@
 export type { StorageBackend, SearchOptions } from "../types.js";
 export type {
   GraphArmStorage,
+  EntityEmbeddingStorage,
   NeighborChunkStorage,
   Neo4jArmStorage,
 } from "../retrieval/types.js";
@@ -21,6 +22,7 @@ import type {
 } from "../types.js";
 import type {
   GraphArmStorage,
+  EntityEmbeddingStorage,
   NeighborChunkStorage,
   Neo4jArmStorage,
 } from "../retrieval/types.js";
@@ -37,6 +39,8 @@ import type {
  */
 export interface GraphRagStorageBackend extends StorageBackend {
   graphArmSeed?: GraphArmStorage;
+  /** Optional Postgres entity-embedding seed/score read path. */
+  entityEmbedding?: EntityEmbeddingStorage;
   neo4jArmSeed?: Neo4jArmStorage;
 }
 
@@ -54,6 +58,21 @@ export function supportsNeo4jArm(
   storage: StorageBackend
 ): storage is Neo4jArmBackend {
   const seam = (storage as Partial<Neo4jArmBackend>).neo4jArmSeed;
+  return (
+    typeof seam?.seedEntitiesByEmbedding === "function" &&
+    typeof seam.chunksByEntityIds === "function"
+  );
+}
+
+/** Runtime narrowing for the optional Postgres entity-embedding path. */
+export function supportsEntityEmbedding(
+  storage: StorageBackend
+): storage is StorageBackend & { entityEmbedding: EntityEmbeddingStorage } {
+  const seam = (
+    storage as Partial<{
+      entityEmbedding: EntityEmbeddingStorage;
+    }>
+  ).entityEmbedding;
   return (
     typeof seam?.seedEntitiesByEmbedding === "function" &&
     typeof seam.chunksByEntityIds === "function"

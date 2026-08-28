@@ -33,6 +33,7 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_NODE_EMBEDDING_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
   "GRAPHRAG_MEMORY_RETRIEVAL_PRESET",
@@ -818,6 +819,21 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
       expect(retrieval.bm25Enabled).toBe(true);
       expect(retrieval.graphEnabled).toBe(true);
     });
+  });
+
+  it("keeps direct node-embedding retrieval off by default", () => {
+    withRetrievalEnv({}, () => {
+      expect(loadEnv().retrieval.nodeEmbeddingEnabled).toBe(false);
+    });
+  });
+
+  it("enables direct node-embedding retrieval explicitly", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_NODE_EMBEDDING_ENABLED: "true" },
+      () => {
+        expect(loadEnv().retrieval.nodeEmbeddingEnabled).toBe(true);
+      }
+    );
   });
 
   it("defaults rerank enable to false on a fresh env", () => {

@@ -19,7 +19,7 @@
  * other suites use.
  *
  * Keyless real-run refusal (CR High #1): T6's `buildLlm()` throws
- * ConfigError for a real extraction when GRAPHRAG_MEMORY_ANTHROPIC_API_KEY is
+ * ConfigError for a real extraction when ANTHROPIC_AUTH_TOKEN is
  * unset; the `FakeLLMClient` (scripted ok) is only reachable behind `--dry-run`
  * / `--list-unmapped` or via direct `runCli` injection. There is no env hook
  * (e.g. no GRAPHRAG_MEMORY_TEST_FAKE_OUTPUTS) to inject a custom queue or a
@@ -195,7 +195,7 @@ describe("extract CLI subprocess e2e (T9)", () => {
 
   // -----------------------------------------------------------------
   // Scenario 2 (Success Criterion #5 — refusal half): a *real* extraction
-  // without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY must refuse to run, exit 1,
+  // without ANTHROPIC_AUTH_TOKEN must refuse to run, exit 1,
   // surface a typed ConfigError on stderr, and write ZERO rows (the canned
   // FakeLLMClient must NOT silently auto-fill the write path — CR High #1).
   //
@@ -213,7 +213,7 @@ describe("extract CLI subprocess e2e (T9)", () => {
     const result = await runCliSubprocess(["--batch-size", "1"]);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain(
-      "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY"
+      "refusing to run real extraction without ANTHROPIC_AUTH_TOKEN"
     );
     expect(result.stderr).toContain("extract config error");
     // Zero rows: the canned fake MUST NOT reach the write path.
@@ -389,7 +389,7 @@ describe("extract CLI subprocess e2e (T9)", () => {
     const result = await runCliSubprocess([]);
     expect(result.code).toBe(1);
     expect(result.stderr).toContain(
-      "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY"
+      "refusing to run real extraction without ANTHROPIC_AUTH_TOKEN"
     );
   });
 });

@@ -57,6 +57,9 @@ const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "GRAPHRAG_MEMORY_DB_URL",
   "GRAPHRAG_MEMORY_EMBED_API_KEY",
   "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
+  "GRAPHRAG_MEMORY_VECTOR_API_KEY",
+  "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
   "NINE_ROUTER_KEY",
   // A parent Neo4j URI would make the child attempt the production graph
   // arm; this suite pins the Host-acceptance skip path (no URI → no

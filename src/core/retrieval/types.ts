@@ -86,6 +86,11 @@ export interface RetrieveConfig {
    * separate, equally non-degrading reason to skip the arm.
    */
   graphEnabled: boolean;
+  /**
+   * Temporary LLM rerank after Host ranking. Default off. On without the
+   * Anthropic trio is a skip at the orchestrator (T3), not `degraded`.
+   */
+  rerankEnabled: boolean;
   /** Top-K seed entities from the embedding seed query. */
   entityLinkTopK: number;
   /** Hard cap on total candidates pulled from the graph arm. */
@@ -121,6 +126,25 @@ export interface GraphRanker {
     seedEntityIds: readonly string[],
     limit: number
   ): Promise<RankedEntity[]>;
+}
+
+/**
+ * Port: optional post-ranking permutation of retrieve candidates.
+ *
+ * Declared here the same way `GraphRanker` is: retrieval owns the shape,
+ * the Anthropic adapter lives outside this folder so `src/index.ts` can
+ * construct it without importing `src/core/retrieval/*`.
+ */
+export interface RerankCandidate {
+  id: string;
+  content: string;
+}
+
+export interface ChunkReranker {
+  permute(
+    query: string,
+    candidates: readonly RerankCandidate[]
+  ): Promise<readonly string[]>;
 }
 
 /**

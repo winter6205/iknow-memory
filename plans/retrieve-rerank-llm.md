@@ -18,24 +18,24 @@ minimal-change-verifier: yes — one logical task (temporary LLM rerank); not mi
 ## Tasks (ordered by dependency)
 
 1. **Record temporary main-model rerank** — tag: `[decision]`
-   - **Inherits:** spec: extract Anthropic trio is the temporary reranker; not Host; not cross-encoder this slice; default off; fail-open on LLM failure; skip without `degraded` when enable-on but creds absent.
+   - **Inherits:** spec: `ANTHROPIC_AUTH_TOKEN` plus the defaulted model/base URL is the temporary reranker; not Host; not cross-encoder this slice; default off; fail-open on LLM failure; skip without `degraded` when enable-on but the token is absent.
    - **Surface:** `docs/CONTEXT.md` **rerank** (persist already flushed this turn); this plan file.
    - **Acceptance:** CONTEXT **rerank** states the temporary adapter, default off, fail-open, and that a dedicated rerank transport is later; commit may be docs-only.
    - Status: [x] done (CONTEXT flush 2026-08-27)
    - [blocks: none]
 
 2. **Rerank enable gate in retrieve config** — tag: `[implementation]`
-   - **Inherits:** spec SC1–SC2: off → no LLM; on without Anthropic trio → skip, not `degraded`.
-   - **Surface:** existing `RetrieveConfig` / `src/config.ts` env load (same family as other `GRAPHRAG_MEMORY_RETRIEVAL_*` flags). Anthropic trio already used by extract CLI — reuse, do not invent a second product key.
-   - **Acceptance:** config tests: default enable is false; enable true with missing key/model/base URL is a skip (server still starts); invalid enable flag is `ConfigError` if the project already treats retrieval booleans that way.
-   - Status: [ ] pending
+   - **Inherits:** spec SC1–SC2: off → no LLM; on without `ANTHROPIC_AUTH_TOKEN` → skip, not `degraded`.
+   - **Surface:** existing `RetrieveConfig` / `src/config.ts` env load (same family as other `GRAPHRAG_MEMORY_RETRIEVAL_*` flags). The extract CLI's `ANTHROPIC_AUTH_TOKEN` plus model/base defaults are reused; do not invent a second LLM key.
+   - **Acceptance:** config tests: default enable is false; enable true with missing `ANTHROPIC_AUTH_TOKEN` is a skip (server still starts); model / base URL may be unset because they default to MiniMax-M3 / `https://api.minimaxi.com/anthropic`; invalid enable flag is `ConfigError` if the project already treats retrieval booleans that way.
+   - Status: [x] done
    - [blocks: T1]
 
 3. **LLM permutation on retrieve candidates** — tag: `[implementation]`
    - **Inherits:** spec SC3–SC6: valid permutation applied then `limit`; throw/garbage → original order + `degraded`; envelope unchanged; tests without live Anthropic.
-   - **Surface:** `src/core/retrieval` orchestrator (`assembleRetrievalResult`); extract `LLMClient` or a sibling port — implementer chooses, must not import Host.
+   - **Surface:** `src/core/retrieval` orchestrator (`assembleRetrievalResult`); retrieval declares `ChunkReranker` in `src/core/retrieval/types.ts` (same pattern as `GraphRanker`). The Anthropic adapter lives in `src/core/rerank/anthropic-reranker.ts` so `src/index.ts` does not import `src/core/retrieval/*`. Do not modify `src/core/extraction/llm-client.ts`.
    - **Acceptance:** fake LLM reorder is visible on `{ chunks[] }`; empty/negative limit paths do not call LLM; overflow only sends prefix W; two concurrent retrieves do not scramble each other’s order; `npm test` and `npm run build` exit 0.
-   - Status: [ ] pending
+   - Status: [x] done
    - [blocks: T2]
 
 ## 待写入 (persist)

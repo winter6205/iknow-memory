@@ -372,6 +372,8 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25",
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_NODE_EMBEDDING_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_PRESET",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
@@ -421,6 +423,7 @@ describe("retrieve config boundary validation (T5)", () => {
         w_graph: 0.15,
         bm25Enabled: true,
         graphEnabled: true,
+        nodeEmbeddingEnabled: false,
         rerankEnabled: false,
         preset: "balanced",
         // Seed / traversal knobs keep their P0 values.

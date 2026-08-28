@@ -27,6 +27,7 @@ import type {
 } from "./backend.js";
 import type {
   EntityChunkRow,
+  EntityEmbeddingStorage,
   GraphArmStorage,
   NeighborChunkRow,
   NeighborChunkStorage,
@@ -68,7 +69,7 @@ function toVectorLiteral(embedding: number[]): string {
  * `merged_into IS NULL AND retired = false`, ordered by cosine distance.
  */
 const SEED_ENTITIES_SQL =
-  "SELECT id, canonical_name FROM entities " +
+  "SELECT id, canonical_name, 1 - (embedding <=> $1::vector) AS score FROM entities " +
   "WHERE embedding IS NOT NULL AND merged_into IS NULL AND retired = false " +
   "ORDER BY embedding <=> $1::vector LIMIT $2";
 
@@ -620,8 +621,16 @@ export class PgvectorBackend
           topK,
         ]);
         return result.rows.map((r) => {
-          const row = r as { id: string; canonical_name: string };
-          return { id: row.id, canonical_name: row.canonical_name };
+          const row = r as {
+            id: string;
+            canonical_name: string;
+            score: number;
+          };
+          return {
+            id: row.id,
+            canonical_name: row.canonical_name,
+            score: row.score,
+          };
         });
       } catch (err) {
         throw new GraphragError(
@@ -720,5 +729,16 @@ export class PgvectorBackend
         );
       }
     },
+  };
+
+  /**
+   * Direct entity-embedding read seam for retrieve. It deliberately reuses
+   * the Postgres half of the Neo4j arm; no entity vector is copied to Neo4j.
+   */
+  readonly entityEmbedding: EntityEmbeddingStorage = {
+    seedEntitiesByEmbedding: (embedding, topK) =>
+      this.neo4jArmSeed.seedEntitiesByEmbedding(embedding, topK),
+    chunksByEntityIds: (entityIds, validAt, limit) =>
+      this.neo4jArmSeed.chunksByEntityIds(entityIds, validAt, limit),
   };
 }

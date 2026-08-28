@@ -1,33 +1,33 @@
 # Local tickets — retrieve and graph quality stack
 
-GitHub issues **are not the SSOT** for a PR remote (cannot rely on `gh issue view`). Execute from files:
+**GitHub issues are not the tracker.** Execute from files only:
 
-| Artifact                         | Path                                                           |
-| -------------------------------- | -------------------------------------------------------------- |
-| Spec                             | `specs/retrieve-graph-quality.md`                              |
-| Plan (tracer bullets + blocking) | `plans/retrieve-graph-quality.md`                              |
-| Slice 0 extra plan               | `plans/retrieve-rerank-llm.md`                                 |
-| Glossary                         | `docs/CONTEXT.md`                                              |
-| Map index                        | `docs/handoff/wayfinder-tickets/map-retrieve-graph-quality.md` |
+| Artifact             | Path                                                           |
+| -------------------- | -------------------------------------------------------------- |
+| Spec                 | `specs/retrieve-graph-quality.md`                              |
+| Plan (SSOT + Status) | `plans/retrieve-graph-quality.md`                              |
+| Slice 0 (closed)     | `plans/retrieve-rerank-llm.md`                                 |
+| Glossary             | `docs/CONTEXT.md`                                              |
+| Map index            | `docs/handoff/wayfinder-tickets/map-retrieve-graph-quality.md` |
 
-Claim a bullet by marking **Status** in `plans/retrieve-graph-quality.md` on the feature branch. Do not wait on tracker assignee.
+Claim a bullet by marking **Status** in `plans/retrieve-graph-quality.md` on the feature branch.
 
 ## Bullets
 
-| Id  | Tag                | Outcome                                               | Blocks   |
-| --- | ------------------ | ----------------------------------------------------- | -------- |
-| T1  | `[implementation]` | Temporary LLM rerank (`retrieve-rerank-llm` T2–T3)    | —        |
-| T2  | `[implementation]` | Dedicated rerank HTTP on the same hook                | T1       |
-| T3  | `[implementation]` | Projection GC on drain                                | parallel |
-| T4  | `[implementation]` | Self-loop extract reject                              | parallel |
-| T5  | `[implementation]` | Persist `merged_into`                                 | parallel |
-| T6  | `[implementation]` | Mode bundles `conservative` / `balanced` / `tokenmax` | T1       |
-| T7  | `[implementation]` | Neighbor chunk evidence                               | T6       |
-| T8  | `[implementation]` | Node embedding seeds from Postgres                    | T1       |
-| T9  | `[implementation]` | Community summaries for topic retrieve                | T6       |
-| T10 | `[implementation]` | Causal vocab + supersession CLI                       | T5       |
-| T11 | `[implementation]` | Optional retrieve wait-for-drain                      | T3       |
+| Id  | Tag                | Outcome                                | Status          | Blocks   |
+| --- | ------------------ | -------------------------------------- | --------------- | -------- |
+| T1  | `[implementation]` | Temporary LLM rerank                   | **done** (#118) | —        |
+| T2  | `[implementation]` | Dedicated rerank HTTP on the same hook | pending         | T1       |
+| T3  | `[implementation]` | Projection GC on drain                 | pending         | parallel |
+| T4  | `[implementation]` | Self-loop extract reject               | pending         | parallel |
+| T5  | `[implementation]` | Persist `merged_into`                  | pending         | parallel |
+| T6  | `[implementation]` | Mode bundles                           | pending         | T1       |
+| T7  | `[implementation]` | Neighbor chunk evidence                | pending         | T6       |
+| T8  | `[implementation]` | Node embedding seeds from Postgres     | pending         | T1       |
+| T9  | `[implementation]` | Community summaries for topic retrieve | pending         | T6       |
+| T10 | `[implementation]` | Causal vocab + supersession CLI        | pending         | T5       |
+| T11 | `[implementation]` | Optional retrieve wait-for-drain       | pending         | T3       |
 
-Frontier: **T1**, plus **T3 / T4 / T5** in parallel.
+**Frontier:** **T2**（首选），或并行 **T3 / T4 / T5**。
 
-Inherits / Surface / Acceptance: read the matching numbered item in `plans/retrieve-graph-quality.md`. Do not invent a second copy here.
+Inherits / Surface / Acceptance: only in `plans/retrieve-graph-quality.md` — do not duplicate here.

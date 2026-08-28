@@ -51,6 +51,7 @@ import type {
   FusedHit,
   GraphArmStorage,
   GraphRanker,
+  NeighborChunkRow,
   RetrieveConfig,
   RetrieveOutputEnvelope,
 } from "./types.js";
@@ -322,7 +323,7 @@ async function expandNeighborEvidence(
         id: row.id,
         content: row.content,
         source_ref: row.source_ref,
-        valid_window: [row.valid_from, row.valid_until],
+        valid_window: normalizeNeighborWindow(row),
         rrfScore: 0,
         arms: [],
       });
@@ -332,8 +333,17 @@ async function expandNeighborEvidence(
       degraded: undefined,
     };
   } catch {
+    // EXIT: fail-open — 保留已排名结果，并通过 degraded:true 告知调用方
     return { hits: [...hits], degraded: true };
   }
+}
+
+function normalizeNeighborWindow(
+  row: NeighborChunkRow | RetrievedChunk
+): [string, string | null] {
+  return "valid_window" in row
+    ? row.valid_window
+    : [row.valid_from, row.valid_until];
 }
 
 /** Enable-on without a wired adapter is a skip, not degraded. */

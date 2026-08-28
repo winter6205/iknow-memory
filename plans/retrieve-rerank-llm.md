@@ -44,4 +44,4 @@ minimal-change-verifier: yes — one logical task (temporary LLM rerank); not mi
 
 ## End of round
 
-After T2–T3 land: code-review (Standards + Spec) on the impl diff, then verification-before-completion. Graph-priority ranking (`specs/retrieve-graph-priority.md`) is a **separate** plan; do not mix into these commits.
+**CLOSED on main** (PR #118). Dedicated HTTP rerank is quality **T2** in `plans/retrieve-graph-quality.md` — do not reopen this plan for that work.

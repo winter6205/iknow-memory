@@ -74,8 +74,8 @@ import { GraphragError } from "../errors.js";
  * two arms actually agree on a chunk, and agreement is the signal RRF
  * exists to reward. Only the FUSED list is cut to `limit`.
  *
- * 50 matches `candidateCap`'s default order of magnitude without
- * borrowing that knob, which belongs to the archived graph arm.
+ * The mode bundle's `candidateCap` controls this pool when a configured arm
+ * is active; this fallback keeps legacy callers at the balanced width.
  */
 const ARM_CANDIDATE_POOL = 50;
 
@@ -155,13 +155,13 @@ export async function assembleRetrievalResult(
     reranker !== undefined && deps.retrieveConfig !== undefined
       ? rerankWindowSize(args.limit, deps.retrieveConfig.candidateCap)
       : undefined;
+  const candidatePool =
+    fusing && weights !== undefined && weights.preset !== undefined
+      ? weights.candidateCap
+      : ARM_CANDIDATE_POOL;
 
   const searchOpts = {
-    limit: Math.max(
-      args.limit,
-      fusing ? ARM_CANDIDATE_POOL : 0,
-      rerankWindow ?? 0
-    ),
+    limit: Math.max(args.limit, candidatePool, rerankWindow ?? 0),
     validAt: args.validAt,
     ...(args.filters !== undefined ? { filters: args.filters } : {}),
   };

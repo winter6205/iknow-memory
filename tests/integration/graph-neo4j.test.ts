@@ -306,6 +306,35 @@ describeGraph("graph-neo4j: idempotent projection into a live graph", () => {
     expect(await intentStatuses()).toEqual({ done: 3 });
   });
 
+  it("garbage-collects a deleted edge and retired node during drain", async () => {
+    await run(`MATCH (e:Entity) WHERE e.id IN $ids DETACH DELETE e`, {
+      ids: [ALICE, ACME],
+    });
+    await pgClient.query(`DELETE FROM projection_outbox`);
+    expect(await backfill()).toBe(0);
+    expect(await fixtureCounts()).toEqual({ nodes: 2, edges: 1 });
+
+    await pgClient.query(`DELETE FROM triples WHERE id = $1`, [TRIPLE]);
+    await pgClient.query(
+      `INSERT INTO projection_outbox (id, subject_kind, subject_id)
+       VALUES ($1, 'triple', $2)`,
+      [randomUUID(), TRIPLE]
+    );
+    expect(await drain()).toBe(0);
+    expect(await fixtureCounts()).toEqual({ nodes: 2, edges: 0 });
+
+    await pgClient.query(`UPDATE entities SET retired = true WHERE id = $1`, [
+      ALICE,
+    ]);
+    await pgClient.query(
+      `INSERT INTO projection_outbox (id, subject_kind, subject_id)
+       VALUES ($1, 'entity', $2)`,
+      [randomUUID(), ALICE]
+    );
+    expect(await drain()).toBe(0);
+    expect(await fixtureCounts()).toEqual({ nodes: 1, edges: 0 });
+  });
+
   async function intentStatuses(): Promise<Record<string, number>> {
     const res = await pgClient.query<{ status: string; count: number }>(
       `SELECT status, count(*)::int AS count

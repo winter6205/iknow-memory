@@ -65,6 +65,8 @@ class RecordingWriter implements GraphWriter {
   async mergeEdges(edges: readonly GraphEdge[]): Promise<void> {
     this.edges.push(...edges);
   }
+  async deleteNodes(_ids: readonly string[]): Promise<void> {}
+  async deleteEdges(_ids: readonly string[]): Promise<void> {}
   async close(): Promise<void> {}
 }
 

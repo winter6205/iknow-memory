@@ -34,12 +34,17 @@ export interface GraphEdge {
   validUntil: string | null;
 }
 
-/** Idempotent write surface: every call MERGEs on the ledger id. */
+/**
+ * Projection write surface. Merge calls are keyed by the ledger id; delete
+ * calls remove stale subjects that no longer have a live ledger row.
+ */
 export interface GraphWriter {
   /** Uniqueness constraints the MERGEs rely on. Idempotent. */
   ensureConstraints(): Promise<void>;
   mergeNodes(nodes: readonly GraphNode[]): Promise<void>;
   mergeEdges(edges: readonly GraphEdge[]): Promise<void>;
+  deleteNodes(ids: readonly string[]): Promise<void>;
+  deleteEdges(ids: readonly string[]): Promise<void>;
   close(): Promise<void>;
 }
 

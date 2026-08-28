@@ -431,6 +431,8 @@ describe("retrieve config boundary validation (T5)", () => {
         candidateCap: 50,
         neighborWidth: 1,
         graphArmFloor: 3,
+        waitForDrainEnabled: false,
+        waitForDrainTimeoutMs: 5000,
       });
     });
   });

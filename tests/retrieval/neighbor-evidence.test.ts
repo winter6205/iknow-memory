@@ -32,6 +32,7 @@ const CHUNKS: ChunkRecord[] = [
 
 class NeighborChunkBackend implements StorageBackend {
   readonly events: string[] = [];
+  neighborError: Error | undefined;
   readonly neighborCalls: Array<{
     ids: readonly string[];
     width: number;
@@ -55,6 +56,7 @@ class NeighborChunkBackend implements StorageBackend {
   ): Promise<RetrievedChunk[]> {
     this.events.push("neighbors");
     this.neighborCalls.push({ ids, width });
+    if (this.neighborError !== undefined) throw this.neighborError;
     const selected = new Set(ids);
     const rows: RetrievedChunk[] = [];
     for (const target of CHUNKS) {
@@ -149,5 +151,20 @@ describe("neighbor chunk evidence", () => {
 
     expect(body.chunks.map((item) => item.id)).toEqual(["middle"]);
     expect(storage.neighborCalls).toEqual([]);
+  });
+
+  it("keeps ranked output and marks degraded when the neighbor read fails", async () => {
+    const storage = new NeighborChunkBackend();
+    storage.neighborError = new Error("postgres unavailable");
+    const handler = createRetrieveHandler({
+      embedder: new FixedEmbedder(),
+      storage,
+      retrieveConfig: CFG,
+    });
+
+    const body = parseBody(await handler({ query: "middle", limit: 3 }));
+
+    expect(body.chunks.map((item) => item.id)).toEqual(["middle"]);
+    expect(body).toHaveProperty("degraded", true);
   });
 });

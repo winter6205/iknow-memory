@@ -3,9 +3,9 @@
  * the graph (ADR-0001: Postgres is the sole system of record, Neo4j is a
  * derived read-only projection fed exclusively by this projection path).
  *
- * Every statement is a MERGE keyed on the ledger id, so re-projecting the same
- * subject updates in place. That is what makes both the T2 backfill and the T3
- * outbox drain re-runnable without a dedup pass.
+ * Every merge statement is keyed on the ledger id, so re-projecting the same
+ * subject updates in place. Deletions are issued only by the T3 drain when a
+ * claimed subject no longer exists in the Postgres ledger.
  */
 import neo4j, { type Driver } from "neo4j-driver";
 
@@ -44,6 +44,14 @@ const MERGE_EDGES = `UNWIND $rows AS row
       edge.valid_from = row.validFrom,
       edge.valid_until = row.validUntil`;
 
+const DELETE_NODES = `UNWIND $ids AS id
+  MATCH (e:Entity {id: id})
+  DETACH DELETE e`;
+
+const DELETE_EDGES = `UNWIND $ids AS id
+  MATCH ()-[edge:RELATION {id: id}]->()
+  DELETE edge`;
+
 class Neo4jGraphWriter implements GraphWriter {
   constructor(
     private readonly driver: Driver,
@@ -62,6 +70,16 @@ class Neo4jGraphWriter implements GraphWriter {
   async mergeEdges(edges: readonly GraphEdge[]): Promise<void> {
     if (edges.length === 0) return;
     await this.write(MERGE_EDGES, { rows: edges });
+  }
+
+  async deleteNodes(ids: readonly string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.write(DELETE_NODES, { ids: [...ids] });
+  }
+
+  async deleteEdges(ids: readonly string[]): Promise<void> {
+    if (ids.length === 0) return;
+    await this.write(DELETE_EDGES, { ids: [...ids] });
   }
 
   async close(): Promise<void> {

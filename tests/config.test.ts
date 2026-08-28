@@ -34,6 +34,7 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
@@ -109,6 +110,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "logLevel",
       "neo4j",
       "rerank",
+      "rerankUrl",
       "retrieval",
       "storage",
     ]);
@@ -774,6 +776,31 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
   it("defaults rerank enable to false on a fresh env", () => {
     withRetrievalEnv({}, () => {
       expect(loadEnv().retrieval.rerankEnabled).toBe(false);
+    });
+  });
+
+  it("leaves the dedicated rerank URL undefined by default", () => {
+    withRetrievalEnv({}, () => {
+      expect(loadEnv().rerankUrl).toBeUndefined();
+    });
+  });
+
+  it("reads and trims the dedicated rerank URL without requiring Anthropic credentials", () => {
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL:
+          "  https://rerank.example.test/v1/  ",
+      },
+      () => {
+        expect(loadEnv().rerankUrl).toBe("https://rerank.example.test/v1/");
+        expect(loadEnv().rerank).toBeUndefined();
+      }
+    );
+  });
+
+  it("treats a blank dedicated rerank URL as absent", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "   " }, () => {
+      expect(loadEnv().rerankUrl).toBeUndefined();
     });
   });
 

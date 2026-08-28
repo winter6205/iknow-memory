@@ -139,6 +139,8 @@ export interface GraphragEnv {
    * MiniMax-M3 when those env vars are unset.
    */
   rerank: RerankConfig | undefined;
+  /** Dedicated HTTP rerank endpoint; undefined means the adapter is skipped. */
+  rerankUrl: string | undefined;
 }
 
 /**
@@ -233,6 +235,7 @@ const RETRIEVAL_W_GRAPH_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH";
 const RETRIEVAL_BM25_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED";
 const RETRIEVAL_GRAPH_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED";
 const RETRIEVAL_RERANK_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED";
+const RETRIEVAL_RERANK_URL_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL";
 const LLM_AUTH_TOKEN_VAR = "ANTHROPIC_AUTH_TOKEN";
 const ANTHROPIC_MODEL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_MODEL";
 const ANTHROPIC_BASE_URL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL";
@@ -521,6 +524,7 @@ export function loadEnv(): GraphragEnv {
   const retrieval = parseRetrievalConfig();
   const neo4j = parseNeo4jConfig();
   const rerank = parseRerankConfig();
+  const rerankUrl = readTrimmed(RETRIEVAL_RERANK_URL_VAR);
 
   return {
     logLevel,
@@ -535,6 +539,7 @@ export function loadEnv(): GraphragEnv {
     retrieval,
     neo4j,
     rerank,
+    rerankUrl,
   };
 }
 

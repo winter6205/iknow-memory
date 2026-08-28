@@ -15,10 +15,10 @@
  * one-hop arm answers to when a caller injects a `graphConfig` explicitly
  * (#58, `docs/runbooks/sql-graph-arm-archived.md`). Only one of the two
  * ever runs in a given call, so one name and one `w_graph` weight cover
- * both — a fourth arm name would fork the weight table for an arm that is
- * off the default path.
+ * both — the optional node-embedding arm has its own name so debug output
+ * can distinguish direct Postgres ranking from Neo4j graph ranking.
  */
-export type ArmName = "vector" | "bm25" | "graph";
+export type ArmName = "vector" | "bm25" | "graph" | "node-embedding";
 
 /** Named retrieval mode bundles exposed by the retrieve tool. */
 export type RetrievePreset = "conservative" | "balanced" | "tokenmax";
@@ -148,6 +148,11 @@ export interface RetrieveConfig {
    * Anthropic trio is a skip at the orchestrator (T3), not `degraded`.
    */
   rerankEnabled: boolean;
+  /**
+   * Optional direct entity-embedding retrieval. Off preserves the T1
+   * graph-priority/RRF path exactly.
+   */
+  nodeEmbeddingEnabled?: boolean;
   /** Top-K seed entities from the embedding seed query. */
   entityLinkTopK: number;
   /** Hard cap on total candidates pulled from the graph arm. */
@@ -247,23 +252,25 @@ export interface NeighborChunkStorage {
 }
 
 /**
- * Postgres side of the Neo4j graph arm: entity seeds in, their chunks out.
+ * Postgres entity-embedding read path: entity seeds in, their chunks out.
  *
- * Shares `seedEntitiesByEmbedding` with the archived SQL arm's seam by
- * shape (spec A7 allows reusing the entity-linking idea), but not the
- * one-hop JOIN — the traversal moved to the graph engine.
+ * The optional score is the cosine similarity calculated by Postgres. A
+ * backend may omit it when it only exposes deterministic seed order.
  */
-export interface Neo4jArmStorage {
+export interface EntityEmbeddingStorage {
   seedEntitiesByEmbedding(
     embedding: number[],
     topK: number
-  ): Promise<Array<{ id: string; canonical_name: string }>>;
+  ): Promise<Array<{ id: string; canonical_name: string; score?: number }>>;
   chunksByEntityIds(
     entityIds: readonly string[],
     validAt: string,
     limit: number
   ): Promise<EntityChunkRow[]>;
 }
+
+/** The Neo4j PPR arm reuses the same Postgres entity read seam. */
+export interface Neo4jArmStorage extends EntityEmbeddingStorage {}
 
 /** Storage seam for the graph arm; implemented optionally by StorageBackend. */
 export interface GraphArmStorage {

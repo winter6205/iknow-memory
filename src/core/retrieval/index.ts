@@ -17,6 +17,8 @@
  *     name and runs only when a caller passes `graphConfig` explicitly and
  *     the Neo4j arm is not active — the default server wiring passes no
  *     `graphConfig` (#58, `docs/runbooks/sql-graph-arm-archived.md`).
+ *   - **node embedding** optionally seeds and scores entities from the
+ *     Postgres ledger, then maps them directly to chunks.
  *
  * Ranking is GRAPH-PRIORITY (`graph-priority.ts`,
  * specs/retrieve-graph-priority.md): the Neo4j arm's own order leads
@@ -41,28 +43,24 @@
  */
 import { assembleGraphPriority } from "./graph-priority.js";
 import { maybeRerank, rerankWindowSize } from "./rerank.js";
-import { runGraphArm, type GraphArmDeps } from "./graph-arm.js";
-import { runNeo4jGraphArm, type Neo4jGraphArmDeps } from "./neo4j-graph-arm.js";
+import {
+  hasOptionalArms,
+  resolveOptionalArms,
+  runOptionalArms,
+  selectRetrievalResults,
+} from "./optional-arms.js";
+import type { OptionalArmResults } from "./optional-arms.js";
 import type {
-  ArmHit,
-  ArmName,
   ArmResult,
   ChunkReranker,
   FusedHit,
-  GraphArmStorage,
   GraphRanker,
   NeighborChunkRow,
   RetrieveConfig,
   RetrieveOutputEnvelope,
 } from "./types.js";
 import type { RetrievedChunk, StorageBackend } from "../types.js";
-import {
-  supportsLexicalSearch,
-  supportsNeighborChunks,
-  supportsNeo4jArm,
-  type GraphRagStorageBackend,
-  type LexicalStorageBackend,
-} from "../storage/backend.js";
+import { supportsNeighborChunks } from "../storage/backend.js";
 import type { EmbeddingClient } from "../embedder.js";
 import { GraphragError } from "../errors.js";
 
@@ -138,20 +136,11 @@ export async function assembleRetrievalResult(
   // starts.
   const queryEmbedding = await embedQuery(deps.embedder, args.query);
 
-  // Fusion WEIGHTS may fall back: a legacy graph-arm caller passes only
-  // `graphConfig`, production passes only `retrieveConfig`, and RRF needs
-  // weights either way. The BM25 GATE must NOT fall back — `getLexicalArm`
-  // reads `deps.retrieveConfig` alone, so injecting the archived graph arm
-  // can never switch the lexical arm on behind the operator's back.
+  // Fusion weights may fall back to the archived graph config. Optional-arm
+  // gates themselves remain owned by their production/archived configs.
   const weights = deps.retrieveConfig ?? deps.graphConfig;
-  const lexical = getLexicalArm(deps);
-  const neo4jGraph = getNeo4jGraphArm(deps);
-  // At most ONE graph arm per call: both answer to the arm name "graph",
-  // so running the pair would double-weight the same chunk and collide in
-  // the debug payload. Production wins over the archive.
-  const graph = neo4jGraph === undefined ? getGraphSeed(deps) : undefined;
-  const fusing =
-    lexical !== undefined || graph !== undefined || neo4jGraph !== undefined;
+  const arms = resolveOptionalArms(deps);
+  const fusing = hasOptionalArms(arms);
   const reranker = getReranker(deps);
   const rerankWindow =
     reranker !== undefined && deps.retrieveConfig !== undefined
@@ -174,62 +163,69 @@ export async function assembleRetrievalResult(
   // `weights === undefined` half is unreachable at runtime. It is what
   // narrows `weights` for the `rrfFuse` call below.
   if (!fusing || weights === undefined) {
-    // Vector-only: chunks flow through unchanged unless a reranker is wired.
-    const retrieved = await vectorSearch;
-    const reranked = await maybeRerank(
-      toFusedFromRetrieved(retrieved),
-      args,
-      deps.retrieveConfig,
-      reranker
-    );
-    const neighbors = await expandNeighborEvidence(
-      reranked.hits,
-      args,
-      deps.retrieveConfig,
-      deps.storage
-    );
-    return buildEnvelope(
-      neighbors.hits,
-      mergeDegraded(reranked.degraded, neighbors.degraded),
-      undefined
-    );
+    return assembleVectorOnlyResult(vectorSearch, args, deps, reranker);
   }
 
-  // Every optional arm is launched before the first await so they overlap
-  // rather than run in series. Each is wrapped fail-open, so none can
-  // reject and take the vector results down with it.
-  const pending: Array<Promise<ArmResult>> = [];
-  if (lexical !== undefined) {
-    pending.push(runLexicalArmSafe(lexical, args.query, searchOpts));
-  }
-  if (graph !== undefined) {
-    pending.push(
-      runGraphArmSafe(
-        queryEmbedding,
-        { storage: graph.seed, config: graph.config },
-        new Date(args.validAt)
-      )
-    );
-  }
-  // The Neo4j arm is awaited on its own handle, not merged into `pending`:
-  // graph priority is bound to THIS arm's result object, and the archived
-  // SQL arm above answers to the same arm name.
-  const neo4jPending =
-    neo4jGraph !== undefined
-      ? runNeo4jGraphArm(queryEmbedding, neo4jGraph, args.validAt)
-      : undefined;
-
-  const [retrieved, weighted, neo4jResult] = await Promise.all([
+  const [retrieved, optionalResults] = await Promise.all([
     vectorSearch,
-    Promise.all(pending),
-    neo4jPending,
+    runOptionalArms(queryEmbedding, args, searchOpts, arms),
   ]);
+  return assembleFusedResult(retrieved, optionalResults, {
+    args,
+    deps,
+    reranker,
+    rerankWindow,
+    weights,
+  });
+}
 
-  const optional =
-    neo4jResult === undefined ? weighted : [...weighted, neo4jResult];
+interface FusedAssemblyContext {
+  args: AssembleArgs;
+  deps: AssembleDeps;
+  reranker: ChunkReranker | undefined;
+  rerankWindow: number | undefined;
+  weights: RetrieveConfig;
+}
+
+async function assembleVectorOnlyResult(
+  vectorSearch: Promise<RetrievedChunk[]>,
+  args: AssembleArgs,
+  deps: AssembleDeps,
+  reranker: ChunkReranker | undefined
+): Promise<RetrieveOutputEnvelope> {
+  const retrieved = await vectorSearch;
+  const reranked = await maybeRerank(
+    toFusedFromRetrieved(retrieved),
+    args,
+    deps.retrieveConfig,
+    reranker
+  );
+  const neighbors = await expandNeighborEvidence(
+    reranked.hits,
+    args,
+    deps.retrieveConfig,
+    deps.storage
+  );
+  return buildEnvelope(
+    neighbors.hits,
+    mergeDegraded(reranked.degraded, neighbors.degraded),
+    undefined
+  );
+}
+
+async function assembleFusedResult(
+  retrieved: RetrievedChunk[],
+  optionalResults: OptionalArmResults,
+  context: FusedAssemblyContext
+): Promise<RetrieveOutputEnvelope> {
+  const { args, deps, reranker, rerankWindow, weights } = context;
+  const { optional, graphPriority, remainder } = selectRetrievalResults(
+    retrieved,
+    optionalResults
+  );
   const fused = assembleGraphPriority(
-    neo4jResult,
-    [toVectorResult(retrieved), ...weighted],
+    graphPriority,
+    remainder,
     weights,
     rerankWindow ?? args.limit
   );
@@ -257,8 +253,9 @@ export async function assembleRetrievalResult(
 
 /**
  * `degraded` marks an arm that was ATTEMPTED and could not deliver: a
- * lexical arm that threw, or a graph arm that threw or under-floored. An
- * arm that simply found nothing has not degraded, and neither has one the
+ * lexical arm that threw, a graph arm that threw or under-floored, or a
+ * node-embedding read that threw. An arm that simply found nothing has not
+ * degraded, and neither has one the
  * operator turned off — those never reach this function.
  */
 function degradedFlag(optional: ArmResult[]): true | undefined {
@@ -386,140 +383,6 @@ async function embedQuery(
     );
   }
   return queryEmbedding;
-}
-
-/**
- * Resolve the graph-arm seam. Returns undefined when ANY of the three
- * prerequisites is missing: graphConfig unset, backend type not narrowable
- * to `GraphRagStorageBackend`, or backend not carrying `graphArmSeed`.
- */
-function getGraphSeed(
-  deps: AssembleDeps
-): { seed: GraphArmStorage; config: RetrieveConfig } | undefined {
-  if (deps.graphConfig === undefined) return undefined;
-  // Narrow the chunk-only contract to the optional graph-rag seam. The
-  // runtime guard is `"graphArmSeed" in`; the cast just teaches TS that a
-  // backend exposing the key implements GraphRagStorageBackend.
-  if (!("graphArmSeed" in deps.storage)) return undefined;
-  const rag = deps.storage as GraphRagStorageBackend;
-  if (rag.graphArmSeed === undefined) return undefined;
-  return { seed: rag.graphArmSeed, config: deps.graphConfig };
-}
-
-/**
- * Resolve the production Neo4j graph arm. Returns undefined — "do not run
- * it", NOT "it failed" — when any of the three prerequisites is missing:
- *
- *   - no `retrieveConfig`, or the operator set `graphEnabled=false` (SC9);
- *   - no `graphRanker`, which is how "no Neo4j URI configured" reaches
- *     this layer (SC7). The distinction the spec insists on lives here:
- *     cannot attempt ≠ failed attempt, so neither case sets `degraded`;
- *   - the backend has no `neo4jArmSeed` seam (MemoryBackend).
- *
- * The gate reads `deps.retrieveConfig` only, never `graphConfig`: opting
- * into the archived SQL arm must not switch the production arm on.
- */
-function getNeo4jGraphArm(deps: AssembleDeps): Neo4jGraphArmDeps | undefined {
-  const config = deps.retrieveConfig;
-  if (config === undefined || !config.graphEnabled) return undefined;
-  if (deps.graphRanker === undefined) return undefined;
-  if (!supportsNeo4jArm(deps.storage)) return undefined;
-  return {
-    storage: deps.storage.neo4jArmSeed,
-    ranker: deps.graphRanker,
-    config,
-  };
-}
-
-/**
- * Resolve the BM25 arm. Returns undefined — meaning "do not run it", NOT
- * "it failed" — when any prerequisite is missing: no `retrieveConfig`, the
- * operator disabled it, or the backend has no lexical seam. None of those
- * set `degraded`, because none of them is an attempt.
- *
- * The gate reads `deps.retrieveConfig` and nothing else. Falling back to
- * `graphConfig` would let a caller who only opted into the archived graph
- * arm (#58) turn on a lexical arm it never asked for, and `graphConfig`
- * carries a `bm25Enabled` field purely because both share `RetrieveConfig`.
- */
-function getLexicalArm(deps: AssembleDeps): LexicalStorageBackend | undefined {
-  const config = deps.retrieveConfig;
-  if (config === undefined || !config.bm25Enabled) return undefined;
-  if (!supportsLexicalSearch(deps.storage)) return undefined;
-  return deps.storage;
-}
-
-/**
- * Run the BM25 arm, converting a throw into a degraded empty result.
- * Ranks are 1-based positions in the arm's own output — RRF fuses on
- * those, never on the backend-specific lexical score.
- */
-async function runLexicalArmSafe(
-  storage: LexicalStorageBackend,
-  query: string,
-  opts: { limit: number; validAt: string; filters?: Record<string, string> }
-): Promise<ArmResult> {
-  try {
-    const hits = await storage.searchLexical(query, opts);
-    return {
-      arm: "bm25",
-      hits: hits.map((hit, i) => toArmHit(hit, "bm25", i)),
-      belowFloor: false,
-    };
-  } catch (err) {
-    // EXIT: degraded:true + failureReason 上行 envelope，调用方可见
-    return {
-      arm: "bm25",
-      hits: [],
-      belowFloor: true,
-      failureReason: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
-/**
- * Wrap `runGraphArm` so an unexpected throw degrades instead of rejecting.
- * This is what keeps `Promise.all` fail-open: the vector arm's results
- * survive any graph-arm failure.
- */
-async function runGraphArmSafe(
-  queryEmbedding: number[],
-  deps: GraphArmDeps,
-  now: Date
-): Promise<ArmResult> {
-  try {
-    return await runGraphArm(queryEmbedding, deps, now);
-  } catch (err) {
-    // EXIT: degraded:true + failureReason 上行 envelope，调用方可见
-    return {
-      arm: "graph",
-      hits: [],
-      belowFloor: true,
-      failureReason: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
-/** Project RetrievedChunk[] into the vector arm's `ArmResult`. */
-function toVectorResult(retrieved: RetrievedChunk[]): ArmResult {
-  return {
-    arm: "vector",
-    hits: retrieved.map((r, i) => toArmHit(r, "vector", i)),
-    belowFloor: false,
-  };
-}
-
-/** Single arm hit — rank is the 1-based position in that arm's output. */
-function toArmHit(r: RetrievedChunk, arm: ArmName, i: number): ArmHit {
-  return {
-    id: r.id,
-    arm,
-    rank: i + 1,
-    score: r.score,
-    content: r.content,
-    source_ref: r.source_ref,
-    valid_window: r.valid_window,
-  };
 }
 
 /** Project FusedHit[] into the envelope chunk shape; score = rrfScore. */

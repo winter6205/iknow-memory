@@ -548,6 +548,44 @@ function insertedEntityRows(client: FakeClient): unknown[] {
   }));
 }
 
+/** Include persisted merge pointers when serving fake entity rows. */
+function insertedEntityRowsWithMergePointers(client: FakeClient): unknown[] {
+  return insertedEntityRows(client).map((row) => {
+    const id = (row as { id: string }).id;
+    const pointer = boundValuesFor(
+      client,
+      /UPDATE entities SET merged_into/
+    ).find((values) => values[0] === id)?.[1];
+    return { ...row, merged_into: pointer ?? null };
+  });
+}
+
+/** Serve a survivor plus the rows written by the run, including pointers. */
+function serveMergePersistenceRows(
+  client: FakeClient,
+  survivor: unknown
+): void {
+  client.rowsOverride = (text) => {
+    if (/SELECT merged_into FROM entities WHERE id = \$1/.test(text)) {
+      const id = client.valuesList.at(-1)?.[0];
+      const rows = [survivor, ...insertedEntityRowsWithMergePointers(client)];
+      return rows
+        .filter((row) => (row as { id: string }).id === id)
+        .map((row) => ({
+          merged_into:
+            (row as { merged_into?: string | null }).merged_into ?? null,
+        }));
+    }
+    if (/FROM chunks c/.test(text)) {
+      return [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }];
+    }
+    if (/^\s*SELECT[\s\S]*FROM entities/.test(text)) {
+      return [survivor, ...insertedEntityRowsWithMergePointers(client)];
+    }
+    return [];
+  };
+}
+
 /** A live person row as `loadEntities` reads it back. */
 function personRow(id: string, canonicalName: string) {
   return {
@@ -659,6 +697,57 @@ describe("same-output head/tail are mutually exclusive merge candidates (SC6)", 
   });
 });
 
+describe("merged_into is persisted for fuzzy merges (T5)", () => {
+  it("stores loser → survivor and makes a second extract idempotent", async () => {
+    const client = new FakeClient();
+    serveMergePersistenceRows(
+      client,
+      personRow(SURVIVOR_HEAD, SELF_LOOP_OUTPUT.head)
+    );
+    const llm = new FakeLLMClient({
+      scripted: async () => ({
+        kind: "ok" as const,
+        outputs: [
+          {
+            ...SELF_LOOP_OUTPUT,
+            head: "Alicia Smith",
+            tail: "Acme",
+            tailType: "system",
+          },
+        ],
+      }),
+    });
+    const deps: CliDeps = {
+      ...makeDeps(client, llm),
+      embedder: new ConstantEmbedder(8),
+    };
+
+    expect(await runCli(["--batch-size", "1"], deps)).toBe(0);
+
+    const entityInserts = boundValuesFor(client, /INSERT INTO entities/);
+    const loser = entityInserts.find((values) => values[1] === "Alicia Smith");
+    expect(loser).toBeDefined();
+    expect(
+      boundValuesFor(client, /UPDATE entities SET merged_into/)
+    ).toContainEqual([loser![0], SURVIVOR_HEAD]);
+    expect(upsertedEndpoints(client)[0]?.[0]).toBe(SURVIVOR_HEAD);
+
+    expect(await runCli(["--batch-size", "1"], deps)).toBe(0);
+
+    // The existing loser pointer is followed; no duplicate loser or rewrite
+    // is produced, and the triple still points to the canonical survivor.
+    expect(
+      boundValuesFor(client, /INSERT INTO entities/).filter(
+        (values) => values[1] === "Alicia Smith"
+      )
+    ).toHaveLength(1);
+    expect(
+      boundValuesFor(client, /UPDATE entities SET merged_into/)
+    ).toHaveLength(1);
+    expect(upsertedEndpoints(client).at(-1)?.[0]).toBe(SURVIVOR_HEAD);
+  });
+});
+
 describe("self-loop outputs are extract rejects (T4)", () => {
   it("rejects before entity creation, graph writes, or chunk failure", async () => {
     const client = new FakeClient();
@@ -747,9 +836,7 @@ describe("self-loop outputs are extract rejects (T4)", () => {
     const deps = makeDeps(client, llm);
 
     expect(await runCli(["--batch-size", "1"], deps)).toBe(0);
-    expect(
-      await runCli(["--only-failed", "--batch-size", "1"], deps)
-    ).toBe(0);
+    expect(await runCli(["--only-failed", "--batch-size", "1"], deps)).toBe(0);
 
     expect(extractCalls).toBe(1);
     const onlyFailedScan = client.queries.filter((query) =>

@@ -42,6 +42,7 @@
  * on the envelope while the vector results still reach the caller.
  */
 import { assembleGraphPriority } from "./graph-priority.js";
+import { RRF_K } from "./rrf.js";
 import { maybeRerank, rerankWindowSize } from "./rerank.js";
 import {
   hasOptionalArms,
@@ -219,10 +220,8 @@ async function assembleFusedResult(
   context: FusedAssemblyContext
 ): Promise<RetrieveOutputEnvelope> {
   const { args, deps, reranker, rerankWindow, weights } = context;
-  const { optional, graphPriority, remainder } = selectRetrievalResults(
-    retrieved,
-    optionalResults
-  );
+  const { optional, communityPriority, graphPriority, remainder } =
+    selectRetrievalResults(retrieved, optionalResults);
   const fused = assembleGraphPriority(
     graphPriority,
     remainder,
@@ -235,8 +234,13 @@ async function assembleFusedResult(
     deps.retrieveConfig,
     reranker
   );
-  const neighbors = await expandNeighborEvidence(
+  const prioritized = prependCommunityPriority(
+    communityPriority,
     reranked.hits,
+    args.limit
+  );
+  const neighbors = await expandNeighborEvidence(
+    prioritized,
     args,
     deps.retrieveConfig,
     deps.storage
@@ -387,13 +391,38 @@ async function embedQuery(
 
 /** Project FusedHit[] into the envelope chunk shape; score = rrfScore. */
 function projectFused(hit: FusedHit): RetrieveOutputEnvelope["chunks"][number] {
-  return {
+  const chunk: RetrieveOutputEnvelope["chunks"][number] = {
     id: hit.id,
     content: hit.content,
     source_ref: hit.source_ref,
     valid_window: hit.valid_window,
     score: hit.rrfScore,
   };
+  if (hit.metadata !== undefined) chunk.metadata = hit.metadata;
+  return chunk;
+}
+
+/** Put enabled community summaries ahead of the existing T8 ranking. */
+function prependCommunityPriority(
+  summary: ArmResult | undefined,
+  ranked: FusedHit[],
+  limit: number
+): FusedHit[] {
+  const summaryHits = summary?.hits ?? [];
+  if (summaryHits.length === 0) return ranked;
+  const topScore = ranked[0]?.rrfScore ?? 0;
+  const placed = new Set(summaryHits.map((hit) => hit.id));
+  const fill = ranked.filter((hit) => !placed.has(hit.id));
+  const lead: FusedHit[] = summaryHits.slice(0, limit).map((hit, i) => ({
+    id: hit.id,
+    content: hit.content,
+    source_ref: hit.source_ref,
+    valid_window: hit.valid_window,
+    rrfScore: topScore + 1 / (RRF_K + i + 1),
+    arms: [hit.arm],
+    ...(hit.metadata !== undefined ? { metadata: hit.metadata } : {}),
+  }));
+  return [...lead, ...fill].slice(0, limit);
 }
 
 /**

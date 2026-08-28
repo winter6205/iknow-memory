@@ -72,6 +72,7 @@ import {
   type CandidateEntity,
   type IncomingEntity,
 } from "../core/entities/merge.js";
+import { resolveCanonicalId } from "../core/entities/resolve.js";
 import { computeEntityEmbeddingText } from "../core/entities/embedding.js";
 import { GraphragError } from "../core/errors.js";
 import {
@@ -710,11 +711,25 @@ async function resolveEntity(
     }
   );
   if (decision !== "created-new" && decision.kind === "merge") {
-    const survivor = live.find((c) => c.id === canonicalId);
-    if (survivor && survivor.canonicalName !== incoming.canonicalName) {
-      await insertAlias(client, canonicalId, incoming.canonicalName, "variant");
+    const survivorId = await resolveCanonicalId(client, canonicalId);
+    const survivor = live.find((c) => c.id === survivorId);
+    if (decision.via === "L3") {
+      // L3 is the only fuzzy merge: materialize the incoming entity as the
+      // loser so the ledger retains a rollbackable merged_into edge. L0
+      // matches an existing row exactly and must remain idempotent.
+      const loserId = randomUUID();
+      await insertEntity(
+        client,
+        loserId,
+        incoming,
+        await embedEntity(deps, incoming)
+      );
+      await linkMergedEntity(client, loserId, survivorId);
     }
-    return canonicalId;
+    if (survivor && survivor.canonicalName !== incoming.canonicalName) {
+      await insertAlias(client, survivorId, incoming.canonicalName, "variant");
+    }
+    return survivorId;
   }
   const id = randomUUID();
   await insertEntity(client, id, incoming, await embedEntity(deps, incoming));
@@ -798,6 +813,19 @@ async function insertEntity(
       toVectorLiteral(embedding),
       JSON.stringify({ description: incoming.description }),
     ]
+  );
+}
+
+/** Persist a soft-merge pointer without rewriting any triple foreign keys. */
+async function linkMergedEntity(
+  client: Queryable,
+  loserId: string,
+  survivorId: string
+): Promise<void> {
+  await client.query(
+    `UPDATE entities SET merged_into = $2
+      WHERE id = $1 AND merged_into IS NULL`,
+    [loserId, survivorId]
   );
 }
 

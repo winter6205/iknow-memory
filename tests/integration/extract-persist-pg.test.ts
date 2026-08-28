@@ -409,34 +409,63 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
   });
 
   // -----------------------------------------------------------------
-  // SC9: name alias at creation, variant alias on a differing-surface L3
-  // merge, and an identical (entity_id, alias) re-insert that neither
+  // SC9/T5: name alias at creation, variant alias on a differing-surface
+  // L3 merge, and an identical (entity_id, alias) re-insert that neither
   // throws nor duplicates.
   // -----------------------------------------------------------------
-  it("SC9: creation writes a name alias, an L3 merge writes a variant, and a repeat insert is a no-op", async () => {
+  it("SC9/T5: L3 merge persists loser → survivor and a repeat extract is idempotent", async () => {
     const c = client!;
     await resetSchema(c);
     await seedChunks(c, ["Alice at Acme.", "Alicia at Acme.", "Alicia again."]);
 
-    // Chunk 1 creates "Alice Smith"; chunks 2 and 3 present a differing
-    // surface form that the constant embedder merges through L3 twice — the
-    // second one is the duplicate `(entity_id, alias)` probe.
+    // Chunk 1 creates "Alice Smith"; chunk 2 presents a differing surface
+    // form that is merged through L3 and materialized as a loser. Chunk 3
+    // repeats the same extraction so the existing pointer is exercised.
     const variant = output({ head: "Alicia Smith" });
     const code = await runExtraction(
       [
         { kind: "ok", outputs: [output()] },
-        { kind: "ok", outputs: [variant] },
         { kind: "ok", outputs: [variant] },
       ],
       new ConstantEmbedder(DIM)
     );
     expect(code).toBe(0);
 
-    // The L3 merge means no second person row was created.
-    const people = await c.query<{ canonical_name: string }>(
-      `SELECT canonical_name FROM entities WHERE type = 'person'`
+    const repeatCode = await runExtraction(
+      [{ kind: "ok", outputs: [variant] }],
+      new ConstantEmbedder(DIM)
     );
-    expect(people.rows.map((r) => r.canonical_name)).toEqual(["Alice Smith"]);
+    expect(repeatCode).toBe(0);
+
+    const people = await c.query<{
+      id: string;
+      canonical_name: string;
+      merged_into: string | null;
+    }>(
+      `SELECT id, canonical_name, merged_into
+         FROM entities WHERE type = 'person' ORDER BY created_at`
+    );
+    expect(people.rows).toHaveLength(2);
+    const survivor = people.rows.find(
+      (row) => row.canonical_name === "Alice Smith"
+    );
+    const loser = people.rows.find(
+      (row) => row.canonical_name === "Alicia Smith"
+    );
+    expect(survivor?.merged_into).toBeNull();
+    expect(loser?.merged_into).toBe(survivor?.id);
+
+    // The repeated extraction does not create another loser row.
+    expect(
+      people.rows.filter((row) => row.canonical_name === "Alicia Smith")
+    ).toHaveLength(1);
+
+    // Existing/new triples keep their FKs on the canonical survivor; merge
+    // persistence does not rewrite triple endpoint columns.
+    const tripleHeads = await c.query<{ head_id: string }>(
+      `SELECT DISTINCT head_id FROM triples ORDER BY head_id`
+    );
+    expect(tripleHeads.rows).toEqual([{ head_id: survivor?.id }]);
 
     const aliases = await c.query<{ alias: string; alias_type: string }>(
       `SELECT a.alias, a.alias_type FROM entity_aliases a

@@ -11,9 +11,9 @@
 
 ## 当前状态
 
-- **阶段 0+1 已完成**：chunks-only ingest/retrieve + vector cosine + valid_window 时间切片
-- **P0 规划中**：三元组抽取 + canonical 实体合并（升级方案 ROI 最高；P0a schema 原型已验证，见 `acff699`）
-- **后续**：P1 图检索（PPR + node embedding）→ P2 时间/因果 → P3 社区
+- **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并 wiring；vector + BM25；Neo4j PPR 图臂；graph-priority 排序；临时 LLM rerank（默认 off）
+- **进行中**：检索/图谱质量栈 T2–T11 — `plans/retrieve-graph-quality.md`（tracker 只认仓库文件，不认 GitHub issues）
+- **后置**：抽取 F1（#15）、多粒度切分、专用社区/因果等见该 plan 未勾选项
 
 ## 运行
 

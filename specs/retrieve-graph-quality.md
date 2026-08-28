@@ -1,9 +1,9 @@
 # Spec: Retrieve and graph quality stack
 
-> **Status:** draft → ACR in this file.
-> **Source:** operator 2026-08-28 — coarse single contract (not one-question tickets); new wayfinder map for this destination; parent map remains [wayfinder:map] iknow-memory：自研外置记忆 MCP 服务 (#1).
-> **Predecessors:** `specs/retrieve-graph-priority.md` (Host order), `specs/retrieve-rerank-llm.md` (temporary LLM rerank), `specs/neo4j-graph-arm.md` (PPR arm + outbox).
-> **Tracker (files):** `plans/retrieve-graph-quality.md` is SSOT for implementation slices. GitHub map/issues are optional and may be invisible to a PR remote.
+> **Status:** ACR all-yes; slice 0 (temporary LLM rerank) **on main** (#118). Remaining slices T2–T11 tracked only in `plans/retrieve-graph-quality.md` (no GitHub issues).
+> **Source:** operator 2026-08-28 — coarse single contract (not one-question tickets); new wayfinder map for this destination; parent map remains local `docs/handoff/wayfinder-tickets/map-1.md`.
+> **Predecessors:** `specs/retrieve-graph-priority.md` (Host order, on main), `specs/retrieve-rerank-llm.md` (temporary LLM rerank, on main), `specs/neo4j-graph-arm.md` (PPR arm + outbox, on main).
+> **Tracker (files):** `plans/retrieve-graph-quality.md` is SSOT for implementation slices. Do not use GitHub issues.
 > **Assumption gate:** operator chose one overview spec. Locks below are the gate; object in review or they stand.
 
 ## Objective

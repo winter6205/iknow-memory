@@ -35,6 +35,8 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_NODE_EMBEDDING_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
   "GRAPHRAG_MEMORY_RETRIEVAL_PRESET",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
@@ -840,6 +842,40 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     withRetrievalEnv({}, () => {
       expect(loadEnv().retrieval.rerankEnabled).toBe(false);
     });
+  });
+
+  it("defaults wait-for-drain to disabled with a bounded timeout", () => {
+    withRetrievalEnv({}, () => {
+      const { retrieval } = loadEnv();
+      expect(retrieval.waitForDrainEnabled).toBe(false);
+      expect(retrieval.waitForDrainTimeoutMs).toBe(5000);
+    });
+  });
+
+  it("reads wait-for-drain enablement and timeout from env", () => {
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_ENABLED: "true",
+        GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS: "250",
+      },
+      () => {
+        const { retrieval } = loadEnv();
+        expect(retrieval.waitForDrainEnabled).toBe(true);
+        expect(retrieval.waitForDrainTimeoutMs).toBe(250);
+      }
+    );
+  });
+
+  it("rejects a non-positive wait-for-drain timeout", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS: "0" },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS/
+        );
+      }
+    );
   });
 
   it("leaves the dedicated rerank URL undefined by default", () => {

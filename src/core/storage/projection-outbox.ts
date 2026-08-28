@@ -17,6 +17,7 @@
  * the CLI above it only decides flags, ordering and exit codes.
  */
 import { randomUUID } from "node:crypto";
+import { GraphragError } from "../errors.js";
 
 /** Subjects that may be projected. `chunk` is deliberately absent (ADR-0001). */
 export type ProjectionSubjectKind = "entity" | "triple";
@@ -207,6 +208,40 @@ export async function countIntentsByStatus(
   const counts: Record<string, number> = { pending: 0, done: 0, failed: 0 };
   for (const row of rows) counts[row.status as string] = Number(row.count);
   return counts;
+}
+
+/**
+ * Observe the outbox until no pending or failed intents remain.
+ *
+ * This is deliberately read-only: retrieve never runs the drain and never
+ * writes Neo4j. The operator's drain process remains responsible for applying
+ * the projection.
+ */
+export async function waitForProjectionDrain(
+  client: OutboxClient,
+  timeoutMs: number,
+  pollIntervalMs = 25
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const counts = await countIntentsByStatus(client);
+    if ((counts.failed ?? 0) > 0) {
+      throw new GraphragError(
+        "projection outbox contains failed intents",
+        "STORAGE_ERROR"
+      );
+    }
+    if ((counts.pending ?? 0) === 0) return;
+    if (Date.now() >= deadline) {
+      throw new GraphragError(
+        `projection outbox did not drain within ${timeoutMs}ms`,
+        "STORAGE_ERROR"
+      );
+    }
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, Math.min(pollIntervalMs, deadline - Date.now()))
+    );
+  }
 }
 
 /** First occurrence wins; keeps the caller's order for a readable query log. */

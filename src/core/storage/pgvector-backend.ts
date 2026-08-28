@@ -28,6 +28,8 @@ import type {
 import type {
   EntityChunkRow,
   GraphArmStorage,
+  NeighborChunkRow,
+  NeighborChunkStorage,
   Neo4jArmStorage,
 } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
@@ -114,6 +116,38 @@ const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_re
       AND (c.valid_until IS NULL OR c.valid_until > $2::timestamptz)
     ORDER BY array_position($1::uuid[], ranked.entity_id), c.id
     LIMIT $3`;
+
+/**
+ * Same-source neighboring chunks around already-ranked anchors.
+ *
+ * `created_at, id` is the stable ingest order. The visibility predicate is
+ * repeated inside the CTE so temporal filtering happens before positions are
+ * calculated; an expired row must not shift the visible neighbor window.
+ */
+const NEIGHBOR_CHUNKS_SQL = `
+WITH visible AS (
+  SELECT id, content, source_ref, valid_from, valid_until, created_at,
+         row_number() OVER (
+           PARTITION BY source_ref
+           ORDER BY created_at ASC, id ASC
+         ) AS position
+    FROM chunks
+   WHERE valid_from <= $2::timestamptz
+     AND (valid_until IS NULL OR valid_until > $2::timestamptz)
+),
+targets AS (
+  SELECT id, source_ref, position
+    FROM visible
+   WHERE id = ANY($1::uuid[])
+)
+SELECT DISTINCT n.id, n.content, n.source_ref, n.valid_from,
+                n.valid_until, n.created_at
+  FROM visible n
+  JOIN targets t
+    ON n.source_ref = t.source_ref
+   AND n.position BETWEEN t.position - $3::bigint
+                       AND t.position + $3::bigint
+ ORDER BY n.source_ref, n.created_at, n.id`;
 
 /**
  * Text-search configuration for the lexical arm. `simple` deliberately,
@@ -214,7 +248,7 @@ function appendFilterClauses(
  * works out of the box.
  */
 export class PgvectorBackend
-  implements GraphRagStorageBackend, LexicalStorageBackend
+  implements GraphRagStorageBackend, LexicalStorageBackend, NeighborChunkStorage
 {
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
@@ -503,6 +537,48 @@ export class PgvectorBackend
       const row = r as ChunkRow & { rank: number };
       return rowToRetrievedChunk(row, row.rank);
     });
+  }
+
+  /**
+   * Read visible chunks within `width` ingest positions of each anchor.
+   * Neighbor expansion is a Postgres concern: chunks remain ledger rows and
+   * are never written to or looked up in Neo4j.
+   */
+  async chunksByChunkIds(
+    chunkIds: readonly string[],
+    validAt: string,
+    width: number
+  ): Promise<NeighborChunkRow[]> {
+    if (chunkIds.length === 0 || width <= 0) return [];
+    try {
+      const pool = await this.ensureReady();
+      const result = await pool.query(NEIGHBOR_CHUNKS_SQL, [
+        [...chunkIds],
+        validAt,
+        width,
+      ]);
+      return result.rows.map((r) => {
+        const row = r as {
+          id: string;
+          content: string;
+          source_ref: string;
+          valid_from: Date;
+          valid_until: Date | null;
+        };
+        return {
+          id: row.id,
+          content: row.content,
+          source_ref: row.source_ref,
+          valid_from: row.valid_from.toISOString(),
+          valid_until: row.valid_until?.toISOString() ?? null,
+        };
+      });
+    } catch (err) {
+      throw new GraphragError(
+        `PgvectorBackend.chunksByChunkIds failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
   }
 
   async close(): Promise<void> {

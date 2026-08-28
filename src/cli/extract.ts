@@ -68,6 +68,7 @@ import {
 } from "../core/extraction/records.js";
 import {
   mergeEntitiesWithGating,
+  normalizeAlias,
   type CandidateEntity,
   type IncomingEntity,
 } from "../core/entities/merge.js";
@@ -560,6 +561,13 @@ async function persistOutputs(
   let unmapped = 0;
   const projected: ProjectionSubject[] = [];
   for (const out of outputs) {
+    if (
+      normalizeAlias(out.head) === normalizeAlias(out.tail) &&
+      normalizeEntityType(out.headType) === normalizeEntityType(out.tailType)
+    ) {
+      logSelfLoopRejection(deps, chunkId, out);
+      continue;
+    }
     const { headId, tailId } = await resolveEndpoints(deps, client, out);
     // Both endpoints are projectable nodes even when the triple below is
     // rejected — an entity with no edge is still a node the graph arm can
@@ -636,11 +644,11 @@ function logSelfLoopRejection(
   deps: CliDeps,
   chunkId: string,
   out: ExtractionOutput,
-  entityId: string
+  entityId?: string
 ): void {
   deps.logger.warn("triple-self-loop-rejected", {
     chunkId,
-    entityId,
+    entityId: entityId ?? null,
     head: out.head,
     tail: out.tail,
     relationRaw: out.relationRaw,

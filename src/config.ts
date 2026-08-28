@@ -4,7 +4,9 @@
  * Loads from process.env with `.env.local` (cwd) as fallback.
  * Precedence: process.env > `.env.local`.
  *
- * Never logs secret values.
+ * LLM authentication uses ANTHROPIC_AUTH_TOKEN. Vector/embedding
+ * authentication uses the dedicated embedding key or vector aliases below;
+ * those credentials are never interchangeable and are never logged.
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -42,7 +44,10 @@ function isStorageMode(value: string): value is StorageMode {
  *   1. GRAPHRAG_MEMORY_EMBED_API_KEY     — the secret VALUE itself. Only
  *      ever set in a host-local, untracked registration (e.g. Claude Code's
  *      `~/.claude.json` local scope). NEVER in a git-tracked `.mcp.json`.
- *   2. GRAPHRAG_MEMORY_EMBED_API_KEY_ENV — the NAME of an env var holding
+ *   2. GRAPHRAG_MEMORY_VECTOR_API_KEY — the preferred vector/embedding alias.
+ *   3. GRAPHRAG_MEMORY_ANTHROPIC_API_KEY — the legacy vector/embedding alias
+ *      (not the LLM token).
+ *   4. GRAPHRAG_MEMORY_EMBED_API_KEY_ENV — the NAME of an env var holding
  *      the secret (e.g. "NINE_ROUTER_KEY" for the iknow 9router convention,
  *      or any other var a generic host uses). config.ts just reads whatever
  *      name it is handed.
@@ -54,6 +59,10 @@ function isStorageMode(value: string): value is StorageMode {
  */
 const EMBED_API_KEY_VALUE_VAR = "GRAPHRAG_MEMORY_EMBED_API_KEY";
 const EMBED_API_KEY_NAME_VAR = "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV";
+/** Preferred vector/embedding secret — not the LLM token. */
+const VECTOR_API_KEY_VAR = "GRAPHRAG_MEMORY_VECTOR_API_KEY";
+/** Legacy vector alias — not the LLM token (`ANTHROPIC_AUTH_TOKEN`). */
+const LEGACY_VECTOR_API_KEY_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY";
 
 /** Env-var name for the required embedding dimension integer. */
 const EMBED_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_EMBED_DIMENSIONS";
@@ -124,6 +133,23 @@ export interface GraphragEnv {
    * failed" — see Neo4jConfig.
    */
   neo4j: Neo4jConfig | undefined;
+  /**
+   * LLM credentials for temporary retrieve rerank, or undefined when
+   * `ANTHROPIC_AUTH_TOKEN` is absent. Model / base URL default to China
+   * MiniMax-M3 when those env vars are unset.
+   */
+  rerank: RerankConfig | undefined;
+}
+
+/**
+ * Credentials for the temporary retrieve rerank adapter.
+ * Secret: `ANTHROPIC_AUTH_TOKEN`. Model / base URL default to MiniMax-M3
+ * on `https://api.minimaxi.com/anthropic`.
+ */
+export interface RerankConfig {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
 }
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -206,6 +232,14 @@ const RETRIEVAL_W_BM25_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25";
 const RETRIEVAL_W_GRAPH_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH";
 const RETRIEVAL_BM25_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED";
 const RETRIEVAL_GRAPH_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED";
+const RETRIEVAL_RERANK_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED";
+const LLM_AUTH_TOKEN_VAR = "ANTHROPIC_AUTH_TOKEN";
+const ANTHROPIC_MODEL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_MODEL";
+const ANTHROPIC_BASE_URL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL";
+/** China MiniMax Anthropic-compatible SDK base (not api.minimax.io). */
+export const DEFAULT_LLM_BASE_URL = "https://api.minimaxi.com/anthropic";
+/** China MiniMax M3 model id. */
+export const DEFAULT_LLM_MODEL = "MiniMax-M3";
 const RETRIEVAL_ENTITY_LINK_TOP_K_VAR =
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K";
 const RETRIEVAL_CANDIDATE_CAP_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP";
@@ -329,6 +363,11 @@ function parseRetrievalConfig(): RetrieveConfig {
       readEnv(RETRIEVAL_GRAPH_ENABLED_VAR),
       true
     ),
+    rerankEnabled: parseBoolean(
+      RETRIEVAL_RERANK_ENABLED_VAR,
+      readEnv(RETRIEVAL_RERANK_ENABLED_VAR),
+      false
+    ),
     entityLinkTopK,
     candidateCap,
     graphArmFloor: parsePositiveInt(
@@ -398,6 +437,23 @@ function parseNeo4jConfig(): Neo4jConfig | undefined {
   return { uri, user, password };
 }
 
+/**
+ * Load retrieve-rerank credentials.
+ *
+ * Key is `ANTHROPIC_AUTH_TOKEN`. Model / base URL default to China MiniMax
+ * M3 (`MiniMax-M3` at `https://api.minimaxi.com/anthropic`) when unset.
+ * No key → undefined (skip). Explicit MODEL / BASE_URL still override.
+ */
+function parseRerankConfig(): RerankConfig | undefined {
+  const apiKey = readTrimmed(LLM_AUTH_TOKEN_VAR);
+  if (apiKey === undefined) return undefined;
+  const model = readTrimmed(ANTHROPIC_MODEL_VAR) ?? DEFAULT_LLM_MODEL;
+  const baseUrl = (
+    readTrimmed(ANTHROPIC_BASE_URL_VAR) ?? DEFAULT_LLM_BASE_URL
+  ).replace(/\/$/, "");
+  return { apiKey, model, baseUrl };
+}
+
 /** Scheme of `uri` including the colon, or undefined if it is not a URI. */
 function uriScheme(uri: string): string | undefined {
   try {
@@ -452,18 +508,19 @@ export function loadEnv(): GraphragEnv {
   const embedBaseUrl = readTrimmed("GRAPHRAG_MEMORY_EMBED_BASE_URL");
   if (embedApiKey !== undefined && embedBaseUrl === undefined) {
     throw new ConfigError(
-      "GRAPHRAG_MEMORY_EMBED_BASE_URL is required when an embedding API key is configured (GRAPHRAG_MEMORY_EMBED_API_KEY or the var named by GRAPHRAG_MEMORY_EMBED_API_KEY_ENV)"
+      "GRAPHRAG_MEMORY_EMBED_BASE_URL is required when an embedding API key is configured (GRAPHRAG_MEMORY_EMBED_API_KEY, GRAPHRAG_MEMORY_VECTOR_API_KEY, GRAPHRAG_MEMORY_ANTHROPIC_API_KEY, or the var named by GRAPHRAG_MEMORY_EMBED_API_KEY_ENV)"
     );
   }
   const embedModel = readTrimmed("GRAPHRAG_MEMORY_EMBED_MODEL");
   if (embedApiKey !== undefined && embedModel === undefined) {
     throw new ConfigError(
-      "GRAPHRAG_MEMORY_EMBED_MODEL is required when an embedding API key is configured (GRAPHRAG_MEMORY_EMBED_API_KEY or the var named by GRAPHRAG_MEMORY_EMBED_API_KEY_ENV)"
+      "GRAPHRAG_MEMORY_EMBED_MODEL is required when an embedding API key is configured (GRAPHRAG_MEMORY_EMBED_API_KEY, GRAPHRAG_MEMORY_VECTOR_API_KEY, GRAPHRAG_MEMORY_ANTHROPIC_API_KEY, or the var named by GRAPHRAG_MEMORY_EMBED_API_KEY_ENV)"
     );
   }
 
   const retrieval = parseRetrievalConfig();
   const neo4j = parseNeo4jConfig();
+  const rerank = parseRerankConfig();
 
   return {
     logLevel,
@@ -477,6 +534,7 @@ export function loadEnv(): GraphragEnv {
     embedApiKey,
     retrieval,
     neo4j,
+    rerank,
   };
 }
 
@@ -484,17 +542,21 @@ export function loadEnv(): GraphragEnv {
  * Resolve the embedding API key value.
  *
  * Order (first non-blank wins):
- *   1. GRAPHRAG_MEMORY_EMBED_API_KEY      — direct secret value
- *   2. process.env[GRAPHRAG_MEMORY_EMBED_API_KEY_ENV] — indirect by the
- *      var NAME the operator supplied (no default — see the constant block)
- *   3. undefined → FakeEmbedder path
+ *   1. GRAPHRAG_MEMORY_EMBED_API_KEY      — dedicated embed secret
+ *   2. GRAPHRAG_MEMORY_VECTOR_API_KEY   — preferred vector alias
+ *   3. GRAPHRAG_MEMORY_ANTHROPIC_API_KEY — legacy vector alias (not LLM)
+ *   4. process.env[GRAPHRAG_MEMORY_EMBED_API_KEY_ENV] — indirect by name
+ *   5. undefined → FakeEmbedder path
  *
- * Both sources go through readTrimmed, so a blank value or blank var-name
- * collapses to undefined rather than selecting an empty-string key.
+ * `ANTHROPIC_AUTH_TOKEN` is the LLM key and is never consulted here.
  */
 function resolveEmbedApiKey(): string | undefined {
   const direct = readTrimmed(EMBED_API_KEY_VALUE_VAR);
   if (direct !== undefined) return direct;
+  const vector = readTrimmed(VECTOR_API_KEY_VAR);
+  if (vector !== undefined) return vector;
+  const legacyVector = readTrimmed(LEGACY_VECTOR_API_KEY_VAR);
+  if (legacyVector !== undefined) return legacyVector;
   const keyEnvName = readTrimmed(EMBED_API_KEY_NAME_VAR);
   if (keyEnvName === undefined) return undefined;
   return readTrimmed(keyEnvName);

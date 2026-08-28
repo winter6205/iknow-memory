@@ -18,7 +18,11 @@ import {
 } from "./registry.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { SearchOptions, StorageBackend } from "../core/types.js";
-import type { GraphRanker, RetrieveConfig } from "../core/retrieval/types.js";
+import type {
+  ChunkReranker,
+  GraphRanker,
+  RetrieveConfig,
+} from "../core/retrieval/types.js";
 import { assembleRetrievalResult } from "../core/retrieval/index.js";
 
 const DEFAULT_LIMIT = 10;
@@ -55,6 +59,11 @@ export interface RetrieveDeps {
    * envelope (spec SC7).
    */
   graphRanker?: GraphRanker;
+  /**
+   * Temporary LLM reranker. Absent when rerank is off or credentials are
+   * incomplete — skip, not degraded.
+   */
+  reranker?: ChunkReranker;
   /** Debug gate; wired to `DEBUG=1` by the caller. */
   debug?: boolean;
 }
@@ -84,6 +93,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         retrieveConfig: deps.retrieveConfig,
         graphConfig: deps.graphConfig,
         graphRanker: deps.graphRanker,
+        reranker: deps.reranker,
         debug: deps.debug,
       }
     );

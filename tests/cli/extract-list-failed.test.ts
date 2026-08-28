@@ -4,7 +4,7 @@
  * SC11's four cases run as real `node dist/cli/extract.js` subprocesses so the
  * exit codes are the process's own: empty table, populated table, `--batch-id`
  * filter, and keyless operation. `runCliSubprocess` builds the child env from
- * scratch and never sets GRAPHRAG_MEMORY_ANTHROPIC_API_KEY, so *every* case
+ * scratch and never sets ANTHROPIC_AUTH_TOKEN, so *every* case
  * here is the keyless case — a run that reached buildLlm's real-extraction leg
  * would exit 1 with the CR High #1 refusal on stderr instead.
  *

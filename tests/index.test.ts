@@ -15,11 +15,11 @@ import { MemoryBackend } from "../src/core/storage/memory-backend.ts";
  * false signal. Clearing the vars for the duration of the call pins the
  * memory + FakeEmbedder path these tests are written against.
  *
- * Both key knobs must be scrubbed, not just the legacy `NINE_ROUTER_KEY`:
- * `GRAPHRAG_MEMORY_EMBED_API_KEY` carries the secret value directly and
- * `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV` names the var holding it. Leaving
- * either in place also drags in the key-coupled BASE_URL / MODEL required
- * check, so `createServer()` throws ConfigError instead of running offline.
+ * All embedding key knobs must be scrubbed, not just the legacy
+ * `NINE_ROUTER_KEY`: direct key values and
+ * `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV` can all select a real embedder. Leaving
+ * any in place also drags in the key-coupled BASE_URL / MODEL required check,
+ * so `createServer()` throws ConfigError instead of running offline.
  */
 const ENV_KEYS = [
   "GRAPHRAG_MEMORY_STORAGE",
@@ -29,7 +29,11 @@ const ENV_KEYS = [
   "GRAPHRAG_MEMORY_EMBED_MODEL",
   "GRAPHRAG_MEMORY_EMBED_API_KEY",
   "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
+  "GRAPHRAG_MEMORY_VECTOR_API_KEY",
   "NINE_ROUTER_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
+  "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
 ] as const;
 
 async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
@@ -291,6 +295,7 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
     w_graph: 0.15,
     bm25Enabled: true,
     graphEnabled: true,
+    rerankEnabled: false,
     entityLinkTopK: 8,
     candidateCap: 50,
     graphArmFloor: 3,
@@ -342,6 +347,7 @@ describe("buildRetrieveDeps — Neo4j graph arm wiring (#70)", () => {
     w_graph: 0.15,
     bm25Enabled: true,
     graphEnabled: true,
+    rerankEnabled: false,
     entityLinkTopK: 8,
     candidateCap: 50,
     graphArmFloor: 3,
@@ -364,5 +370,37 @@ describe("buildRetrieveDeps — Neo4j graph arm wiring (#70)", () => {
       false
     );
     expect(deps.graphRanker).toBe(graphRanker);
+  });
+});
+
+describe("buildRetrieveDeps — temporary LLM rerank wiring", () => {
+  const embedder = new FakeEmbedder(1536);
+  const storage = new MemoryBackend(1536);
+  const retrieval = {
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    w_graph: 0.15,
+    bm25Enabled: true,
+    graphEnabled: true,
+    rerankEnabled: true,
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    graphArmFloor: 3,
+  };
+  const reranker = {
+    permute: async () => [],
+  };
+
+  it("omits reranker entirely when none was built", () => {
+    const deps = buildRetrieveDeps({ embedder, storage, retrieval }, false);
+    expect(Object.hasOwn(deps, "reranker")).toBe(false);
+  });
+
+  it("passes the reranker through when one was built", () => {
+    const deps = buildRetrieveDeps(
+      { embedder, storage, retrieval, reranker },
+      false
+    );
+    expect(deps.reranker).toBe(reranker);
   });
 });

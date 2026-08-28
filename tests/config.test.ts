@@ -33,9 +33,22 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
+] as const;
+
+/**
+ * Extract Anthropic trio reused as the temporary rerank adapter.
+ * Scrubbed so a developer machine with extract credentials cannot turn
+ * a "skip" assertion into a configured rerank block.
+ */
+const ANTHROPIC_VARS = [
+  "ANTHROPIC_AUTH_TOKEN",
+  "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
+  "GRAPHRAG_MEMORY_ANTHROPIC_MODEL",
+  "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL",
 ] as const;
 
 /**
@@ -60,12 +73,14 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     "GRAPHRAG_MEMORY_EMBED_BASE_URL",
     "GRAPHRAG_MEMORY_EMBED_MODEL",
     "GRAPHRAG_MEMORY_EMBED_API_KEY",
+    "GRAPHRAG_MEMORY_VECTOR_API_KEY",
     "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
     "NINE_ROUTER_KEY",
     // Retrieval pipeline knobs (spec-3 T5) — scrub so a developer's real
     // values don't trip the boundary validation or leak into assertions.
     ...RETRIEVAL_VARS,
     ...NEO4J_VARS,
+    ...ANTHROPIC_VARS,
   ];
   const saved = new Map<string, string | undefined>();
   beforeAll(() => {
@@ -93,6 +108,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "embedModel",
       "logLevel",
       "neo4j",
+      "rerank",
       "retrieval",
       "storage",
     ]);
@@ -152,6 +168,8 @@ const STAGE1_KEYS = [
   "GRAPHRAG_MEMORY_EMBED_MODEL",
   "GRAPHRAG_MEMORY_EMBED_API_KEY",
   "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
+  "GRAPHRAG_MEMORY_VECTOR_API_KEY",
+  "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
   "NINE_ROUTER_KEY",
 ] as const;
 
@@ -482,18 +500,22 @@ describe("loadEnv — embed config boundary cases", () => {
  * NINE_ROUTER_KEY).
  *
  * Resolution order: GRAPHRAG_MEMORY_EMBED_API_KEY (direct value) >
+ * GRAPHRAG_MEMORY_VECTOR_API_KEY (preferred vector alias) >
+ * GRAPHRAG_MEMORY_ANTHROPIC_API_KEY (legacy vector alias) >
  * process.env[GRAPHRAG_MEMORY_EMBED_API_KEY_ENV] (indirect by the var name
  * the operator declared) > undefined (FakeEmbedder). There is NO default
- * var name: if neither knob is set, the key is undefined even when
- * NINE_ROUTER_KEY happens to exist in the environment — the choice of key
- * is declared in the MCP layer, never decided by config. Every case scrubs
- * all key-related vars first so a developer machine's real key can't leak
- * into the assertion.
+ * var name: if no source is set, the key is undefined even when NINE_ROUTER_KEY
+ * happens to exist in the environment — the choice of key is declared in the
+ * MCP layer, never decided by config. Every case scrubs all key-related vars
+ * first so a developer machine's real key can't leak into the assertion.
  */
 describe("loadEnv — embedding API key resolution", () => {
   const KEY_VARS = [
     "GRAPHRAG_MEMORY_EMBED_API_KEY",
     "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
+    "GRAPHRAG_MEMORY_VECTOR_API_KEY",
+    "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "NINE_ROUTER_KEY",
     "CUSTOM_KEY_VAR",
   ] as const;
@@ -525,6 +547,69 @@ describe("loadEnv — embedding API key resolution", () => {
       { GRAPHRAG_MEMORY_EMBED_API_KEY: "direct-secret", ...ENDPOINT },
       () => {
         expect(loadEnv().embedApiKey).toBe("direct-secret");
+      }
+    );
+  });
+
+  it("reads the vector key GRAPHRAG_MEMORY_ANTHROPIC_API_KEY when EMBED_API_KEY is unset", () => {
+    withKeyEnv(
+      {
+        GRAPHRAG_MEMORY_ANTHROPIC_API_KEY: "vector-secret",
+        ...ENDPOINT,
+      },
+      () => {
+        expect(loadEnv().embedApiKey).toBe("vector-secret");
+      }
+    );
+  });
+
+  it("reads the preferred vector key GRAPHRAG_MEMORY_VECTOR_API_KEY when EMBED_API_KEY is unset", () => {
+    withKeyEnv(
+      {
+        GRAPHRAG_MEMORY_VECTOR_API_KEY: "preferred-vector-secret",
+        ...ENDPOINT,
+      },
+      () => {
+        expect(loadEnv().embedApiKey).toBe("preferred-vector-secret");
+      }
+    );
+  });
+
+  it("EMBED_API_KEY wins over GRAPHRAG_MEMORY_ANTHROPIC_API_KEY", () => {
+    withKeyEnv(
+      {
+        GRAPHRAG_MEMORY_EMBED_API_KEY: "direct-secret",
+        GRAPHRAG_MEMORY_VECTOR_API_KEY: "preferred-vector-secret",
+        GRAPHRAG_MEMORY_ANTHROPIC_API_KEY: "vector-secret",
+        ...ENDPOINT,
+      },
+      () => {
+        expect(loadEnv().embedApiKey).toBe("direct-secret");
+      }
+    );
+  });
+
+  it("preferred vector key wins over the legacy vector alias", () => {
+    withKeyEnv(
+      {
+        GRAPHRAG_MEMORY_VECTOR_API_KEY: "preferred-vector-secret",
+        GRAPHRAG_MEMORY_ANTHROPIC_API_KEY: "legacy-vector-secret",
+        ...ENDPOINT,
+      },
+      () => {
+        expect(loadEnv().embedApiKey).toBe("preferred-vector-secret");
+      }
+    );
+  });
+
+  it("does not treat ANTHROPIC_AUTH_TOKEN as an embedding key", () => {
+    withKeyEnv(
+      {
+        ANTHROPIC_AUTH_TOKEN: "llm-secret",
+        ...ENDPOINT,
+      },
+      () => {
+        expect(loadEnv().embedApiKey).toBeUndefined();
       }
     );
   });
@@ -637,7 +722,14 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     patch: Record<string, string | undefined>,
     fn: () => void
   ) {
-    const keys = [...RETRIEVAL_VARS, "GRAPHRAG_MEMORY_EMBED_DIMENSIONS"];
+    const keys = [
+      ...RETRIEVAL_VARS,
+      ...ANTHROPIC_VARS,
+      "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
+      "GRAPHRAG_MEMORY_EMBED_BASE_URL",
+      "GRAPHRAG_MEMORY_EMBED_MODEL",
+      "GRAPHRAG_MEMORY_EMBED_API_KEY",
+    ];
     const saved = new Map<string, string | undefined>();
     for (const k of keys) {
       saved.set(k, process.env[k]);
@@ -677,6 +769,133 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
       expect(retrieval.bm25Enabled).toBe(true);
       expect(retrieval.graphEnabled).toBe(true);
     });
+  });
+
+  it("defaults rerank enable to false on a fresh env", () => {
+    withRetrievalEnv({}, () => {
+      expect(loadEnv().retrieval.rerankEnabled).toBe(false);
+    });
+  });
+
+  it("turns rerank on when the enable flag is true", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "true" },
+      () => {
+        expect(loadEnv().retrieval.rerankEnabled).toBe(true);
+      }
+    );
+  });
+
+  it("accepts 1 / 0 / case-insensitive rerank enable flags", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "1" }, () => {
+      expect(loadEnv().retrieval.rerankEnabled).toBe(true);
+    });
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "FALSE" },
+      () => {
+        expect(loadEnv().retrieval.rerankEnabled).toBe(false);
+      }
+    );
+  });
+
+  it("treats a blank rerank enable flag as the default off", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "   " },
+      () => {
+        expect(loadEnv().retrieval.rerankEnabled).toBe(false);
+      }
+    );
+  });
+
+  for (const value of ["yes", "on", "2"]) {
+    it(`rejects rerank enable = "${value}" with ConfigError`, () => {
+      withRetrievalEnv(
+        { GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: value },
+        () => {
+          expect(() => loadEnv()).toThrow(ConfigError);
+          expect(() => loadEnv()).toThrow(
+            /GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED/
+          );
+        }
+      );
+    });
+  }
+
+  it("skips the rerank credential block when the Anthropic trio is absent", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "true" },
+      () => {
+        const env = loadEnv();
+        expect(env.retrieval.rerankEnabled).toBe(true);
+        expect(env.rerank).toBeUndefined();
+      }
+    );
+  });
+
+  it("does not treat GRAPHRAG_MEMORY_VECTOR_API_KEY as the rerank LLM secret", () => {
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_VECTOR_API_KEY: "preferred-vector-secret",
+        GRAPHRAG_MEMORY_EMBED_BASE_URL: "https://embed.example.invalid/v1",
+        GRAPHRAG_MEMORY_EMBED_MODEL: "embedding-test",
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.rerank).toBeUndefined();
+        expect(env.embedApiKey).toBe("preferred-vector-secret");
+      }
+    );
+  });
+
+  it("defaults MiniMax-M3 China Anthropic URL when only ANTHROPIC_AUTH_TOKEN is set", () => {
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "true",
+        ANTHROPIC_AUTH_TOKEN: "test-key-not-a-real-secret",
+      },
+      () => {
+        expect(() => loadEnv()).not.toThrow();
+        expect(loadEnv().rerank).toEqual({
+          apiKey: "test-key-not-a-real-secret",
+          model: "MiniMax-M3",
+          baseUrl: "https://api.minimaxi.com/anthropic",
+        });
+      }
+    );
+  });
+
+  it("does not treat GRAPHRAG_MEMORY_ANTHROPIC_API_KEY as the rerank LLM secret", () => {
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_ANTHROPIC_API_KEY: "test-key-not-a-real-secret",
+        GRAPHRAG_MEMORY_ANTHROPIC_MODEL: "claude-test",
+        GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL: "https://example.invalid/v1",
+        GRAPHRAG_MEMORY_EMBED_BASE_URL: "https://embed.example.invalid/v1",
+        GRAPHRAG_MEMORY_EMBED_MODEL: "embedding-test",
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.rerank).toBeUndefined();
+        expect(env.embedApiKey).toBe("test-key-not-a-real-secret");
+      }
+    );
+  });
+
+  it("loads the rerank block when ANTHROPIC_AUTH_TOKEN and model/base URL are present", () => {
+    withRetrievalEnv(
+      {
+        ANTHROPIC_AUTH_TOKEN: "test-key-not-a-real-secret",
+        GRAPHRAG_MEMORY_ANTHROPIC_MODEL: "claude-test",
+        GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL: "https://example.invalid/v1",
+      },
+      () => {
+        expect(loadEnv().rerank).toEqual({
+          apiKey: "test-key-not-a-real-secret",
+          model: "claude-test",
+          baseUrl: "https://example.invalid/v1",
+        });
+      }
+    );
   });
 
   it("leaves the seed / traversal knobs at their prior defaults", () => {

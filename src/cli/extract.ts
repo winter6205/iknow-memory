@@ -15,7 +15,7 @@
  *     from the expected per-chunk extraction failures mark-and-continue
  *     absorbs).
  *
- * LLM client: `AnthropicLLMClient` when GRAPHRAG_MEMORY_ANTHROPIC_API_KEY is
+ * LLM client: `AnthropicLLMClient` when ANTHROPIC_AUTH_TOKEN is
  * set. With the key unset, `FakeLLMClient` (canned ok) is only used by the
  * non-extraction flags `--dry-run`, `--list-unmapped`, `--list-failed` and
  * `--backfill-embeddings`; a *real* extraction with no key throws ConfigError
@@ -31,7 +31,13 @@
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 
-import { loadEnv, ConfigError, type GraphragEnv } from "../config.js";
+import {
+  loadEnv,
+  ConfigError,
+  DEFAULT_LLM_BASE_URL,
+  DEFAULT_LLM_MODEL,
+  type GraphragEnv,
+} from "../config.js";
 import { createLogger, type Logger } from "../logging.js";
 import { upSchemaP0 } from "../core/storage/schema-p0.js";
 import {
@@ -846,7 +852,7 @@ const CANNED_OUTPUT = {
  * below), so it is not a keyless run.
  */
 function buildLlm({ flags }: { flags: CliFlags }): LLMClient {
-  const apiKey = process.env.GRAPHRAG_MEMORY_ANTHROPIC_API_KEY?.trim();
+  const apiKey = process.env.ANTHROPIC_AUTH_TOKEN?.trim();
   if (!apiKey) {
     if (!(
       flags.dryRun ||
@@ -855,7 +861,7 @@ function buildLlm({ flags }: { flags: CliFlags }): LLMClient {
       flags.backfillEmbeddings
     )) {
       throw new ConfigError(
-        "refusing to run real extraction without GRAPHRAG_MEMORY_ANTHROPIC_API_KEY; pass --dry-run, --list-unmapped or --list-failed for keyless operation"
+        "refusing to run real extraction without ANTHROPIC_AUTH_TOKEN; pass --dry-run, --list-unmapped or --list-failed for keyless operation"
       );
     }
     // No key + a non-extraction path → scripted fake; canned ok so dry-run
@@ -864,13 +870,12 @@ function buildLlm({ flags }: { flags: CliFlags }): LLMClient {
       scripted: async () => ({ kind: "ok", outputs: [CANNED_OUTPUT] }),
     });
   }
-  const baseUrl = process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL?.trim();
-  const model = process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL?.trim();
-  if (!baseUrl || !model) {
-    throw new ConfigError(
-      "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL and GRAPHRAG_MEMORY_ANTHROPIC_MODEL are required when GRAPHRAG_MEMORY_ANTHROPIC_API_KEY is set"
-    );
-  }
+  const baseUrl = (
+    process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL?.trim() ||
+    DEFAULT_LLM_BASE_URL
+  ).replace(/\/$/, "");
+  const model =
+    process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL?.trim() || DEFAULT_LLM_MODEL;
   return new AnthropicLLMClient({ apiKey, baseUrl, model });
 }
 
@@ -909,7 +914,7 @@ function buildEmbedder({
   if (persistsEmbeddings(flags)) {
     throw new ConfigError(
       "refusing to persist embeddings without embedding credentials; " +
-        "GRAPHRAG_MEMORY_EMBED_API_KEY (or GRAPHRAG_MEMORY_EMBED_API_KEY_ENV), " +
+        "GRAPHRAG_MEMORY_EMBED_API_KEY, GRAPHRAG_MEMORY_VECTOR_API_KEY, or GRAPHRAG_MEMORY_ANTHROPIC_API_KEY / GRAPHRAG_MEMORY_EMBED_API_KEY_ENV, " +
         "GRAPHRAG_MEMORY_EMBED_BASE_URL and GRAPHRAG_MEMORY_EMBED_MODEL are " +
         "required for a real extraction and for --backfill-embeddings; pass " +
         "--dry-run, --list-unmapped or --list-failed for keyless operation"

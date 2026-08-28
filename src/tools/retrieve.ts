@@ -22,6 +22,7 @@ import type {
   ChunkReranker,
   RetrievePreset,
   GraphRanker,
+  ProjectionDrainWaiter,
   RetrieveConfig,
 } from "../core/retrieval/types.js";
 import {
@@ -41,6 +42,8 @@ export const RetrieveInputSchema = z.object({
   filters: z.record(z.string(), z.string()).optional(),
   limit: z.number().int().min(1).max(100).optional(),
   preset: z.enum(RETRIEVE_PRESETS).optional(),
+  wait_for_drain: z.boolean().optional(),
+  wait_for_drain_timeout_ms: z.number().int().min(1).max(600_000).optional(),
 });
 
 export type RetrieveInput = z.infer<typeof RetrieveInputSchema>;
@@ -75,13 +78,20 @@ export interface RetrieveDeps {
   reranker?: ChunkReranker;
   /** Debug gate; wired to `DEBUG=1` by the caller. */
   debug?: boolean;
+  /** Optional read-only projection outbox wait seam. */
+  projectionDrain?: ProjectionDrainWaiter;
 }
 
 export function createRetrieveHandler(deps: RetrieveDeps) {
   return async function retrieveHandler(
     input: RetrieveInput
   ): Promise<ToolResult> {
-    const retrieveConfig = applyPreset(deps.retrieveConfig, input.preset);
+    const retrieveConfig = applyPreset(
+      deps.retrieveConfig,
+      input.preset,
+      input.wait_for_drain,
+      input.wait_for_drain_timeout_ms
+    );
     // Default valid_at to "now" so time-bounded filtering always has a
     // concrete reference point. Pass through exact-match filters.
     const opts: SearchOptions = {
@@ -105,6 +115,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         graphRanker: deps.graphRanker,
         reranker: deps.reranker,
         debug: deps.debug,
+        projectionDrain: deps.projectionDrain,
       }
     );
 
@@ -119,9 +130,20 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
  */
 function applyPreset(
   configured: RetrieveConfig | undefined,
-  requested: RetrievePreset | undefined
+  requested: RetrievePreset | undefined,
+  waitForDrain: boolean | undefined,
+  waitForDrainTimeoutMs: number | undefined
 ): RetrieveConfig | undefined {
-  if (requested === undefined) return configured;
+  if (
+    requested === undefined &&
+    waitForDrain === undefined &&
+    waitForDrainTimeoutMs === undefined
+  ) {
+    return configured;
+  }
+  if (requested === undefined) {
+    return applyWaitOverrides(configured, waitForDrain, waitForDrainTimeoutMs);
+  }
   if (!isRetrievePreset(requested)) {
     throw new RetrieveConfigError(
       `retrieve preset must be one of ${RETRIEVE_PRESETS.join(" | ")}, got "${requested}"`
@@ -138,10 +160,42 @@ function applyPreset(
     rerankEnabled: false,
     graphArmFloor: 3,
   };
+  return applyWaitOverrides(
+    {
+      ...base,
+      ...bundle,
+      preset: requested,
+    },
+    waitForDrain,
+    waitForDrainTimeoutMs
+  );
+}
+
+function applyWaitOverrides(
+  configured: RetrieveConfig | undefined,
+  waitForDrain: boolean | undefined,
+  waitForDrainTimeoutMs: number | undefined
+): RetrieveConfig | undefined {
+  if (waitForDrain === undefined && waitForDrainTimeoutMs === undefined) {
+    return configured;
+  }
+  const bundle =
+    RETRIEVE_PRESET_BUNDLES[configured?.preset ?? DEFAULT_RETRIEVE_PRESET];
+  const base: RetrieveConfig = configured ?? {
+    ...bundle,
+    preset: DEFAULT_RETRIEVE_PRESET,
+    w_graph: 0.15,
+    bm25Enabled: true,
+    graphEnabled: true,
+    rerankEnabled: false,
+    graphArmFloor: 3,
+  };
   return {
     ...base,
-    ...bundle,
-    preset: requested,
+    ...(waitForDrain !== undefined
+      ? { waitForDrainEnabled: waitForDrain }
+      : {}),
+    ...(waitForDrainTimeoutMs !== undefined ? { waitForDrainTimeoutMs } : {}),
   };
 }
 

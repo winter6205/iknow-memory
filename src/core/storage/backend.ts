@@ -15,6 +15,7 @@ export type {
   NeighborChunkStorage,
   Neo4jArmStorage,
   CommunitySummaryStorage,
+  ProjectionDrainWaiter,
 } from "../retrieval/types.js";
 import type {
   RetrievedChunk,
@@ -27,6 +28,7 @@ import type {
   NeighborChunkStorage,
   Neo4jArmStorage,
   CommunitySummaryStorage,
+  ProjectionDrainWaiter,
 } from "../retrieval/types.js";
 
 /**
@@ -47,6 +49,10 @@ export interface GraphRagStorageBackend extends StorageBackend {
   /** Optional ledger search over index-time community summaries. */
   communitySummaries?: CommunitySummaryStorage;
 }
+
+/** A backend that can observe an externally running projection drain. */
+export interface ProjectionDrainBackend
+  extends StorageBackend, ProjectionDrainWaiter {}
 
 /** A backend that can feed the Neo4j graph arm both of its Postgres steps. */
 export interface Neo4jArmBackend extends StorageBackend {
@@ -95,6 +101,16 @@ export function supportsCommunitySummaries(
     }>
   ).communitySummaries;
   return typeof seam?.searchCommunitySummaries === "function";
+}
+
+/** Runtime narrowing for the optional read-only projection drain wait. */
+export function supportsProjectionDrain(
+  storage: StorageBackend
+): storage is ProjectionDrainBackend {
+  return (
+    typeof (storage as Partial<ProjectionDrainBackend>)
+      .waitForProjectionDrain === "function"
+  );
 }
 
 /**

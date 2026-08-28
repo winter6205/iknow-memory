@@ -57,11 +57,15 @@ import type {
   FusedHit,
   GraphRanker,
   NeighborChunkRow,
+  ProjectionDrainWaiter,
   RetrieveConfig,
   RetrieveOutputEnvelope,
 } from "./types.js";
 import type { RetrievedChunk, StorageBackend } from "../types.js";
-import { supportsNeighborChunks } from "../storage/backend.js";
+import {
+  supportsNeighborChunks,
+  supportsProjectionDrain,
+} from "../storage/backend.js";
 import type { EmbeddingClient } from "../embedder.js";
 import { GraphragError } from "../errors.js";
 
@@ -79,6 +83,7 @@ import { GraphragError } from "../errors.js";
  * is active; this fallback keeps legacy callers at the balanced width.
  */
 const ARM_CANDIDATE_POOL = 50;
+const DEFAULT_WAIT_FOR_DRAIN_TIMEOUT_MS = 5_000;
 
 /** Inputs — what the orchestrator needs from the retrieve tool. */
 export interface AssembleArgs {
@@ -126,6 +131,8 @@ export interface AssembleDeps {
   reranker?: ChunkReranker;
   /** Injectable debug gate; wired to `DEBUG=1` by the tool. */
   debug?: boolean;
+  /** Optional read-only projection outbox wait seam. */
+  projectionDrain?: ProjectionDrainWaiter;
 }
 
 export async function assembleRetrievalResult(
@@ -164,20 +171,89 @@ export async function assembleRetrievalResult(
   // `weights === undefined` half is unreachable at runtime. It is what
   // narrows `weights` for the `rrfFuse` call below.
   if (!fusing || weights === undefined) {
-    return assembleVectorOnlyResult(vectorSearch, args, deps, reranker);
+    const result = await assembleVectorOnlyResult(
+      vectorSearch,
+      args,
+      deps,
+      reranker
+    );
+    return waitForProjectionDrain(result, deps);
   }
 
   const [retrieved, optionalResults] = await Promise.all([
     vectorSearch,
     runOptionalArms(queryEmbedding, args, searchOpts, arms),
   ]);
-  return assembleFusedResult(retrieved, optionalResults, {
+  const result = await assembleFusedResult(retrieved, optionalResults, {
     args,
     deps,
     reranker,
     rerankWindow,
     weights,
   });
+  return waitForProjectionDrain(result, deps);
+}
+
+/**
+ * Waiting happens after ranking so a timeout or outbox error can return the
+ * answer already assembled for this request. The wait port is read-only:
+ * another process owns the Neo4j-writing drain.
+ */
+async function waitForProjectionDrain(
+  result: RetrieveOutputEnvelope,
+  deps: AssembleDeps
+): Promise<RetrieveOutputEnvelope> {
+  if (deps.retrieveConfig?.waitForDrainEnabled !== true) return result;
+
+  const waiter = deps.projectionDrain ?? getProjectionDrain(deps.storage);
+  if (waiter === undefined) {
+    // EXIT: configured wait without an observation seam cannot be fulfilled;
+    // preserve the ranking and expose the optional-path degradation.
+    return { ...result, degraded: true };
+  }
+
+  const timeoutMs =
+    deps.retrieveConfig.waitForDrainTimeoutMs ??
+    DEFAULT_WAIT_FOR_DRAIN_TIMEOUT_MS;
+  try {
+    await withTimeout(waiter.waitForProjectionDrain(timeoutMs), timeoutMs);
+    return result;
+  } catch {
+    // EXIT: fail-open — return the pre-wait ranking and mark it degraded.
+    return { ...result, degraded: true };
+  }
+}
+
+function getProjectionDrain(
+  storage: StorageBackend
+): ProjectionDrainWaiter | undefined {
+  return supportsProjectionDrain(storage) ? storage : undefined;
+}
+
+async function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new GraphragError(
+                "projection drain wait timed out",
+                "STORAGE_ERROR"
+              )
+            ),
+          timeoutMs
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 interface FusedAssemblyContext {

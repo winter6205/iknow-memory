@@ -14,6 +14,7 @@ export type {
   EntityEmbeddingStorage,
   NeighborChunkStorage,
   Neo4jArmStorage,
+  CommunitySummaryStorage,
 } from "../retrieval/types.js";
 import type {
   RetrievedChunk,
@@ -25,6 +26,7 @@ import type {
   EntityEmbeddingStorage,
   NeighborChunkStorage,
   Neo4jArmStorage,
+  CommunitySummaryStorage,
 } from "../retrieval/types.js";
 
 /**
@@ -42,6 +44,8 @@ export interface GraphRagStorageBackend extends StorageBackend {
   /** Optional Postgres entity-embedding seed/score read path. */
   entityEmbedding?: EntityEmbeddingStorage;
   neo4jArmSeed?: Neo4jArmStorage;
+  /** Optional ledger search over index-time community summaries. */
+  communitySummaries?: CommunitySummaryStorage;
 }
 
 /** A backend that can feed the Neo4j graph arm both of its Postgres steps. */
@@ -77,6 +81,20 @@ export function supportsEntityEmbedding(
     typeof seam?.seedEntitiesByEmbedding === "function" &&
     typeof seam.chunksByEntityIds === "function"
   );
+}
+
+/** Runtime narrowing for the optional community-summary read seam. */
+export function supportsCommunitySummaries(
+  storage: StorageBackend
+): storage is StorageBackend & {
+  communitySummaries: CommunitySummaryStorage;
+} {
+  const seam = (
+    storage as Partial<{
+      communitySummaries: CommunitySummaryStorage;
+    }>
+  ).communitySummaries;
+  return typeof seam?.searchCommunitySummaries === "function";
 }
 
 /**

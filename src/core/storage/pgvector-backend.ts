@@ -33,10 +33,12 @@ import type {
   NeighborChunkStorage,
   Neo4jArmStorage,
   CommunitySummaryRow,
+  ProjectionDrainWaiter,
 } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
 import { upSchemaP0 } from "./schema-p0.js";
+import { waitForProjectionDrain } from "./projection-outbox.js";
 
 /**
  * Minimal structural subset of the `pg` package we use. Declared as an
@@ -257,7 +259,11 @@ function appendFilterClauses(
  * works out of the box.
  */
 export class PgvectorBackend
-  implements GraphRagStorageBackend, LexicalStorageBackend, NeighborChunkStorage
+  implements
+    GraphRagStorageBackend,
+    LexicalStorageBackend,
+    NeighborChunkStorage,
+    ProjectionDrainWaiter
 {
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
@@ -585,6 +591,24 @@ export class PgvectorBackend
     } catch (err) {
       throw new GraphragError(
         `PgvectorBackend.chunksByChunkIds failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+  }
+
+  /**
+   * Read-only projection synchronization seam. The graph drain runs in its
+   * own process; retrieve only observes the Postgres outbox and never writes
+   * Neo4j inside a request transaction.
+   */
+  async waitForProjectionDrain(timeoutMs: number): Promise<void> {
+    try {
+      const pool = await this.ensureReady();
+      await waitForProjectionDrain(pool, timeoutMs);
+    } catch (err) {
+      if (err instanceof GraphragError) throw err;
+      throw new GraphragError(
+        `PgvectorBackend.waitForProjectionDrain failed: ${(err as Error).message}`,
         "STORAGE_ERROR"
       );
     }

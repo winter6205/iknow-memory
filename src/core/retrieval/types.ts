@@ -175,6 +175,10 @@ export interface RetrieveConfig {
   neighborWidth: number;
   /** Minimum number of graph-arm hits before degraded flips to false. */
   graphArmFloor: number;
+  /** Whether retrieve waits for the projection outbox to drain. */
+  waitForDrainEnabled?: boolean;
+  /** Maximum time retrieve waits for the projection outbox, in milliseconds. */
+  waitForDrainTimeoutMs?: number;
 }
 
 /** One entity ranked by the graph engine, with the engine's own score. */
@@ -297,6 +301,11 @@ export interface CommunitySummaryStorage {
     embedding: number[],
     limit: number
   ): Promise<CommunitySummaryRow[]>;
+}
+
+/** Read-only port for waiting on an externally running projection drain. */
+export interface ProjectionDrainWaiter {
+  waitForProjectionDrain(timeoutMs: number): Promise<void>;
 }
 
 /** The Neo4j PPR arm reuses the same Postgres entity read seam. */

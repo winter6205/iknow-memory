@@ -61,10 +61,12 @@ interface AnthropicLike {
 export interface AnthropicLLMClientOpts {
   /** Model id forwarded as `model:` on each `messages.create` call. */
   model: string;
-  /** Bearer token for the Anthropic SDK; ignored when `anthropic` is injected. */
+  /** API key sent by the SDK as `x-api-key`; ignored when injected. */
   apiKey: string;
   /** Base URL for the Anthropic-compatible endpoint. */
   baseUrl: string;
+  /** Injectable transport for tests; defaults to the SDK's fetch. */
+  fetch?: typeof globalThis.fetch;
   /**
    * Injected Anthropic SDK client. Required for tests; defaults to a fresh
    * `new Anthropic({...})`. Tests should always supply this to avoid the
@@ -101,7 +103,12 @@ export class AnthropicLLMClient implements LLMClient {
       opts.anthropic ??
       (new Anthropic({
         apiKey: opts.apiKey,
+        // MiniMax authenticates this Anthropic-compatible endpoint with
+        // x-api-key. Do not let ANTHROPIC_AUTH_TOKEN add a conflicting
+        // Authorization header from the process environment.
+        authToken: null,
         baseURL: opts.baseUrl,
+        fetch: opts.fetch,
       }) as unknown as AnthropicLike);
     this.sleep = opts.sleep ?? defaultSleep;
   }

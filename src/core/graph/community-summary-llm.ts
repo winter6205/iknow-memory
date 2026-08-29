@@ -21,9 +21,12 @@ interface AnthropicLike {
 }
 
 export interface AnthropicCommunitySummaryClientOptions {
+  /** API key sent by the SDK as `x-api-key`. */
   apiKey: string;
   model: string;
   baseUrl: string;
+  /** Injectable transport for tests; defaults to the SDK's fetch. */
+  fetch?: typeof globalThis.fetch;
   anthropic?: AnthropicLike;
 }
 
@@ -37,7 +40,12 @@ export class AnthropicCommunitySummaryClient implements CommunitySummaryClient {
       options.anthropic ??
       (new Anthropic({
         apiKey: options.apiKey,
+        // MiniMax authenticates this Anthropic-compatible endpoint with
+        // x-api-key. Do not let ANTHROPIC_AUTH_TOKEN add a conflicting
+        // Authorization header from the process environment.
+        authToken: null,
         baseURL: options.baseUrl,
+        fetch: options.fetch,
       }) as unknown as AnthropicLike);
   }
 

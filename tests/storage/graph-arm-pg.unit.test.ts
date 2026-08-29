@@ -226,6 +226,51 @@ describe("PgvectorBackend.graphArmSeed", () => {
 });
 
 describe("PgvectorBackend.communitySummaries", () => {
+  it("reads one summary by community id", async () => {
+    const { backend, calls } = makeBackend([
+      {
+        id: "summary-1",
+        community_id: "7",
+        summary: "storage topic",
+        score: 0.8,
+      },
+    ]);
+
+    await expect(
+      backend.communitySummaries.getCommunitySummaryByCommunityId("7")
+    ).resolves.toEqual({
+      id: "summary-1",
+      communityId: "7",
+      summary: "storage topic",
+    });
+
+    const [sql, params] = calls[0]!;
+    expect(sql).toContain("FROM community_summaries");
+    expect(sql).toContain("WHERE community_id = $1");
+    expect(params).toEqual(["7"]);
+  });
+
+  it("returns undefined for an empty or missing community id", async () => {
+    const empty = makeBackend([]);
+    await expect(
+      empty.backend.communitySummaries.getCommunitySummaryByCommunityId("")
+    ).resolves.toBeUndefined();
+    expect(empty.calls).toHaveLength(0);
+
+    const missing = makeBackend([]);
+    await expect(
+      missing.backend.communitySummaries.getCommunitySummaryByCommunityId("missing")
+    ).resolves.toBeUndefined();
+    expect(missing.calls).toHaveLength(1);
+  });
+
+  it("converts a community-id read failure to GraphragError", async () => {
+    const { backend } = makeBackend([], new Error("summary table unavailable"));
+    await expect(
+      backend.communitySummaries.getCommunitySummaryByCommunityId("7")
+    ).rejects.toMatchObject({ code: "STORAGE_ERROR" });
+  });
+
   it("maps summary rows and queries Postgres by the supplied embedding", async () => {
     const { backend, calls } = makeBackend([
       {

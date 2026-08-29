@@ -1,7 +1,7 @@
 # Spec: Retrieve and graph quality stack
 
 > **Status:** ACR all-yes; slice 0 (temporary LLM rerank) **on main** (#118). Remaining slices T2–T11 tracked only in `plans/retrieve-graph-quality.md` (no GitHub issues).
-> **Source:** operator 2026-08-28 — coarse single contract (not one-question tickets); new wayfinder map for this destination; parent map remains local `docs/handoff/wayfinder-tickets/map-1.md`.
+> **Source:** operator 2026-08-28 — coarse single contract (not one-question tickets); new wayfinder map for this destination; parent map remains local `docs/handoff/wayfinder-tickets/map-1.md`. Slice 8 detail: `specs/retrieve-community.md`.
 > **Predecessors:** `specs/retrieve-graph-priority.md` (Host order, on main), `specs/retrieve-rerank-llm.md` (temporary LLM rerank, on main), `specs/neo4j-graph-arm.md` (PPR arm + outbox, on main).
 > **Tracker (files):** `plans/retrieve-graph-quality.md` is SSOT for implementation slices. Do not use GitHub issues.
 > **Assumption gate:** operator chose one overview spec. Locks below are the gate; object in review or they stand.
@@ -48,7 +48,7 @@ Exact copy from `docs/CONTEXT.md` (not redefined): **iknow-memory**, **MCP tool*
   6. **Slice 5 — mode bundles:** named presets `conservative` | `balanced` | `tokenmax` on retrieve (env default + optional input). Each sets candidateK / topK / rerank window / vector-BM25 weights / neighbor width. Invalid name → `ConfigError` at process start or typed tool error on call.
   7. **Slice 6 — neighboring chunk evidence:** after ranking (and optional rerank), expand ±N chunks on the same `source_ref` (N from preset, default 1). Deduped by id; still cut to `limit` unless preset says evidence-fill may grow to a documented cap. N=0 is identity.
   8. **Slice 7 — node embedding in retrieve:** optional seed/score using Postgres `entities.embedding`; fail-open to today’s graph-priority path + `degraded` if the embedding path throws. No Neo4j vector index in this spec.
-  9. **Slice 8 — community summaries:** index-time Louvain + LLM summary per community stored on the ledger; retrieve may lead with summary chunks for topic-like queries when the preset enables it. Detection/summary failure fail-open (no summaries, not a hard retrieve fail).
+  9. **Slice 8 — community summaries:** implement `specs/retrieve-community.md` (T9). Index-time Louvain + LLM summary per **community** on the ledger; retrieve may **include** summary chunks (typed metadata) when the preset topic-retrieve switch is on; graph-priority prefix unchanged. Detection/summary failure fail-open (no summaries, not a hard retrieve fail).
   10. **Slice 9 — causal edges and supersession:** allow causal `relation_norm` values in vocabulary; extract may emit them. Consolidate CLI: detect contradiction / superseded facts, default dry-run; apply writes `superseded_by` and closes `valid_window`. Retrieve honors `valid_at` (already) so superseded facts drop out of time-valid graph mapping.
   11. **Slice 10 — optional projection wait:** retrieve flag/env to wait for outbox drain up to a timeout; timeout or drain error → fail-open + `degraded`. Default off.
 

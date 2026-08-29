@@ -128,6 +128,10 @@ const COMMUNITY_SUMMARIES_SQL = `SELECT id, community_id, summary,
  ORDER BY embedding <=> $1::vector ASC, id ASC
  LIMIT $2`;
 
+const COMMUNITY_SUMMARY_BY_ID_SQL = `SELECT id, community_id, summary
+  FROM community_summaries
+ WHERE community_id = $1`;
+
 /**
  * Same-source neighboring chunks around already-ranked anchors.
  *
@@ -780,6 +784,35 @@ export class PgvectorBackend
    * seam used only by a summary-enabled preset.
    */
   readonly communitySummaries = {
+    getCommunitySummaryByCommunityId: async (
+      communityId: string
+    ): Promise<CommunitySummaryRow | undefined> => {
+      if (communityId === "") return undefined;
+      try {
+        const pool = await this.ensureReady();
+        const result = await pool.query(COMMUNITY_SUMMARY_BY_ID_SQL, [
+          communityId,
+        ]);
+        const row = result.rows[0] as
+          | {
+              id: string;
+              community_id: string;
+              summary: string;
+            }
+          | undefined;
+        if (row === undefined) return undefined;
+        return {
+          id: row.id,
+          communityId: row.community_id,
+          summary: row.summary,
+        };
+      } catch (err) {
+        throw new GraphragError(
+          `PgvectorBackend.communitySummaries.getCommunitySummaryByCommunityId failed: ${(err as Error).message}`,
+          "STORAGE_ERROR"
+        );
+      }
+    },
     searchCommunitySummaries: async (
       embedding: number[],
       limit: number

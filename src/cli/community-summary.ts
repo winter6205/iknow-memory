@@ -4,13 +4,23 @@
  * The flow is GDS Louvain → load live entity names from Postgres → summarize
  * with the configured LLM → embed the summary → upsert the Postgres ledger
  * row. Neo4j is read-only here. A failed detector or failed individual
- * summary is fail-open: existing retrieval and existing summaries remain
- * usable, and the run reports the failure instead of aborting the batch.
+ * summary fails the job; individual summary failures do not abort the batch.
+ *
+ * Exit-code map:
+ *   0 successful summary run
+ *   1 configuration / fatal error, including a typed job failure
+ *   2 usage error
+ *   3 documented skip — no Neo4j URI, so Louvain is not attempted
  */
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 
-import { ConfigError, loadEnv, type GraphragEnv } from "../config.js";
+import {
+  ConfigError,
+  loadEnv,
+  NEO4J_URI_VAR,
+  type GraphragEnv,
+} from "../config.js";
 import { createLogger, type Logger } from "../logging.js";
 import { NineRouterEmbedder, type EmbeddingClient } from "../core/embedder.js";
 import {
@@ -53,6 +63,36 @@ interface Flags {
   dryRun: boolean;
 }
 
+export const COMMUNITY_SUMMARY_SKIP_EXIT = 3;
+export const COMMUNITY_SUMMARY_JOB_EXIT = 1;
+
+export class CommunitySummarySkipError extends Error {
+  readonly code = "COMMUNITY_SUMMARY_NEO4J_NOT_CONFIGURED" as const;
+  readonly exitCode = COMMUNITY_SUMMARY_SKIP_EXIT;
+
+  constructor() {
+    super(`${NEO4J_URI_VAR} is not configured; Louvain was not attempted`);
+    this.name = "CommunitySummarySkipError";
+  }
+}
+
+export type CommunitySummaryJobFailurePhase = "detection" | "summary";
+
+export class CommunitySummaryJobError extends Error {
+  readonly code = "COMMUNITY_SUMMARY_JOB_FAILED" as const;
+  readonly exitCode = COMMUNITY_SUMMARY_JOB_EXIT;
+
+  constructor(
+    readonly phase: CommunitySummaryJobFailurePhase,
+    message: string,
+    readonly cause: unknown,
+    readonly communityId?: string
+  ) {
+    super(`community summary ${phase} failed: ${message}`, { cause });
+    this.name = "CommunitySummaryJobError";
+  }
+}
+
 const USAGE = "usage: community-summary [--dry-run]";
 
 export function parseArgs(
@@ -84,11 +124,10 @@ export async function runCli(
     try {
       communities = await deps.detector.detect();
     } catch (err) {
-      // EXIT: fail-open — 保留现有检索与摘要可用性，记录失败后正常结束。
       deps.logger.warn("community-detection-failed", {
         error: errorMessage(err),
       });
-      return 0;
+      throw new CommunitySummaryJobError("detection", errorMessage(err), err);
     }
     if (parsed.flags.dryRun) {
       deps.logger.info("community-summary-plan", {
@@ -107,6 +146,7 @@ export async function runCli(
 
     let stored = 0;
     let failed = 0;
+    let firstFailure: CommunitySummaryJobError | undefined;
     for (const community of communities) {
       try {
         const names = await loadEntityNames(client, community.entityIds);
@@ -123,6 +163,12 @@ export async function runCli(
       } catch (err) {
         // EXIT: 单个 community 失败仅记录并继续批处理，不阻断其他摘要。
         failed += 1;
+        firstFailure ??= new CommunitySummaryJobError(
+          "summary",
+          errorMessage(err),
+          err,
+          community.id
+        );
         deps.logger.warn("community-summary-failed", {
           communityId: community.id,
           error: errorMessage(err),
@@ -134,6 +180,7 @@ export async function runCli(
       stored,
       failed,
     });
+    if (firstFailure !== undefined) throw firstFailure;
     return 0;
   } finally {
     client.release();
@@ -219,11 +266,16 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     );
     return 1;
   }
-  if (env.neo4j === undefined) {
+  let neo4j: NonNullable<GraphragEnv["neo4j"]>;
+  try {
+    if (env.neo4j === undefined) throw new CommunitySummarySkipError();
+    neo4j = env.neo4j;
+  } catch (err) {
+    if (!(err instanceof CommunitySummarySkipError)) throw err;
     process.stderr.write(
-      "community-summary config error: GRAPHRAG_MEMORY_NEO4J_URI is required\n"
+      `community-summary skipped [${err.code}]: ${err.message}; EXIT: ${err.exitCode}\n`
     );
-    return 1;
+    return err.exitCode;
   }
   if (env.rerank === undefined || env.embedApiKey === undefined) {
     process.stderr.write(
@@ -235,7 +287,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
   const pool = new Pool({ connectionString: env.dbUrl });
   const deps: CommunitySummaryDeps = {
     pool: pool as unknown as CommunitySummaryPool,
-    detector: createNeo4jCommunityDetector(env.neo4j),
+    detector: createNeo4jCommunityDetector(neo4j),
     summarizer: new AnthropicCommunitySummaryClient({
       apiKey: env.rerank.apiKey,
       model: env.rerank.model,

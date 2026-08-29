@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   runCli,
+  runCliFromEnv,
+  CommunitySummaryJobError,
   type CommunitySummaryClient,
   type CommunitySummaryDeps,
   type CommunitySummaryPool,
@@ -14,6 +16,7 @@ import {
   COMMUNITY_DROP_CYPHER,
   COMMUNITY_PROJECT_CYPHER,
   createCommunityDetector,
+  createNeo4jCommunityDetector,
   type CypherSession,
 } from "../../src/core/graph/neo4j-community.js";
 import type {
@@ -28,6 +31,16 @@ import type {
   StorageBackend,
 } from "../../src/core/types.js";
 
+vi.mock("../../src/core/graph/neo4j-community.js", async () => {
+  const actual = await vi.importActual<
+    typeof import("../../src/core/graph/neo4j-community.js")
+  >("../../src/core/graph/neo4j-community.js");
+  return {
+    ...actual,
+    createNeo4jCommunityDetector: vi.fn(actual.createNeo4jCommunityDetector),
+  };
+});
+
 const COMMUNITY: Community = {
   id: "7",
   entityIds: ["11111111-1111-4111-8111-111111111111"],
@@ -38,6 +51,50 @@ const embedder: EmbeddingClient = {
     return [[1]];
   },
 };
+
+const COMMUNITY_SUMMARY_ENV_KEYS = [
+  "GRAPHRAG_MEMORY_DB_URL",
+  "GRAPHRAG_MEMORY_NEO4J_URI",
+  "GRAPHRAG_MEMORY_NEO4J_USER",
+  "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
+  "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
+  "GRAPHRAG_MEMORY_EMBED_BASE_URL",
+  "GRAPHRAG_MEMORY_EMBED_MODEL",
+  "GRAPHRAG_MEMORY_EMBED_API_KEY",
+  "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
+  "GRAPHRAG_MEMORY_VECTOR_API_KEY",
+  "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+] as const;
+
+async function withMissingNeo4jEnv<T>(fn: () => Promise<T>): Promise<T> {
+  const saved = new Map<string, string | undefined>();
+  for (const key of COMMUNITY_SUMMARY_ENV_KEYS) {
+    saved.set(key, process.env[key]);
+    process.env[key] = "";
+  }
+  process.env["GRAPHRAG_MEMORY_DB_URL"] = "postgres://localhost:5432/test";
+  process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+  try {
+    return await fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+function captureStderr(): { text: () => string; restore: () => void } {
+  let output = "";
+  const spy = vi
+    .spyOn(process.stderr, "write")
+    .mockImplementation((chunk: unknown) => {
+      output += String(chunk);
+      return true;
+    });
+  return { text: () => output, restore: () => spy.mockRestore() };
+}
 
 interface Query {
   text: string;
@@ -172,6 +229,23 @@ function deps(
 }
 
 describe("community summary index CLI", () => {
+  it("types a missing Neo4j URI as a documented skip without invoking Louvain", async () => {
+    const stderr = captureStderr();
+    try {
+      const exitCode = await withMissingNeo4jEnv(() => runCliFromEnv([]));
+
+      expect(exitCode).toBe(3);
+      expect(stderr.text()).toContain(
+        "community-summary skipped [COMMUNITY_SUMMARY_NEO4J_NOT_CONFIGURED]"
+      );
+      expect(stderr.text()).toContain("Louvain was not attempted");
+      expect(stderr.text()).toContain("EXIT: 3");
+      expect(vi.mocked(createNeo4jCommunityDetector)).not.toHaveBeenCalled();
+    } finally {
+      stderr.restore();
+    }
+  });
+
   it("stores one generated summary per detected community", async () => {
     const h = deps();
 
@@ -190,7 +264,7 @@ describe("community summary index CLI", () => {
     ]);
   });
 
-  it("continues successfully when GDS or one community summary fails", async () => {
+  it("fails with a typed non-zero job error when GDS detection fails", async () => {
     const h = deps({
       detector: {
         async detect() {
@@ -200,7 +274,13 @@ describe("community summary index CLI", () => {
       },
     });
 
-    await expect(runCli([], h.deps)).resolves.toBe(0);
+    const failure = runCli([], h.deps);
+    await expect(failure).rejects.toBeInstanceOf(CommunitySummaryJobError);
+    await expect(failure).rejects.toMatchObject({
+      code: "COMMUNITY_SUMMARY_JOB_FAILED",
+      exitCode: 1,
+      phase: "detection",
+    });
     expect(
       h.client.queries.some((query) => /INSERT INTO/.test(query.text))
     ).toBe(false);
@@ -300,7 +380,11 @@ describe("community summary index CLI", () => {
       },
     });
 
-    await expect(runCli([], h.deps)).resolves.toBe(0);
+    await expect(runCli([], h.deps)).rejects.toMatchObject({
+      code: "COMMUNITY_SUMMARY_JOB_FAILED",
+      exitCode: 1,
+      phase: "detection",
+    });
     expect(client.summaryRows).toEqual(oldRows);
     expect(
       client.queries.some((query) =>
@@ -323,7 +407,7 @@ describe("community summary index CLI", () => {
     ).toBe(false);
   });
 
-  it("skips a failed community summary and stores the other communities", async () => {
+  it("continues the batch but fails with a typed non-zero job error after an LLM failure", async () => {
     const h = deps({
       detector: {
         async detect() {
@@ -344,7 +428,12 @@ describe("community summary index CLI", () => {
       },
     });
 
-    await expect(runCli([], h.deps)).resolves.toBe(0);
+    await expect(runCli([], h.deps)).rejects.toMatchObject({
+      code: "COMMUNITY_SUMMARY_JOB_FAILED",
+      exitCode: 1,
+      phase: "summary",
+      communityId: "7",
+    });
     expect(
       h.client.queries.filter((query) =>
         /INSERT INTO community_summaries/.test(query.text)

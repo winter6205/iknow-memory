@@ -316,6 +316,19 @@ describe("retrieveTool", () => {
     const result = tool.inputSchema.safeParse({ query: "hello" });
     expect(result.success).toBe(true);
   });
+
+  it("input schema accepts the optional projection wait controls", () => {
+    const tool = retrieveTool({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    const result = tool.inputSchema.safeParse({
+      query: "hello",
+      wait_for_drain: true,
+      wait_for_drain_timeout_ms: 250,
+    });
+    expect(result.success).toBe(true);
+  });
 });
 
 describe("createRetrieveHandler error path", () => {
@@ -353,5 +366,29 @@ describe("createRetrieveHandler error path", () => {
     const err = new GraphragError("test", "INVALID_INPUT");
     expect(err).toBeInstanceOf(GraphragError);
     expect(err.code).toBe("INVALID_INPUT");
+  });
+});
+
+describe("createRetrieveHandler projection wait input", () => {
+  it("enables the read-only drain wait for one retrieve call", async () => {
+    let calls = 0;
+    const handler = createRetrieveHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+      projectionDrain: {
+        waitForProjectionDrain: async () => {
+          calls += 1;
+        },
+      },
+    });
+
+    const result = await handler({
+      query: "anything",
+      wait_for_drain: true,
+      wait_for_drain_timeout_ms: 250,
+    });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toBe(1);
   });
 });

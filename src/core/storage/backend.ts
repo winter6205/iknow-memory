@@ -9,13 +9,27 @@
  * `if (storage.graphArmSeed)` before using the graph arm.
  */
 export type { StorageBackend, SearchOptions } from "../types.js";
-export type { GraphArmStorage, Neo4jArmStorage } from "../retrieval/types.js";
+export type {
+  GraphArmStorage,
+  EntityEmbeddingStorage,
+  NeighborChunkStorage,
+  Neo4jArmStorage,
+  CommunitySummaryStorage,
+  ProjectionDrainWaiter,
+} from "../retrieval/types.js";
 import type {
   RetrievedChunk,
   SearchOptions,
   StorageBackend,
 } from "../types.js";
-import type { GraphArmStorage, Neo4jArmStorage } from "../retrieval/types.js";
+import type {
+  GraphArmStorage,
+  EntityEmbeddingStorage,
+  NeighborChunkStorage,
+  Neo4jArmStorage,
+  CommunitySummaryStorage,
+  ProjectionDrainWaiter,
+} from "../retrieval/types.js";
 
 /**
  * Graph-rag storage backend: the chunk-store contract plus the OPTIONAL
@@ -29,8 +43,16 @@ import type { GraphArmStorage, Neo4jArmStorage } from "../retrieval/types.js";
  */
 export interface GraphRagStorageBackend extends StorageBackend {
   graphArmSeed?: GraphArmStorage;
+  /** Optional Postgres entity-embedding seed/score read path. */
+  entityEmbedding?: EntityEmbeddingStorage;
   neo4jArmSeed?: Neo4jArmStorage;
+  /** Optional ledger search over index-time community summaries. */
+  communitySummaries?: CommunitySummaryStorage;
 }
+
+/** A backend that can observe an externally running projection drain. */
+export interface ProjectionDrainBackend
+  extends StorageBackend, ProjectionDrainWaiter {}
 
 /** A backend that can feed the Neo4j graph arm both of its Postgres steps. */
 export interface Neo4jArmBackend extends StorageBackend {
@@ -49,6 +71,45 @@ export function supportsNeo4jArm(
   return (
     typeof seam?.seedEntitiesByEmbedding === "function" &&
     typeof seam.chunksByEntityIds === "function"
+  );
+}
+
+/** Runtime narrowing for the optional Postgres entity-embedding path. */
+export function supportsEntityEmbedding(
+  storage: StorageBackend
+): storage is StorageBackend & { entityEmbedding: EntityEmbeddingStorage } {
+  const seam = (
+    storage as Partial<{
+      entityEmbedding: EntityEmbeddingStorage;
+    }>
+  ).entityEmbedding;
+  return (
+    typeof seam?.seedEntitiesByEmbedding === "function" &&
+    typeof seam.chunksByEntityIds === "function"
+  );
+}
+
+/** Runtime narrowing for the optional community-summary read seam. */
+export function supportsCommunitySummaries(
+  storage: StorageBackend
+): storage is StorageBackend & {
+  communitySummaries: CommunitySummaryStorage;
+} {
+  const seam = (
+    storage as Partial<{
+      communitySummaries: CommunitySummaryStorage;
+    }>
+  ).communitySummaries;
+  return typeof seam?.searchCommunitySummaries === "function";
+}
+
+/** Runtime narrowing for the optional read-only projection drain wait. */
+export function supportsProjectionDrain(
+  storage: StorageBackend
+): storage is ProjectionDrainBackend {
+  return (
+    typeof (storage as Partial<ProjectionDrainBackend>)
+      .waitForProjectionDrain === "function"
   );
 }
 
@@ -77,6 +138,16 @@ export function supportsLexicalSearch(
 ): storage is LexicalStorageBackend {
   return (
     typeof (storage as Partial<LexicalStorageBackend>).searchLexical ===
+    "function"
+  );
+}
+
+/** Runtime narrowing for the optional same-source neighbor seam. */
+export function supportsNeighborChunks(
+  storage: StorageBackend
+): storage is StorageBackend & NeighborChunkStorage {
+  return (
+    typeof (storage as Partial<NeighborChunkStorage>).chunksByChunkIds ===
     "function"
   );
 }

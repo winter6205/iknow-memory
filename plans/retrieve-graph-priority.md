@@ -44,4 +44,4 @@ minimal-change-verifier: yes — one logical task (Host ranking graph-priority);
 
 ## End of round
 
-After T2–T3 land: code-review (Standards + Spec) on the impl diff, then verification-before-completion. Do **not** mix `plans/retrieve-rerank-llm.md` T2–T3 into these commits. Recommended product order: this plan **before** LLM rerank implementation (rerank permutes the list this plan defines).
+**CLOSED on main** (PR #94). Temporary LLM rerank shipped separately as #118; remaining quality work is `plans/retrieve-graph-quality.md` T2–T11.

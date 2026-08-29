@@ -42,7 +42,7 @@ import {
   createNeo4jPprRanker,
   type PprRanker,
 } from "./core/graph/neo4j-ppr.js";
-import { createAnthropicChunkReranker } from "./core/rerank/anthropic-reranker.js";
+import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
 import type { StorageBackend } from "./core/types.js";
 
 const SERVER_NAME = "iknow-memory";
@@ -88,11 +88,7 @@ interface ServerDeps {
    * as an ABSENT key, not an empty one — see `buildRetrieveDeps`.
    */
   graphRanker?: PprRanker;
-  /**
-   * Temporary retrieve rerank adapter. Constructed only when rerank is
-   * enabled and the Anthropic trio is complete. Typed structurally so
-   * this file never imports src/core/retrieval/*.
-   */
+  /** Dedicated HTTP retrieve rerank adapter, absent when its URL is unset. */
   reranker?: {
     permute(
       query: string,
@@ -218,8 +214,8 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     ...(env.neo4j !== undefined
       ? { graphRanker: createNeo4jPprRanker(env.neo4j) }
       : {}),
-    ...(env.retrieval.rerankEnabled && env.rerank !== undefined
-      ? { reranker: createAnthropicChunkReranker(env.rerank) }
+    ...(env.retrieval.rerankEnabled && env.rerankUrl !== undefined
+      ? { reranker: createHttpChunkReranker(env.rerankUrl) }
       : {}),
   };
 }

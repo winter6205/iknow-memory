@@ -15,10 +15,66 @@
  * one-hop arm answers to when a caller injects a `graphConfig` explicitly
  * (#58, `docs/runbooks/sql-graph-arm-archived.md`). Only one of the two
  * ever runs in a given call, so one name and one `w_graph` weight cover
- * both — a fourth arm name would fork the weight table for an arm that is
- * off the default path.
+ * both — the optional node-embedding arm has its own name so debug output
+ * can distinguish direct Postgres ranking from Neo4j graph ranking.
  */
-export type ArmName = "vector" | "bm25" | "graph";
+export type ArmName =
+  "vector" | "bm25" | "graph" | "node-embedding" | "community-summary";
+
+/** Named retrieval mode bundles exposed by the retrieve tool. */
+export type RetrievePreset = "conservative" | "balanced" | "tokenmax";
+
+export const RETRIEVE_PRESETS = [
+  "conservative",
+  "balanced",
+  "tokenmax",
+] as const satisfies readonly RetrievePreset[];
+
+export const DEFAULT_RETRIEVE_PRESET: RetrievePreset = "balanced";
+
+/** The recall and evidence levers owned by a mode bundle. */
+export interface RetrievePresetBundle {
+  entityLinkTopK: number;
+  candidateCap: number;
+  w_vec: number;
+  w_bm25: number;
+  neighborWidth: number;
+}
+
+/**
+ * Preset values are immutable so concurrent retrieve calls cannot share a
+ * mutable ranking configuration. Conservative and tokenmax deliberately
+ * bracket the balanced defaults without changing the wire envelope.
+ */
+export const RETRIEVE_PRESET_BUNDLES: Readonly<
+  Record<RetrievePreset, RetrievePresetBundle>
+> = {
+  conservative: {
+    entityLinkTopK: 4,
+    candidateCap: 25,
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    neighborWidth: 0,
+  },
+  balanced: {
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    neighborWidth: 1,
+  },
+  tokenmax: {
+    entityLinkTopK: 16,
+    candidateCap: 100,
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    neighborWidth: 2,
+  },
+};
+
+export function isRetrievePreset(value: string): value is RetrievePreset {
+  return (RETRIEVE_PRESETS as readonly string[]).includes(value);
+}
 
 /** A single hit produced by one retrieval arm. */
 export interface ArmHit {
@@ -40,6 +96,10 @@ export interface ArmHit {
   source_ref: string;
   /** Temporal validity window for filtering. */
   valid_window: [string, string | null];
+  metadata?: {
+    kind: "community-summary";
+    communityId: string;
+  };
 }
 
 /** Result of one retrieval arm. */
@@ -67,10 +127,16 @@ export interface FusedHit {
   rrfScore: number;
   /** Which arm(s) contributed to this hit. */
   arms: ArmName[];
+  metadata?: {
+    kind: "community-summary";
+    communityId: string;
+  };
 }
 
 /** Configuration for the retrieval pipeline (loaded from env, see src/config.ts). */
 export interface RetrieveConfig {
+  /** Named mode bundle selected at startup; defaults to balanced. */
+  preset: RetrievePreset;
   /** Weight for the vector arm in RRF. */
   w_vec: number;
   /** Weight for the BM25 lexical arm in RRF. */
@@ -91,12 +157,28 @@ export interface RetrieveConfig {
    * Anthropic trio is a skip at the orchestrator (T3), not `degraded`.
    */
   rerankEnabled: boolean;
+  /**
+   * Optional direct entity-embedding retrieval. Off preserves the T1
+   * graph-priority/RRF path exactly.
+   */
+  nodeEmbeddingEnabled?: boolean;
+  /**
+   * Optional topic-level community summary recall. When omitted, the
+   * tokenmax preset enables it; balanced and conservative stay unchanged.
+   */
+  communitySummaryEnabled?: boolean;
   /** Top-K seed entities from the embedding seed query. */
   entityLinkTopK: number;
   /** Hard cap on total candidates pulled from the graph arm. */
   candidateCap: number;
+  /** Number of same-source neighboring chunks enabled by the bundle. */
+  neighborWidth: number;
   /** Minimum number of graph-arm hits before degraded flips to false. */
   graphArmFloor: number;
+  /** Whether retrieve waits for the projection outbox to drain. */
+  waitForDrainEnabled?: boolean;
+  /** Maximum time retrieve waits for the projection outbox, in milliseconds. */
+  waitForDrainTimeoutMs?: number;
 }
 
 /** One entity ranked by the graph engine, with the engine's own score. */
@@ -163,24 +245,71 @@ export interface EntityChunkRow {
   valid_until: string | null;
 }
 
+/** A chunk row returned by the same-source neighbor lookup. */
+export interface NeighborChunkRow {
+  id: string;
+  content: string;
+  source_ref: string;
+  valid_from: string;
+  valid_until: string | null;
+}
+
 /**
- * Postgres side of the Neo4j graph arm: entity seeds in, their chunks out.
+ * Postgres chunk ledger seam for neighboring evidence.
  *
- * Shares `seedEntitiesByEmbedding` with the archived SQL arm's seam by
- * shape (spec A7 allows reusing the entity-linking idea), but not the
- * one-hop JOIN — the traversal moved to the graph engine.
+ * The lookup is intentionally expressed in chunk ids rather than source refs:
+ * the storage layer owns ingest ordering and can select the rows immediately
+ * around the already-ranked anchors.
  */
-export interface Neo4jArmStorage {
+export interface NeighborChunkStorage {
+  chunksByChunkIds(
+    chunkIds: readonly string[],
+    validAt: string,
+    width: number
+  ): Promise<NeighborChunkRow[]>;
+}
+
+/**
+ * Postgres entity-embedding read path: entity seeds in, their chunks out.
+ *
+ * The optional score is the cosine similarity calculated by Postgres. A
+ * backend may omit it when it only exposes deterministic seed order.
+ */
+export interface EntityEmbeddingStorage {
   seedEntitiesByEmbedding(
     embedding: number[],
     topK: number
-  ): Promise<Array<{ id: string; canonical_name: string }>>;
+  ): Promise<Array<{ id: string; canonical_name: string; score?: number }>>;
   chunksByEntityIds(
     entityIds: readonly string[],
     validAt: string,
     limit: number
   ): Promise<EntityChunkRow[]>;
 }
+
+/** A ledger-stored community summary exposed as a retrieve candidate. */
+export interface CommunitySummaryRow {
+  id: string;
+  communityId: string;
+  summary: string;
+  score?: number;
+}
+
+/** Postgres seam for optional topic-level summary recall. */
+export interface CommunitySummaryStorage {
+  searchCommunitySummaries(
+    embedding: number[],
+    limit: number
+  ): Promise<CommunitySummaryRow[]>;
+}
+
+/** Read-only port for waiting on an externally running projection drain. */
+export interface ProjectionDrainWaiter {
+  waitForProjectionDrain(timeoutMs: number): Promise<void>;
+}
+
+/** The Neo4j PPR arm reuses the same Postgres entity read seam. */
+export interface Neo4jArmStorage extends EntityEmbeddingStorage {}
 
 /** Storage seam for the graph arm; implemented optionally by StorageBackend. */
 export interface GraphArmStorage {
@@ -211,6 +340,10 @@ export interface RetrieveOutputEnvelope {
     source_ref: string;
     valid_window: [string, string | null];
     score: number;
+    metadata?: {
+      kind: "community-summary";
+      communityId: string;
+    };
   }>;
   /**
    * Optional: present (true) when an optional arm was ATTEMPTED and could

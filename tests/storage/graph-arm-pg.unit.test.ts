@@ -12,7 +12,10 @@ import { describe, it, expect } from "vitest";
 
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { GraphragError } from "../../src/core/errors.js";
-import type { GraphArmStorage } from "../../src/core/retrieval/types.js";
+import type {
+  CommunitySummaryStorage,
+  GraphArmStorage,
+} from "../../src/core/retrieval/types.js";
 
 /**
  * Minimal structural pool shape the class expects (query + connect + end).
@@ -219,5 +222,41 @@ describe("PgvectorBackend.graphArmSeed", () => {
         )
       ).rejects.toMatchObject({ code: "STORAGE_ERROR" });
     });
+  });
+});
+
+describe("PgvectorBackend.communitySummaries", () => {
+  it("maps summary rows and queries Postgres by the supplied embedding", async () => {
+    const { backend, calls } = makeBackend([
+      {
+        id: "summary-1",
+        community_id: "7",
+        summary: "storage topic",
+        score: 0.8,
+      },
+    ]);
+    const seam: CommunitySummaryStorage = backend.communitySummaries;
+
+    await expect(seam.searchCommunitySummaries([0.1, 0.2], 5)).resolves.toEqual(
+      [
+        {
+          id: "summary-1",
+          communityId: "7",
+          summary: "storage topic",
+          score: 0.8,
+        },
+      ]
+    );
+    const [sql, params] = calls[0]!;
+    expect(sql).toContain("FROM community_summaries");
+    expect(sql).toContain("embedding <=> $1::vector");
+    expect(params).toEqual(["[0.1,0.2]", 5]);
+  });
+
+  it("converts a summary ledger failure to GraphragError", async () => {
+    const { backend } = makeBackend([], new Error("summary table unavailable"));
+    await expect(
+      backend.communitySummaries.searchCommunitySummaries([0.1], 5)
+    ).rejects.toMatchObject({ code: "STORAGE_ERROR" });
   });
 });

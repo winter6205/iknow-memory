@@ -27,12 +27,18 @@ import type {
 } from "./backend.js";
 import type {
   EntityChunkRow,
+  EntityEmbeddingStorage,
   GraphArmStorage,
+  NeighborChunkRow,
+  NeighborChunkStorage,
   Neo4jArmStorage,
+  CommunitySummaryRow,
+  ProjectionDrainWaiter,
 } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
 import { upSchemaP0 } from "./schema-p0.js";
+import { waitForProjectionDrain } from "./projection-outbox.js";
 
 /**
  * Minimal structural subset of the `pg` package we use. Declared as an
@@ -66,7 +72,7 @@ function toVectorLiteral(embedding: number[]): string {
  * `merged_into IS NULL AND retired = false`, ordered by cosine distance.
  */
 const SEED_ENTITIES_SQL =
-  "SELECT id, canonical_name FROM entities " +
+  "SELECT id, canonical_name, 1 - (embedding <=> $1::vector) AS score FROM entities " +
   "WHERE embedding IS NOT NULL AND merged_into IS NULL AND retired = false " +
   "ORDER BY embedding <=> $1::vector LIMIT $2";
 
@@ -114,6 +120,45 @@ const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_re
       AND (c.valid_until IS NULL OR c.valid_until > $2::timestamptz)
     ORDER BY array_position($1::uuid[], ranked.entity_id), c.id
     LIMIT $3`;
+
+const COMMUNITY_SUMMARIES_SQL = `SELECT id, community_id, summary,
+    1 - (embedding <=> $1::vector) AS score
+  FROM community_summaries
+ WHERE embedding IS NOT NULL
+ ORDER BY embedding <=> $1::vector ASC, id ASC
+ LIMIT $2`;
+
+/**
+ * Same-source neighboring chunks around already-ranked anchors.
+ *
+ * `created_at, id` is the stable ingest order. The visibility predicate is
+ * repeated inside the CTE so temporal filtering happens before positions are
+ * calculated; an expired row must not shift the visible neighbor window.
+ */
+const NEIGHBOR_CHUNKS_SQL = `
+WITH visible AS (
+  SELECT id, content, source_ref, valid_from, valid_until, created_at,
+         row_number() OVER (
+           PARTITION BY source_ref
+           ORDER BY created_at ASC, id ASC
+         ) AS position
+    FROM chunks
+   WHERE valid_from <= $2::timestamptz
+     AND (valid_until IS NULL OR valid_until > $2::timestamptz)
+),
+targets AS (
+  SELECT id, source_ref, position
+    FROM visible
+   WHERE id = ANY($1::uuid[])
+)
+SELECT DISTINCT n.id, n.content, n.source_ref, n.valid_from,
+                n.valid_until, n.created_at
+  FROM visible n
+  JOIN targets t
+    ON n.source_ref = t.source_ref
+   AND n.position BETWEEN t.position - $3::bigint
+                       AND t.position + $3::bigint
+ ORDER BY n.source_ref, n.created_at, n.id`;
 
 /**
  * Text-search configuration for the lexical arm. `simple` deliberately,
@@ -214,7 +259,11 @@ function appendFilterClauses(
  * works out of the box.
  */
 export class PgvectorBackend
-  implements GraphRagStorageBackend, LexicalStorageBackend
+  implements
+    GraphRagStorageBackend,
+    LexicalStorageBackend,
+    NeighborChunkStorage,
+    ProjectionDrainWaiter
 {
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
@@ -505,6 +554,66 @@ export class PgvectorBackend
     });
   }
 
+  /**
+   * Read visible chunks within `width` ingest positions of each anchor.
+   * Neighbor expansion is a Postgres concern: chunks remain ledger rows and
+   * are never written to or looked up in Neo4j.
+   */
+  async chunksByChunkIds(
+    chunkIds: readonly string[],
+    validAt: string,
+    width: number
+  ): Promise<NeighborChunkRow[]> {
+    if (chunkIds.length === 0 || width <= 0) return [];
+    try {
+      const pool = await this.ensureReady();
+      const result = await pool.query(NEIGHBOR_CHUNKS_SQL, [
+        [...chunkIds],
+        validAt,
+        width,
+      ]);
+      return result.rows.map((r) => {
+        const row = r as {
+          id: string;
+          content: string;
+          source_ref: string;
+          valid_from: Date;
+          valid_until: Date | null;
+        };
+        return {
+          id: row.id,
+          content: row.content,
+          source_ref: row.source_ref,
+          valid_from: row.valid_from.toISOString(),
+          valid_until: row.valid_until?.toISOString() ?? null,
+        };
+      });
+    } catch (err) {
+      throw new GraphragError(
+        `PgvectorBackend.chunksByChunkIds failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+  }
+
+  /**
+   * Read-only projection synchronization seam. The graph drain runs in its
+   * own process; retrieve only observes the Postgres outbox and never writes
+   * Neo4j inside a request transaction.
+   */
+  async waitForProjectionDrain(timeoutMs: number): Promise<void> {
+    try {
+      const pool = await this.ensureReady();
+      await waitForProjectionDrain(pool, timeoutMs);
+    } catch (err) {
+      if (err instanceof GraphragError) throw err;
+      throw new GraphragError(
+        `PgvectorBackend.waitForProjectionDrain failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+  }
+
   async close(): Promise<void> {
     if (!this.pool) return;
     try {
@@ -544,8 +653,16 @@ export class PgvectorBackend
           topK,
         ]);
         return result.rows.map((r) => {
-          const row = r as { id: string; canonical_name: string };
-          return { id: row.id, canonical_name: row.canonical_name };
+          const row = r as {
+            id: string;
+            canonical_name: string;
+            score: number;
+          };
+          return {
+            id: row.id,
+            canonical_name: row.canonical_name,
+            score: row.score,
+          };
         });
       } catch (err) {
         throw new GraphragError(
@@ -640,6 +757,56 @@ export class PgvectorBackend
       } catch (err) {
         throw new GraphragError(
           `PgvectorBackend.neo4jArmSeed.chunksByEntityIds failed: ${(err as Error).message}`,
+          "STORAGE_ERROR"
+        );
+      }
+    },
+  };
+
+  /**
+   * Direct entity-embedding read seam for retrieve. It deliberately reuses
+   * the Postgres half of the Neo4j arm; no entity vector is copied to Neo4j.
+   */
+  readonly entityEmbedding: EntityEmbeddingStorage = {
+    seedEntitiesByEmbedding: (embedding, topK) =>
+      this.neo4jArmSeed.seedEntitiesByEmbedding(embedding, topK),
+    chunksByEntityIds: (entityIds, validAt, limit) =>
+      this.neo4jArmSeed.chunksByEntityIds(entityIds, validAt, limit),
+  };
+
+  /**
+   * Semantic lookup for index-time summaries. Summary rows are kept in
+   * Postgres and are never copied to Neo4j; this is the optional retrieve
+   * seam used only by a summary-enabled preset.
+   */
+  readonly communitySummaries = {
+    searchCommunitySummaries: async (
+      embedding: number[],
+      limit: number
+    ): Promise<CommunitySummaryRow[]> => {
+      try {
+        const pool = await this.ensureReady();
+        const result = await pool.query(COMMUNITY_SUMMARIES_SQL, [
+          toVectorLiteral(embedding),
+          limit,
+        ]);
+        return result.rows.map((r) => {
+          const row = r as {
+            id: string;
+            community_id: string;
+            summary: string;
+            score: number;
+          };
+          return {
+            id: row.id,
+            communityId: row.community_id,
+            summary: row.summary,
+            score: Number(row.score),
+          };
+        });
+      } catch (err) {
+        throw new GraphragError(
+          `PgvectorBackend.communitySummaries.searchCommunitySummaries failed: ${(err as Error).message}`,
           "STORAGE_ERROR"
         );
       }

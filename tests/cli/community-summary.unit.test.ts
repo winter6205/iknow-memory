@@ -275,9 +275,7 @@ describe("community summary index CLI", () => {
     });
 
     const failure = runCli([], h.deps);
-    await expect(failure).rejects.toBeInstanceOf(
-      CommunitySummaryJobError
-    );
+    await expect(failure).rejects.toBeInstanceOf(CommunitySummaryJobError);
     await expect(failure).rejects.toMatchObject({
       code: "COMMUNITY_SUMMARY_JOB_FAILED",
       exitCode: 1,

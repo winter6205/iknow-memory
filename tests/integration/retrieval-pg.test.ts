@@ -58,6 +58,7 @@ const SCHEMA_URL =
 
 /** Default RetrieveConfig (locked by T5 + spec glossary): w=1/1, topK=8, cap=50, floor=3. */
 const CFG: RetrieveConfig = {
+  preset: "balanced",
   w_vec: 1,
   w_bm25: 1,
   w_graph: 1,
@@ -66,6 +67,7 @@ const CFG: RetrieveConfig = {
   rerankEnabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
+  neighborWidth: 1,
   graphArmFloor: 3,
 };
 
@@ -144,6 +146,8 @@ async function seedChunk(
     content?: string;
     validFrom?: string;
     validUntil?: string | null;
+    sourceRef?: string;
+    createdAt?: string;
   } = {}
 ): Promise<string> {
   const id = randomUUID();
@@ -152,14 +156,15 @@ async function seedChunk(
   await c.query(
     `INSERT INTO chunks (id, content, embedding, valid_from, valid_until,
                           source_ref, metadata, created_at)
-     VALUES ($1, $2, $3::vector, $4, $5, $6, '{}', now())`,
+     VALUES ($1, $2, $3::vector, $4, $5, $6, '{}', $7)`,
     [
       id,
       content,
       vecLiteral(vec),
       over.validFrom ?? COVER_START,
       over.validUntil ?? null,
-      `src/${id}`,
+      over.sourceRef ?? `src/${id}`,
+      over.createdAt ?? new Date().toISOString(),
     ]
   );
   return id;
@@ -190,13 +195,14 @@ async function seedTriple(
     start?: string;
     end?: string | null;
   }
-): Promise<void> {
+): Promise<string> {
+  const id = randomUUID();
   await c.query(
     `INSERT INTO triples (id, head_id, tail_id, relation_raw, relation_norm,
                           confidence, source_chunk_id, valid_window)
      VALUES ($1, $2, $3, 'rel', 'rel', 1.0, $4, tstzrange($5, $6, '[)'))`,
     [
-      randomUUID(),
+      id,
       over.head,
       over.tail,
       over.chunkId,
@@ -204,6 +210,7 @@ async function seedTriple(
       over.end ?? null,
     ]
   );
+  return id;
 }
 
 async function bulkEntities(c: pg.Client, n: number): Promise<string[]> {
@@ -621,6 +628,96 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
     const ids = rows.map((r) => r.id);
     expect(ids).toContain(live);
     expect(ids).not.toContain(past); // past chunk's valid_window excludes now
+  });
+
+  it("11. neighboring evidence reads the same-source ±1 window after ranking", async () => {
+    const c = client!;
+    await resetSchema(c);
+    const sourceRef = "t7/three-chunks";
+    const left = await seedChunk(c, {
+      content: "left",
+      sourceRef,
+      createdAt: "2024-01-01T00:00:00.000Z",
+    });
+    const middle = await seedChunk(c, {
+      content: "middle",
+      sourceRef,
+      createdAt: "2024-01-01T00:01:00.000Z",
+    });
+    const right = await seedChunk(c, {
+      content: "right",
+      sourceRef,
+      createdAt: "2024-01-01T00:02:00.000Z",
+    });
+
+    // Keep the storage read real while constraining the ranked result to the
+    // middle anchor, which makes the subsequent neighbor expansion observable.
+    const rankedOnlyStorage = {
+      upsert: async () => [],
+      search: async () => [
+        {
+          id: middle,
+          content: "middle",
+          source_ref: sourceRef,
+          valid_window: [COVER_START, null] as [string, null],
+          score: 1,
+        },
+      ],
+      chunksByChunkIds: (
+        ids: readonly string[],
+        validAt: string,
+        width: number
+      ) => backend!.chunksByChunkIds(ids, validAt, width),
+      close: async () => {},
+    };
+
+    const out = await assembleRetrievalResult(
+      {
+        query: "middle",
+        validAt: NOW_ISO,
+        limit: 3,
+      },
+      {
+        embedder,
+        storage: rankedOnlyStorage,
+        retrieveConfig: CFG,
+      }
+    );
+
+    expect(out.chunks.map((chunk) => chunk.id)).toEqual([middle, left, right]);
+  });
+
+  it("10. superseded fact with an expired window is absent from graph-mapped chunks", async () => {
+    const c = client!;
+    await resetSchema(c);
+    const oldChunk = await seedChunk(c, {});
+    const replacementChunk = await seedChunk(c, {});
+    const head = await seedEntity(c, { name: "Alice", desc: "employment" });
+    const oldTail = await seedEntity(c, { name: "Acme", desc: "employer" });
+    const newTail = await seedEntity(c, { name: "Globex", desc: "employer" });
+    const oldFact = await seedTriple(c, {
+      head,
+      tail: oldTail,
+      chunkId: oldChunk,
+      start: PAST_START,
+      end: PAST_END,
+    });
+    const replacementFact = await seedTriple(c, {
+      head,
+      tail: newTail,
+      chunkId: replacementChunk,
+    });
+    await c.query(`UPDATE triples SET superseded_by = $2 WHERE id = $1`, [
+      oldFact,
+      replacementFact,
+    ]);
+
+    const rows = await backend!.graphArmSeed!.chunksByOneHopFromEntities(
+      [head],
+      NOW_ISO,
+      20
+    );
+    expect(rows.map((row) => row.id)).toEqual([replacementChunk]);
   });
 
   it("9. SC4: fresh PG -> ingest the probe corpus -> CLI extract -> graph arm clears the default floor without degraded", async () => {

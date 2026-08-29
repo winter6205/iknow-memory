@@ -32,6 +32,8 @@ export interface RetrieveInput {
   valid_at?: string; // ISO 8601; defaults to now
   filters?: Record<string, string>; // exact match on source_ref / metadata keys
   limit?: number; // top-K; defaults to 10
+  wait_for_drain?: boolean;
+  wait_for_drain_timeout_ms?: number;
 }
 
 /** A single chunk in a retrieve response. */

@@ -45,6 +45,7 @@ export async function runGraphArm(
   try {
     seeds = await getSeedEntities(deps, queryEmbedding);
   } catch (err) {
+    // EXIT: degraded ArmResult 上行 orchestrator → envelope degraded:true
     return armResultWithError(err);
   }
   // Short-circuit: an empty seed set has no reachable one-hop path. The
@@ -62,6 +63,7 @@ export async function runGraphArm(
   try {
     rows = await storageOneHop(deps, seeds, now);
   } catch (err) {
+    // EXIT: degraded ArmResult 上行 orchestrator → envelope degraded:true
     return armResultWithError(err);
   }
   // Floor counts chunks (per spec §Boundaries: "if chunksByOneHopFromEntities

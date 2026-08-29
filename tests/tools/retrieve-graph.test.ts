@@ -9,10 +9,14 @@
  * satisfied path omits `degraded`; and the RRF fusion marks both-arm hits.
  */
 import { describe, it, expect } from "vitest";
-import { createRetrieveHandler } from "../../src/tools/retrieve.js";
+import {
+  createRetrieveHandler,
+  RetrieveInputSchema,
+} from "../../src/tools/retrieve.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
 import { loadEnv, ConfigError } from "../../src/config.js";
+import { RetrieveConfigError } from "../../src/core/retrieval/types.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
 import type {
   GraphArmStorage,
@@ -26,6 +30,7 @@ const TEST_DIM = 1536;
 
 /** Default RetrieveConfig the handler tests run under. */
 const CFG: RetrieveConfig = {
+  preset: "balanced",
   w_vec: 1,
   w_bm25: 1,
   w_graph: 1,
@@ -34,6 +39,7 @@ const CFG: RetrieveConfig = {
   rerankEnabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
+  neighborWidth: 1,
   graphArmFloor: 3,
 };
 
@@ -92,6 +98,12 @@ class FakeGraphBackend implements GraphRagStorageBackend {
     this.searchCalls.push(opts);
     return this.searchResults.slice(0, opts.limit);
   }
+  async searchLexical(
+    _query: string,
+    opts: SearchOptions
+  ): Promise<RetrievedChunk[]> {
+    return this.searchResults.slice(0, opts.limit);
+  }
   async close(): Promise<void> {}
 }
 
@@ -145,6 +157,50 @@ function makeGraphHandler(opts: {
 }
 
 describe("retrieve graph-arm envelope (T5)", () => {
+  it("retrieve input schema rejects an unknown preset", () => {
+    expect(
+      RetrieveInputSchema.safeParse({ query: "q", preset: "fast" }).success
+    ).toBe(false);
+  });
+
+  it("unknown direct retrieve input is rejected with a typed error", async () => {
+    const handler = createRetrieveHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    await expect(
+      handler({ query: "q", preset: "fast" } as never)
+    ).rejects.toBeInstanceOf(RetrieveConfigError);
+  });
+
+  it("input preset narrows the rerank candidate window", async () => {
+    const backend = new FakeGraphBackend();
+    backend.searchResults = Array.from({ length: 60 }, (_, i) =>
+      vecChunk(`preset-${i}`)
+    );
+    const rerankCandidates: number[] = [];
+    const handler = createRetrieveHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: backend,
+      retrieveConfig: {
+        ...CFG,
+        bm25Enabled: true,
+        rerankEnabled: true,
+      },
+      reranker: {
+        async permute(_query, candidates) {
+          rerankCandidates.push(candidates.length);
+          return candidates.map((candidate) => candidate.id);
+        },
+      },
+    });
+
+    await handler({ query: "q", preset: "conservative" });
+
+    expect(backend.searchCalls[0]?.limit).toBe(25);
+    expect(rerankCandidates).toEqual([25]);
+  });
+
   it("empty P0 DB + MemoryBackend (no graphArmSeed, no graphConfig) → exactly { chunks: [] }", async () => {
     const handler = createRetrieveHandler({
       embedder: new FakeEmbedder(TEST_DIM),
@@ -316,6 +372,9 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25",
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_NODE_EMBEDDING_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_PRESET",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
@@ -364,11 +423,16 @@ describe("retrieve config boundary validation (T5)", () => {
         w_graph: 0.15,
         bm25Enabled: true,
         graphEnabled: true,
+        nodeEmbeddingEnabled: false,
         rerankEnabled: false,
+        preset: "balanced",
         // Seed / traversal knobs keep their P0 values.
         entityLinkTopK: 8,
         candidateCap: 50,
+        neighborWidth: 1,
         graphArmFloor: 3,
+        waitForDrainEnabled: false,
+        waitForDrainTimeoutMs: 5000,
       });
     });
   });

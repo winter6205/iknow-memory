@@ -34,13 +34,23 @@ const ARM_WEIGHT: Record<ArmName, (cfg: RetrieveConfig) => number> = {
   vector: (cfg) => cfg.w_vec,
   bm25: (cfg) => cfg.w_bm25,
   graph: (cfg) => cfg.w_graph,
+  // Node embedding is a graph-priority lead in the orchestrator. Keeping a
+  // weight here makes the ArmResult total and safe if it is ever fused.
+  "node-embedding": (cfg) => cfg.w_graph,
+  "community-summary": () => 0,
 };
 
 /**
  * Tie-break priority when two hits score identically. Vector leads because
  * it is the arm that always runs; graph trails because it is archived.
  */
-const ARM_ORDER: readonly ArmName[] = ["vector", "bm25", "graph"];
+const ARM_ORDER: readonly ArmName[] = [
+  "vector",
+  "bm25",
+  "graph",
+  "node-embedding",
+  "community-summary",
+];
 
 function armRank(arm: ArmName | undefined): number {
   const i = arm === undefined ? -1 : ARM_ORDER.indexOf(arm);
@@ -63,6 +73,7 @@ function addHit(acc: Map<string, FusedHit>, hit: ArmHit, weight: number): void {
     valid_window: hit.valid_window,
     rrfScore: score,
     arms: [hit.arm],
+    ...(hit.metadata !== undefined ? { metadata: hit.metadata } : {}),
   });
 }
 

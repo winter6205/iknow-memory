@@ -39,6 +39,8 @@ class FixedEmbedder implements EmbeddingClient {
 
 class SummaryBackend implements StorageBackend {
   readonly communitySummaries: CommunitySummaryStorage = {
+    getCommunitySummaryByCommunityId: async (communityId) =>
+      this.rows.find((row) => row.communityId === communityId),
     searchCommunitySummaries: async () => this.rows,
   };
   readonly neo4jArmSeed: Neo4jArmStorage = {

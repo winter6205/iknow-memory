@@ -88,9 +88,9 @@ minimal-change-verifier: yes **for this spec as one contract**; implementation *
    - [blocks: T1]
 
 9. **Community summaries for topic retrieve** — tag: `[implementation]`
-   - **Inherits:** spec SC10, slice 8: Louvain on GDS; summaries on Postgres ledger; retrieve may lead with summary chunks when the preset enables topic retrieve; failure fail-open (no summaries, retrieve still returns); Host still generates the answer.
-   - **Surface:** graph projection / GDS; extract or a graph CLI for index-time summary; retrieve orchestrator.
-   - **Acceptance:** community off or empty communities → order unchanged vs post-T8 (or post-T1 if T8 off); fail-open does not hard-fail retrieve; `npm test` without live Neo4j still exit 0 when the path is off.
+   - **Inherits:** `specs/retrieve-community.md`; execute `plans/retrieve-community.md`. Louvain on GDS at index time; summaries on Postgres ledger; retrieve may **include** summary chunks (typed metadata) when the topic-retrieve switch is on; graph-priority prefix unchanged; fail-open on ledger read; Host still generates the answer.
+   - **Surface:** see `plans/retrieve-community.md` (graph CLI / GDS, Postgres ledger, retrieve orchestrator).
+   - **Acceptance:** that plan’s T1–T3; `npm test` without live Neo4j still exit 0 when the path is off.
    - Status: [ ] pending
    - [blocks: T6]
 

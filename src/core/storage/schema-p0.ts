@@ -139,6 +139,8 @@ async function createExtractionRecords(client: PoolClient): Promise<void> {
 }
 
 /** Index-time summaries keyed by the community id returned by GDS Louvain. */
+const MAX_PGVECTOR_ANN_DIMENSIONS = 2000;
+
 async function createCommunitySummaries(
   client: PoolClient,
   dimensions: number
@@ -153,6 +155,11 @@ async function createCommunitySummaries(
       created_at   timestamptz NOT NULL DEFAULT now(),
       updated_at   timestamptz NOT NULL DEFAULT now()
     )`);
+  // pgvector's ANN indexes cap vector dimensions at 2000. The table remains
+  // searchable by the exact cosine-distance query when the configured
+  // embedding width is larger, so do not make bootstrap fail for valid
+  // high-dimensional embeddings.
+  if (dimensions > MAX_PGVECTOR_ANN_DIMENSIONS) return;
   await client.query(`
     CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx
       ON community_summaries USING hnsw (embedding vector_cosine_ops)`);

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   runCli,
   runCliFromEnv,
+  CommunitySummaryJobError,
   type CommunitySummaryClient,
   type CommunitySummaryDeps,
   type CommunitySummaryPool,
@@ -263,7 +264,7 @@ describe("community summary index CLI", () => {
     ]);
   });
 
-  it("continues successfully when GDS or one community summary fails", async () => {
+  it("fails with a typed non-zero job error when GDS detection fails", async () => {
     const h = deps({
       detector: {
         async detect() {
@@ -273,7 +274,15 @@ describe("community summary index CLI", () => {
       },
     });
 
-    await expect(runCli([], h.deps)).resolves.toBe(0);
+    const failure = runCli([], h.deps);
+    await expect(failure).rejects.toBeInstanceOf(
+      CommunitySummaryJobError
+    );
+    await expect(failure).rejects.toMatchObject({
+      code: "COMMUNITY_SUMMARY_JOB_FAILED",
+      exitCode: 1,
+      phase: "detection",
+    });
     expect(
       h.client.queries.some((query) => /INSERT INTO/.test(query.text))
     ).toBe(false);
@@ -373,7 +382,11 @@ describe("community summary index CLI", () => {
       },
     });
 
-    await expect(runCli([], h.deps)).resolves.toBe(0);
+    await expect(runCli([], h.deps)).rejects.toMatchObject({
+      code: "COMMUNITY_SUMMARY_JOB_FAILED",
+      exitCode: 1,
+      phase: "detection",
+    });
     expect(client.summaryRows).toEqual(oldRows);
     expect(
       client.queries.some((query) =>
@@ -396,7 +409,7 @@ describe("community summary index CLI", () => {
     ).toBe(false);
   });
 
-  it("skips a failed community summary and stores the other communities", async () => {
+  it("continues the batch but fails with a typed non-zero job error after an LLM failure", async () => {
     const h = deps({
       detector: {
         async detect() {
@@ -417,7 +430,12 @@ describe("community summary index CLI", () => {
       },
     });
 
-    await expect(runCli([], h.deps)).resolves.toBe(0);
+    await expect(runCli([], h.deps)).rejects.toMatchObject({
+      code: "COMMUNITY_SUMMARY_JOB_FAILED",
+      exitCode: 1,
+      phase: "summary",
+      communityId: "7",
+    });
     expect(
       h.client.queries.filter((query) =>
         /INSERT INTO community_summaries/.test(query.text)

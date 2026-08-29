@@ -1,7 +1,7 @@
 # Local map index — [wayfinder:map] 检索与图谱质量：完整 Host retrieve 栈
 
 > 父地图: [map-1.md](map-1.md)
-> 合同: `specs/retrieve-graph-quality.md`（slice 0 已合：`specs/retrieve-rerank-llm.md`）
+> 合同: `specs/retrieve-graph-quality.md`（slice 0 已合：`specs/retrieve-rerank-llm.md`；slice 8 细节：`specs/retrieve-community.md` / `plans/retrieve-community.md`）
 > **不要用 GitHub issues 当 tracker。**
 
 ## Destination（一句）

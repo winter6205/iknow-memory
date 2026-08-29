@@ -25,7 +25,7 @@ Claim a bullet by marking **Status** in `plans/retrieve-graph-quality.md` on the
 | T6  | `[implementation]` | Mode bundles                                        | pending         | T1       |
 | T7  | `[implementation]` | Neighbor chunk evidence                             | pending         | T6       |
 | T8  | `[implementation]` | Node embedding seeds from Postgres                  | pending         | T1       |
-| T9  | `[implementation]` | Community summaries (`plans/retrieve-community.md`) | pending         | T6       |
+| T9  | `[implementation]` | Community summaries (`plans/retrieve-community.md`) | **done** (2026-08-29) | T6       |
 | T10 | `[implementation]` | Causal vocab + supersession CLI                     | pending         | T5       |
 | T11 | `[implementation]` | Optional retrieve wait-for-drain                    | pending         | T3       |
 

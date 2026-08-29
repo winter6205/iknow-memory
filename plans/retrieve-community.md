@@ -23,21 +23,21 @@ External blocker: quality-stack **T6** (mode bundle + topic-retrieve **switch**)
    - **Inherits:** spec A3, SC2: summaries are Postgres ledger rows; empty ledger with topic switch on → identity retrieve, no throw, no `degraded` solely from empty ledger. ADR-0001: Neo4j is not SoR for summary text. Chunks never enter Neo4j.
    - **Surface:** existing Postgres / P0 schema family and storage backend used by retrieve.
    - **Acceptance:** a summary row can be written and read by community id; empty ledger is a legal retrieve input; `npm test` path that covers this store does not require live GDS.
-   - Status: [ ] pending
+   - Status: [x] done (ae57170, 2026-08-29)
    - [blocks: quality T6]
 
 2. **Index-time Louvain and summary job** — tag: `[implementation]`
    - **Inherits:** spec A2, A7, A11, SC5: Louvain via Neo4j GDS at **index time** only; typed job failure, no empty `catch`; EXIT: operator reruns the job; missing URI → skip Louvain (not retrieve `degraded`); retrieve never runs Louvain or summary LLM. Extract Anthropic trio may write summaries; not the Host chat model. Hyperparameters and prompt are open.
    - **Surface:** existing graph projection / GDS path and operator CLI family (extract-adjacent or graph CLI).
    - **Acceptance:** missing URI does not attempt Louvain; a thrown GDS or summary LLM fails the job with a typed error and non-zero or documented skip exit; successful run leaves ledger rows; retrieve unit tests still do not call this job.
-   - Status: [ ] pending
+   - Status: [x] done (bdf9391 + fbb07ca, 2026-08-29)
    - [blocks: T1]
 
 3. **[parallel] Retrieve includes ledger summaries** — tag: `[implementation]`
    - **Inherits:** spec A4, A5, A8, SC1–SC4, SC6–SC7: gate is the topic-retrieve **switch** only (not a query-class detector); include summaries in `chunks[]` with a typed metadata flag; do **not** displace a non-empty graph-arm prefix; switch off → identical order to post-T8 (or post-graph-priority if node-embedding seeds are off); ledger **read** throw → fail-open, no Host throw, `degraded` not required this slice; envelope `{ chunks[] }` (+ optional `degraded`); `limit` holds. Which presets default the switch on is open (T6 headroom).
    - **Surface:** existing retrieve orchestrator / `RetrieveConfig` (same family as other retrieval flags).
    - **Acceptance:** unit tests with a fake ledger: off → identity; on + empty → identity; on + fixtures → at least one typed summary item and graph-arm hits still lead when present; read throw → pre-community list, no throw; `npm test` and `npm run build` exit 0 without live Neo4j GDS when the path is off.
-   - Status: [ ] pending
+   - Status: [x] done (9bd3ca6, 2026-08-29)
    - [parallel]
    - [blocks: T1, quality T6]
 

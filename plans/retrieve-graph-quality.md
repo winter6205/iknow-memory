@@ -91,7 +91,7 @@ minimal-change-verifier: yes **for this spec as one contract**; implementation *
    - **Inherits:** `specs/retrieve-community.md`; execute `plans/retrieve-community.md`. Louvain on GDS at index time; summaries on Postgres ledger; retrieve may **include** summary chunks (typed metadata) when the topic-retrieve switch is on; graph-priority prefix unchanged; fail-open on ledger read; Host still generates the answer.
    - **Surface:** see `plans/retrieve-community.md` (graph CLI / GDS, Postgres ledger, retrieve orchestrator).
    - **Acceptance:** that plan’s T1–T3; `npm test` without live Neo4j still exit 0 when the path is off.
-   - Status: [ ] pending
+   - Status: [x] done (2026-08-29; see retrieve-community plan)
    - [blocks: T6]
 
 10. **Causal relations and fact supersession** — tag: `[implementation]`

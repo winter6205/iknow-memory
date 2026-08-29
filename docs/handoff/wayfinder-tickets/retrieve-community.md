@@ -16,9 +16,9 @@ Claim a bullet by marking **Status** in `plans/retrieve-community.md` on the fea
 
 | Id  | Tag                | Outcome                            | Status  | Blocks         |
 | --- | ------------------ | ---------------------------------- | ------- | -------------- |
-| T1  | `[implementation]` | Persist community summary ledger   | pending | quality T6     |
-| T2  | `[implementation]` | Index-time Louvain + summary job   | pending | T1             |
-| T3  | `[implementation]` | Retrieve includes ledger summaries | pending | T1, quality T6 |
+| T1  | `[implementation]` | Persist community summary ledger   | **done** (2026-08-29) | quality T6     |
+| T2  | `[implementation]` | Index-time Louvain + summary job   | **done** (2026-08-29) | T1             |
+| T3  | `[implementation]` | Retrieve includes ledger summaries | **done** (2026-08-29) | T1, quality T6 |
 
 **Frontier:** quality T6, then this file’s T1.
 

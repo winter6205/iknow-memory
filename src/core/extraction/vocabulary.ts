@@ -11,7 +11,7 @@
  * frozen-by: T3 [impl]
  */
 
-/** Closed set of relation_norm terms (max 36). Traversal key for triples. */
+/** Closed set of relation_norm terms. Traversal key for triples. */
 export const ALLOWED: readonly string[] = [
   "related_to",
   "part_of",
@@ -20,6 +20,10 @@ export const ALLOWED: readonly string[] = [
   "located_at",
   "occurred_at",
   "occurred_in",
+  // Typed causal edges (SC11).
+  "caused",
+  "enabled",
+  "prevented",
   "caused_by",
   "causes",
   "depends_on",
@@ -59,7 +63,7 @@ export const ALIASES: Readonly<Record<string, string>> = {
   "based at": "located_at",
   "happened in": "occurred_in",
   "happened at": "occurred_at",
-  caused: "causes",
+  "was caused by": "caused_by",
   "responsible for": "causes",
   "leads to": "enables",
   "comes before": "precedes",

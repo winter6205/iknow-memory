@@ -39,6 +39,15 @@ describe("normalizeRelation cascade", () => {
     expect(await normalizeRelation("located_in", {})).toBe("located_in");
   });
 
+  it("accepts the typed causal relations in the vocabulary", async () => {
+    for (const relation of ["caused", "enabled", "prevented"]) {
+      expect(ALLOWED).toContain(relation);
+      expect(await normalizeRelation(` ${relation.toUpperCase()} `, {})).toBe(
+        relation
+      );
+    }
+  });
+
   it("synonym match returns the mapped ALLOWED term", async () => {
     expect(await normalizeRelation("is part of", {})).toBe("part_of");
     expect(await normalizeRelation("works at", {})).toBe("works_for");

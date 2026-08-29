@@ -254,6 +254,8 @@ function cmp(a: string[], b: string[]): number {
 class FakeWriter implements GraphWriter {
   nodes: GraphNode[] = [];
   edges: GraphEdge[] = [];
+  deletedNodeIds: string[] = [];
+  deletedEdgeIds: string[] = [];
   /** Every mergeNodes / mergeEdges call, in order. */
   calls: string[] = [];
   constraintCalls = 0;
@@ -268,6 +270,12 @@ class FakeWriter implements GraphWriter {
   async mergeEdges(edges: readonly GraphEdge[]): Promise<void> {
     this.calls.push("edges");
     this.edges.push(...edges);
+  }
+  async deleteNodes(ids: readonly string[]): Promise<void> {
+    this.deletedNodeIds.push(...ids);
+  }
+  async deleteEdges(ids: readonly string[]): Promise<void> {
+    this.deletedEdgeIds.push(...ids);
   }
   async close(): Promise<void> {
     this.closed += 1;
@@ -616,6 +624,8 @@ describe("graph-drain handles a subject the ledger dropped", () => {
     expect(code).toBe(0);
     expect(h.writer.nodes).toEqual([]);
     expect(h.writer.edges).toEqual([]);
+    expect(h.writer.deletedNodeIds).toEqual([RETIRED]);
+    expect(h.writer.deletedEdgeIds).toEqual([TRIPLE_RETIRED]);
     expect(h.db.byStatus("done")).toHaveLength(2);
     expect(fieldsOf(h.lines, "graph-drain-complete")).toMatchObject({
       intents: 2,

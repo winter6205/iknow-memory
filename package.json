@@ -7,7 +7,8 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "extract": "bin/extract.js"
+    "extract": "bin/extract.js",
+    "consolidate": "bin/consolidate.js"
   },
   "exports": {
     ".": {
@@ -26,8 +27,10 @@
     "start": "node dist/index.js",
     "eval:retrieve": "node dist/cli/eval-retrieve.js",
     "extract": "node dist/cli/extract.js",
+    "consolidate": "node dist/cli/consolidate.js",
     "graph:backfill": "node dist/cli/graph-backfill.js",
     "graph:drain": "node dist/cli/graph-drain.js",
+    "community:summary": "node dist/cli/community-summary.js",
     "prepare": "husky"
   },
   "dependencies": {

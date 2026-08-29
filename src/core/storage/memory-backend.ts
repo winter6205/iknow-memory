@@ -237,6 +237,52 @@ export class MemoryBackend implements StorageBackend, LexicalStorageBackend {
   }
 
   /**
+   * Return visible chunks within `width` ingest positions of each anchor.
+   * This mirrors the Postgres neighbor seam and keeps the in-memory backend
+   * useful for retrieve tests without making the orchestrator special-case it.
+   */
+  async chunksByChunkIds(
+    chunkIds: readonly string[],
+    validAt: string,
+    width: number
+  ): Promise<RetrievedChunk[]> {
+    if (chunkIds.length === 0 || width <= 0) return [];
+
+    const admits = this.buildAdmissionFilter("chunksByChunkIds", {
+      limit: Number.MAX_SAFE_INTEGER,
+      validAt,
+    });
+    const visible = [...this.store.values()]
+      .filter(admits)
+      .sort(compareIngestOrder);
+    const bySource = new Map<string, ChunkRecord[]>();
+    for (const chunk of visible) {
+      const sourceChunks = bySource.get(chunk.source_ref) ?? [];
+      sourceChunks.push(chunk);
+      bySource.set(chunk.source_ref, sourceChunks);
+    }
+    const selected = new Set<string>();
+
+    for (const anchorId of chunkIds) {
+      const anchor = visible.find((chunk) => chunk.id === anchorId);
+      if (anchor === undefined) continue;
+      const sourceChunks = bySource.get(anchor.source_ref)!;
+      const anchorPosition = sourceChunks.indexOf(anchor);
+      for (
+        let position = Math.max(0, anchorPosition - width);
+        position <= Math.min(sourceChunks.length - 1, anchorPosition + width);
+        position += 1
+      ) {
+        selected.add(sourceChunks[position]!.id);
+      }
+    }
+
+    return visible
+      .filter((chunk) => selected.has(chunk.id))
+      .map((chunk) => toRetrievedChunk(chunk, 0));
+  }
+
+  /**
    * Build the shared "is this chunk visible to this query" predicate:
    * temporal window plus exact-match source_ref / metadata filters. Both
    * arms must agree on visibility, so they share one implementation
@@ -303,6 +349,11 @@ export class MemoryBackend implements StorageBackend, LexicalStorageBackend {
     this.postings.clear();
     this.totalLength = 0;
   }
+}
+
+function compareIngestOrder(a: ChunkRecord, b: ChunkRecord): number {
+  const createdAt = Date.parse(a.created_at) - Date.parse(b.created_at);
+  return createdAt !== 0 ? createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 /** Project a stored chunk into the retrieve shape with a given score. */

@@ -313,7 +313,8 @@ async function assembleFusedResult(
   const prioritized = prependCommunityPriority(
     communityPriority,
     reranked.hits,
-    args.limit
+    args.limit,
+    graphPriority?.hits.length ?? 0
   );
   const neighbors = await expandNeighborEvidence(
     prioritized,
@@ -478,17 +479,21 @@ function projectFused(hit: FusedHit): RetrieveOutputEnvelope["chunks"][number] {
   return chunk;
 }
 
-/** Put enabled community summaries ahead of the existing T8 ranking. */
+/** Put enabled community summaries after the graph-priority prefix. */
 function prependCommunityPriority(
   summary: ArmResult | undefined,
   ranked: FusedHit[],
-  limit: number
+  limit: number,
+  graphPriorityLength: number
 ): FusedHit[] {
   const summaryHits = summary?.hits ?? [];
   if (summaryHits.length === 0) return ranked;
   const topScore = ranked[0]?.rrfScore ?? 0;
   const placed = new Set(summaryHits.map((hit) => hit.id));
-  const fill = ranked.filter((hit) => !placed.has(hit.id));
+  const graphPrefix = ranked.slice(0, graphPriorityLength);
+  const fill = ranked
+    .slice(graphPriorityLength)
+    .filter((hit) => !placed.has(hit.id));
   const lead: FusedHit[] = summaryHits.slice(0, limit).map((hit, i) => ({
     id: hit.id,
     content: hit.content,
@@ -498,7 +503,7 @@ function prependCommunityPriority(
     arms: [hit.arm],
     ...(hit.metadata !== undefined ? { metadata: hit.metadata } : {}),
   }));
-  return [...lead, ...fill].slice(0, limit);
+  return [...graphPrefix, ...lead, ...fill].slice(0, limit);
 }
 
 /**

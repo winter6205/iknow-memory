@@ -297,6 +297,9 @@ export interface CommunitySummaryRow {
 
 /** Postgres seam for optional topic-level summary recall. */
 export interface CommunitySummaryStorage {
+  getCommunitySummaryByCommunityId(
+    communityId: string
+  ): Promise<CommunitySummaryRow | undefined>;
   searchCommunitySummaries(
     embedding: number[],
     limit: number

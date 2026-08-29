@@ -1,0 +1,278 @@
+/**
+ * Index-time community summary CLI.
+ *
+ * The flow is GDS Louvain → load live entity names from Postgres → summarize
+ * with the configured LLM → embed the summary → upsert the Postgres ledger
+ * row. Neo4j is read-only here. A failed detector or failed individual
+ * summary is fail-open: existing retrieval and existing summaries remain
+ * usable, and the run reports the failure instead of aborting the batch.
+ */
+import { randomUUID } from "node:crypto";
+import { Pool, type PoolClient } from "pg";
+
+import { ConfigError, loadEnv, type GraphragEnv } from "../config.js";
+import { createLogger, type Logger } from "../logging.js";
+import { NineRouterEmbedder, type EmbeddingClient } from "../core/embedder.js";
+import {
+  createNeo4jCommunityDetector,
+  type Community,
+  type CommunityDetector,
+} from "../core/graph/neo4j-community.js";
+import {
+  AnthropicCommunitySummaryClient,
+  type CommunitySummaryClient,
+} from "../core/graph/community-summary-llm.js";
+import { upSchemaP0 } from "../core/storage/schema-p0.js";
+
+export type {
+  Community,
+  CommunityDetector,
+} from "../core/graph/neo4j-community.js";
+export type { CommunitySummaryClient } from "../core/graph/community-summary-llm.js";
+
+export interface CommunitySummaryDbClient {
+  query(text: string, values?: unknown[]): Promise<{ rows: any[] }>;
+  release(): void;
+}
+
+export interface CommunitySummaryPool {
+  connect(): Promise<CommunitySummaryDbClient>;
+  end(): Promise<void>;
+}
+
+export interface CommunitySummaryDeps {
+  pool: CommunitySummaryPool;
+  detector: CommunityDetector;
+  summarizer: CommunitySummaryClient;
+  embedder: EmbeddingClient;
+  dimensions: number;
+  logger: Logger;
+}
+
+interface Flags {
+  dryRun: boolean;
+}
+
+const USAGE = "usage: community-summary [--dry-run]";
+
+export function parseArgs(
+  argv: string[]
+): { ok: true; flags: Flags } | { ok: false; error: string } {
+  const flags: Flags = { dryRun: false };
+  for (const arg of argv) {
+    if (arg === "--dry-run") flags.dryRun = true;
+    else return { ok: false, error: `unknown flag: "${arg}"` };
+  }
+  return { ok: true, flags };
+}
+
+export async function runCli(
+  argv: string[],
+  deps: CommunitySummaryDeps
+): Promise<number> {
+  const parsed = parseArgs(argv);
+  if (!parsed.ok) {
+    process.stderr.write(`${USAGE}\ncommunity-summary: ${parsed.error}\n`);
+    return 2;
+  }
+  const client = await deps.pool.connect();
+  try {
+    if (!parsed.flags.dryRun) {
+      await upSchemaP0(client as unknown as PoolClient, deps.dimensions);
+    }
+    let communities: Community[];
+    try {
+      communities = await deps.detector.detect();
+    } catch (err) {
+      // EXIT: fail-open — 保留现有检索与摘要可用性，记录失败后正常结束。
+      deps.logger.warn("community-detection-failed", {
+        error: errorMessage(err),
+      });
+      return 0;
+    }
+    if (parsed.flags.dryRun) {
+      deps.logger.info("community-summary-plan", {
+        communities: communities.length,
+      });
+      return 0;
+    }
+
+    if (communities.length === 0) {
+      await clearCommunitySummaries(client);
+      deps.logger.info("community-summaries-cleared", {
+        reason: "community-detection-returned-empty",
+      });
+      return 0;
+    }
+
+    let stored = 0;
+    let failed = 0;
+    for (const community of communities) {
+      try {
+        const names = await loadEntityNames(client, community.entityIds);
+        if (names.length === 0) continue;
+        const summary = (await deps.summarizer.summarize(names)).trim();
+        if (summary === "")
+          throw new Error("summary client returned empty text");
+        const [embedding] = await deps.embedder.embed([summary]);
+        if (embedding === undefined || embedding.length === 0) {
+          throw new Error("summary embedder returned no vector");
+        }
+        await upsertSummary(client, community, summary, embedding);
+        stored += 1;
+      } catch (err) {
+        // EXIT: 单个 community 失败仅记录并继续批处理，不阻断其他摘要。
+        failed += 1;
+        deps.logger.warn("community-summary-failed", {
+          communityId: community.id,
+          error: errorMessage(err),
+        });
+      }
+    }
+    deps.logger.info("community-summary-complete", {
+      communities: communities.length,
+      stored,
+      failed,
+    });
+    return 0;
+  } finally {
+    client.release();
+    try {
+      await deps.detector.close();
+    } catch (err) {
+      deps.logger.warn("community-detector-close-failed", {
+        error: errorMessage(err),
+      });
+    }
+  }
+}
+
+async function clearCommunitySummaries(
+  client: CommunitySummaryDbClient
+): Promise<void> {
+  await client.query("DELETE FROM community_summaries", []);
+}
+
+async function loadEntityNames(
+  client: CommunitySummaryDbClient,
+  entityIds: readonly string[]
+): Promise<string[]> {
+  if (entityIds.length === 0) return [];
+  const result = await client.query(
+    `SELECT canonical_name FROM entities
+      WHERE id = ANY($1::uuid[]) AND retired = false
+      ORDER BY id`,
+    [[...entityIds]]
+  );
+  return result.rows
+    .map((row) => row.canonical_name)
+    .filter((name): name is string => typeof name === "string" && name !== "");
+}
+
+async function upsertSummary(
+  client: CommunitySummaryDbClient,
+  community: Community,
+  summary: string,
+  embedding: number[]
+): Promise<void> {
+  await client.query(
+    `INSERT INTO community_summaries
+       (id, community_id, summary, entity_ids, embedding)
+     VALUES ($1, $2, $3, $4, $5::vector)
+     ON CONFLICT (community_id) DO UPDATE SET
+       summary = EXCLUDED.summary,
+       entity_ids = EXCLUDED.entity_ids,
+       embedding = EXCLUDED.embedding,
+       updated_at = now()`,
+    [
+      randomUUID(),
+      community.id,
+      summary,
+      [...community.entityIds],
+      toVectorLiteral(embedding),
+    ]
+  );
+}
+
+function toVectorLiteral(embedding: number[]): string {
+  return `[${embedding.join(",")}]`;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+export async function runCliFromEnv(argv: string[]): Promise<number> {
+  let env: GraphragEnv;
+  try {
+    env = loadEnv();
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      process.stderr.write(`community-summary config error: ${err.message}\n`);
+      return 1;
+    }
+    throw err;
+  }
+  if (env.dbUrl === undefined) {
+    process.stderr.write(
+      "community-summary config error: GRAPHRAG_MEMORY_DB_URL is required\n"
+    );
+    return 1;
+  }
+  if (env.neo4j === undefined) {
+    process.stderr.write(
+      "community-summary config error: GRAPHRAG_MEMORY_NEO4J_URI is required\n"
+    );
+    return 1;
+  }
+  if (env.rerank === undefined || env.embedApiKey === undefined) {
+    process.stderr.write(
+      "community-summary config error: Anthropic and embedding credentials are required\n"
+    );
+    return 1;
+  }
+
+  const pool = new Pool({ connectionString: env.dbUrl });
+  const deps: CommunitySummaryDeps = {
+    pool: pool as unknown as CommunitySummaryPool,
+    detector: createNeo4jCommunityDetector(env.neo4j),
+    summarizer: new AnthropicCommunitySummaryClient({
+      apiKey: env.rerank.apiKey,
+      model: env.rerank.model,
+      baseUrl: env.rerank.baseUrl,
+    }),
+    embedder: new NineRouterEmbedder({
+      baseUrl: env.embedBaseUrl!,
+      model: env.embedModel!,
+      apiKey: env.embedApiKey,
+      dimensions: env.embedDimensions,
+    }),
+    dimensions: env.embedDimensions,
+    logger: createLogger(env.logLevel),
+  };
+  try {
+    return await runCli(argv, deps);
+  } finally {
+    await pool.end();
+  }
+}
+
+export async function main(): Promise<void> {
+  process.exit(await runCliFromEnv(process.argv.slice(2)));
+}
+
+const isMain = (() => {
+  const arg1 = process.argv[1];
+  return (
+    arg1 !== undefined &&
+    (arg1.endsWith("cli/community-summary.ts") ||
+      arg1.endsWith("cli/community-summary.js"))
+  );
+})();
+
+if (isMain) {
+  main().catch((err) => {
+    process.stderr.write(`community-summary fatal: ${errorMessage(err)}\n`);
+    process.exit(1);
+  });
+}

@@ -31,11 +31,10 @@
  *     with its error), so an operator scripting the projection can treat 3 as
  *     "try later" while still seeing the Validation block on stderr.
  *
- * Known gap, owned upstream: nothing here DELETES from Neo4j. An intent whose
- * subject has since been retired or deleted resolves to no ledger row; it is
- * counted as `unresolved`, logged, and marked done, which leaves the old node
- * in the graph. The backfill has the same property — projection GC is not part
- * of T3.
+ * Projection GC is drain-only: an intent whose subject has since been retired
+ * or deleted resolves to no live ledger row, so the stale graph subject is
+ * deleted before the intent is marked done. Backfill still only projects live
+ * ledger rows; it does not sweep arbitrary graph subjects.
  */
 import { Pool } from "pg";
 
@@ -230,6 +229,11 @@ interface BatchOutcome {
   unresolved: number;
 }
 
+interface UnresolvedSubjects {
+  entity: string[];
+  triple: string[];
+}
+
 const EMPTY_BATCH: BatchOutcome = {
   intents: 0,
   nodes: 0,
@@ -308,15 +312,18 @@ async function project(
   const nodes = await loadEntitiesByIds(client, [...nodeIds]);
   await writer.mergeNodes(nodes);
   await writer.mergeEdges(edges);
-  const unresolved = reportUnresolved(deps, claimed, {
+  const unresolvedSubjects = reportUnresolved(deps, claimed, {
     entity: new Set(nodes.map((node) => node.id)),
     triple: new Set(edges.map((edge) => edge.id)),
   });
+  await writer.deleteEdges(unresolvedSubjects.triple);
+  await writer.deleteNodes(unresolvedSubjects.entity);
   return {
     intents: claimed.length,
     nodes: nodes.length,
     edges: edges.length,
-    unresolved,
+    unresolved:
+      unresolvedSubjects.entity.length + unresolvedSubjects.triple.length,
   };
 }
 
@@ -333,25 +340,25 @@ function subjectIds(
  * Name the intents whose subject the ledger no longer answers for — retired,
  * merged away, or (for a triple) hanging off a retired endpoint. They are
  * still marked done by the caller: there is nothing left to project and a
- * `failed` row would be a permanent red the queue can never clear. The warning
- * is the record that the graph now holds something the ledger dropped.
+ * `failed` row would be a permanent red the queue can never clear. Return the
+ * ids so the drain can garbage-collect their stale projection subjects.
  */
 function reportUnresolved(
   deps: DrainDeps,
   claimed: readonly OutboxIntent[],
   resolved: { entity: Set<string>; triple: Set<string> }
-): number {
-  let count = 0;
+): UnresolvedSubjects {
+  const unresolved: UnresolvedSubjects = { entity: [], triple: [] };
   for (const intent of claimed) {
     if (resolved[intent.subject.kind].has(intent.subject.id)) continue;
-    count += 1;
+    unresolved[intent.subject.kind].push(intent.subject.id);
     deps.logger.warn("graph-drain-subject-gone", {
       intentId: intent.id,
       kind: intent.subject.kind,
       subjectId: intent.subject.id,
     });
   }
-  return count;
+  return unresolved;
 }
 
 /**

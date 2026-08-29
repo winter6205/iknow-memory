@@ -33,7 +33,12 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_NODE_EMBEDDING_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS",
+  "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
+  "GRAPHRAG_MEMORY_RETRIEVAL_PRESET",
   "GRAPHRAG_MEMORY_RETRIEVAL_ENTITY_LINK_TOP_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
@@ -109,6 +114,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "logLevel",
       "neo4j",
       "rerank",
+      "rerankUrl",
       "retrieval",
       "storage",
     ]);
@@ -763,6 +769,52 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     });
   });
 
+  it("defaults the retrieve mode bundle to balanced with its locked levers", () => {
+    withRetrievalEnv({}, () => {
+      const { retrieval } = loadEnv();
+      expect(retrieval.preset).toBe("balanced");
+      expect(retrieval.entityLinkTopK).toBe(8);
+      expect(retrieval.candidateCap).toBe(50);
+      expect(retrieval.w_vec).toBe(0.7);
+      expect(retrieval.w_bm25).toBe(0.15);
+      expect(retrieval.neighborWidth).toBe(1);
+    });
+  });
+
+  it("applies the conservative bundle with a narrower window and no neighbors", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_PRESET: "conservative" },
+      () => {
+        const { retrieval } = loadEnv();
+        expect(retrieval.preset).toBe("conservative");
+        expect(retrieval.entityLinkTopK).toBeLessThan(8);
+        expect(retrieval.candidateCap).toBeLessThan(50);
+        expect(retrieval.neighborWidth).toBe(0);
+        expect(retrieval.w_vec).toBe(0.7);
+        expect(retrieval.w_bm25).toBe(0.15);
+      }
+    );
+  });
+
+  it("applies the tokenmax bundle with a wider window and neighbor evidence", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_PRESET: "tokenmax" }, () => {
+      const { retrieval } = loadEnv();
+      expect(retrieval.preset).toBe("tokenmax");
+      expect(retrieval.entityLinkTopK).toBeGreaterThan(8);
+      expect(retrieval.candidateCap).toBeGreaterThan(50);
+      expect(retrieval.neighborWidth).toBeGreaterThanOrEqual(1);
+      expect(retrieval.w_vec).toBe(0.7);
+      expect(retrieval.w_bm25).toBe(0.15);
+    });
+  });
+
+  it("rejects an unknown retrieve mode bundle with ConfigError", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_PRESET: "fast" }, () => {
+      expect(() => loadEnv()).toThrow(ConfigError);
+      expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_RETRIEVAL_PRESET/);
+    });
+  });
+
   it("SC6: both partner arms are enabled on a fresh env", () => {
     withRetrievalEnv({}, () => {
       const { retrieval } = loadEnv();
@@ -771,9 +823,83 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     });
   });
 
+  it("keeps direct node-embedding retrieval off by default", () => {
+    withRetrievalEnv({}, () => {
+      expect(loadEnv().retrieval.nodeEmbeddingEnabled).toBe(false);
+    });
+  });
+
+  it("enables direct node-embedding retrieval explicitly", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_NODE_EMBEDDING_ENABLED: "true" },
+      () => {
+        expect(loadEnv().retrieval.nodeEmbeddingEnabled).toBe(true);
+      }
+    );
+  });
+
   it("defaults rerank enable to false on a fresh env", () => {
     withRetrievalEnv({}, () => {
       expect(loadEnv().retrieval.rerankEnabled).toBe(false);
+    });
+  });
+
+  it("defaults wait-for-drain to disabled with a bounded timeout", () => {
+    withRetrievalEnv({}, () => {
+      const { retrieval } = loadEnv();
+      expect(retrieval.waitForDrainEnabled).toBe(false);
+      expect(retrieval.waitForDrainTimeoutMs).toBe(5000);
+    });
+  });
+
+  it("reads wait-for-drain enablement and timeout from env", () => {
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_ENABLED: "true",
+        GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS: "250",
+      },
+      () => {
+        const { retrieval } = loadEnv();
+        expect(retrieval.waitForDrainEnabled).toBe(true);
+        expect(retrieval.waitForDrainTimeoutMs).toBe(250);
+      }
+    );
+  });
+
+  it("rejects a non-positive wait-for-drain timeout", () => {
+    withRetrievalEnv(
+      { GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS: "0" },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS/
+        );
+      }
+    );
+  });
+
+  it("leaves the dedicated rerank URL undefined by default", () => {
+    withRetrievalEnv({}, () => {
+      expect(loadEnv().rerankUrl).toBeUndefined();
+    });
+  });
+
+  it("reads and trims the dedicated rerank URL without requiring Anthropic credentials", () => {
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL:
+          "  https://rerank.example.test/v1/  ",
+      },
+      () => {
+        expect(loadEnv().rerankUrl).toBe("https://rerank.example.test/v1/");
+        expect(loadEnv().rerank).toBeUndefined();
+      }
+    );
+  });
+
+  it("treats a blank dedicated rerank URL as absent", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "   " }, () => {
+      expect(loadEnv().rerankUrl).toBeUndefined();
     });
   });
 

@@ -154,10 +154,10 @@ _Avoid_: "uncertain match" (vague); "borderline" (colloquial)
 
 ### Evaluation
 
-**extraction F1**: fact-level precision and recall for triple extraction, evaluated against human-annotated ground truth. Separate metrics for entity recognition and relation classification. The quality gate for P0. _Stage: P0._
-_Avoid_: "accuracy" (F1 is more informative for imbalanced extraction); "quality score" (too vague)
+**extraction F1**: fact-level precision and recall for **triple** extraction against **LLM gold** (cross-family gold model + git **eval filter**), not human-annotated labels. Micro-F1 is the primary gate; schema-compliance and hallucination are additional axes. Separate from **P@5 / R@5**. Contract: `specs/p0-eval.md`. _Stage: spec locked (#15); harness not on main._
+_Avoid_: "accuracy" (F1 is more informative for imbalanced extraction); "quality score" (too vague); "human gold" (superseded)
 
-**P@5 / R@5**: precision and recall at rank 5 over the Host-visible `chunks[]` after graph-priority ranking (graph hits first when present, else vector+BM25 RRF); gold is query → relevant chunk ids, Bootstrap records numbers only (no CI gate), and a missing Neo4j URI now sets `degraded` (see **degraded=true**), so such a run is no longer published as a clean two-arm run. Operated by `npm run eval:retrieve` through `assembleRetrievalResult`, baseline `eval/baseline/retrieve-p5.json`. Separate from **extraction F1** (#15 postponed). _Stage: harness on main (#80/#82); ranking semantics follow `specs/retrieve-graph-priority.md` once implemented._
+**P@5 / R@5**: precision and recall at rank 5 over the Host-visible `chunks[]` after graph-priority ranking (graph hits first when present, else vector+BM25 RRF); gold is query → relevant chunk ids, Bootstrap records numbers only (no CI gate), and a missing Neo4j URI now sets `degraded` (see **degraded=true**), so such a run is no longer published as a clean two-arm run. Operated by `npm run eval:retrieve` through `assembleRetrievalResult`, baseline `eval/baseline/retrieve-p5.json`. Separate from **extraction F1** (`specs/p0-eval.md`). _Stage: harness on main (#80/#82); ranking semantics follow `specs/retrieve-graph-priority.md` once implemented._
 _Avoid_: "hit rate" (ambiguous); "three-arm fused P@5" (retired ranking); "extraction F1" (different layer)
 
 **ablation**: the evaluation method of switching off exactly one capability at a time and comparing against the all-on and all-off baselines, reporting both percentage and absolute differences. Turning a capability off is itself visible — it sets `degraded` and names the item — and that is expected output of the run, not a silent behavior change. _Stage: `specs/retrieval-stack.md` (§B1 / §B4)._

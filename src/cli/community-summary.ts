@@ -127,11 +127,7 @@ export async function runCli(
       deps.logger.warn("community-detection-failed", {
         error: errorMessage(err),
       });
-      throw new CommunitySummaryJobError(
-        "detection",
-        errorMessage(err),
-        err
-      );
+      throw new CommunitySummaryJobError("detection", errorMessage(err), err);
     }
     if (parsed.flags.dryRun) {
       deps.logger.info("community-summary-plan", {

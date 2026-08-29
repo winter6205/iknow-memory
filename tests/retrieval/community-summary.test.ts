@@ -3,6 +3,8 @@ import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
 import type {
   CommunitySummaryRow,
   CommunitySummaryStorage,
+  GraphRanker,
+  Neo4jArmStorage,
   RetrieveConfig,
 } from "../../src/core/retrieval/types.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
@@ -38,6 +40,30 @@ class FixedEmbedder implements EmbeddingClient {
 class SummaryBackend implements StorageBackend {
   readonly communitySummaries: CommunitySummaryStorage = {
     searchCommunitySummaries: async () => this.rows,
+  };
+  readonly neo4jArmSeed: Neo4jArmStorage = {
+    seedEntitiesByEmbedding: async () => [
+      { id: "entity-1", canonical_name: "Entity 1" },
+      { id: "entity-2", canonical_name: "Entity 2" },
+    ],
+    chunksByEntityIds: async () => [
+      {
+        entity_id: "entity-1",
+        id: "graph-1",
+        content: "graph hit one",
+        source_ref: "source/graph",
+        valid_from: NOW,
+        valid_until: null,
+      },
+      {
+        entity_id: "entity-2",
+        id: "graph-2",
+        content: "graph hit two",
+        source_ref: "source/graph",
+        valid_from: NOW,
+        valid_until: null,
+      },
+    ],
   };
 
   rows: CommunitySummaryRow[] = [];
@@ -75,6 +101,44 @@ function summaryRow(communityId: string, summary: string): CommunitySummaryRow {
 }
 
 describe("community summary retrieve path", () => {
+  it("keeps non-empty graph hits ahead of summaries and honors the limit", async () => {
+    const storage = new SummaryBackend();
+    storage.rows = [
+      summaryRow("7", "Postgres and pgvector form one storage topic."),
+    ];
+    const graphRanker: GraphRanker = {
+      rankEntities: async () => [
+        { id: "entity-1", score: 0.9 },
+        { id: "entity-2", score: 0.8 },
+      ],
+    };
+
+    const result = await assembleRetrievalResult(
+      { query: "storage topic", validAt: NOW, limit: 3 },
+      {
+        embedder: new FixedEmbedder(),
+        storage,
+        retrieveConfig: {
+          ...BASE_CONFIG,
+          preset: "tokenmax",
+          graphEnabled: true,
+        },
+        graphRanker,
+      }
+    );
+
+    expect(result.chunks).toHaveLength(3);
+    expect(result.chunks.map((chunk) => chunk.id)).toEqual([
+      "graph-1",
+      "graph-2",
+      "community-summary:7",
+    ]);
+    expect(result.chunks[2]).toMatchObject({
+      content: "Postgres and pgvector form one storage topic.",
+      metadata: { kind: "community-summary", communityId: "7" },
+    });
+  });
+
   it("leads with typed summary chunks when the preset enables summaries", async () => {
     const storage = new SummaryBackend();
     storage.rows = [

@@ -28,6 +28,8 @@ Gate ran on `specs/retrieval-stack.md` after the assumption gate (R1–R4) and b
 
 The gate ran against `specs/retrieval-stack.md` before this plan was written; all five lines came back yes.
 
+**Assumption gate (R1–R4): closed.** The four items were finalized and written back into the shared baseline §B1; the "待确认建议值" note is gone and every row of that table is now a finalized contract. Concurrency and latency split into L1 (retrieval / read path, no LLM: 16 concurrent, 120 s, 9:1 read/write, ≥ 1200 total requests, p95 ≤ 800 ms, p99 ≤ 2000 ms) and L2 (full run with LLM: 8 concurrent, 120 s, its own p50 < 60 s and p95 ≤ 120 s, produced by fin); the eval-set chunk floor moved from ≥ 5000 to ≥ 20000 and ≤ 120000; new rows cover 查询分档, 语料来源与许可 (three provenance tiers) and 评测资源预算; ablation runs a scripted 20–40 query subset. No task in this plan owns that decision — it landed directly in the two specs, and there is no T1-equivalent entry to close here.
+
 bounded-context-guardian: yes
 defensive-contract-validator: yes
 error-handling-enforcer: yes
@@ -190,7 +192,7 @@ OVERALL: PASSED — implementation may start at T1.
     - [blocks: T20, T23]
 
 20. **Query-class coverage and gold provenance** — tag: `[implementation]`
-    - **Inherits:** spec SC-21 (four query classes — entity-anchored via the graph, exact-string via phrase, semantic-generalization via vector, temporal carrying `valid_at` — each meeting the §B1 share floor; shortfall → non-zero exit), SC-28 (a gold missing provenance — source document id, judgement method, judgement time, judge model id — is a loader typed error; a judge model id equal to a production extraction or embedding model id is a `ConfigError`), §B1 标注与查询构成 (every query has ≥ 1 gold, every gold carries provenance).
+    - **Inherits:** spec SC-21 (four query classes — entity-anchored via the graph, exact-string via phrase, semantic-generalization via vector, temporal carrying `valid_at` — each meeting the §B1 share floor; shortfall → non-zero exit), SC-28 (a gold missing provenance — source document id, judgement method, judgement time, judge model id — is a loader typed error; a judge model id equal to a production extraction or embedding model id is a `ConfigError`), §B1 查询分档 (the CI contract set and the full set, each query class meeting the share floor).
     - **Surface:** evaluation (gold loader + query-set validation)
     - **Acceptance:** all four classes are present and each meets the share floor, otherwise the validator exits non-zero; a query with zero golds is rejected; a gold missing any provenance field is a typed error; a judge model id colliding with a production model id is a config error; the counts come from §B1, not from a second set of numbers in this repo.
     - Status: [ ] pending
@@ -210,10 +212,10 @@ OVERALL: PASSED — implementation may start at T1.
     - Status: [ ] pending
     - [blocks: T24]
 
-23. **Concurrency entry: main scenario, idempotent scenario, latency thresholds** — tag: `[implementation]`
-    - **Inherits:** spec SC-30 – SC-36; §B1 并发主场景 (read-mostly) and 并发幂等场景 (all-write) supply concurrency, duration, read/write ratio, and total-request floor — taken from the shared baseline, never restated here; error count = 0 with p50 / p95 / p99 all persisted; latency thresholds per §B1 延迟阈值 with warm-up requests excluded; SC-33 — connection-wait timeout is its own observed failure class and counts 0; SC-34 — ≥ 99% of queries return the same result id set as the serial baseline; SC-35 — within one `retrieve`, the vector, keyword, and graph arms start concurrently rather than waiting in series; SC-36 — the all-write rerun leaves the chunk total delta at 0 with 0 errors.
+23. **Concurrency entry: L1 scenario, idempotent scenario, latency thresholds** — tag: `[implementation]`
+    - **Inherits:** spec SC-30 – SC-36; §B1 并发 L1 (retrieval / read path, no LLM) and 并发幂等场景 (all-write) supply concurrency, duration, read/write ratio, and total-request floor — taken from the shared baseline, never restated here; §B1 并发 L2 (full run with LLM) is produced by fin on the same run and is not recomputed here; error count = 0 with p50 / p95 / p99 all persisted; latency thresholds per §B1 延迟阈值 (which applies only to L1) with warm-up requests excluded; SC-33 — connection-wait timeout is its own observed failure class and counts 0; SC-34 — ≥ 99% of queries return the same result id set as the serial baseline; SC-35 — within one `retrieve`, the vector, keyword, and graph arms start concurrently rather than waiting in series; SC-36 — the all-write rerun leaves the chunk total delta at 0 with 0 errors.
     - **Surface:** evaluation / cli (concurrency entry) + config; entry-point location is implementer headroom
-    - **Acceptance:** the main scenario runs at the baseline's concurrency, duration, and read/write ratio, exits non-zero if the total request count falls below the floor, records 0 errors, and persists all three percentiles (any missing percentile exits non-zero); p95 / p99 land under the baseline thresholds with warm-up excluded; the connection-wait-timeout counter exists and reads 0; result-set agreement with the serial baseline meets the §B1 share; the three arms demonstrably start within one call rather than in sequence; the all-write scenario reruns the same batch and ends with a chunk total delta of 0 and 0 errors.
+    - **Acceptance:** the L1 scenario runs at the baseline's concurrency, duration, and read/write ratio, exits non-zero if the total request count falls below the floor, records 0 errors, and persists all three percentiles (any missing percentile exits non-zero); p95 / p99 land under the baseline thresholds with warm-up excluded; the connection-wait-timeout counter exists and reads 0; result-set agreement with the serial baseline meets the §B1 share; the three arms demonstrably start within one call rather than in sequence; the all-write scenario reruns the same batch and ends with a chunk total delta of 0 and 0 errors.
     - Status: [ ] pending
     - [parallel] with T21 / T22 once T19 and T7 have landed
     - [blocks: T24]

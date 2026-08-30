@@ -5,7 +5,7 @@
 > **Wayfinder parent:** winter6205/iknow-memory#1.
 > **Predecessor:** `specs/p0-integration.md`, `specs/p0-wiring-closure.md` (graph arm + RRF exist; this spec re-routes production retrieve).
 > **Assumption gate:** confirmed 2026-08-26 (A1–A14 below), plus operator addendum: **SQL 图臂归档清理写进本契约**.
-> **Partially superseded by `specs/retrieval-stack.md` (C-1):** the production shape of the lexical arm moved from a Postgres `tsvector` column to the Elasticsearch **precision layer** (CJK segmentation, Okapi BM25 with configurable k1 / b, phrase queries, field boosting). Only the clauses marked **Superseded (C-1)** below change; the rest of this spec — including its out-of-scope list — stands.
+> **Partially superseded by `specs/retrieval-stack.md` (C-1, C-11):** the production shape of the lexical arm moved from a Postgres `tsvector` column to the Elasticsearch **precision layer** (CJK segmentation, Okapi BM25 with configurable k1 / b, phrase queries, field boosting) **(C-1)**; the out-of-scope entry "multi-granularity chunking" is upgraded to **chunking in any form**, because splitting belongs to fin in full **(C-11)**. Only the clauses marked **Superseded (C-1)** / **(C-11)** below change; the rest of this spec stands.
 
 ## Objective
 
@@ -44,7 +44,7 @@ Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here:
 8. BM25 fail-open → vector results; set `degraded=true` when BM25 was attempted and failed. Vector-only (BM25 disabled) must **not** set `degraded` solely for that reason.
 9. MemoryBackend: same-contract lightweight BM25 for tests; score distribution need not match Postgres.
 10. MCP wire: `retrieve` still primarily `{ chunks[] }`; no new tool; ingest public fields unchanged (storage may maintain tsv internally).
-11. Out of scope: Neo4j, reopening SQL fake-graph as a product arm, #15 eval, multi-granularity chunking, cross-encoder rerank, cosine re-score polish.
+11. Out of scope: Neo4j, reopening SQL fake-graph as a product arm, #15 eval, ~~multi-granularity chunking~~ **chunking in any form** (**Superseded (C-11, `specs/retrieval-stack.md` §B4):** splitting belongs to fin in full; this repo stores and recalls the pushed text verbatim and keeps no chunking path), cross-encoder rerank, cosine re-score polish.
 12. **SQL graph-arm cleanup is in scope** (operator addendum + #58): production path must stop running the SQL one-hop arm; minimal proven approach from #61 is stop passing `graphConfig` at server wiring (or equivalent explicit default-off). Ledger (`entities` / `triples` / …) **retained**.
 13. Tests: `npm test` green; RRF N-arm unit tests; MemoryBackend hybrid unit tests; ≥1 real Postgres integration test proving literal BM25 hit after ingest; no real LLM.
 14. Branch/PR targets #62 (and references #58); artifacts at `specs/bm25-retrieve.md`, `plans/bm25-retrieve.md`.

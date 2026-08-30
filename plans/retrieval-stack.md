@@ -20,7 +20,7 @@ and are deliberately not restated in any Acceptance below.
 **ACR:** passed — the five-line verdict came back all yes against `specs/retrieval-stack.md`; recorded below.
 **Cross-repo alignment:** fin's master plan `plans/retrieval-upgrade.md` runs phase 0 (shared baseline) serially, then line A (parsing + chunking) / line B (this repo's retrieval stack) / line C (dataset) in parallel under phase 1, then phase 2 (ingest push, needs A + B) and phase 3 (ablation + quantified + concurrency). This plan covers line B, the retrieval-side half of line C, the phase-2 retrieval-side capabilities (idempotency, invalidation), and the retrieval-side half of phase 3. fin owns parsing, chunking, the citation gate, orchestration, intent, and short-term memory; nothing here re-slices content.
 **Per-ticket loop (all bullets):** tdd → typecheck+tests → code-review → verification-before-completion → one commit on the ticket branch
-**Tracker:** GitHub main path (remote + `gh` present). No parent issue exists for this round yet — open one before implementation and file one child per bullet with native blocking edges; until then this file is the fallback and holds the bullets.
+**Tracker:** This file is the tracker for this round (operator-directed, in-file tracker). No GitHub issue is created; blocking edges are the `[blocks:]` marks written inside this file, and status is each bullet's `Status` checkbox.
 
 ## architecture-change-reviewer verdict
 
@@ -48,6 +48,35 @@ OVERALL: PASSED — implementation may start at T1.
 - No ADR is reopened or contradicted by this plan; ADR-0001 stays intact.
 
 ## Tasks (ordered by dependency)
+
+Tracker index for this round: every bullet at a glance, with its dependencies and status. Status here mirrors each bullet's own `Status` checkbox (keep the two in sync); blocking edges are the `[blocks:]` marks written in this file, and bullets marked `[parallel]` may run alongside the others in the same cluster.
+
+| # | Title | Tag | Blocked by | Parallel | Status |
+| --- | --- | --- | --- | --- | --- |
+| T1 | Cross-repo baseline drift gate | `[implementation]` | — | — | Pending |
+| T2 | ADR: chunking exits the retrieval service (no re-chunking) | `[decision]` | T4 | Yes | Pending |
+| T3 | ADR: degraded signal and partial-failure semantics | `[decision]` | T8 | Yes | Pending |
+| T4 | Ingest stores pushed text as-is (no re-chunking) | `[implementation]` | T2, T5, T6, T19 | — | Pending |
+| T5 | Ingest idempotency on (`source_ref`, content identity) | `[implementation]` | T7 | Yes | Pending |
+| T6 | Content invalidation (close the validity window, never delete) | `[implementation]` | — | Yes | Pending |
+| T7 | Batch ingest + connection pool parameters | `[implementation]` | T23 | — | Pending |
+| T8 | Degraded envelope with the four set rules | `[implementation]` | T9, T10, T11, T12 | — | Pending |
+| T9 | Partial-failure semantics, and invalid input vs legal empty | `[implementation]` | — | — | Pending |
+| T10 | Graph multi-hop is on by default; a missing address degrades | `[implementation]` | T17 | Yes | Pending |
+| T11 | Rerank on by default; fail-open keeps the mark | `[implementation]` | T17 | Yes | Pending |
+| T12 | No deterministic pseudo-vectors when credentials are missing | `[implementation]` | — | Yes | Pending |
+| T13 | Vector index built in place, with a real dimension guard | `[implementation]` | T18 | Yes | Pending |
+| T14 | Precision layer bring-up: CJK segmentation as one arm at both stages | `[implementation]` | T15, T18 | Yes | Pending |
+| T15 | Okapi BM25 parameters, phrase queries, and field boosting | `[implementation]` | T17 | — | Pending |
+| T16 | Fusion parameters configurable (RRF k, vector / keyword weights) | `[implementation]` | T17, T21 | Yes | Pending |
+| T17 | Default configuration enables every capability, asserted hard | `[implementation]` | T21, T24 | — | Pending |
+| T18 | Derived indexes rebuild from the authoritative source with no loss and no regression | `[implementation]` | T24 | — | Pending |
+| T19 | Evaluation dataset: real data, format and scale floors, one-command rebuild | `[implementation]` | T20, T23 | Yes | Pending |
+| T20 | Query-class coverage and gold provenance | `[implementation]` | T21 | — | Pending |
+| T21 | Ablation: eight switches, the full configuration matrix, no silent behaviour change | `[implementation]` | T22 | — | Pending |
+| T22 | Quantified report: full metric set, percentage deltas, reproducible | `[implementation]` | T24 | — | Pending |
+| T23 | Concurrency entry: L1 scenario, idempotent scenario, latency thresholds | `[implementation]` | T24 | Yes | Pending |
+| T24 | Suite closure, CONTEXT stage refresh, persist flush | `[implementation]` | T17, T18, T22, T23 | — | Pending |
 
 1. **Cross-repo baseline drift gate** — tag: `[implementation]`
    - **Inherits:** spec SC-39 / §B6 — the two specs' 跨仓对齐基线 sections are byte-identical; take each section body, sha256 it, equal passes, unequal fails. Both file paths are supplied at run time, not hard-coded in the spec.

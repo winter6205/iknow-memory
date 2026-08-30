@@ -24,12 +24,12 @@ Exact copy from `docs/CONTEXT.md` after the persist flush in this SPECIFY turn (
 ## Confirmed assumptions (gate · 2026-08-27)
 
 1. Scope is MCP `retrieve` Host ranking only. No ingest / extract / outbox / drain / backfill. Envelope stays `{ chunks[] }` (+ optional `degraded`).
-2. Graph did not walk: no URI or `graphEnabled=false` (do not attempt, not degraded) OR zero seeds / empty PPR / no valid mapped chunks (empty hits, not degraded) OR arm throw (empty hits, `degraded=true`). Ranking then is vector + BM25 RRF (k=60), no empty graph arm as a third vote.
+2. Graph did not walk: no URI (**Superseded C-6, `specs/retrieval-stack.md` §B3 rule 1** — do not attempt, but now `degraded=true` with graph multi-hop named in `degraded_reasons`) or `graphEnabled=false` (do not attempt, not degraded — caller switched it off, §B3 rule 4) OR zero seeds / empty PPR / no valid mapped chunks (empty hits, not degraded) OR arm throw (empty hits, `degraded=true`). Ranking in every one of these cases is vector + BM25 RRF (k=60), no empty graph arm as a third vote — the graph-priority Host order is unchanged by C-6.
 3. Non-empty graph hits: no equal-weight RRF vs vector/BM25. Graph-arm order occupies the front of the list; if fewer than `limit`, fill from vector+BM25 RRF, deduped by chunk id (graph-already-present ids skipped). If graph hits ≥ `limit`, no fill.
 4. Query embeds once. Vector / BM25 / graph may still run concurrently for latency; fusion follows 2–3.
 5. Levers unchanged: `entityLinkTopK=8`, `candidateCap=50`, Host `limit` default 10, PPR damping 0.85. `triples.confidence` stays off the ranking path. SQL graph arm stays archived.
 6. Out of this spec: Neo4j tombstones, unresolved-graph DELETE, id-set reconcile, self-loop typed reject, #88 rerank, #15 extraction F1, read-your-writes.
-7. Tests: existing assembler tests assert the new order; `npm run eval:retrieve` keeps the same gold harness (order changes, not harness shape); missing Neo4j URI still skips the graph, run not failed. `npm test` green without live Neo4j.
+7. Tests: existing assembler tests assert the new order; `npm run eval:retrieve` keeps the same gold harness (order changes, not harness shape). **Superseded (C-6, `specs/retrieval-stack.md` §B3):** a missing Neo4j URI still skips the graph, but the run is now `degraded` and is therefore refused before publish by the harness rule in SC8. `npm test` green without live Neo4j.
 8. CONTEXT terms that still describe three-arm RRF 0.7/0.15/0.15 as production ranking are flushed in this SPECIFY persist (domain-modeling). ADR-0001 unchanged.
 
 ## Boundaries

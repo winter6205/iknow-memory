@@ -225,18 +225,17 @@ describePg("pgvector startup self-check (SC-2 Check 4)", () => {
     }
   });
 
-  it("exits non-zero with a message when dimensions exceed the ANN limit", async () => {
+  it("exits with code 2 when dimensions exceed the ANN limit", async () => {
     const result = await runServer(2_001);
     reportProcess("dimension-over-limit", result);
 
     expect(result.timedOut).toBe(false);
-    expect(result.code).not.toBeNull();
-    expect(result.code).not.toBe(0);
+    expect(result.code).toBe(2);
     expect(result.stderr.trim()).not.toBe("");
     expect(result.stderr).toMatch(/GRAPHRAG_MEMORY_EMBED_DIMENSIONS|2000/);
   });
 
-  it("exits non-zero with a message when the chunk index cannot be built", async () => {
+  it("exits with code 1 when the chunk index cannot be built", async () => {
     await client!.query(`
       CREATE TABLE "${schema}".chunks (
         id uuid PRIMARY KEY,
@@ -248,9 +247,18 @@ describePg("pgvector startup self-check (SC-2 Check 4)", () => {
     reportProcess("index-build-failure", result);
 
     expect(result.timedOut).toBe(false);
-    expect(result.code).not.toBeNull();
-    expect(result.code).not.toBe(0);
+    expect(result.code).toBe(1);
     expect(result.stderr.trim()).not.toBe("");
     expect(result.stderr).toMatch(/chunks_embedding_idx|embedding|index/i);
   });
+
+  it("keeps a correctly configured pgvector server running after startup", async () => {
+    const result = await runServer(1_536, { logLevel: "info" });
+    reportProcess("startup-success", result);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.code).toBeNull();
+    expect(result.signal).toBe("SIGTERM");
+    expect(result.stderr).toContain("stdio transport connected");
+  }, 10_000);
 });

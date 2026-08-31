@@ -10,7 +10,7 @@
 import { Pool } from "pg";
 
 import { ConfigError, loadEnv } from "../config.js";
-import { createLogger, type Logger } from "../logging.js";
+import { createLogger, type Logger, writeStderr } from "../logging.js";
 import {
   findSupersessionCandidates,
   type FactRow,
@@ -71,7 +71,7 @@ export async function runCli(
 ): Promise<number> {
   const parsed = parseArgs(argv);
   if (!parsed.ok) {
-    process.stderr.write(`${USAGE}\nconsolidate: ${parsed.error}\n`);
+    writeStderr(`${USAGE}\nconsolidate: ${parsed.error}\n`);
     return 2;
   }
 
@@ -177,7 +177,7 @@ async function applyCandidates(
 
 function reportFatal(logger: Logger, err: unknown): void {
   const message = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`consolidate fatal: ${message}\n`);
+  writeStderr(`consolidate fatal: ${message}\n`);
   logger.error("consolidate-fatal", { error: message });
 }
 
@@ -187,13 +187,13 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     env = loadEnv();
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`consolidate config error: ${err.message}\n`);
+      writeStderr(`consolidate config error: ${err.message}\n`);
       return 1;
     }
     throw err;
   }
   if (!env.dbUrl) {
-    process.stderr.write(
+    writeStderr(
       "consolidate config error: GRAPHRAG_MEMORY_DB_URL is required\n"
     );
     return 1;
@@ -224,7 +224,7 @@ const isMain = (() => {
 
 if (isMain) {
   main().catch((err) => {
-    process.stderr.write(
+    writeStderr(
       `consolidate fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`
     );
     process.exit(1);

@@ -9,51 +9,30 @@
  */
 import { randomUUID } from "node:crypto";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import {
   buildVectorSearchQuery,
   PgvectorBackend,
 } from "../../src/core/storage/pgvector-backend.js";
+import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 1536;
-const DB_URL =
-  process.env.GRAPHRAG_MEMORY_DB_URL ??
-  "postgresql://postgres@localhost:5432/postgres";
-const SCHEMA = `vector_index_pg_${randomUUID().slice(0, 8).replace(/-/g, "")}`;
-const SCHEMA_URL =
-  DB_URL +
-  (DB_URL.includes("?") ? "&" : "?") +
-  `options=-c%20search_path%3D${SCHEMA},public`;
 const VALID_AT = "2026-08-01T00:00:00.000Z";
 const REPRESENTATIVE_ROW_COUNT = 5_000;
-
-let PGVECTOR_AVAILABLE = false;
-try {
-  const probe = new pg.Client({ connectionString: DB_URL });
-  await probe.connect();
-  await probe.query("SELECT 1");
-  const extension = await probe.query<{ installed_version: string | null }>(
-    "SELECT installed_version FROM pg_available_extensions WHERE name = 'vector'"
-  );
-  await probe.end();
-  if (extension.rows[0]?.installed_version === undefined) {
-    throw new Error("pgvector extension is not installed");
-  }
-  PGVECTOR_AVAILABLE = true;
-} catch (err) {
-  console.warn(
-    `\n[vector-index-pg] Postgres/pgvector unavailable at ${DB_URL}: ${(err as Error).message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/vector-index-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/vector-index-pg.test.ts\n" +
-      `- Blocking issue: cannot use Postgres with pgvector at ${DB_URL}\n`
-  );
-}
-
-const describePg = PGVECTOR_AVAILABLE ? describe : describe.skip;
+const pgHarness = await createPgIntegrationHarness({
+  label: "vector-index-pg",
+  testPath: "tests/integration/vector-index-pg.test.ts",
+  expectedCommand: "npx vitest run tests/integration/vector-index-pg.test.ts",
+  schemaPrefix: "vector_index_pg",
+  defaultConnectionString: "postgresql://postgres@localhost:5432/postgres",
+  requiresVector: true,
+});
+const {
+  schema: SCHEMA,
+  schemaConnectionString: SCHEMA_URL,
+  describePg,
+} = pgHarness;
 
 function vectorLiteral(): string {
   return `[${new Array<number>(DIM).fill(0).join(",")}]`;
@@ -83,10 +62,9 @@ describePg("chunk vector ANN index (SC-2)", () => {
   let backend: PgvectorBackend | undefined;
 
   beforeAll(async () => {
-    client = new pg.Client({ connectionString: SCHEMA_URL });
+    client = pgHarness.createClient(SCHEMA_URL);
     await client.connect();
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.query(`CREATE SCHEMA "${SCHEMA}"`);
+    await pgHarness.resetSchema(client);
     await client.query(`SET search_path TO "${SCHEMA}", public`);
     backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
   });
@@ -94,7 +72,7 @@ describePg("chunk vector ANN index (SC-2)", () => {
   afterAll(async () => {
     if (backend) await backend.close();
     if (client) {
-      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await pgHarness.dropSchema(client);
       await client.end();
     }
   });

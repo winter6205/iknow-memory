@@ -12,11 +12,28 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+
+import {
+  redactPgDiagnostic,
+  warnPgUnavailable,
+} from "../integration/pg-test-harness.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const pkgRoot = path.resolve(here, "../..");
 const serverPath = path.join(pkgRoot, "dist", "index.js");
+const failingPgLoaderPath = path.join(
+  here,
+  "pgvector-startup-failing-pg-loader.mjs"
+);
 const baseDbUrl =
   process.env.GRAPHRAG_MEMORY_DB_URL ??
   "postgresql://postgres@localhost:5432/postgres";
@@ -32,8 +49,9 @@ interface ProcessResult {
 
 let postgresAvailable = false;
 let postgresProbeError: unknown;
-const probe = new pg.Client({ connectionString: baseDbUrl });
+let probe: pg.Client | undefined;
 try {
+  probe = new pg.Client({ connectionString: baseDbUrl });
   await probe.connect();
   await probe.query("SELECT 1");
   const extension = await probe.query<{ installed_version: string | null }>(
@@ -46,21 +64,22 @@ try {
 } catch (error) {
   postgresProbeError = error;
 } finally {
-  await probe.end().catch((error: unknown) => {
-    postgresProbeError ??= error;
-  });
+  if (probe !== undefined) {
+    await probe.end().catch((error: unknown) => {
+      postgresProbeError ??= error;
+    });
+  }
 }
 
 if (!postgresAvailable) {
-  console.warn(
-    `\n[pgvector-startup] Postgres/pgvector unavailable at ${baseDbUrl}: ${String(postgresProbeError)}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/storage/pgvector-startup.test.ts\n" +
-      "- Expected command: npx vitest run tests/storage/pgvector-startup.test.ts\n" +
-      `- Blocking issue: cannot use Postgres with pgvector at ${baseDbUrl}\n`
-  );
+  warnPgUnavailable({
+    label: "pgvector-startup",
+    testPath: "tests/storage/pgvector-startup.test.ts",
+    expectedCommand: "npx vitest run tests/storage/pgvector-startup.test.ts",
+    connectionString: baseDbUrl,
+    error: postgresProbeError ?? new Error("Postgres probe failed"),
+    requiresVector: true,
+  });
 }
 
 const describePg = postgresAvailable ? describe : describe.skip;
@@ -70,18 +89,33 @@ function schemaDbUrl(): string {
   return `${baseDbUrl}${separator}options=-c%20search_path%3D${encodeURIComponent(`${schema},public`)}`;
 }
 
-function serverEnv(dimensions: number): Record<string, string> {
+interface RunServerOptions {
+  connectionString?: string;
+  logLevel?: "error" | "info";
+  nodeOptions?: string;
+}
+
+function serverEnv(
+  dimensions: number,
+  options: RunServerOptions
+): Record<string, string> {
   return {
     GRAPHRAG_MEMORY_STORAGE: "pgvector",
-    GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
+    GRAPHRAG_MEMORY_DB_URL: options.connectionString ?? schemaDbUrl(),
     GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(dimensions),
     GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
-    GRAPHRAG_MEMORY_LOG_LEVEL: "error",
+    GRAPHRAG_MEMORY_LOG_LEVEL: options.logLevel ?? "error",
     PATH: process.env.PATH ?? "",
+    ...(options.nodeOptions === undefined
+      ? {}
+      : { NODE_OPTIONS: options.nodeOptions }),
   };
 }
 
-function runServer(dimensions: number): Promise<ProcessResult> {
+function runServer(
+  dimensions: number,
+  options: RunServerOptions = {}
+): Promise<ProcessResult> {
   if (!existsSync(serverPath)) {
     throw new Error(
       `compiled server missing at ${serverPath} — run \`npm run build\` first`
@@ -90,7 +124,7 @@ function runServer(dimensions: number): Promise<ProcessResult> {
 
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [serverPath], {
-      env: serverEnv(dimensions),
+      env: serverEnv(dimensions, options),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -127,9 +161,49 @@ function runServer(dimensions: number): Promise<ProcessResult> {
 function reportProcess(label: string, result: ProcessResult): void {
   console.info(
     `[pgvector-startup] ${label}: exit=${String(result.code)} signal=${String(result.signal)}\n` +
-      `stderr:\n${result.stderr.trim()}`
+      `stderr:\n${redactPgDiagnostic(result.stderr)}`
   );
 }
+
+it("redacts a password from fatal startup stderr", async () => {
+  const secret = "startup-fatal-password";
+  const connectionString = `postgresql://ci-user:${secret}@db.example.test:5432/graph`;
+  const result = await runServer(1_536, {
+    connectionString,
+    nodeOptions: `--no-warnings --experimental-loader=${failingPgLoaderPath}`,
+  });
+
+  reportProcess("fatal-redaction", result);
+
+  expect(result.timedOut).toBe(false);
+  expect(result.code).toBe(1);
+  expect(result.stderr).not.toContain(secret);
+  expect(result.stderr).toContain("iknow-memory fatal");
+});
+
+it("redacts captured child stderr before replaying it", () => {
+  const secret = "replayed-child-password";
+  const output: string[] = [];
+  const info = vi
+    .spyOn(console, "info")
+    .mockImplementation((...args: unknown[]) => {
+      output.push(args.map((arg) => String(arg)).join(" "));
+    });
+
+  try {
+    reportProcess("child-error", {
+      code: 1,
+      signal: null,
+      stdout: "",
+      stderr: `driver error for postgresql://ci-user:${secret}@db.example.test:5432/graph`,
+      timedOut: false,
+    });
+  } finally {
+    info.mockRestore();
+  }
+
+  expect(output.join("\n")).not.toContain(secret);
+});
 
 describePg("pgvector startup self-check (SC-2 Check 4)", () => {
   let client: pg.Client | undefined;
@@ -137,8 +211,11 @@ describePg("pgvector startup self-check (SC-2 Check 4)", () => {
   beforeAll(async () => {
     client = new pg.Client({ connectionString: baseDbUrl });
     await client.connect();
-    await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
-    await client.query(`CREATE SCHEMA "${schema}"`);
+  });
+
+  beforeEach(async () => {
+    await client!.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await client!.query(`CREATE SCHEMA "${schema}"`);
   });
 
   afterAll(async () => {

@@ -11,7 +11,10 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
+import {
+  buildVectorSearchQuery,
+  PgvectorBackend,
+} from "../../src/core/storage/pgvector-backend.js";
 
 const DIM = 1536;
 const DB_URL =
@@ -22,6 +25,8 @@ const SCHEMA_URL =
   DB_URL +
   (DB_URL.includes("?") ? "&" : "?") +
   `options=-c%20search_path%3D${SCHEMA},public`;
+const VALID_AT = "2026-08-01T00:00:00.000Z";
+const REPRESENTATIVE_ROW_COUNT = 5_000;
 
 let PGVECTOR_AVAILABLE = false;
 try {
@@ -52,6 +57,25 @@ const describePg = PGVECTOR_AVAILABLE ? describe : describe.skip;
 
 function vectorLiteral(): string {
   return `[${new Array<number>(DIM).fill(0).join(",")}]`;
+}
+
+function sequentialScanRelations(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => sequentialScanRelations(entry));
+  }
+  if (typeof value !== "object" || value === null) return [];
+
+  const node = value as {
+    "Node Type"?: string;
+    "Relation Name"?: string;
+  };
+  const own =
+    node["Node Type"] === "Seq Scan"
+      ? [node["Relation Name"] ?? "<unknown>"]
+      : [];
+  return own.concat(
+    Object.values(value).flatMap((entry) => sequentialScanRelations(entry))
+  );
 }
 
 describePg("chunk vector ANN index (SC-2)", () => {
@@ -88,6 +112,21 @@ describePg("chunk vector ANN index (SC-2)", () => {
         created_at: "2026-01-01T00:00:00.000Z",
       },
     ]);
+    await client!.query(
+      `INSERT INTO chunks
+         (id, content, embedding, valid_from, valid_until,
+          source_ref, metadata, created_at)
+       SELECT lpad(to_hex(row_number), 32, '0')::uuid,
+              'representative vector fixture ' || row_number,
+              $1::vector,
+              $2::timestamptz,
+              NULL::timestamptz,
+              'vector-index/representative',
+              '{}'::jsonb,
+              $2::timestamptz
+         FROM generate_series(1, $3::int) AS rows(row_number)`,
+      [vectorLiteral(), "2026-01-01T00:00:00.000Z", REPRESENTATIVE_ROW_COUNT]
+    );
 
     const indexes = await client!.query<{ indexname: string }>(
       `SELECT indexname
@@ -99,14 +138,29 @@ describePg("chunk vector ANN index (SC-2)", () => {
     );
     expect(indexes.rows).toHaveLength(1);
 
-    await client!.query("SET enable_seqscan = off");
-    const plan = await client!.query(
-      `EXPLAIN (FORMAT JSON)
-         SELECT id
-           FROM chunks
-          ORDER BY embedding <=> '${vectorLiteral()}'::vector
-          LIMIT 1`
+    const settings = await client!.query<{ enable_seqscan: string }>(
+      "SELECT current_setting('enable_seqscan') AS enable_seqscan"
     );
-    expect(JSON.stringify(plan.rows)).not.toContain('"Node Type": "Seq Scan"');
+    expect(settings.rows[0]?.enable_seqscan).toBe("on");
+
+    const retrieval = buildVectorSearchQuery(new Array<number>(DIM).fill(0), {
+      validAt: VALID_AT,
+      limit: 10,
+    });
+    expect(retrieval.sql).toContain("valid_from <= $2::timestamptz");
+    expect(retrieval.sql).toContain(
+      "(valid_until IS NULL OR valid_until > $2::timestamptz)"
+    );
+    const plan = await client!.query(
+      `EXPLAIN (FORMAT JSON) ${retrieval.sql}`,
+      retrieval.params
+    );
+    const planJson = plan.rows[0]?.["QUERY PLAN"];
+    console.info(
+      `[vector-index-pg] settings: enable_seqscan=${settings.rows[0]?.enable_seqscan}; ` +
+        `representative_rows=${REPRESENTATIVE_ROW_COUNT}\n` +
+        JSON.stringify(planJson, null, 2)
+    );
+    expect(sequentialScanRelations(planJson)).not.toContain("chunks");
   });
 });

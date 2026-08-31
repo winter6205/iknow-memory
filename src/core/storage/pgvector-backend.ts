@@ -286,6 +286,40 @@ function appendFilterClauses(
   }
 }
 
+export interface VectorSearchQuery {
+  sql: string;
+  params: unknown[];
+}
+
+/**
+ * Build the production vector retrieval query and its bound parameters.
+ *
+ * Keeping EXPLAIN callers on this builder prevents a test-only query from
+ * claiming that the production retrieval path uses the ANN index. The
+ * validity-window predicates are part of the query by construction.
+ */
+export function buildVectorSearchQuery(
+  queryEmbedding: number[],
+  opts: SearchOptions
+): VectorSearchQuery {
+  const where = [...VALID_WINDOW_CLAUSES];
+  const params: unknown[] = [toVectorLiteral(queryEmbedding), opts.validAt];
+  appendFilterClauses(opts.filters ?? {}, where, params);
+  params.push(opts.limit);
+
+  return {
+    sql: `
+      SELECT id, content, source_ref, valid_from, valid_until,
+             embedding <=> $1::vector AS distance
+      FROM chunks
+      WHERE ${where.join(" AND ")}
+      ORDER BY embedding <=> $1::vector ASC
+      LIMIT $${params.length}
+    `,
+    params,
+  };
+}
+
 function closePgValidityWindow(
   current: Date | null,
   invalidatedAt: string
@@ -338,10 +372,12 @@ export class ConnectionWaitTimeoutError extends GraphragError {
 /**
  * Storage backend backed by PostgreSQL + the pgvector extension.
  *
- * Lazy init: the `pg` module is imported on the first call to `upsert`
- * or `search`, not in the constructor. This keeps `import { PgvectorBackend }`
- * from forcing every consumer to install `pg` — operators running with
- * GRAPHRAG_MEMORY_STORAGE=memory never touch the dependency.
+ * Lazy init: the `pg` module is imported on the first call to `initialize`,
+ * `upsert`, or `search`, not in the constructor. This keeps
+ * `import { PgvectorBackend }` from forcing every consumer to install `pg` —
+ * operators running with GRAPHRAG_MEMORY_STORAGE=memory never touch the
+ * dependency. The production server calls `initialize()` before opening its
+ * transport so schema and ANN-index failures are startup failures.
  *
  * `ensureTable()` is called once per backend instance (idempotent
  * CREATE EXTENSION + CREATE TABLE IF NOT EXISTS), so a fresh database
@@ -392,6 +428,17 @@ export class PgvectorBackend
       peakConcurrentConnections: this.peakConcurrentConnections,
       connectionWaitTimeouts: this.connectionWaitTimeouts,
     };
+  }
+
+  /**
+   * Run the storage bootstrap self-check explicitly.
+   *
+   * Direct backend consumers may still rely on lazy initialization through
+   * `upsert` or `search`; the MCP server calls this method during startup so
+   * dimension and index-build failures cannot become tool-level responses.
+   */
+  async initialize(): Promise<void> {
+    await this.ensureReady();
   }
 
   /**
@@ -826,21 +873,7 @@ export class PgvectorBackend
     }
     const pool = await this.ensureReady();
 
-    // Parameters are collected in order so the $N placeholders stay in
-    // sync with the values array.
-    const where = [...VALID_WINDOW_CLAUSES];
-    const params: unknown[] = [toVectorLiteral(queryEmbedding), opts.validAt];
-    appendFilterClauses(opts.filters ?? {}, where, params);
-    params.push(opts.limit);
-
-    const sql = `
-      SELECT id, content, source_ref, valid_from, valid_until,
-             embedding <=> $1::vector AS distance
-      FROM chunks
-      WHERE ${where.join(" AND ")}
-      ORDER BY embedding <=> $1::vector ASC
-      LIMIT $${params.length}
-    `;
+    const { sql, params } = buildVectorSearchQuery(queryEmbedding, opts);
 
     let rows: unknown[];
     try {

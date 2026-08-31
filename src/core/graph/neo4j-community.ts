@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import neo4j, { type Driver } from "neo4j-driver";
 
 import type { Neo4jConfig } from "../../config.js";
+import { writeStderr } from "../../logging.js";
 import { GraphUnavailableError } from "./types.js";
 
 export interface Community {
@@ -125,9 +126,9 @@ async function dropQuietly(
     await session.run(COMMUNITY_DROP_CYPHER, { graphName });
   } catch (err) {
     // EXIT: detection error remains primary; cleanup is observable only.
-    console.warn(
+    writeStderr(
       `neo4j-community: failed to drop projection ${graphName}: ` +
-        `${err instanceof Error ? err.message : String(err)}`
+        `${err instanceof Error ? err.message : String(err)}\n`
     );
   }
 }

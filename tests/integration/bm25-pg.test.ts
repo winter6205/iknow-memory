@@ -20,22 +20,29 @@
  */
 import { randomUUID } from "node:crypto";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { supportsLexicalSearch } from "../../src/core/storage/backend.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import type { ChunkRecord } from "../../src/core/types.js";
+import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 32;
-const DB_URL =
-  process.env.GRAPHRAG_MEMORY_DB_URL ??
-  "postgresql://postgres@localhost:5432/postgres";
-const SCHEMA = `bm25_pg_${randomUUID().slice(0, 8).replace(/-/g, "")}`;
-const SCHEMA_URL =
-  DB_URL +
-  (DB_URL.includes("?") ? "&" : "?") +
-  `options=-c%20search_path%3D${SCHEMA},public`;
+const pgHarness = await createPgIntegrationHarness({
+  label: "bm25-pg",
+  testPath: "tests/integration/bm25-pg.test.ts",
+  expectedCommand: "npx vitest run tests/integration/bm25-pg.test.ts",
+  schemaPrefix: "bm25_pg",
+  defaultConnectionString: "postgresql://postgres@localhost:5432/postgres",
+  requiresVector: true,
+});
+const {
+  connectionString: DB_URL,
+  schema: SCHEMA,
+  schemaConnectionString: SCHEMA_URL,
+  describePg,
+} = pgHarness;
 
 const embedder = new FakeEmbedder(DIM);
 
@@ -51,26 +58,6 @@ const COVER_START = new Date(NOW.getTime() - 864e5).toISOString();
  * matching finds it where vector similarity would not.
  */
 const RARE_TOKEN = "zubrowka";
-
-let PG_AVAILABLE = false;
-try {
-  const probe = new pg.Client({ connectionString: DB_URL });
-  await probe.connect();
-  await probe.query("SELECT 1");
-  await probe.end();
-  PG_AVAILABLE = true;
-} catch (err) {
-  console.warn(
-    `\n[bm25-pg] Postgres unreachable at ${DB_URL}: ${(err as Error).message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/bm25-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/bm25-pg.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${DB_URL}\n`
-  );
-}
-const describePg = PG_AVAILABLE ? describe : describe.skip;
 
 async function chunk(
   content: string,
@@ -99,10 +86,9 @@ describePg("bm25-pg: Postgres lexical arm (#65)", () => {
   let backend: PgvectorBackend | undefined;
 
   beforeAll(async () => {
-    client = new pg.Client({ connectionString: SCHEMA_URL });
+    client = pgHarness.createClient(SCHEMA_URL);
     await client.connect();
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.query(`CREATE SCHEMA "${SCHEMA}"`);
+    await pgHarness.resetSchema(client);
     await client.query(`SET search_path TO "${SCHEMA}", public`);
     backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
   });
@@ -110,7 +96,7 @@ describePg("bm25-pg: Postgres lexical arm (#65)", () => {
   afterAll(async () => {
     if (backend) await backend.close();
     if (client) {
-      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await pgHarness.dropSchema(client);
       await client.end();
     }
   });
@@ -322,7 +308,7 @@ describePg("bm25-pg: Postgres lexical arm (#65)", () => {
       DB_URL +
       (DB_URL.includes("?") ? "&" : "?") +
       `options=-c%20search_path%3D${legacySchema},public`;
-    const c = new pg.Client({ connectionString: legacyUrl });
+    const c = pgHarness.createClient(legacyUrl);
     await c.connect();
     let legacyBackend: PgvectorBackend | undefined;
     try {

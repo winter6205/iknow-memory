@@ -21,9 +21,15 @@
  * src/index.ts:buildDeps.
  */
 import type { ChunkRecord, RetrievedChunk, SearchOptions } from "../types.js";
-import type {
-  GraphRagStorageBackend,
-  LexicalStorageBackend,
+import {
+  appendContentInvalidation,
+  CONTENT_INVALIDATIONS_METADATA_KEY,
+  normalizeContentInvalidationRequest,
+  readContentInvalidations,
+  type ContentInvalidationRecord,
+  type ContentInvalidationStorage,
+  type GraphRagStorageBackend,
+  type LexicalStorageBackend,
 } from "./backend.js";
 import type {
   EntityChunkRow,
@@ -252,6 +258,27 @@ function appendFilterClauses(
   }
 }
 
+function closePgValidityWindow(
+  current: Date | null,
+  invalidatedAt: string
+): string {
+  if (current === null || current.getTime() > Date.parse(invalidatedAt)) {
+    return invalidatedAt;
+  }
+  return current.toISOString();
+}
+
+function sortInvalidationRecords(
+  records: ContentInvalidationRecord[]
+): ContentInvalidationRecord[] {
+  return records.sort(
+    (a, b) =>
+      a.chunk_id.localeCompare(b.chunk_id) ||
+      a.invalidated_at.localeCompare(b.invalidated_at) ||
+      a.triggered_by.localeCompare(b.triggered_by)
+  );
+}
+
 /**
  * Storage backend backed by PostgreSQL + the pgvector extension.
  *
@@ -268,6 +295,7 @@ export class PgvectorBackend
   implements
     GraphRagStorageBackend,
     LexicalStorageBackend,
+    ContentInvalidationStorage,
     NeighborChunkStorage,
     ProjectionDrainWaiter
 {
@@ -463,9 +491,26 @@ export class PgvectorBackend
              content = EXCLUDED.content,
              embedding = EXCLUDED.embedding,
              valid_from = EXCLUDED.valid_from,
-             valid_until = EXCLUDED.valid_until,
+             valid_until = CASE
+               WHEN chunks.metadata ? '${CONTENT_INVALIDATIONS_METADATA_KEY}'
+               THEN CASE
+                 WHEN chunks.valid_until IS NULL THEN EXCLUDED.valid_until
+                 WHEN EXCLUDED.valid_until IS NULL THEN chunks.valid_until
+                 WHEN chunks.valid_until <= EXCLUDED.valid_until
+                   THEN chunks.valid_until
+                 ELSE EXCLUDED.valid_until
+               END
+               ELSE EXCLUDED.valid_until
+             END,
              source_ref = EXCLUDED.source_ref,
-             metadata = EXCLUDED.metadata,
+             metadata = CASE
+               WHEN chunks.metadata ? '${CONTENT_INVALIDATIONS_METADATA_KEY}'
+               THEN EXCLUDED.metadata || jsonb_build_object(
+                 '${CONTENT_INVALIDATIONS_METADATA_KEY}',
+                 chunks.metadata -> '${CONTENT_INVALIDATIONS_METADATA_KEY}'
+               )
+               ELSE EXCLUDED.metadata
+             END,
              created_at = EXCLUDED.created_at`,
           [
             chunk.id,
@@ -487,6 +532,127 @@ export class PgvectorBackend
       );
     }
     return ids;
+  }
+
+  async invalidateSourceRef(
+    sourceRef: string,
+    invalidatedAt: string,
+    triggeredBy: string
+  ): Promise<ContentInvalidationRecord[]> {
+    const request = normalizeContentInvalidationRequest(
+      sourceRef,
+      invalidatedAt,
+      triggeredBy
+    );
+    let client: PgClient | undefined;
+    let transactionStarted = false;
+    try {
+      const pool = await this.ensureReady();
+      client = await pool.connect();
+      await client.query("BEGIN", []);
+      transactionStarted = true;
+      const result = await client.query(
+        `SELECT id, valid_until, metadata
+           FROM chunks
+          WHERE source_ref = $1
+          ORDER BY id
+          FOR UPDATE`,
+        [request.sourceRef]
+      );
+      if (result.rows.length === 0) {
+        throw new GraphragError(
+          `content invalidation: unknown source_ref "${request.sourceRef}"`,
+          "INVALID_INPUT"
+        );
+      }
+
+      const records: ContentInvalidationRecord[] = [];
+      for (const raw of result.rows) {
+        const row = raw as {
+          id: string;
+          valid_until: Date | null;
+          metadata: Record<string, unknown>;
+        };
+        const record: ContentInvalidationRecord = {
+          chunk_id: row.id,
+          invalidated_at: request.invalidatedAt,
+          triggered_by: request.triggeredBy,
+        };
+        const metadata = appendContentInvalidation(row.metadata, record);
+        await client.query(
+          `UPDATE chunks
+              SET valid_until = $2, metadata = $3::jsonb
+            WHERE id = $1`,
+          [
+            row.id,
+            closePgValidityWindow(row.valid_until, request.invalidatedAt),
+            JSON.stringify(metadata),
+          ]
+        );
+        records.push(record);
+      }
+      await client.query("COMMIT", []);
+      transactionStarted = false;
+      return sortInvalidationRecords(records);
+    } catch (err) {
+      if (client !== undefined && transactionStarted) {
+        try {
+          await client.query("ROLLBACK", []);
+        } catch (rollbackErr) {
+          const rollbackMessage =
+            rollbackErr instanceof Error
+              ? rollbackErr.message
+              : String(rollbackErr);
+          throw new GraphragError(
+            `PgvectorBackend.invalidateSourceRef rollback failed: ${rollbackMessage}`,
+            "STORAGE_ERROR"
+          );
+        }
+      }
+      if (err instanceof GraphragError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new GraphragError(
+        `PgvectorBackend.invalidateSourceRef failed: ${message}`,
+        "STORAGE_ERROR"
+      );
+    } finally {
+      client?.release();
+    }
+  }
+
+  async listInvalidations(
+    sourceRef?: string
+  ): Promise<ContentInvalidationRecord[]> {
+    if (sourceRef !== undefined && sourceRef.trim() === "") {
+      throw new GraphragError(
+        "content invalidation: source_ref must be a non-empty string",
+        "INVALID_INPUT"
+      );
+    }
+    const where = sourceRef === undefined ? "" : " WHERE source_ref = $1";
+    const params = sourceRef === undefined ? [] : [sourceRef];
+    let rows: unknown[];
+    try {
+      const pool = await this.ensureReady();
+      const result = await pool.query(
+        `SELECT metadata FROM chunks${where} ORDER BY id`,
+        params
+      );
+      rows = result.rows;
+    } catch (err) {
+      if (err instanceof GraphragError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new GraphragError(
+        `PgvectorBackend.listInvalidations failed: ${message}`,
+        "STORAGE_ERROR"
+      );
+    }
+    const records: ContentInvalidationRecord[] = [];
+    for (const raw of rows) {
+      const row = raw as { metadata: Record<string, unknown> };
+      records.push(...readContentInvalidations(row.metadata));
+    }
+    return sortInvalidationRecords(records);
   }
 
   async search(

@@ -22,6 +22,10 @@ and are deliberately not restated in any Acceptance below.
 **Per-ticket loop (all bullets):** tdd → typecheck+tests → code-review → verification-before-completion → one commit on the ticket branch
 **Tracker:** This file is the tracker for this round (operator-directed, in-file tracker). No GitHub issue is created; blocking edges are the `[blocks:]` marks written inside this file, and status is each bullet's `Status` checkbox.
 
+## Closed / Merged
+
+PR #165 (391dd10) is merged. T1–T13 and T16 are Done; T14+ remain Pending.
+
 ## architecture-change-reviewer verdict
 
 Gate ran on `specs/retrieval-stack.md` after the assumption gate (R1–R4) and before this plan was written. Result:

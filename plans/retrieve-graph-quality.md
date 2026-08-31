@@ -19,7 +19,7 @@
 | Temporary LLM rerank (slice 0 / T1)       | PR #118 · `plans/retrieve-rerank-llm.md` **closed**    |
 | Quality stack contract + this plan        | PR #117 · `specs/retrieve-graph-quality.md`            |
 
-**Current starting point:** graph-priority + temporary LLM rerank (default off) are on `main`. Next work is **T2–T11** below.
+**Current starting point:** graph-priority + temporary LLM rerank (default on) are on `main`. Next work is **T2–T11** below.
 
 ## ACR
 
@@ -32,7 +32,7 @@ minimal-change-verifier: yes **for this spec as one contract**; implementation *
 ## Tasks (ordered by dependency)
 
 1. **Temporary LLM rerank (slice 0)** — tag: `[implementation]`
-   - **Inherits:** `specs/retrieve-rerank-llm.md` SC1–SC6; spec slice 0; default off; skip without `degraded` when creds absent; LLM throw fail-open + `degraded`; not Host chat model.
+   - **Inherits:** `specs/retrieve-rerank-llm.md` SC1–SC6; spec slice 0; default on; missing token on a default-on path sets `degraded` and names `rerank` (`specs/retrieval-stack.md` §B3 / #165); LLM throw fail-open + `degraded`; not Host chat model.
    - **Surface:** `RetrieveConfig` / retrieve orchestrator; extract Anthropic adapter. Follow `plans/retrieve-rerank-llm.md` (closed).
    - **Acceptance:** those SC pass; `npm test` and `npm run build` exit 0 without live Anthropic; envelope still `{ chunks[] }` (+ optional `degraded`).
    - Status: [x] done (#118 MERGED 2026-08-28)

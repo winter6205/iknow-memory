@@ -52,7 +52,7 @@
  * the production server never wires that exception into retrieve.
  */
 import { ConfigError, loadEnv } from "../config.js";
-import { createLogger, type Logger } from "../logging.js";
+import { createLogger, type Logger, writeStderr } from "../logging.js";
 import { FakeEmbedder, NineRouterEmbedder } from "../core/embedder.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import { MemoryBackend } from "../core/storage/memory-backend.js";
@@ -173,7 +173,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
 export async function runCli(argv: string[], deps: EvalDeps): Promise<number> {
   const parsed = parseArgs(argv);
   if (!parsed.ok) {
-    process.stderr.write(`${USAGE}\neval-retrieve: ${parsed.error}\n`);
+    writeStderr(`${USAGE}\neval-retrieve: ${parsed.error}\n`);
     return 2;
   }
   try {
@@ -190,7 +190,7 @@ export async function runCli(argv: string[], deps: EvalDeps): Promise<number> {
   } catch (err) {
     // EXIT: 退出码 1 + stderr 上行给操作者；baseline 未被写入，旧文件保持原样
     const message = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`eval-retrieve failed: ${message}\n`);
+    writeStderr(`eval-retrieve failed: ${message}\n`);
     deps.logger.error("eval-retrieve-failed", { error: message });
     return 1;
   }
@@ -382,7 +382,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     embedder = buildEmbedder(env);
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`eval-retrieve config error: ${err.message}\n`);
+      writeStderr(`eval-retrieve config error: ${err.message}\n`);
       return 1;
     }
     throw err;
@@ -434,7 +434,7 @@ const isMain = (() => {
 
 if (isMain) {
   main().catch((err) => {
-    process.stderr.write(
+    writeStderr(
       `eval-retrieve fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`
     );
     process.exit(1);

@@ -21,7 +21,7 @@ import {
   NEO4J_URI_VAR,
   type GraphragEnv,
 } from "../config.js";
-import { createLogger, type Logger } from "../logging.js";
+import { createLogger, type Logger, writeStderr } from "../logging.js";
 import { NineRouterEmbedder, type EmbeddingClient } from "../core/embedder.js";
 import {
   createNeo4jCommunityDetector,
@@ -112,7 +112,7 @@ export async function runCli(
 ): Promise<number> {
   const parsed = parseArgs(argv);
   if (!parsed.ok) {
-    process.stderr.write(`${USAGE}\ncommunity-summary: ${parsed.error}\n`);
+    writeStderr(`${USAGE}\ncommunity-summary: ${parsed.error}\n`);
     return 2;
   }
   const client = await deps.pool.connect();
@@ -255,13 +255,13 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     env = loadEnv();
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`community-summary config error: ${err.message}\n`);
+      writeStderr(`community-summary config error: ${err.message}\n`);
       return 1;
     }
     throw err;
   }
   if (env.dbUrl === undefined) {
-    process.stderr.write(
+    writeStderr(
       "community-summary config error: GRAPHRAG_MEMORY_DB_URL is required\n"
     );
     return 1;
@@ -272,13 +272,13 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     neo4j = env.neo4j;
   } catch (err) {
     if (!(err instanceof CommunitySummarySkipError)) throw err;
-    process.stderr.write(
+    writeStderr(
       `community-summary skipped [${err.code}]: ${err.message}; EXIT: ${err.exitCode}\n`
     );
     return err.exitCode;
   }
   if (env.rerank === undefined || env.embedApiKey === undefined) {
-    process.stderr.write(
+    writeStderr(
       "community-summary config error: Anthropic and embedding credentials are required\n"
     );
     return 1;
@@ -324,7 +324,7 @@ const isMain = (() => {
 
 if (isMain) {
   main().catch((err) => {
-    process.stderr.write(`community-summary fatal: ${errorMessage(err)}\n`);
+    writeStderr(`community-summary fatal: ${errorMessage(err)}\n`);
     process.exit(1);
   });
 }

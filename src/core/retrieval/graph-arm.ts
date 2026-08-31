@@ -24,6 +24,7 @@ import type {
   GraphArmStorage,
   RetrieveConfig,
 } from "./types.js";
+import { redactDiagnostic, writeStderr } from "../../logging.js";
 
 /** Runtime deps injected by the retrieve orchestrator (T5). */
 export interface GraphArmDeps {
@@ -142,8 +143,8 @@ function mapChunksToHits(
 
 /** Degrade to an empty under-floor result carrying the failure reason. */
 function armResultWithError(err: unknown): ArmResult {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = redactDiagnostic(err instanceof Error ? err.message : err);
   // Log at warn; the T5 envelope makes the failure observable to the caller.
-  console.warn(`graph-arm degraded: ${message}`);
+  writeStderr(`graph-arm degraded: ${message}\n`);
   return { arm: "graph", hits: [], belowFloor: true, failureReason: message };
 }

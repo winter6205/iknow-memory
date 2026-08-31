@@ -68,6 +68,32 @@ describe("rrfFuse", () => {
     expect(RRF_K).toBe(60);
   });
 
+  it("changes the fused order when the configured RRF k changes", () => {
+    const arms = [
+      result("vector", [hit({ id: "v", rank: 500 })]),
+      result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
+    ];
+
+    const defaultK = rrfFuse(arms, { ...PROD_CFG, rrfK: 60 }, 10);
+    const largeK = rrfFuse(arms, { ...PROD_CFG, rrfK: 1000 }, 10);
+
+    expect(defaultK.map((fused) => fused.id)).toEqual(["b", "v"]);
+    expect(largeK.map((fused) => fused.id)).toEqual(["v", "b"]);
+  });
+
+  it("changes the fused order when vector and keyword weights change", () => {
+    const arms = [
+      result("vector", [hit({ id: "v", rank: 1 })]),
+      result("bm25", [hit({ id: "b", rank: 1, arm: "bm25" })]),
+    ];
+
+    const vectorHeavy = rrfFuse(arms, { ...CFG, w_vec: 2, w_bm25: 1 }, 10);
+    const keywordHeavy = rrfFuse(arms, { ...CFG, w_vec: 1, w_bm25: 2 }, 10);
+
+    expect(vectorHeavy.map((fused) => fused.id)).toEqual(["v", "b"]);
+    expect(keywordHeavy.map((fused) => fused.id)).toEqual(["b", "v"]);
+  });
+
   it("ranks a single vector arm by 1/(k+rank)", () => {
     const out = rrfFuse(
       [

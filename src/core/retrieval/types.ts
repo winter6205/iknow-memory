@@ -137,6 +137,8 @@ export interface FusedHit {
 export interface RetrieveConfig {
   /** Named mode bundle selected at startup; defaults to balanced. */
   preset: RetrievePreset;
+  /** RRF denominator offset; omitted by legacy callers, defaulting to 60. */
+  rrfK?: number;
   /** Weight for the vector arm in RRF. */
   w_vec: number;
   /** Weight for the BM25 lexical arm in RRF. */

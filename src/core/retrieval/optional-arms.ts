@@ -16,6 +16,7 @@ import type {
   ArmHit,
   ArmName,
   ArmResult,
+  CapabilityObservation,
   CommunitySummaryStorage,
   GraphArmStorage,
   GraphRanker,
@@ -47,6 +48,7 @@ export interface OptionalArmSet {
   neo4jGraph?: Neo4jGraphArmDeps;
   nodeEmbedding?: NodeEmbeddingArmDeps;
   communitySummaries?: CommunitySummaryStorage;
+  observations: CapabilityObservation[];
 }
 
 export interface OptionalArmResults {
@@ -54,6 +56,7 @@ export interface OptionalArmResults {
   neo4j?: ArmResult;
   nodeEmbedding?: ArmResult;
   communitySummary?: ArmResult;
+  observations: CapabilityObservation[];
 }
 
 export interface SelectedRetrievalResults {
@@ -66,13 +69,31 @@ export interface SelectedRetrievalResults {
 /** Resolve every optional arm without attempting an unavailable seam. */
 export function resolveOptionalArms(deps: OptionalArmDeps): OptionalArmSet {
   const neo4jGraph = getNeo4jGraphArm(deps);
+  const graph = neo4jGraph === undefined ? getGraphSeed(deps) : undefined;
   return {
     lexical: getLexicalArm(deps),
-    graph: neo4jGraph === undefined ? getGraphSeed(deps) : undefined,
+    graph,
     neo4jGraph,
     nodeEmbedding: getNodeEmbeddingArm(deps.retrieveConfig, deps.storage),
     communitySummaries: getCommunitySummaries(deps),
+    observations: graphUnavailabilityObservations(deps, graph, neo4jGraph),
   };
+}
+
+function graphUnavailabilityObservations(
+  deps: OptionalArmDeps,
+  graph: OptionalArmSet["graph"],
+  neo4jGraph: OptionalArmSet["neo4jGraph"]
+): CapabilityObservation[] {
+  if (
+    deps.retrieveConfig?.graphEnabled !== true ||
+    deps.graphConfig !== undefined ||
+    graph !== undefined ||
+    neo4jGraph !== undefined
+  ) {
+    return [];
+  }
+  return [{ capability: "graph_ppr", state: "unattempted" }];
 }
 
 export function hasOptionalArms(arms: OptionalArmSet): boolean {
@@ -91,7 +112,7 @@ export function hasOptionalArms(arms: OptionalArmSet): boolean {
  * reads overlap.
  */
 export async function runOptionalArms(
-  queryEmbedding: number[],
+  queryEmbedding: number[] | undefined,
   query: { query: string; validAt: string },
   searchOpts: SearchOptions,
   arms: OptionalArmSet
@@ -100,7 +121,7 @@ export async function runOptionalArms(
   if (arms.lexical !== undefined) {
     weighted.push(runLexicalArmSafe(arms.lexical, query.query, searchOpts));
   }
-  if (arms.graph !== undefined) {
+  if (arms.graph !== undefined && queryEmbedding !== undefined) {
     weighted.push(
       runGraphArmSafe(
         queryEmbedding,
@@ -111,16 +132,19 @@ export async function runOptionalArms(
   }
 
   const neo4j =
-    arms.neo4jGraph === undefined
+    arms.neo4jGraph === undefined || queryEmbedding === undefined
       ? undefined
       : runNeo4jGraphArm(queryEmbedding, arms.neo4jGraph, query.validAt);
-  const nodeEmbedding = startNodeEmbeddingArm(
-    queryEmbedding,
-    arms.nodeEmbedding,
-    query.validAt
-  );
+  const nodeEmbedding =
+    queryEmbedding === undefined
+      ? undefined
+      : startNodeEmbeddingArm(
+          queryEmbedding,
+          arms.nodeEmbedding,
+          query.validAt
+        );
   const communitySummary =
-    arms.communitySummaries === undefined
+    arms.communitySummaries === undefined || queryEmbedding === undefined
       ? undefined
       : runCommunitySummarySafe(
           queryEmbedding,
@@ -143,7 +167,18 @@ export async function runOptionalArms(
     neo4j: neo4jResult,
     nodeEmbedding: nodeEmbeddingResult,
     communitySummary: communitySummaryResult,
+    observations:
+      queryEmbedding === undefined
+        ? graphEmbeddingUnavailabilityObservations(arms)
+        : [],
   };
+}
+
+function graphEmbeddingUnavailabilityObservations(
+  arms: OptionalArmSet
+): CapabilityObservation[] {
+  if (arms.graph === undefined && arms.neo4jGraph === undefined) return [];
+  return [{ capability: "graph_ppr", state: "unattempted" }];
 }
 
 /**

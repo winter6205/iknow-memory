@@ -27,6 +27,7 @@ import { randomUUID } from "node:crypto";
 import neo4j, { type Driver } from "neo4j-driver";
 
 import type { Neo4jConfig } from "../../config.js";
+import { writeStderr } from "../../logging.js";
 import { GraphUnavailableError } from "./types.js";
 
 /** One Cypher round trip — all the PPR flow needs from a driver. */
@@ -174,9 +175,9 @@ async function dropQuietly(
     await session.run(DROP_GRAPH_CYPHER, { graphName });
   } catch (err) {
     // EXIT: 原始结果/错误由调用方继续处理，这里只记录残留的 GDS 投影
-    console.warn(
+    writeStderr(
       `neo4j-ppr: failed to drop projection ${graphName}: ` +
-        `${err instanceof Error ? err.message : String(err)}`
+        `${err instanceof Error ? err.message : String(err)}\n`
     );
   }
 }

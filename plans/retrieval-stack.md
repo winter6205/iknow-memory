@@ -62,9 +62,9 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
 | T7  | Batch ingest + connection pool parameters                                            | `[implementation]` | T5                 | —        | Pending |
 | T8  | Degraded envelope with the four set rules                                            | `[implementation]` | T3                 | —        | Done    |
 | T9  | Partial-failure semantics, and invalid input vs legal empty                          | `[implementation]` | T8                 | —        | Done    |
-| T10 | Graph multi-hop is on by default; a missing address degrades                         | `[implementation]` | T8                 | Yes      | Pending |
-| T11 | Rerank on by default; fail-open keeps the mark                                       | `[implementation]` | T8                 | Yes      | Pending |
-| T12 | No deterministic pseudo-vectors when credentials are missing                         | `[implementation]` | T8                 | Yes      | Pending |
+| T10 | Graph multi-hop is on by default; a missing address degrades                         | `[implementation]` | T8                 | Yes      | Done    |
+| T11 | Rerank on by default; fail-open keeps the mark                                       | `[implementation]` | T8                 | Yes      | Done    |
+| T12 | No deterministic pseudo-vectors when credentials are missing                         | `[implementation]` | T8                 | Yes      | Done    |
 | T13 | Vector index built in place, with a real dimension guard                             | `[implementation]` | —                  | Yes      | Done    |
 | T14 | Precision layer bring-up: CJK segmentation as one arm at both stages                 | `[implementation]` | —                  | Yes      | Pending |
 | T15 | Okapi BM25 parameters, phrase queries, and field boosting                            | `[implementation]` | T14                | —        | Pending |
@@ -148,7 +148,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
     - **Inherits:** spec SC-12 — with a graph address configured, a default-configuration `retrieve` goes through the graph arm (seeds → PPR) and the arm is invoked exactly once; with the address missing, a default-on capability could not be attempted, so §B3 rule 1 sets `degraded` and names graph multi-hop in `degraded_reasons`, which supersedes the older "missing URI skips without `degraded`"; graph-priority Host ordering and the fallback-to-vector-plus-precision-layer path are preserved unchanged.
     - **Surface:** retrieval (graph arm) + config
     - **Acceptance:** default configuration with an address configured invokes the graph arm once per `retrieve`; with no address configured the same call sets `degraded` and names the graph item; graph hits still lead the Host order and an empty graph still falls through to vector plus the precision layer without setting `degraded` on that basis alone.
-    - Status: [ ] pending
+    - Status: [x] done
     - [parallel] with T11, T12, T13, T14, T16
     - [blocks: T8]
 
@@ -156,7 +156,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
     - **Inherits:** spec SC-11 — a default-configuration `retrieve` calls rerank exactly once (injected counter = 1); failure keeps fail-open (pre-rerank order returned, no error thrown at the Host) but **must** set `degraded` and name the rerank item; an unmarked fail-open is a failure; C-3 supersedes "default off / missing token skips without `degraded`".
     - **Surface:** rerank + retrieval assembler
     - **Acceptance:** a default run invokes rerank once; injecting a failing reranker returns the pre-rerank order, throws nothing, and sets `degraded` with the rerank item named; a missing rerank token is the unattempted case and also sets `degraded`.
-    - Status: [ ] pending
+    - Status: [x] done
     - [parallel] with T10, T12, T13, T14, T16
     - [blocks: T8]
 
@@ -164,7 +164,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
     - **Inherits:** spec SC-13 — with embedding credentials absent, the envelope carries `degraded` true and `degraded_reasons` naming vector search, and the result contains no hit computed from a deterministic pseudo-vector; both assertions must hold, not either: an injected embedder shows 0 calls for that `retrieve`, and replaying the same request with the embedder replaced by one that throws a typed error yields the identical hit id sequence with nothing thrown and no empty result masquerading as a hit.
     - **Surface:** embedder + retrieval (vector arm)
     - **Acceptance:** the two SC-13 assertions both pass; the deterministic-pseudo-vector fallback path no longer exists anywhere on the retrieve path; a configured-but-failing embedder is the attempted-and-failed case under §B3 rule 2 rather than a silent substitution.
-    - Status: [ ] pending
+    - Status: [x] done
     - [parallel] with T10, T11, T13, T14, T16
     - [blocks: T8]
 

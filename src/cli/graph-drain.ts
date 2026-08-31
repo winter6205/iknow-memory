@@ -44,7 +44,12 @@ import {
   loadEnv,
   type Neo4jConfig,
 } from "../config.js";
-import { createLogger, type Logger } from "../logging.js";
+import {
+  createLogger,
+  redactDiagnostic,
+  type Logger,
+  writeStderr,
+} from "../logging.js";
 import { connectNeo4j } from "../core/graph/neo4j-writer.js";
 import {
   loadEntitiesByIds,
@@ -138,7 +143,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
 export async function runCli(argv: string[], deps: DrainDeps): Promise<number> {
   const parsed = parseArgs(argv);
   if (!parsed.ok) {
-    process.stderr.write(`${USAGE}\ngraph-drain: ${parsed.error}\n`);
+    writeStderr(`${USAGE}\ngraph-drain: ${parsed.error}\n`);
     return 2;
   }
   const client = await deps.pool.connect();
@@ -149,7 +154,7 @@ export async function runCli(argv: string[], deps: DrainDeps): Promise<number> {
     return await drain(deps, client, parsed.flags);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`graph-drain fatal: ${msg}\n`);
+    writeStderr(`graph-drain fatal: ${msg}\n`);
     deps.logger.error("graph-drain-fatal", { error: msg });
     return 1;
   } finally {
@@ -393,7 +398,9 @@ async function recordFailure(
   cause: unknown
 ): Promise<void> {
   if (claimed.length === 0) return;
-  const message = cause instanceof Error ? cause.message : String(cause);
+  const message = redactDiagnostic(
+    cause instanceof Error ? cause.message : cause
+  );
   try {
     await markIntentsFailed(
       client,
@@ -414,7 +421,7 @@ async function recordFailure(
  * and exit 3 (re-run safe) rather than 1.
  */
 function loudSkip(deps: DrainDeps, err: GraphUnavailableError): number {
-  process.stderr.write(
+  writeStderr(
     `\ngraph-drain: Neo4j unreachable at ${err.uri}\n` +
       "Validation:\n" +
       "- Not run: Neo4j projection (outbox drain)\n" +
@@ -440,13 +447,13 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     logger = createLogger(env.logLevel);
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`graph-drain config error: ${err.message}\n`);
+      writeStderr(`graph-drain config error: ${err.message}\n`);
       return 1;
     }
     throw err;
   }
   if (!dbUrl) {
-    process.stderr.write(
+    writeStderr(
       "graph-drain config error: GRAPHRAG_MEMORY_DB_URL is required\n"
     );
     return 1;
@@ -498,7 +505,7 @@ const isMain = (() => {
 
 if (isMain) {
   main().catch((err) => {
-    process.stderr.write(
+    writeStderr(
       `graph-drain fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`
     );
     process.exit(1);

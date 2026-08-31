@@ -49,6 +49,10 @@ import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { listFailed } from "../../src/core/extraction/records.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
+import {
+  redactPgConnectionString,
+  warnPgUnavailable,
+} from "../integration/pg-test-harness.js";
 
 const DIM = 8;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
@@ -115,15 +119,14 @@ describe("extract CLI subprocess e2e (T9)", () => {
       await client.connect();
       await resetSchema(client);
     } catch (err) {
-      console.warn(
-        `\n[extract-cli-e2e] Postgres unreachable at ${BASE_DB_URL}: ${(err as Error).message}\n`
-      );
-      console.warn(
-        "Validation:\n" +
-          "- Not run: tests/cli/extract.test.ts\n" +
-          "- Expected command: npx vitest run tests/cli/extract.test.ts\n" +
-          `- Blocking issue: cannot connect to Postgres at ${BASE_DB_URL}\n`
-      );
+      warnPgUnavailable({
+        label: "extract-cli-e2e",
+        testPath: "tests/cli/extract.test.ts",
+        expectedCommand: "npx vitest run tests/cli/extract.test.ts",
+        connectionString: BASE_DB_URL,
+        error: err,
+        requiresVector: false,
+      });
       client = undefined;
     }
   });
@@ -143,7 +146,7 @@ describe("extract CLI subprocess e2e (T9)", () => {
   function requireClient(): pg.Client {
     if (!client) {
       throw new Error(
-        `Postgres not reachable at ${BASE_DB_URL} — see Validation block in beforeAll`
+        `Postgres not reachable at ${redactPgConnectionString(BASE_DB_URL)} — see Validation block in beforeAll`
       );
     }
     return client;

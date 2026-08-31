@@ -34,6 +34,7 @@ import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
+import { warnPgUnavailable } from "../integration/pg-test-harness.js";
 
 const DIM = 8;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
@@ -107,15 +108,14 @@ try {
   await probe.end();
   PG_AVAILABLE = true;
 } catch (err) {
-  console.warn(
-    `\n[extract-list-failed] Postgres unreachable at ${BASE_DB_URL}: ${(err as Error).message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/cli/extract-list-failed.test.ts\n" +
-      "- Expected command: npx vitest run tests/cli/extract-list-failed.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${BASE_DB_URL}\n`
-  );
+  warnPgUnavailable({
+    label: "extract-list-failed",
+    testPath: "tests/cli/extract-list-failed.test.ts",
+    expectedCommand: "npx vitest run tests/cli/extract-list-failed.test.ts",
+    connectionString: BASE_DB_URL,
+    error: err,
+    requiresVector: false,
+  });
 }
 const describePg = PG_AVAILABLE ? describe : describe.skip;
 

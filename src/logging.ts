@@ -7,9 +7,10 @@
  * no JSON line protocol until we need one.
  *
  * Logs go to stderr to keep stdout reserved for the MCP stdio transport.
- * Never log secrets; callers are responsible for redacting.
+ * Diagnostics are redacted here so callers cannot accidentally log secrets.
  */
 import type { LogLevel } from "./config.js";
+import { redactPgDiagnostic } from "./core/storage/pg-diagnostics.js";
 
 const ORDER: Record<LogLevel, number> = {
   debug: 10,
@@ -36,8 +37,49 @@ function emit(
   const line = fields
     ? `${level.toUpperCase()} ${msg} ${JSON.stringify(fields)}`
     : `${level.toUpperCase()} ${msg}`;
+  writeStderr(line + "\n");
+}
+
+const NEO4J_URL_PATTERN =
+  /\b(?:bolt|neo4j)(?:\+(?:s|ssc))?:\/\/[^\s"'`<>]*(?:(?<=[/:@?&=%.])\r?\n[ \t]*[^\s"'`<>]+)*/gi;
+const NEO4J_URL_SCHEME_PATTERN = /^(?:bolt|neo4j)(?:\+(?:s|ssc))?:$/i;
+
+function redactNeo4jUrls(diagnostic: string): string {
+  return diagnostic.replace(NEO4J_URL_PATTERN, (candidate) => {
+    const trailing = candidate.match(/[.,;:!?)}\]]+$/)?.[0] ?? "";
+    const connectionString = trailing
+      ? candidate.slice(0, -trailing.length)
+      : candidate;
+    const normalized = connectionString.replace(/\r?\n[ \t]*/g, "");
+
+    try {
+      const url = new URL(normalized);
+      if (!NEO4J_URL_SCHEME_PATTERN.test(url.protocol)) {
+        return `${url.protocol}//[redacted]${trailing}`;
+      }
+      const port = url.port === "" ? "" : `:${url.port}`;
+      return `${url.protocol}//${url.hostname || "[redacted]"}${port}${trailing}`;
+    } catch {
+      return `${normalized.slice(0, normalized.indexOf("://") + 3)}[redacted]${trailing}`;
+    }
+  });
+}
+
+/**
+ * Redact diagnostics from every production output boundary.
+ *
+ * PostgreSQL redaction remains the single source of truth for PostgreSQL
+ * URLs and key/value credentials. Neo4j accepts a different URI family, so
+ * its authority and query are reduced to scheme + host + port here.
+ */
+export function redactDiagnostic(value: unknown): string {
+  return redactNeo4jUrls(redactPgDiagnostic(value));
+}
+
+/** Write a diagnostic to stderr without exposing connection credentials. */
+export function writeStderr(message: string): void {
   // stderr keeps stdout clean for the MCP stdio transport.
-  (level === "error" ? process.stderr : process.stderr).write(line + "\n");
+  process.stderr.write(redactDiagnostic(message));
 }
 
 export function createLogger(level: LogLevel): Logger {

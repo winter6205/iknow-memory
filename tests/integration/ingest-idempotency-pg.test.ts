@@ -114,6 +114,15 @@ describe("Postgres diagnostic redaction", () => {
 
     expect(output.join("\n")).not.toContain(secret);
   });
+
+  it("does not emit credentials from a line-broken connection URL", () => {
+    const secret = "wrapped-password";
+    const diagnostic = new Error(
+      `driver failure for postgresql://ci-user:\n${secret}@db.example.test:5432/graph`
+    );
+
+    expect(redactPgDiagnostic(diagnostic)).not.toContain(secret);
+  });
 });
 
 const DIM = 32;

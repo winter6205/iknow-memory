@@ -38,7 +38,7 @@ import {
   DEFAULT_LLM_MODEL,
   type GraphragEnv,
 } from "../config.js";
-import { createLogger, type Logger } from "../logging.js";
+import { createLogger, type Logger, writeStderr } from "../logging.js";
 import { upSchemaP0 } from "../core/storage/schema-p0.js";
 import {
   emitProjectionIntents,
@@ -217,7 +217,7 @@ function flagConflict(flags: CliFlags): string | null {
 export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   const parsed = parseArgs(argv);
   if (!parsed.ok) {
-    process.stderr.write(`${USAGE}\nextract: ${parsed.error}\n`);
+    writeStderr(`${USAGE}\nextract: ${parsed.error}\n`);
     return 2;
   }
   try {
@@ -237,7 +237,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
 
 function reportFatal(logger: Logger, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
-  process.stderr.write(`extract fatal: ${msg}\n`);
+  writeStderr(`extract fatal: ${msg}\n`);
   logger.error("extract-fatal", { error: msg });
 }
 
@@ -972,20 +972,18 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     env = loadEnv();
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`extract config error: ${err.message}\n`);
+      writeStderr(`extract config error: ${err.message}\n`);
       return 1;
     }
     throw err;
   }
   if (!env.dbUrl) {
-    process.stderr.write(
-      "extract config error: GRAPHRAG_MEMORY_DB_URL is required\n"
-    );
+    writeStderr("extract config error: GRAPHRAG_MEMORY_DB_URL is required\n");
     return 1;
   }
   const parsed = parseArgs(argv);
   if (!parsed.ok) {
-    process.stderr.write(`${USAGE}\nextract: ${parsed.error}\n`);
+    writeStderr(`${USAGE}\nextract: ${parsed.error}\n`);
     return 2;
   }
   const pool = new Pool({ connectionString: env.dbUrl });
@@ -1000,7 +998,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     return await runCli(argv, deps);
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`extract config error: ${err.message}\n`);
+      writeStderr(`extract config error: ${err.message}\n`);
       return 1;
     }
     throw err;
@@ -1025,7 +1023,7 @@ const isMain = (() => {
 
 if (isMain) {
   main().catch((err) => {
-    process.stderr.write(
+    writeStderr(
       `extract fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`
     );
     process.exit(1);

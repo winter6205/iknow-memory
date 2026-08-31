@@ -51,44 +51,44 @@ OVERALL: PASSED — implementation may start at T1.
 
 Tracker index for this round: every bullet at a glance, with its dependencies and status. Status here mirrors each bullet's own `Status` checkbox (keep the two in sync); blocking edges are the `[blocks:]` marks written in this file, and bullets marked `[parallel]` may run alongside the others in the same cluster.
 
-| # | Title | Tag | Blocked by | Parallel | Status |
-| --- | --- | --- | --- | --- | --- |
-| T1 | Cross-repo baseline drift gate | `[implementation]` | — | — | Pending |
-| T2 | ADR: chunking exits the retrieval service (no re-chunking) | `[decision]` | T1 | Yes | Pending |
-| T3 | ADR: degraded signal and partial-failure semantics | `[decision]` | T1 | Yes | Pending |
-| T4 | Ingest stores pushed text as-is (no re-chunking) | `[implementation]` | T2 | — | Pending |
-| T5 | Ingest idempotency on (`source_ref`, content identity) | `[implementation]` | T1, T4 | Yes | Pending |
-| T6 | Content invalidation (close the validity window, never delete) | `[implementation]` | T1, T4 | Yes | Pending |
-| T7 | Batch ingest + connection pool parameters | `[implementation]` | T5 | — | Pending |
-| T8 | Degraded envelope with the four set rules | `[implementation]` | T3 | — | Pending |
-| T9 | Partial-failure semantics, and invalid input vs legal empty | `[implementation]` | T8 | — | Pending |
-| T10 | Graph multi-hop is on by default; a missing address degrades | `[implementation]` | T8 | Yes | Pending |
-| T11 | Rerank on by default; fail-open keeps the mark | `[implementation]` | T8 | Yes | Pending |
-| T12 | No deterministic pseudo-vectors when credentials are missing | `[implementation]` | T8 | Yes | Pending |
-| T13 | Vector index built in place, with a real dimension guard | `[implementation]` | — | Yes | Pending |
-| T14 | Precision layer bring-up: CJK segmentation as one arm at both stages | `[implementation]` | — | Yes | Pending |
-| T15 | Okapi BM25 parameters, phrase queries, and field boosting | `[implementation]` | T14 | — | Pending |
-| T16 | Fusion parameters configurable (RRF k, vector / keyword weights) | `[implementation]` | — | Yes | Pending |
-| T17 | Default configuration enables every capability, asserted hard | `[implementation]` | T10, T11, T15, T16 | — | Pending |
-| T18 | Derived indexes rebuild from the authoritative source with no loss and no regression | `[implementation]` | T13, T14 | — | Pending |
-| T19 | Evaluation dataset: real data, format and scale floors, one-command rebuild | `[implementation]` | T1, T4 | Yes | Pending |
-| T20 | Query-class coverage and gold provenance | `[implementation]` | T19 | — | Pending |
-| T21 | Ablation: eight switches, the full configuration matrix, no silent behaviour change | `[implementation]` | T1, T16, T17, T20 | — | Pending |
-| T22 | Quantified report: full metric set, percentage deltas, reproducible | `[implementation]` | T1, T21 | — | Pending |
-| T23 | Concurrency entry: L1 scenario, idempotent scenario, latency thresholds | `[implementation]` | T1, T7, T19 | Yes | Pending |
-| T24 | Suite closure, CONTEXT stage refresh, persist flush | `[implementation]` | T17, T18, T22, T23 | — | Pending |
+| #   | Title                                                                                | Tag                | Blocked by         | Parallel | Status  |
+| --- | ------------------------------------------------------------------------------------ | ------------------ | ------------------ | -------- | ------- |
+| T1  | Cross-repo baseline drift gate                                                       | `[implementation]` | —                  | —        | Done    |
+| T2  | ADR: chunking exits the retrieval service (no re-chunking)                           | `[decision]`       | T1                 | Yes      | Done    |
+| T3  | ADR: degraded signal and partial-failure semantics                                   | `[decision]`       | T1                 | Yes      | Done    |
+| T4  | Ingest stores pushed text as-is (no re-chunking)                                     | `[implementation]` | T2                 | —        | Pending |
+| T5  | Ingest idempotency on (`source_ref`, content identity)                               | `[implementation]` | T1, T4             | Yes      | Pending |
+| T6  | Content invalidation (close the validity window, never delete)                       | `[implementation]` | T1, T4             | Yes      | Pending |
+| T7  | Batch ingest + connection pool parameters                                            | `[implementation]` | T5                 | —        | Pending |
+| T8  | Degraded envelope with the four set rules                                            | `[implementation]` | T3                 | —        | Pending |
+| T9  | Partial-failure semantics, and invalid input vs legal empty                          | `[implementation]` | T8                 | —        | Pending |
+| T10 | Graph multi-hop is on by default; a missing address degrades                         | `[implementation]` | T8                 | Yes      | Pending |
+| T11 | Rerank on by default; fail-open keeps the mark                                       | `[implementation]` | T8                 | Yes      | Pending |
+| T12 | No deterministic pseudo-vectors when credentials are missing                         | `[implementation]` | T8                 | Yes      | Pending |
+| T13 | Vector index built in place, with a real dimension guard                             | `[implementation]` | —                  | Yes      | Done    |
+| T14 | Precision layer bring-up: CJK segmentation as one arm at both stages                 | `[implementation]` | —                  | Yes      | Pending |
+| T15 | Okapi BM25 parameters, phrase queries, and field boosting                            | `[implementation]` | T14                | —        | Pending |
+| T16 | Fusion parameters configurable (RRF k, vector / keyword weights)                     | `[implementation]` | —                  | Yes      | Done    |
+| T17 | Default configuration enables every capability, asserted hard                        | `[implementation]` | T10, T11, T15, T16 | —        | Pending |
+| T18 | Derived indexes rebuild from the authoritative source with no loss and no regression | `[implementation]` | T13, T14           | —        | Pending |
+| T19 | Evaluation dataset: real data, format and scale floors, one-command rebuild          | `[implementation]` | T1, T4             | Yes      | Pending |
+| T20 | Query-class coverage and gold provenance                                             | `[implementation]` | T19                | —        | Pending |
+| T21 | Ablation: eight switches, the full configuration matrix, no silent behaviour change  | `[implementation]` | T1, T16, T17, T20  | —        | Pending |
+| T22 | Quantified report: full metric set, percentage deltas, reproducible                  | `[implementation]` | T1, T21            | —        | Pending |
+| T23 | Concurrency entry: L1 scenario, idempotent scenario, latency thresholds              | `[implementation]` | T1, T7, T19        | Yes      | Pending |
+| T24 | Suite closure, CONTEXT stage refresh, persist flush                                  | `[implementation]` | T17, T18, T22, T23 | —        | Pending |
 
 1. **Cross-repo baseline drift gate** — tag: `[implementation]`
    - **Inherits:** spec SC-39 / §B6 — the two specs' 跨仓对齐基线 sections are byte-identical; take each section body, sha256 it, equal passes, unequal fails. Both file paths are supplied at run time, not hard-coded in the spec.
    - **Surface:** repo-level check entry point (evaluation / cli — location is implementer headroom)
    - **Acceptance:** the check exits 0 while the two sections match and prints both hashes; injecting one byte of drift into either section makes it exit non-zero and print both hashes; the check does not import the MCP server entry.
-   - Status: [ ] pending
+   - Status: [x] done
 
 2. **ADR: chunking exits the retrieval service (no re-chunking)** — tag: `[decision]`
    - **Inherits:** spec §B4 不二次切分 — "fin 推送的文本即最终文本。检索服务对推送内容不做任何形式的二次切分、截断、重组或归一化改写，按原样存储与召回；召回返回的块文本与推送文本逐字节相同"; C-11 reverses CONTEXT **chunk** ("produced by the chunker during ingest"), **ingest** ("validate → size check → chunk → embed → store") and the relationship row `content → chunker → chunk[]`; reason recorded in the spec: the citation gate requires an answer span to be a contiguous substring of the frozen unit text.
    - **Surface:** `docs/adr/` — the ADR file (0004) is this bullet's outcome; the CONTEXT **chunk** / **ingest** / relationship-table reversal rides along as the same decision.
    - **Acceptance:** the accepted ADR states "no re-chunking, pushed text is final text" with the citation-gate rationale and names fin as the sole chunking authority; the commit touches no product code; CONTEXT no longer describes chunking as an ingest step of iknow-memory.
-   - Status: [ ] pending
+   - Status: [x] done
    - [parallel] with T3
    - [blocks: T1]
 
@@ -96,7 +96,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
    - **Inherits:** spec §B2 / §B3 — one arm succeeding releases the response with a mark, all arms failing is a typed error, vector-arm failure with no graph hit counts as all-failed; the four set rules (unattemptable default-on capability → set; attempted and failed → set; attempted and found nothing → not set; caller-switched-off → not set); banned silent shapes (deterministic pseudo-vectors, empty results, silent skip, unmarked sequential fallback); field names verbatim `degraded` and `degraded_reasons`.
    - **Surface:** `docs/adr/` — the ADR file (0005) is this bullet's outcome.
    - **Acceptance:** the accepted ADR restates the four set rules and the consumption rule, names the banned silent shapes, and records that missing embedding credentials must not be papered over with deterministic pseudo-vectors; the commit touches no product code; it cites the shared baseline chapter as its source rather than restating different numbers.
-   - Status: [ ] pending
+   - Status: [x] done
    - [parallel] with T2
    - [blocks: T1]
 
@@ -172,7 +172,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
     - **Inherits:** spec SC-2 — the index exists (introspection finds exactly one), the query plan does not reach the chunk table by sequential scan, the dimension limit is read from config (asserted > 0, finite, actually used in the bound check), the configured dimension is within it, and both a dimension over the limit and an "index cannot be built" condition exit non-zero with a non-empty message instead of skipping silently; all four hold or the criterion fails. Dimension-reduction method, index type, and index parameters are implementer headroom; a dimension change is a one-shot full re-embed, never a mixed-dimension store.
     - **Surface:** storage (vector index) + config
     - **Acceptance:** all four SC-2 checks pass; the limit value comes from configuration and participates in the bound check rather than being a constant; an unbuildable index exits non-zero with a non-empty message (exit 0 = fail); after the change, no code path silently skips index creation.
-    - Status: [ ] pending
+    - Status: [x] done
     - [parallel] with T10, T11, T12, T14, T16
 
 14. **Precision layer bring-up: CJK segmentation as one arm at both stages** — tag: `[implementation]`
@@ -193,7 +193,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
     - **Inherits:** spec SC-8 — RRF k and the vector / keyword weights are changeable through config, the fused result for the same input changes accordingly, nothing throws, and the default k stays 60.
     - **Surface:** config + retrieval (fusion)
     - **Acceptance:** changing k or the weights through config changes the fused order for the same input and throws nothing; a fresh default configuration reads k = 60; illegal values are a config error.
-    - Status: [ ] pending
+    - Status: [x] done
     - [parallel] with T10, T11, T12, T13, T14
 
 17. **Default configuration enables every capability, asserted hard** — tag: `[implementation]`

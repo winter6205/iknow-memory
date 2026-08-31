@@ -17,6 +17,7 @@ import {
   type RetrieveConfig,
   type RetrievePreset,
 } from "./core/retrieval/types.js";
+import { RRF_K } from "./core/retrieval/rrf.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -72,6 +73,11 @@ const LEGACY_VECTOR_API_KEY_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY";
 
 /** Env-var name for the required embedding dimension integer. */
 const EMBED_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_EMBED_DIMENSIONS";
+/** Env-var name for the pgvector ANN dimension ceiling. */
+export const PGVECTOR_ANN_MAX_DIMENSIONS_VAR =
+  "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+/** pgvector's HNSW / IVFFlat dimension ceiling for the supported extension. */
+export const DEFAULT_PGVECTOR_ANN_MAX_DIMENSIONS = 2000;
 
 /**
  * Startup configuration failure. Distinct from GraphragError (core/errors.ts),
@@ -122,6 +128,8 @@ export interface GraphragEnv {
   embedModel: string | undefined;
   /** Vector dimension. Always set — every code path (real + fake) needs it. */
   embedDimensions: number;
+  /** Maximum vector width accepted by the configured ANN index. */
+  pgvectorAnnMaxDimensions: number;
   /**
    * Resolved embedding API key value; undefined means "fall back to
    * FakeEmbedder". See the EMBED_API_KEY_* constants for resolution order.
@@ -197,6 +205,20 @@ function readEnv(key: string): string | undefined {
 }
 
 /**
+ * Read an environment value without collapsing an explicit blank to absent.
+ * Numeric configuration needs this distinction so `KEY=` cannot silently
+ * select a fallback while an actually absent key still gets its documented
+ * default.
+ */
+function readRawEnv(key: string): string | undefined {
+  if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+    return process.env[key];
+  }
+  const file = parseEnvFile(join(process.cwd(), ".env.local"));
+  return file[key];
+}
+
+/**
  * Read an env var and normalize: trim whitespace, treat empty/whitespace-only
  * as absent (undefined). Keeps config.ts and index.ts in agreement — both
  * treat a blank key as "no key" (FakeEmbedder path) without relying on JS
@@ -233,11 +255,33 @@ function parseEmbedDimensions(raw: string | undefined): number {
   return n;
 }
 
+/**
+ * Load the pgvector ANN width ceiling from configuration. The extension's
+ * current ceiling is an explicit default, while a present blank or malformed
+ * override is rejected before schema bootstrap can silently skip an index.
+ */
+export function readPgvectorAnnMaxDimensions(): number {
+  const raw = readRawEnv(PGVECTOR_ANN_MAX_DIMENSIONS_VAR);
+  const value =
+    raw === undefined ? String(DEFAULT_PGVECTOR_ANN_MAX_DIMENSIONS) : raw;
+  const n = Number(value);
+  if (
+    raw !== undefined &&
+    (raw.trim() === "" || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0)
+  ) {
+    throw new ConfigError(
+      `${PGVECTOR_ANN_MAX_DIMENSIONS_VAR} must be a finite positive integer, got "${raw}"`
+    );
+  }
+  return n;
+}
+
 // --- Retrieval config (spec-3 p0-integration T5) ---
 
 const RETRIEVAL_W_VEC_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC";
 const RETRIEVAL_W_BM25_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25";
 const RETRIEVAL_W_GRAPH_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH";
+const RETRIEVAL_RRF_K_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RRF_K";
 const RETRIEVAL_BM25_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED";
 const RETRIEVAL_GRAPH_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED";
 const RETRIEVAL_NODE_EMBEDDING_ENABLED_VAR =
@@ -293,7 +337,12 @@ function parseFinitePositive(
   raw: string | undefined,
   fallback: number
 ): number {
-  const value = raw !== undefined && raw.trim() !== "" ? raw : String(fallback);
+  if (raw !== undefined && raw.trim() === "") {
+    throw new ConfigError(
+      `${name} must be a finite positive number, got "${raw}"`
+    );
+  }
+  const value = raw !== undefined ? raw : String(fallback);
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
     throw new ConfigError(
@@ -365,19 +414,24 @@ function parseRetrievalConfig(): RetrieveConfig {
   }
   return {
     preset,
+    rrfK: parseFinitePositive(
+      RETRIEVAL_RRF_K_VAR,
+      readRawEnv(RETRIEVAL_RRF_K_VAR),
+      RRF_K
+    ),
     w_vec: parseFinitePositive(
       RETRIEVAL_W_VEC_VAR,
-      readEnv(RETRIEVAL_W_VEC_VAR),
+      readRawEnv(RETRIEVAL_W_VEC_VAR),
       bundle.w_vec
     ),
     w_bm25: parseFinitePositive(
       RETRIEVAL_W_BM25_VAR,
-      readEnv(RETRIEVAL_W_BM25_VAR),
+      readRawEnv(RETRIEVAL_W_BM25_VAR),
       bundle.w_bm25
     ),
     w_graph: parseFinitePositive(
       RETRIEVAL_W_GRAPH_VAR,
-      readEnv(RETRIEVAL_W_GRAPH_VAR),
+      readRawEnv(RETRIEVAL_W_GRAPH_VAR),
       0.15
     ),
     bm25Enabled: parseBoolean(
@@ -546,6 +600,7 @@ export function loadEnv(): GraphragEnv {
   // values collapse to undefined — a blank key does not silently drag an
   // operator into the real-embedder path.
   const embedDimensions = parseEmbedDimensions(readEnv(EMBED_DIMENSIONS_VAR));
+  const pgvectorAnnMaxDimensions = readPgvectorAnnMaxDimensions();
   const embedApiKey = resolveEmbedApiKey();
 
   const embedBaseUrl = readTrimmed("GRAPHRAG_MEMORY_EMBED_BASE_URL");
@@ -571,6 +626,7 @@ export function loadEnv(): GraphragEnv {
     storage: rawStorage,
     dbUrl,
     embedDimensions,
+    pgvectorAnnMaxDimensions,
     embedBaseUrl: embedBaseUrl?.replace(/\/$/, ""),
     embedModel,
     // Looked up by NAME — the secret value only ever exists in the process

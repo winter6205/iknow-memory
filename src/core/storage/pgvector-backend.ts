@@ -35,9 +35,10 @@ import type {
   CommunitySummaryRow,
   ProjectionDrainWaiter,
 } from "../retrieval/types.js";
+import { readPgvectorAnnMaxDimensions } from "../../config.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
-import { upSchemaP0 } from "./schema-p0.js";
+import { assertPgvectorAnnDimensions, upSchemaP0 } from "./schema-p0.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
 
 /**
@@ -172,6 +173,7 @@ SELECT DISTINCT n.id, n.content, n.source_ref, n.valid_from,
  * changing the config later rewrites the whole table.
  */
 const TEXT_SEARCH_CONFIG = "simple";
+export const CHUNK_VECTOR_INDEX_NAME = "chunks_embedding_idx";
 
 /**
  * Build the lexical query with OR semantics over the query's terms.
@@ -274,7 +276,8 @@ export class PgvectorBackend
 
   constructor(
     private readonly dbUrl: string,
-    private readonly dimensions: number
+    private readonly dimensions: number,
+    private readonly annMaxDimensions?: number
   ) {}
 
   /**
@@ -333,6 +336,9 @@ export class PgvectorBackend
    * with a versioned migration runner if the schema grows.
    */
   private async ensureTable(): Promise<void> {
+    const annMaxDimensions =
+      this.annMaxDimensions ?? readPgvectorAnnMaxDimensions();
+    assertPgvectorAnnDimensions(this.dimensions, annMaxDimensions);
     const pool = this.pool!;
     // Acquire a dedicated client so upSchemaP0 can wrap its DDL in a
     // BEGIN/COMMIT/ROLLBACK transaction without conflicting with the
@@ -357,6 +363,25 @@ export class PgvectorBackend
            )`,
           []
         );
+        await client.query(
+          `CREATE INDEX IF NOT EXISTS ${CHUNK_VECTOR_INDEX_NAME}
+             ON chunks USING hnsw (embedding vector_cosine_ops)`,
+          []
+        );
+        const indexCheck = await client.query(
+          `SELECT indexname
+             FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'chunks'
+              AND indexname = '${CHUNK_VECTOR_INDEX_NAME}'`,
+          []
+        );
+        if (indexCheck.rows.length !== 1) {
+          throw new GraphragError(
+            `PgvectorBackend: expected exactly one ${CHUNK_VECTOR_INDEX_NAME} catalog entry, found ${indexCheck.rows.length}`,
+            "STORAGE_ERROR"
+          );
+        }
         // Lexical index for the BM25 arm. Kept as a separate ALTER rather
         // than a column in the CREATE above because the CREATE is
         // IF NOT EXISTS and no-ops on every existing deployment — an
@@ -386,13 +411,18 @@ export class PgvectorBackend
         // .query is actually used by upSchemaP0, so the structural surface
         // is sufficient. Pass this.dimensions so entities.embedding width
         // matches chunks.embedding width (H1).
-        await upSchemaP0(client as unknown as PoolClient, this.dimensions);
+        await upSchemaP0(
+          client as unknown as PoolClient,
+          this.dimensions,
+          annMaxDimensions
+        );
       } finally {
         client.release();
       }
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       throw new GraphragError(
-        `PgvectorBackend: ensureTable failed (${(err as Error).message})`,
+        `PgvectorBackend: ensureTable failed (${message})`,
         "STORAGE_ERROR"
       );
     }

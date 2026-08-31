@@ -7,7 +7,8 @@
  * state and does NOT mutate `deps`.
  *
  * Arms:
- *   - **vector** always runs, and its failure is the caller's failure.
+ *   - **vector** always runs; its failure is released only when another
+ *     eligible arm succeeds, otherwise the call returns a typed error.
  *   - **BM25** runs when `retrieveConfig.bm25Enabled` is set and the backend
  *     implements the lexical seam. This is the production partner arm (#59).
  *   - **graph** runs when `retrieveConfig.graphEnabled` is set, a
@@ -37,8 +38,8 @@
  *
  * Optional arms are fail-open: each is wrapped so a throw becomes an empty
  * `ArmResult` carrying a `failureReason`; the central capability registry
- * turns that observation into a named `degraded_reasons` entry while the
- * vector results still reach the caller.
+ * turns that observation into a named `degraded_reasons` entry while any
+ * successful arm's results still reach the caller.
  */
 import { assembleGraphPriority } from "./graph-priority.js";
 import { RRF_K } from "./rrf.js";
@@ -65,7 +66,11 @@ import type {
   RetrieveConfig,
   RetrieveOutputEnvelope,
 } from "./types.js";
-import type { RetrievedChunk, StorageBackend } from "../types.js";
+import type {
+  RetrievedChunk,
+  SearchOptions,
+  StorageBackend,
+} from "../types.js";
 import {
   supportsNeighborChunks,
   supportsProjectionDrain,
@@ -151,6 +156,11 @@ interface AssemblyResult {
   debug: Record<string, unknown> | undefined;
 }
 
+interface VectorSearchOutcome {
+  retrieved: RetrievedChunk[];
+  failureReason?: string;
+}
+
 const ARM_CAPABILITY: Readonly<Record<ArmName, DegradedCapability>> = {
   vector: "vector",
   bm25: "keyword_bm25",
@@ -188,15 +198,23 @@ export async function assembleRetrievalResult(
     validAt: args.validAt,
     ...(args.filters !== undefined ? { filters: args.filters } : {}),
   };
-  const vectorSearch = deps.storage.search(queryEmbedding, searchOpts);
+  const vectorSearch = startVectorSearch(
+    deps.storage,
+    queryEmbedding,
+    searchOpts
+  );
 
   // An active arm always implies its own config — the lexical arm implies
   // `retrieveConfig`, the graph arm implies `graphConfig` — so the
   // `weights === undefined` half is unreachable at runtime. It is what
   // narrows `weights` for the `rrfFuse` call below.
   if (!fusing || weights === undefined) {
+    const vector = await resolveVectorSearch(vectorSearch);
+    if (vector.failureReason !== undefined) {
+      throw allArmsFailed(vector);
+    }
     const result = await assembleVectorOnlyResult(
-      vectorSearch,
+      vector.retrieved,
       args,
       deps,
       reranker
@@ -209,16 +227,20 @@ export async function assembleRetrievalResult(
     );
   }
 
-  const [retrieved, optionalResults] = await Promise.all([
-    vectorSearch,
+  const [vector, optionalResults] = await Promise.all([
+    resolveVectorSearch(vectorSearch),
     runOptionalArms(queryEmbedding, args, searchOpts, arms),
   ]);
-  const result = await assembleFusedResult(retrieved, optionalResults, {
+  if (shouldRejectAllArms(vector, optionalResults)) {
+    throw allArmsFailed(vector, optionalResults);
+  }
+  const result = await assembleFusedResult(vector.retrieved, optionalResults, {
     args,
     deps,
     reranker,
     rerankWindow,
     weights,
+    vectorFailureReason: vector.failureReason,
   });
   const waited = await waitForProjectionDrain(result, deps);
   return buildEnvelope(
@@ -226,6 +248,93 @@ export async function assembleRetrievalResult(
     [...waited.observations, ...(deps.capabilityObservations ?? [])],
     waited.debug
   );
+}
+
+function startVectorSearch(
+  storage: StorageBackend,
+  embedding: number[],
+  options: SearchOptions
+): Promise<RetrievedChunk[]> {
+  try {
+    return storage.search(embedding, options);
+  } catch (err) {
+    return Promise.reject(err);
+  }
+}
+
+async function resolveVectorSearch(
+  search: Promise<RetrievedChunk[]>
+): Promise<VectorSearchOutcome> {
+  try {
+    return { retrieved: await search };
+  } catch (err) {
+    return {
+      retrieved: [],
+      failureReason: failureMessage(err),
+    };
+  }
+}
+
+function shouldRejectAllArms(
+  vector: VectorSearchOutcome,
+  optional: OptionalArmResults
+): boolean {
+  if (vector.failureReason === undefined) return false;
+  const optionalArms = optionalResultsList(optional);
+  const graphArms = optionalArms.filter((arm) => arm.arm === "graph");
+  if (graphArms.length > 0 && graphArms.every((arm) => arm.hits.length === 0)) {
+    return true;
+  }
+  return optionalArms.every((arm) => arm.belowFloor);
+}
+
+function allArmsFailed(
+  vector: VectorSearchOutcome,
+  optional?: OptionalArmResults
+): GraphragError {
+  const failures = [
+    ...(vector.failureReason === undefined
+      ? []
+      : [`vector: ${vector.failureReason}`]),
+    ...(optional === undefined
+      ? []
+      : optionalResultsList(optional)
+          .filter((arm) => arm.belowFloor)
+          .map(
+            (arm) =>
+              `${arm.arm}: ${arm.failureReason ?? "arm could not deliver"}`
+          )),
+  ];
+  const graphArms =
+    optional === undefined
+      ? []
+      : optionalResultsList(optional).filter((arm) => arm.arm === "graph");
+  if (
+    vector.failureReason !== undefined &&
+    graphArms.length > 0 &&
+    graphArms.every((arm) => arm.hits.length === 0)
+  ) {
+    failures.push("graph: no hit while vector fallback was unavailable");
+  }
+  return new GraphragError(
+    `all retrieval arms failed${failures.length > 0 ? `: ${failures.join("; ")}` : ""}`,
+    "STORAGE_ERROR"
+  );
+}
+
+function optionalResultsList(optional: OptionalArmResults): ArmResult[] {
+  return [
+    ...optional.weighted,
+    ...(optional.neo4j === undefined ? [] : [optional.neo4j]),
+    ...(optional.nodeEmbedding === undefined ? [] : [optional.nodeEmbedding]),
+    ...(optional.communitySummary === undefined
+      ? []
+      : [optional.communitySummary]),
+  ];
+}
+
+function failureMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /**
@@ -296,15 +405,15 @@ interface FusedAssemblyContext {
   reranker: ChunkReranker | undefined;
   rerankWindow: number | undefined;
   weights: RetrieveConfig;
+  vectorFailureReason?: string;
 }
 
 async function assembleVectorOnlyResult(
-  vectorSearch: Promise<RetrievedChunk[]>,
+  retrieved: RetrievedChunk[],
   args: AssembleArgs,
   deps: AssembleDeps,
   reranker: ChunkReranker | undefined
 ): Promise<AssemblyResult> {
-  const retrieved = await vectorSearch;
   const reranked = await maybeRerank(
     toFusedFromRetrieved(retrieved),
     args,
@@ -336,7 +445,8 @@ async function assembleFusedResult(
   optionalResults: OptionalArmResults,
   context: FusedAssemblyContext
 ): Promise<AssemblyResult> {
-  const { args, deps, reranker, rerankWindow, weights } = context;
+  const { args, deps, reranker, rerankWindow, weights, vectorFailureReason } =
+    context;
   const { optional, communityPriority, graphPriority, remainder } =
     selectRetrievalResults(retrieved, optionalResults);
   const fused = assembleGraphPriority(
@@ -366,6 +476,9 @@ async function assembleFusedResult(
   return {
     hits: neighbors.hits,
     observations: [
+      ...(vectorFailureReason !== undefined
+        ? [observation("vector", "attempted-and-failed")]
+        : []),
       ...observationsFromOptional(optional),
       ...(reranked.degraded === true
         ? [observation("rerank", "attempted-and-failed")]
@@ -374,7 +487,12 @@ async function assembleFusedResult(
         ? [observation("neighbor_evidence", "attempted-and-failed")]
         : []),
     ],
-    debug: buildDebug(deps.debug, retrieved.length, optional),
+    debug: buildDebug(
+      deps.debug,
+      retrieved.length,
+      optional,
+      vectorFailureReason
+    ),
   };
 }
 
@@ -634,10 +752,14 @@ function resolveDegradedReasons(
 function buildDebug(
   enabled: boolean | undefined,
   vectorHits: number,
-  optional: ArmResult[]
+  optional: ArmResult[],
+  vectorFailureReason?: string
 ): Record<string, unknown> | undefined {
   if (!enabled) return undefined;
   const debug: Record<string, unknown> = { vectorHits };
+  if (vectorFailureReason !== undefined) {
+    debug.vectorFailureReason = vectorFailureReason;
+  }
   for (const arm of optional) {
     debug[`${arm.arm}Hits`] = arm.hits.length;
     if (arm.arm === "graph") debug["graphBelowFloor"] = arm.belowFloor;

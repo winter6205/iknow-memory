@@ -80,6 +80,21 @@ export const PGVECTOR_ANN_MAX_DIMENSIONS_VAR =
   "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
 /** pgvector's HNSW / IVFFlat dimension ceiling for the supported extension. */
 export const DEFAULT_PGVECTOR_ANN_MAX_DIMENSIONS = 2000;
+/** Environment variable for the maximum number of items in one ingest call. */
+export const INGEST_BATCH_LIMIT_VAR = "GRAPHRAG_MEMORY_INGEST_BATCH_LIMIT";
+/** A bounded default keeps embedding requests and writes reasonably sized. */
+export const DEFAULT_INGEST_BATCH_LIMIT = 100;
+/** Environment variable for the PostgreSQL pool connection cap. */
+export const PGVECTOR_POOL_MAX_VAR = "GRAPHRAG_MEMORY_PGVECTOR_POOL_MAX";
+/** A conservative default avoids exhausting a local PostgreSQL instance. */
+export const DEFAULT_PGVECTOR_POOL_MAX = 10;
+/**
+ * Maximum time a pool acquisition may wait before the request fails.
+ * `pg` receives this value as its connectionTimeoutMillis setting too.
+ */
+export const PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS_VAR =
+  "GRAPHRAG_MEMORY_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS";
+export const DEFAULT_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS = 5_000;
 
 /**
  * Startup configuration failure. Distinct from GraphragError (core/errors.ts),
@@ -131,6 +146,12 @@ export interface GraphragEnv {
   embedDimensions: number;
   /** Maximum vector width accepted by the configured ANN index. */
   pgvectorAnnMaxDimensions: number;
+  /** Maximum number of items accepted by one ingest call. */
+  ingestBatchLimit: number;
+  /** Maximum number of concurrent PostgreSQL pool clients. */
+  pgvectorPoolMax: number;
+  /** Maximum pool-acquisition wait before a typed failure. */
+  pgvectorConnectionWaitTimeoutMs: number;
   /**
    * Resolved embedding API key value; undefined means production embedding is
    * unavailable. The offline evaluation CLI may opt into FakeEmbedder.
@@ -273,6 +294,59 @@ export function readPgvectorAnnMaxDimensions(): number {
     );
   }
   return n;
+}
+
+/**
+ * Parse a positive integer with an explicit default for an absent env var.
+ * A present blank value is rejected as a missing configuration value rather
+ * than silently selecting the default.
+ */
+function parseConfiguredPositiveInt(
+  name: string,
+  raw: string | undefined,
+  fallback: number
+): number {
+  if (raw === undefined) return fallback;
+  if (raw.trim() === "") {
+    throw new ConfigError(`${name} is required and must be a positive integer`);
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    throw new ConfigError(
+      `${name} must be a finite positive integer, got "${raw}"`
+    );
+  }
+  return n;
+}
+
+/** Read the batch limit used by the ingest surface. */
+export function readIngestBatchLimit(): number {
+  return parseConfiguredPositiveInt(
+    INGEST_BATCH_LIMIT_VAR,
+    readRawEnv(INGEST_BATCH_LIMIT_VAR),
+    DEFAULT_INGEST_BATCH_LIMIT
+  );
+}
+
+export interface PgvectorPoolConfig {
+  max: number;
+  connectionWaitTimeoutMs: number;
+}
+
+/** Read the PostgreSQL pool cap and acquisition timeout. */
+export function readPgvectorPoolConfig(): PgvectorPoolConfig {
+  return {
+    max: parseConfiguredPositiveInt(
+      PGVECTOR_POOL_MAX_VAR,
+      readRawEnv(PGVECTOR_POOL_MAX_VAR),
+      DEFAULT_PGVECTOR_POOL_MAX
+    ),
+    connectionWaitTimeoutMs: parseConfiguredPositiveInt(
+      PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS_VAR,
+      readRawEnv(PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS_VAR),
+      DEFAULT_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS
+    ),
+  };
 }
 
 // --- Retrieval config (spec-3 p0-integration T5) ---
@@ -600,6 +674,8 @@ export function loadEnv(): GraphragEnv {
   // operator into the real-embedder path.
   const embedDimensions = parseEmbedDimensions(readEnv(EMBED_DIMENSIONS_VAR));
   const pgvectorAnnMaxDimensions = readPgvectorAnnMaxDimensions();
+  const ingestBatchLimit = readIngestBatchLimit();
+  const pgvectorPool = readPgvectorPoolConfig();
   const embedApiKey = resolveEmbedApiKey();
 
   const embedBaseUrl = readTrimmed("GRAPHRAG_MEMORY_EMBED_BASE_URL");
@@ -626,6 +702,9 @@ export function loadEnv(): GraphragEnv {
     dbUrl,
     embedDimensions,
     pgvectorAnnMaxDimensions,
+    ingestBatchLimit,
+    pgvectorPoolMax: pgvectorPool.max,
+    pgvectorConnectionWaitTimeoutMs: pgvectorPool.connectionWaitTimeoutMs,
     embedBaseUrl: embedBaseUrl?.replace(/\/$/, ""),
     embedModel,
     // Looked up by NAME — the secret value only ever exists in the process

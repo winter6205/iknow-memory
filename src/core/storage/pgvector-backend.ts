@@ -41,7 +41,12 @@ import type {
   CommunitySummaryRow,
   ProjectionDrainWaiter,
 } from "../retrieval/types.js";
-import { readPgvectorAnnMaxDimensions } from "../../config.js";
+import {
+  ConfigError,
+  readPgvectorAnnMaxDimensions,
+  readPgvectorPoolConfig,
+  type PgvectorPoolConfig,
+} from "../../config.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
 import { assertPgvectorAnnDimensions, upSchemaP0 } from "./schema-p0.js";
@@ -54,7 +59,11 @@ import { waitForProjectionDrain } from "./projection-outbox.js";
  * only if it matches.
  */
 interface PgModule {
-  Pool: new (config: { connectionString: string }) => PgPool;
+  Pool: new (config: {
+    connectionString: string;
+    max: number;
+    connectionTimeoutMillis: number;
+  }) => PgPool;
 }
 interface PgPool {
   query: (text: string, values: unknown[]) => Promise<{ rows: unknown[] }>;
@@ -63,10 +72,29 @@ interface PgPool {
   // takes ownership of the BEGIN/COMMIT/ROLLBACK and releases via finally
   // — see ensureTable().
   connect: () => Promise<PgClient>;
+  on?: (
+    event: "acquire" | "release",
+    listener: (...args: unknown[]) => void
+  ) => PgPool;
 }
 interface PgClient {
   query: (text: string, values: unknown[]) => Promise<{ rows: unknown[] }>;
   release: () => void;
+}
+
+/** Optional constructor overrides for the PostgreSQL connection pool. */
+export interface PgvectorPoolOptions {
+  max?: number;
+  connectionWaitTimeoutMs?: number;
+}
+
+/** Observable pool counters consumed by the later concurrency harness. */
+export interface PgvectorPoolStats {
+  configuredMax: number;
+  connectionWaitTimeoutMs: number;
+  observedConcurrentConnections: number;
+  peakConcurrentConnections: number;
+  connectionWaitTimeouts: number;
 }
 
 /** Serialized pgvector literal: `[0.1,0.2,...]` with no spaces. */
@@ -279,6 +307,34 @@ function sortInvalidationRecords(
   );
 }
 
+function validatePoolParameter(
+  name: string,
+  value: number | undefined,
+  fallback: number
+): number {
+  const resolved = value ?? fallback;
+  if (
+    !Number.isFinite(resolved) ||
+    !Number.isInteger(resolved) ||
+    resolved <= 0
+  ) {
+    throw new ConfigError(
+      `${name} must be a finite positive integer, got "${String(value)}"`
+    );
+  }
+  return resolved;
+}
+
+export class ConnectionWaitTimeoutError extends GraphragError {
+  constructor(timeoutMs: number) {
+    super(
+      `PgvectorBackend: connection wait exceeded ${timeoutMs}ms`,
+      "STORAGE_ERROR"
+    );
+    this.name = "ConnectionWaitTimeoutError";
+  }
+}
+
 /**
  * Storage backend backed by PostgreSQL + the pgvector extension.
  *
@@ -301,12 +357,42 @@ export class PgvectorBackend
 {
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
+  private readonly poolConfig: PgvectorPoolConfig;
+  private observedConcurrentConnections = 0;
+  private peakConcurrentConnections = 0;
+  private connectionWaitTimeouts = 0;
 
   constructor(
     private readonly dbUrl: string,
     private readonly dimensions: number,
-    private readonly annMaxDimensions?: number
-  ) {}
+    private readonly annMaxDimensions?: number,
+    poolOptions: PgvectorPoolOptions = {}
+  ) {
+    const defaults = readPgvectorPoolConfig();
+    this.poolConfig = {
+      max: validatePoolParameter(
+        "PostgreSQL pool max",
+        poolOptions.max,
+        defaults.max
+      ),
+      connectionWaitTimeoutMs: validatePoolParameter(
+        "PostgreSQL connection wait timeout",
+        poolOptions.connectionWaitTimeoutMs,
+        defaults.connectionWaitTimeoutMs
+      ),
+    };
+  }
+
+  /** Return pool settings and live counters without exposing the pg client. */
+  getPoolStats(): PgvectorPoolStats {
+    return {
+      configuredMax: this.poolConfig.max,
+      connectionWaitTimeoutMs: this.poolConfig.connectionWaitTimeoutMs,
+      observedConcurrentConnections: this.observedConcurrentConnections,
+      peakConcurrentConnections: this.peakConcurrentConnections,
+      connectionWaitTimeouts: this.connectionWaitTimeouts,
+    };
+  }
 
   /**
    * Lazily initialize the pg module + connection pool + schema.
@@ -332,8 +418,13 @@ export class PgvectorBackend
           "STORAGE_ERROR"
         );
       }
-      const pool = new mod.Pool({ connectionString: this.dbUrl });
-      this.pool = pool;
+      const rawPool = new mod.Pool({
+        connectionString: this.dbUrl,
+        max: this.poolConfig.max,
+        connectionTimeoutMillis: this.poolConfig.connectionWaitTimeoutMs,
+      });
+      this.attachPoolObservers(rawPool);
+      this.pool = this.wrapPool(rawPool);
       try {
         await this.ensureTable();
       } catch (err) {
@@ -351,6 +442,74 @@ export class PgvectorBackend
       this.initPromise = undefined;
     }
     return this.pool!;
+  }
+
+  private attachPoolObservers(pool: PgPool): void {
+    if (pool.on === undefined) return;
+    pool.on("acquire", () => {
+      this.observedConcurrentConnections += 1;
+      this.peakConcurrentConnections = Math.max(
+        this.peakConcurrentConnections,
+        this.observedConcurrentConnections
+      );
+    });
+    pool.on("release", () => {
+      this.observedConcurrentConnections = Math.max(
+        0,
+        this.observedConcurrentConnections - 1
+      );
+    });
+  }
+
+  private wrapPool(rawPool: PgPool): PgPool {
+    return {
+      query: (text, values) => this.queryWithPoolClient(rawPool, text, values),
+      connect: () => this.connectWithTimeout(rawPool),
+      end: () => rawPool.end(),
+    };
+  }
+
+  private async queryWithPoolClient(
+    pool: PgPool,
+    text: string,
+    values: unknown[]
+  ): Promise<{ rows: unknown[] }> {
+    const client = await this.connectWithTimeout(pool);
+    try {
+      return await client.query(text, values);
+    } finally {
+      client.release();
+    }
+  }
+
+  private async connectWithTimeout(pool: PgPool): Promise<PgClient> {
+    const pending = pool.connect();
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        this.connectionWaitTimeouts += 1;
+        reject(
+          new ConnectionWaitTimeoutError(
+            this.poolConfig.connectionWaitTimeoutMs
+          )
+        );
+      }, this.poolConfig.connectionWaitTimeoutMs);
+    });
+    try {
+      return await Promise.race([pending, timeout]);
+    } catch (error) {
+      if (timedOut) {
+        void pending.then(
+          (client) => client.release(),
+          () => undefined
+        );
+      }
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /**

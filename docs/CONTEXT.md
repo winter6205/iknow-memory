@@ -19,7 +19,7 @@ _Avoid_: "client" (too generic); "consumer" (implies passive reading, hosts acti
 
 ### Memory units
 
-**chunk**: a fixed-window text slice produced by the chunker during ingest. Identified by UUID, carries `embedding`, `source_ref`, `metadata`, `valid_from`, `valid_until`, `created_at`. The atomic unit of vector storage and retrieval in stage 1.
+**chunk**: pushed text is final text. fin is the sole chunking authority; iknow-memory stores and recalls the pushed text as-is without re-chunking, truncation, reassembly, or normalization/rewrite. Identified by UUID, carries `embedding`, `source_ref`, `metadata`, `valid_from`, `valid_until`, `created_at`. The atomic unit of vector storage and retrieval in stage 1; returned chunk text is byte-identical to the pushed text.
 _Avoid_: "document" (a chunk is a slice, not a whole document); "passage" (implies semantic completeness); "segment" (ambiguous with context segments)
 
 **entity**: a canonical real-world referent extracted from chunks (person, concept, system, event). Identified by UUID, carries `canonical_name`, `type`, `embedding`, `metadata`. Multiple surface forms (aliases) resolve to one entity. _Stage: P0 (implemented)._
@@ -111,7 +111,7 @@ _Avoid_: "cluster" (too generic, used in embedding clustering too); "topic group
 
 ### Pipeline
 
-**ingest**: the write pipeline: validate → size check → chunk → embed → store. Exposed as MCP tool `ingest(input: {content, source_ref, metadata?, valid_from?, valid_until?}) → {chunk_ids}`. Stage 1: chunks-only. P0 adds: → extract triples → resolve entities → store graph.
+**ingest**: the write pipeline for final pushed text: validate → size check → embed → store as-is. Pushed text is final text; fin is the sole chunking authority, and iknow-memory does not re-chunk, truncate, reassemble, or normalize/rewrite it. Exposed as MCP tool `ingest(input: {content, source_ref, metadata?, valid_from?, valid_until?}) → {chunk_ids}`. Stage 1: chunks-only. P0 adds: → extract triples → resolve entities → store graph.
 _Avoid_: "index" (implies search-index building, not knowledge extraction); "import" (implies bulk file loading)
 
 **ingest idempotency**: the guarantee that repeated pushes of the same idempotency key — (`source_ref`, content identity, where content identity hashes chunk text plus the normalization / parsing-rule / parameter versions) — produce no second write and return the same **chunk** ids. A failed push is returned by name and is not counted against the idempotency assertion. _Stage: `specs/retrieval-stack.md` (C-9)._
@@ -168,7 +168,7 @@ _Avoid_: "load test" (implies capacity discovery); "stress test" (we do not push
 
 ## Relationships
 
-- **content → chunker → chunk[]**: ingest splits raw text into fixed-window overlapping chunks
+- **content → chunker → chunk[]**: fin's chunker produces the final pushed text; pushed text is final text, and iknow-memory stores and recalls each pushed chunk as-is without any ingest-side re-chunking
 - **chunk → embedder → embedding**: each chunk gets a dense vector (real API or FakeEmbedder for dev/test)
 - **chunk + LLM → extract_triples → triple[]**: P0 extraction produces (head, relation, tail) from chunk text
 - **triple → entity resolution → canonical entity**: aliases and mentions merge into deduplicated entities

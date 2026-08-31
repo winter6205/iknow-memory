@@ -42,6 +42,8 @@ const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
 const SCHEMA = `graph_e2e_${randomUUID().slice(0, 8)}`;
 const CLI_PATH = join(process.cwd(), "dist/cli/extract.js");
 const SERVER_PATH = join(process.cwd(), "dist/index.js");
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
 /** Per-connection search_path targeting SCHEMA via libpq `options=`. */
 function schemaDbUrl(): string {
@@ -69,6 +71,7 @@ function runCliSubprocess(
       env: {
         GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_LOG_LEVEL: "error",
         ...envOverrides,
         PATH: process.env.PATH ?? "",
@@ -94,6 +97,7 @@ async function connectServer(envOverrides: Record<string, string>): Promise<{
     env: {
       GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
       GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
+      GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
       GRAPHRAG_MEMORY_LOG_LEVEL: "error",
       ...envOverrides,
       PATH: process.env.PATH ?? "",
@@ -125,6 +129,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   let client: PgClient | undefined;
 
   beforeAll(async () => {
+    process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     try {
       client = new PgClient({ connectionString: BASE_DB_URL });
       await client.connect();
@@ -144,9 +149,15 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   });
 
   afterAll(async () => {
-    if (!client) return;
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.end();
+    if (client) {
+      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await client.end();
+    }
+    if (savedAnnMaxDimensions === undefined) {
+      delete process.env[ANN_MAX_DIMENSIONS_VAR];
+    } else {
+      process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+    }
   });
 
   function requireClient(): PgClient {
@@ -187,7 +198,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         ) STORED
       )
     `);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, 2000);
   }
 
   /**
@@ -294,10 +305,10 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
 
   // ============================================================
   // Case 3: dist/index.js stdio server, retrieve envelope shape.
-  // Memory mode → vector-only → exactly `{ chunks: [...] }`,
-  // no degraded / debug keys (Success Criterion #4).
+  // Memory mode with no embedding credentials returns an empty, explicitly
+  // degraded envelope instead of manufacturing pseudo-vector hits.
   // ============================================================
-  it("Case 3: dist/index.js stdio server, retrieve envelope = exactly { chunks: [] } (Success Criterion #4)", async () => {
+  it("Case 3: dist/index.js stdio server, retrieve marks missing capabilities", async () => {
     const c = requireClient();
     await resetSchema(c);
     const { client: mcp, close } = await connectServer({
@@ -310,11 +321,19 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
       });
       expect(result.isError).not.toBe(true);
       const payload = JSON.parse(textOf(result)) as Record<string, unknown>;
-      // Exact shape: chunks array present, no degraded, no debug.
+      // T12/T10/T11: default-on capabilities that cannot be attempted are
+      // named in the single degraded envelope decision.
       expect(payload).toHaveProperty("chunks");
       expect(Array.isArray(payload.chunks)).toBe(true);
       expect(payload.chunks).toEqual([]);
-      expect(payload).not.toHaveProperty("degraded");
+      expect(payload).toHaveProperty("degraded", true);
+      expect(payload.degraded_reasons).toEqual(
+        expect.arrayContaining([
+          "vector:unattempted",
+          "graph_ppr:unattempted",
+          "rerank:unattempted",
+        ])
+      );
       expect(payload).not.toHaveProperty("debug");
     } finally {
       await close();
@@ -335,11 +354,8 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   // `degraded`; the default wiring now withholds `graphConfig`, so the
   // chunk list stays empty.
   //
-  // The DEBUG payload is what makes this a two-sided proof rather than a
-  // "nothing ran" tautology. Only arms that actually executed get keys,
-  // so `bm25Hits` present with no `graphHits` / `graphBelowFloor` says
-  // the stock server ran vector ∥ BM25 (#66) and skipped the archived
-  // arm — an all-quiet server would show no arm keys at all.
+  // Diagnostics are internal to the evaluator and are deliberately not
+  // serialized by the MCP tool; SC-9 constrains the host-visible envelope.
   // ============================================================
   it(
     "Case 4: DEBUG=1 spawn of dist/index.js (pgvector) → default path runs no SQL graph arm",
@@ -370,15 +386,17 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         // chunk survives — none of the seeded graph chunks can have reached
         // the envelope.
         expect(payload.chunks).toEqual([]);
-        // Neither arm failed, and an arm that is simply not wired is not
-        // a degradation.
-        expect(payload).not.toHaveProperty("degraded");
-        // Spelled out separately so a failure names the archived arm
-        // rather than just diffing an object.
-        expect(payload.debug).toEqual({ vectorHits: 0, bm25Hits: 0 });
-        expect(payload.debug).not.toHaveProperty("graphHits");
-        expect(payload.debug).not.toHaveProperty("graphBelowFloor");
-        expect(payload.debug).not.toHaveProperty("failureReason");
+        // Missing embedding credentials and absent default-on adapters are
+        // unattempted capabilities, so the host-visible envelope is marked.
+        expect(payload).toHaveProperty("degraded", true);
+        expect(payload.degraded_reasons).toEqual(
+          expect.arrayContaining([
+            "vector:unattempted",
+            "graph_ppr:unattempted",
+            "rerank:unattempted",
+          ])
+        );
+        expect(payload).not.toHaveProperty("debug");
       } finally {
         await close();
       }

@@ -27,13 +27,16 @@ import { GraphragError } from "../../src/core/errors.js";
 const DIM = 4;
 const NOW = "2024-06-01T00:00:00Z";
 
-/** Production defaults (#69/#70): vector 0.7 / BM25 0.15 / graph 0.15. */
+/**
+ * BM25-focused fixture: graph is explicitly switched off so these tests
+ * isolate vector/keyword fusion. T10 covers the production graph default.
+ */
 const CFG: RetrieveConfig = {
   w_vec: 0.7,
   w_bm25: 0.15,
   w_graph: 0.15,
   bm25Enabled: true,
-  graphEnabled: true,
+  graphEnabled: false,
   rerankEnabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
@@ -320,17 +323,17 @@ describe("assembleRetrievalResult — BM25 fail-open (SC9)", () => {
     expect(out.debug?.bm25Hits).toBe(0);
   });
 
-  it("keeps an embed failure a hard failure — never fail-open", async () => {
+  it("fail-opens a configured embed failure when BM25 can answer", async () => {
     const storage = await seeded(makeChunk("a", "zubrowka here"));
-    await expect(
-      assembleRetrievalResult(
-        { query: "zubrowka", validAt: NOW, limit: 10 },
-        { embedder: new ThrowingEmbedder(), storage, retrieveConfig: CFG }
-      )
-    ).rejects.toThrow(/provider down/);
+    const out = await assembleRetrievalResult(
+      { query: "zubrowka", validAt: NOW, limit: 10 },
+      { embedder: new ThrowingEmbedder(), storage, retrieveConfig: CFG }
+    );
+    expect(out.chunks.map((chunk) => chunk.id)).toEqual(["a"]);
+    expect(out.degraded_reasons).toEqual(["vector:attempted-and-failed"]);
   });
 
-  it("keeps a vector-arm failure a hard failure even with BM25 healthy", async () => {
+  it("releases BM25 hits when the vector arm fails and marks vector degraded", async () => {
     const base = await seeded(makeChunk("a", "zubrowka here"));
     const storage = withLexical(
       {
@@ -341,12 +344,13 @@ describe("assembleRetrievalResult — BM25 fail-open (SC9)", () => {
       } as unknown as MemoryBackend,
       async (q, o) => base.searchLexical(q, o)
     );
-    await expect(
-      assembleRetrievalResult(
-        { query: "zubrowka", validAt: NOW, limit: 10 },
-        { embedder, storage, retrieveConfig: CFG }
-      )
-    ).rejects.toThrow(/vector store down/);
+    const out = await assembleRetrievalResult(
+      { query: "zubrowka", validAt: NOW, limit: 10 },
+      { embedder, storage, retrieveConfig: CFG }
+    );
+    expect(out.chunks.map((chunk) => chunk.id)).toEqual(["a"]);
+    expect(out.degraded).toBe(true);
+    expect(out.degraded_reasons).toEqual(["vector:attempted-and-failed"]);
   });
 });
 
@@ -371,7 +375,8 @@ describe("retrieve tool — BM25 wiring", () => {
         .map((b) => b.text ?? "")
         .join("")
     ) as { chunks: Array<{ id: string }>; debug?: Record<string, unknown> };
-    expect(body.debug?.bm25Hits).toBe(1);
+    expect(Object.keys(body)).toEqual(["chunks"]);
+    expect(body).not.toHaveProperty("debug");
     expect(body.chunks[0]?.id).toBe("lex");
   });
 });

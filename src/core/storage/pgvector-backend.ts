@@ -21,9 +21,15 @@
  * src/index.ts:buildDeps.
  */
 import type { ChunkRecord, RetrievedChunk, SearchOptions } from "../types.js";
-import type {
-  GraphRagStorageBackend,
-  LexicalStorageBackend,
+import {
+  appendContentInvalidation,
+  CONTENT_INVALIDATIONS_METADATA_KEY,
+  normalizeContentInvalidationRequest,
+  readContentInvalidations,
+  type ContentInvalidationRecord,
+  type ContentInvalidationStorage,
+  type GraphRagStorageBackend,
+  type LexicalStorageBackend,
 } from "./backend.js";
 import type {
   EntityChunkRow,
@@ -35,9 +41,15 @@ import type {
   CommunitySummaryRow,
   ProjectionDrainWaiter,
 } from "../retrieval/types.js";
+import {
+  ConfigError,
+  readPgvectorAnnMaxDimensions,
+  readPgvectorPoolConfig,
+  type PgvectorPoolConfig,
+} from "../../config.js";
 import { GraphragError } from "../errors.js";
 import type { PoolClient } from "pg";
-import { upSchemaP0 } from "./schema-p0.js";
+import { assertPgvectorAnnDimensions, upSchemaP0 } from "./schema-p0.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
 
 /**
@@ -47,7 +59,11 @@ import { waitForProjectionDrain } from "./projection-outbox.js";
  * only if it matches.
  */
 interface PgModule {
-  Pool: new (config: { connectionString: string }) => PgPool;
+  Pool: new (config: {
+    connectionString: string;
+    max: number;
+    connectionTimeoutMillis: number;
+  }) => PgPool;
 }
 interface PgPool {
   query: (text: string, values: unknown[]) => Promise<{ rows: unknown[] }>;
@@ -56,10 +72,29 @@ interface PgPool {
   // takes ownership of the BEGIN/COMMIT/ROLLBACK and releases via finally
   // — see ensureTable().
   connect: () => Promise<PgClient>;
+  on?: (
+    event: "acquire" | "release",
+    listener: (...args: unknown[]) => void
+  ) => PgPool;
 }
 interface PgClient {
   query: (text: string, values: unknown[]) => Promise<{ rows: unknown[] }>;
   release: () => void;
+}
+
+/** Optional constructor overrides for the PostgreSQL connection pool. */
+export interface PgvectorPoolOptions {
+  max?: number;
+  connectionWaitTimeoutMs?: number;
+}
+
+/** Observable pool counters consumed by the later concurrency harness. */
+export interface PgvectorPoolStats {
+  configuredMax: number;
+  connectionWaitTimeoutMs: number;
+  observedConcurrentConnections: number;
+  peakConcurrentConnections: number;
+  connectionWaitTimeouts: number;
 }
 
 /** Serialized pgvector literal: `[0.1,0.2,...]` with no spaces. */
@@ -172,6 +207,7 @@ SELECT DISTINCT n.id, n.content, n.source_ref, n.valid_from,
  * changing the config later rewrites the whole table.
  */
 const TEXT_SEARCH_CONFIG = "simple";
+export const CHUNK_VECTOR_INDEX_NAME = "chunks_embedding_idx";
 
 /**
  * Build the lexical query with OR semantics over the query's terms.
@@ -250,13 +286,98 @@ function appendFilterClauses(
   }
 }
 
+export interface VectorSearchQuery {
+  sql: string;
+  params: unknown[];
+}
+
+/**
+ * Build the production vector retrieval query and its bound parameters.
+ *
+ * Keeping EXPLAIN callers on this builder prevents a test-only query from
+ * claiming that the production retrieval path uses the ANN index. The
+ * validity-window predicates are part of the query by construction.
+ */
+export function buildVectorSearchQuery(
+  queryEmbedding: number[],
+  opts: SearchOptions
+): VectorSearchQuery {
+  const where = [...VALID_WINDOW_CLAUSES];
+  const params: unknown[] = [toVectorLiteral(queryEmbedding), opts.validAt];
+  appendFilterClauses(opts.filters ?? {}, where, params);
+  params.push(opts.limit);
+
+  return {
+    sql: `
+      SELECT id, content, source_ref, valid_from, valid_until,
+             embedding <=> $1::vector AS distance
+      FROM chunks
+      WHERE ${where.join(" AND ")}
+      ORDER BY embedding <=> $1::vector ASC
+      LIMIT $${params.length}
+    `,
+    params,
+  };
+}
+
+function closePgValidityWindow(
+  current: Date | null,
+  invalidatedAt: string
+): string {
+  if (current === null || current.getTime() > Date.parse(invalidatedAt)) {
+    return invalidatedAt;
+  }
+  return current.toISOString();
+}
+
+function sortInvalidationRecords(
+  records: ContentInvalidationRecord[]
+): ContentInvalidationRecord[] {
+  return records.sort(
+    (a, b) =>
+      a.chunk_id.localeCompare(b.chunk_id) ||
+      a.invalidated_at.localeCompare(b.invalidated_at) ||
+      a.triggered_by.localeCompare(b.triggered_by)
+  );
+}
+
+function validatePoolParameter(
+  name: string,
+  value: number | undefined,
+  fallback: number
+): number {
+  const resolved = value ?? fallback;
+  if (
+    !Number.isFinite(resolved) ||
+    !Number.isInteger(resolved) ||
+    resolved <= 0
+  ) {
+    throw new ConfigError(
+      `${name} must be a finite positive integer, got "${String(value)}"`
+    );
+  }
+  return resolved;
+}
+
+export class ConnectionWaitTimeoutError extends GraphragError {
+  constructor(timeoutMs: number) {
+    super(
+      `PgvectorBackend: connection wait exceeded ${timeoutMs}ms`,
+      "STORAGE_ERROR"
+    );
+    this.name = "ConnectionWaitTimeoutError";
+  }
+}
+
 /**
  * Storage backend backed by PostgreSQL + the pgvector extension.
  *
- * Lazy init: the `pg` module is imported on the first call to `upsert`
- * or `search`, not in the constructor. This keeps `import { PgvectorBackend }`
- * from forcing every consumer to install `pg` — operators running with
- * GRAPHRAG_MEMORY_STORAGE=memory never touch the dependency.
+ * Lazy init: the `pg` module is imported on the first call to `initialize`,
+ * `upsert`, or `search`, not in the constructor. This keeps
+ * `import { PgvectorBackend }` from forcing every consumer to install `pg` —
+ * operators running with GRAPHRAG_MEMORY_STORAGE=memory never touch the
+ * dependency. The production server calls `initialize()` before opening its
+ * transport so schema and ANN-index failures are startup failures.
  *
  * `ensureTable()` is called once per backend instance (idempotent
  * CREATE EXTENSION + CREATE TABLE IF NOT EXISTS), so a fresh database
@@ -266,16 +387,59 @@ export class PgvectorBackend
   implements
     GraphRagStorageBackend,
     LexicalStorageBackend,
+    ContentInvalidationStorage,
     NeighborChunkStorage,
     ProjectionDrainWaiter
 {
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
+  private readonly poolConfig: PgvectorPoolConfig;
+  private observedConcurrentConnections = 0;
+  private peakConcurrentConnections = 0;
+  private connectionWaitTimeouts = 0;
 
   constructor(
     private readonly dbUrl: string,
-    private readonly dimensions: number
-  ) {}
+    private readonly dimensions: number,
+    private readonly annMaxDimensions?: number,
+    poolOptions: PgvectorPoolOptions = {}
+  ) {
+    const defaults = readPgvectorPoolConfig();
+    this.poolConfig = {
+      max: validatePoolParameter(
+        "PostgreSQL pool max",
+        poolOptions.max,
+        defaults.max
+      ),
+      connectionWaitTimeoutMs: validatePoolParameter(
+        "PostgreSQL connection wait timeout",
+        poolOptions.connectionWaitTimeoutMs,
+        defaults.connectionWaitTimeoutMs
+      ),
+    };
+  }
+
+  /** Return pool settings and live counters without exposing the pg client. */
+  getPoolStats(): PgvectorPoolStats {
+    return {
+      configuredMax: this.poolConfig.max,
+      connectionWaitTimeoutMs: this.poolConfig.connectionWaitTimeoutMs,
+      observedConcurrentConnections: this.observedConcurrentConnections,
+      peakConcurrentConnections: this.peakConcurrentConnections,
+      connectionWaitTimeouts: this.connectionWaitTimeouts,
+    };
+  }
+
+  /**
+   * Run the storage bootstrap self-check explicitly.
+   *
+   * Direct backend consumers may still rely on lazy initialization through
+   * `upsert` or `search`; the MCP server calls this method during startup so
+   * dimension and index-build failures cannot become tool-level responses.
+   */
+  async initialize(): Promise<void> {
+    await this.ensureReady();
+  }
 
   /**
    * Lazily initialize the pg module + connection pool + schema.
@@ -301,8 +465,13 @@ export class PgvectorBackend
           "STORAGE_ERROR"
         );
       }
-      const pool = new mod.Pool({ connectionString: this.dbUrl });
-      this.pool = pool;
+      const rawPool = new mod.Pool({
+        connectionString: this.dbUrl,
+        max: this.poolConfig.max,
+        connectionTimeoutMillis: this.poolConfig.connectionWaitTimeoutMs,
+      });
+      this.attachPoolObservers(rawPool);
+      this.pool = this.wrapPool(rawPool);
       try {
         await this.ensureTable();
       } catch (err) {
@@ -322,6 +491,74 @@ export class PgvectorBackend
     return this.pool!;
   }
 
+  private attachPoolObservers(pool: PgPool): void {
+    if (pool.on === undefined) return;
+    pool.on("acquire", () => {
+      this.observedConcurrentConnections += 1;
+      this.peakConcurrentConnections = Math.max(
+        this.peakConcurrentConnections,
+        this.observedConcurrentConnections
+      );
+    });
+    pool.on("release", () => {
+      this.observedConcurrentConnections = Math.max(
+        0,
+        this.observedConcurrentConnections - 1
+      );
+    });
+  }
+
+  private wrapPool(rawPool: PgPool): PgPool {
+    return {
+      query: (text, values) => this.queryWithPoolClient(rawPool, text, values),
+      connect: () => this.connectWithTimeout(rawPool),
+      end: () => rawPool.end(),
+    };
+  }
+
+  private async queryWithPoolClient(
+    pool: PgPool,
+    text: string,
+    values: unknown[]
+  ): Promise<{ rows: unknown[] }> {
+    const client = await this.connectWithTimeout(pool);
+    try {
+      return await client.query(text, values);
+    } finally {
+      client.release();
+    }
+  }
+
+  private async connectWithTimeout(pool: PgPool): Promise<PgClient> {
+    const pending = pool.connect();
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        this.connectionWaitTimeouts += 1;
+        reject(
+          new ConnectionWaitTimeoutError(
+            this.poolConfig.connectionWaitTimeoutMs
+          )
+        );
+      }, this.poolConfig.connectionWaitTimeoutMs);
+    });
+    try {
+      return await Promise.race([pending, timeout]);
+    } catch (error) {
+      if (timedOut) {
+        void pending.then(
+          (client) => client.release(),
+          () => undefined
+        );
+      }
+      throw error;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
   /**
    * Create the `vector` extension and the `chunks` table if they don't
    * already exist. Both statements are idempotent (IF NOT EXISTS) so a
@@ -333,6 +570,9 @@ export class PgvectorBackend
    * with a versioned migration runner if the schema grows.
    */
   private async ensureTable(): Promise<void> {
+    const annMaxDimensions =
+      this.annMaxDimensions ?? readPgvectorAnnMaxDimensions();
+    assertPgvectorAnnDimensions(this.dimensions, annMaxDimensions);
     const pool = this.pool!;
     // Acquire a dedicated client so upSchemaP0 can wrap its DDL in a
     // BEGIN/COMMIT/ROLLBACK transaction without conflicting with the
@@ -357,6 +597,25 @@ export class PgvectorBackend
            )`,
           []
         );
+        await client.query(
+          `CREATE INDEX IF NOT EXISTS ${CHUNK_VECTOR_INDEX_NAME}
+             ON chunks USING hnsw (embedding vector_cosine_ops)`,
+          []
+        );
+        const indexCheck = await client.query(
+          `SELECT indexname
+             FROM pg_indexes
+            WHERE schemaname = current_schema()
+              AND tablename = 'chunks'
+              AND indexname = '${CHUNK_VECTOR_INDEX_NAME}'`,
+          []
+        );
+        if (indexCheck.rows.length !== 1) {
+          throw new GraphragError(
+            `PgvectorBackend: expected exactly one ${CHUNK_VECTOR_INDEX_NAME} catalog entry, found ${indexCheck.rows.length}`,
+            "STORAGE_ERROR"
+          );
+        }
         // Lexical index for the BM25 arm. Kept as a separate ALTER rather
         // than a column in the CREATE above because the CREATE is
         // IF NOT EXISTS and no-ops on every existing deployment — an
@@ -386,13 +645,18 @@ export class PgvectorBackend
         // .query is actually used by upSchemaP0, so the structural surface
         // is sufficient. Pass this.dimensions so entities.embedding width
         // matches chunks.embedding width (H1).
-        await upSchemaP0(client as unknown as PoolClient, this.dimensions);
+        await upSchemaP0(
+          client as unknown as PoolClient,
+          this.dimensions,
+          annMaxDimensions
+        );
       } finally {
         client.release();
       }
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       throw new GraphragError(
-        `PgvectorBackend: ensureTable failed (${(err as Error).message})`,
+        `PgvectorBackend: ensureTable failed (${message})`,
         "STORAGE_ERROR"
       );
     }
@@ -433,9 +697,26 @@ export class PgvectorBackend
              content = EXCLUDED.content,
              embedding = EXCLUDED.embedding,
              valid_from = EXCLUDED.valid_from,
-             valid_until = EXCLUDED.valid_until,
+             valid_until = CASE
+               WHEN chunks.metadata ? '${CONTENT_INVALIDATIONS_METADATA_KEY}'
+               THEN CASE
+                 WHEN chunks.valid_until IS NULL THEN EXCLUDED.valid_until
+                 WHEN EXCLUDED.valid_until IS NULL THEN chunks.valid_until
+                 WHEN chunks.valid_until <= EXCLUDED.valid_until
+                   THEN chunks.valid_until
+                 ELSE EXCLUDED.valid_until
+               END
+               ELSE EXCLUDED.valid_until
+             END,
              source_ref = EXCLUDED.source_ref,
-             metadata = EXCLUDED.metadata,
+             metadata = CASE
+               WHEN chunks.metadata ? '${CONTENT_INVALIDATIONS_METADATA_KEY}'
+               THEN EXCLUDED.metadata || jsonb_build_object(
+                 '${CONTENT_INVALIDATIONS_METADATA_KEY}',
+                 chunks.metadata -> '${CONTENT_INVALIDATIONS_METADATA_KEY}'
+               )
+               ELSE EXCLUDED.metadata
+             END,
              created_at = EXCLUDED.created_at`,
           [
             chunk.id,
@@ -459,6 +740,127 @@ export class PgvectorBackend
     return ids;
   }
 
+  async invalidateSourceRef(
+    sourceRef: string,
+    invalidatedAt: string,
+    triggeredBy: string
+  ): Promise<ContentInvalidationRecord[]> {
+    const request = normalizeContentInvalidationRequest(
+      sourceRef,
+      invalidatedAt,
+      triggeredBy
+    );
+    let client: PgClient | undefined;
+    let transactionStarted = false;
+    try {
+      const pool = await this.ensureReady();
+      client = await pool.connect();
+      await client.query("BEGIN", []);
+      transactionStarted = true;
+      const result = await client.query(
+        `SELECT id, valid_until, metadata
+           FROM chunks
+          WHERE source_ref = $1
+          ORDER BY id
+          FOR UPDATE`,
+        [request.sourceRef]
+      );
+      if (result.rows.length === 0) {
+        throw new GraphragError(
+          `content invalidation: unknown source_ref "${request.sourceRef}"`,
+          "INVALID_INPUT"
+        );
+      }
+
+      const records: ContentInvalidationRecord[] = [];
+      for (const raw of result.rows) {
+        const row = raw as {
+          id: string;
+          valid_until: Date | null;
+          metadata: Record<string, unknown>;
+        };
+        const record: ContentInvalidationRecord = {
+          chunk_id: row.id,
+          invalidated_at: request.invalidatedAt,
+          triggered_by: request.triggeredBy,
+        };
+        const metadata = appendContentInvalidation(row.metadata, record);
+        await client.query(
+          `UPDATE chunks
+              SET valid_until = $2, metadata = $3::jsonb
+            WHERE id = $1`,
+          [
+            row.id,
+            closePgValidityWindow(row.valid_until, request.invalidatedAt),
+            JSON.stringify(metadata),
+          ]
+        );
+        records.push(record);
+      }
+      await client.query("COMMIT", []);
+      transactionStarted = false;
+      return sortInvalidationRecords(records);
+    } catch (err) {
+      if (client !== undefined && transactionStarted) {
+        try {
+          await client.query("ROLLBACK", []);
+        } catch (rollbackErr) {
+          const rollbackMessage =
+            rollbackErr instanceof Error
+              ? rollbackErr.message
+              : String(rollbackErr);
+          throw new GraphragError(
+            `PgvectorBackend.invalidateSourceRef rollback failed: ${rollbackMessage}`,
+            "STORAGE_ERROR"
+          );
+        }
+      }
+      if (err instanceof GraphragError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new GraphragError(
+        `PgvectorBackend.invalidateSourceRef failed: ${message}`,
+        "STORAGE_ERROR"
+      );
+    } finally {
+      client?.release();
+    }
+  }
+
+  async listInvalidations(
+    sourceRef?: string
+  ): Promise<ContentInvalidationRecord[]> {
+    if (sourceRef !== undefined && sourceRef.trim() === "") {
+      throw new GraphragError(
+        "content invalidation: source_ref must be a non-empty string",
+        "INVALID_INPUT"
+      );
+    }
+    const where = sourceRef === undefined ? "" : " WHERE source_ref = $1";
+    const params = sourceRef === undefined ? [] : [sourceRef];
+    let rows: unknown[];
+    try {
+      const pool = await this.ensureReady();
+      const result = await pool.query(
+        `SELECT metadata FROM chunks${where} ORDER BY id`,
+        params
+      );
+      rows = result.rows;
+    } catch (err) {
+      if (err instanceof GraphragError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new GraphragError(
+        `PgvectorBackend.listInvalidations failed: ${message}`,
+        "STORAGE_ERROR"
+      );
+    }
+    const records: ContentInvalidationRecord[] = [];
+    for (const raw of rows) {
+      const row = raw as { metadata: Record<string, unknown> };
+      records.push(...readContentInvalidations(row.metadata));
+    }
+    return sortInvalidationRecords(records);
+  }
+
   async search(
     queryEmbedding: number[],
     opts: SearchOptions
@@ -471,21 +873,7 @@ export class PgvectorBackend
     }
     const pool = await this.ensureReady();
 
-    // Parameters are collected in order so the $N placeholders stay in
-    // sync with the values array.
-    const where = [...VALID_WINDOW_CLAUSES];
-    const params: unknown[] = [toVectorLiteral(queryEmbedding), opts.validAt];
-    appendFilterClauses(opts.filters ?? {}, where, params);
-    params.push(opts.limit);
-
-    const sql = `
-      SELECT id, content, source_ref, valid_from, valid_until,
-             embedding <=> $1::vector AS distance
-      FROM chunks
-      WHERE ${where.join(" AND ")}
-      ORDER BY embedding <=> $1::vector ASC
-      LIMIT $${params.length}
-    `;
+    const { sql, params } = buildVectorSearchQuery(queryEmbedding, opts);
 
     let rows: unknown[];
     try {

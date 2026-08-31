@@ -32,7 +32,7 @@ Exact copy from `docs/CONTEXT.md` (not redefined): **iknow-memory**, **MCP tool*
 8. Community detection is **Louvain** via Neo4j GDS (CONTEXT **community**). Summaries are ledger rows (Postgres), optionally projected as nodes; retrieve may return summary text as chunks with a typed metadata flag. Host still generates the user-visible answer.
 9. Causal relations are vocabulary + extract, not a new MCP tool. Fact supersession writes `superseded_by` / `valid_until` on the ledger; operator consolidate is dry-run-first.
 10. Projection stays eventually consistent by default. Optional retrieve wait-for-drain is **default off**; timeout fail-open (pre-wait ranking, `degraded=true`).
-11. Dedicated rerank is HTTP, default off, fail-open; not the Host chat model. Until it ships, slice 0 temporary LLM adapter remains the only on-path rerank.
+11. Dedicated rerank is HTTP, fail-open; not the Host chat model. **Superseded (C-3, `specs/retrieval-stack.md` §B3):** it is **default on**, and a missing URL sets `degraded` rather than skipping. Until it ships, slice 0 temporary LLM adapter remains the only on-path rerank.
 12. `merged_into` persist is implementation of P0c, not a new merge algorithm.
 
 → Correct in review or these are the spec.
@@ -41,7 +41,7 @@ Exact copy from `docs/CONTEXT.md` (not redefined): **iknow-memory**, **MCP tool*
 
 - **Does:**
   1. **Slice 0 — temporary LLM rerank:** implement `specs/retrieve-rerank-llm.md` (T2–T3) if not already on main.
-  2. **Slice 1 — dedicated rerank HTTP:** replace the temporary adapter behind the same retrieve hook; default off; missing URL skip (not `degraded`); throw fail-open + `degraded`.
+  2. **Slice 1 — dedicated rerank HTTP:** replace the temporary adapter behind the same retrieve hook. **Superseded (C-3, `specs/retrieval-stack.md` §B3):** rerank is **default on**; a missing URL leaves a default-on capability unattempted → set `degraded` and name the rerank item in `degraded_reasons`; throw fail-open + `degraded`.
   3. **Slice 2 — projection GC:** ledger delete/retire of entity or triple → drain removes the projection by id (delete edge / `DETACH DELETE` node as needed). Empty graph still backfill. No graph tombstone as the primary scheme.
   4. **Slice 3 — extract reject class:** self-loop triples are row-level reject values; they do not force `--only-failed` re-extract; do not create orphan entities for discarded loops.
   5. **Slice 4 — `merged_into` persist:** extract writes the pointer; `resolveCanonicalId` is the production read path; triples FK unchanged.
@@ -69,7 +69,7 @@ Each slice is independently binary. A slice not yet implemented does not fail sl
 
 0. Slice 0: all Success Criteria in `specs/retrieve-rerank-llm.md` pass (`npm test` exit 0 without live Anthropic).
 1. Dedicated rerank off → identical order to post-slice-0 assembler. Unit test.
-2. Dedicated rerank on, no URL → skip, no `degraded`. Unit test.
+2. Dedicated rerank on, no URL → pre-rerank order, `degraded: true` with the rerank item named in `degraded_reasons` (**Superseded C-3, `specs/retrieval-stack.md` §B3 rule 1** — was "skip, no `degraded`"). Unit test.
 3. Dedicated rerank on, fake HTTP permutation → Host `chunks[]` follows it then `limit`. Unit test.
 4. Ledger entity/triple delete then `graph:drain` → Neo4j has no node/edge for that id. Integration test with testcontainers or recorded Bolt fixture already used by graph-arm tests.
 5. Self-loop triple → recorded as extract reject, zero graph edge, `--only-failed` does not list it as “must re-extract”. Unit / CLI test.
@@ -120,3 +120,5 @@ OVERALL: PASS — hand to `writing-plans` for ordered bullets. Do not implement 
 ## 待写入 (persist)
 
 Flushed 2026-08-28 into `docs/CONTEXT.md` (mode bundle, neighbor evidence, retrieve/community/merged_into/rerank/causal/superseded_by, optional drain wait).
+
+- **Flushed 2026-08-31 (C-3, `specs/retrieval-stack.md` §B3):** CONTEXT **rerank** slice 1 now reads default on; missing URL is an unattempted default-on capability → `degraded` + named in `degraded_reasons`. Slice 8 (**community**) and slice 6 (**neighbor evidence**) stay default off per C-4 — no change.

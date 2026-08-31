@@ -50,8 +50,8 @@ const distEntry = path.join(pkgRoot, "dist", "index.js");
  * `readEnv` (process.env > `.env.local`) cannot fall through to a developer
  * `.env.local` and silently select 9router / Postgres / Neo4j.
  *
- * Blank values collapse to "absent" in `readTrimmed` / FakeEmbedder / skip
- * Neo4j. Deleting the keys is not enough: missing keys read the file.
+ * Blank values collapse to "absent" in `readTrimmed` / UnavailableEmbedder.
+ * Deleting the keys is not enough: missing keys read the file.
  */
 const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "GRAPHRAG_MEMORY_DB_URL",
@@ -62,16 +62,16 @@ const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "ANTHROPIC_AUTH_TOKEN",
   "NINE_ROUTER_KEY",
   // A parent Neo4j URI would make the child attempt the production graph
-  // arm; this suite pins the Host-acceptance skip path (no URI → no
-  // `degraded`). Operator sidecar smoke is the runbook, not CI.
+  // arm; this suite pins a no-sidecar child. T10 separately verifies that
+  // the default-on capability is marked unattempted when absent.
   "GRAPHRAG_MEMORY_NEO4J_URI",
   "GRAPHRAG_MEMORY_NEO4J_USER",
   "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
 ] as const;
 
 /**
- * Build the child-process env: pinned to memory storage with FakeEmbedder,
- * inheriting everything else from the parent. Without this, a developer
+ * Build the child-process env: pinned to memory storage with unavailable
+ * embeddings, inheriting everything else from the parent. Without this, a developer
  * machine with `NINE_ROUTER_KEY` exported would silently pay for embeddings
  * during `npm test`, and an accidental `GRAPHRAG_MEMORY_STORAGE=pgvector`
  * would crash with "no Postgres available" instead of running deterministically.
@@ -83,7 +83,8 @@ function hostSmokeEnv(): Record<string, string> {
   }
   env["GRAPHRAG_MEMORY_STORAGE"] = "memory";
   // GRAPHRAG_MEMORY_EMBED_DIMENSIONS is always required; the smoke suite
-  // runs FakeEmbedder (keys blanked below), so any positive integer works.
+  // runs without an embedding credential (keys blanked below), so any
+  // positive integer works.
   env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   for (const key of HOST_SMOKE_SCRUBBED_ENV_KEYS) env[key] = "";
   return env;
@@ -257,35 +258,22 @@ describe("host-smoke: real stdio MCP client against built server", () => {
   );
 
   test(
-    "a4: ingest -> retrieve round-trips Chinese content through the real stdio transport",
+    "a4: missing embeddings degrade retrieve over the real stdio transport",
     { timeout: 60_000 },
     async () => {
-      // Closes the remaining gate on #49 (per the file header): a real
-      // reference host (Claude Code) drives the server, so
-      // the transport-layer protocol survives the full ingest -> retrieve
-      // round-trip. The Chinese text exercises UTF-8 end-to-end: chunker,
-      // FakeEmbedder (char-code-driven), JSON wire framing, and the chunk
-      // content round-trip through the retrieve response.
+      // The transport still exercises the Host-facing ingest/retrieve
+      // contract, while T12 forbids production pseudo-vectors.
       const client = await connectClient();
       clients.push(client);
 
-      const content = "张三于2024年创办了公司A，公司位于北京。";
-      const sourceRef = "test-bio.md";
-
       const ingested = await client.callTool({
         name: "ingest",
-        arguments: { content, source_ref: sourceRef },
+        arguments: {
+          content: "张三于2024年创办了公司A，公司位于北京。",
+          source_ref: "test-bio.md",
+        },
       });
-      expect(ingested.isError).not.toBe(true);
-      const ingestBody = (
-        ingested.content as Array<{ type: string; text?: string }>
-      )
-        .filter((c) => c.type === "text")
-        .map((c) => c.text ?? "")
-        .join("");
-      const ingestPayload = JSON.parse(ingestBody) as { chunk_ids: string[] };
-      expect(Array.isArray(ingestPayload.chunk_ids)).toBe(true);
-      expect(ingestPayload.chunk_ids.length).toBeGreaterThan(0);
+      expect(ingested.isError).toBe(true);
 
       const retrieved = await client.callTool({
         name: "retrieve",
@@ -299,38 +287,18 @@ describe("host-smoke: real stdio MCP client against built server", () => {
         .map((c) => c.text ?? "")
         .join("");
       const retrievePayload = JSON.parse(retrieveBody) as {
-        chunks: Array<{
-          id: string;
-          content: string;
-          source_ref: string;
-          valid_window: [string, string | null];
-          score: number;
-        }>;
+        chunks: unknown[];
+        degraded?: true;
+        degraded_reasons?: string[];
       };
-      expect(Array.isArray(retrievePayload.chunks)).toBe(true);
-      expect(retrievePayload.chunks.length).toBeGreaterThan(0);
-
-      const topHit = retrievePayload.chunks[0]!;
-      // The ingested Chinese text (or, for longer inputs, the chunked
-      // window containing 公司A / 张三) must surface as a retrieved chunk.
-      // Either the top hit's content carries the original phrases, or one
-      // of the other hits does — accept any that mention the substance.
-      const allContent = retrievePayload.chunks
-        .map((c) => c.content)
-        .join("\n");
-      expect(allContent).toMatch(/公司A|张三/);
-      expect(topHit.score).toBeGreaterThan(0);
-      expect(topHit.source_ref).toBe(sourceRef);
-      // T-007 / spec SC7: Host with no Neo4j URI skips the graph arm.
-      // `degraded` is only for an attempted failure, never for skip.
-      expect(
-        Object.prototype.hasOwnProperty.call(retrievePayload, "degraded")
-      ).toBe(false);
+      expect(retrievePayload.chunks).toEqual([]);
+      expect(retrievePayload.degraded).toBe(true);
+      expect(retrievePayload.degraded_reasons).toContain("vector:unattempted");
     }
   );
 
   test(
-    "planted Neo4j URI on the parent does not degrade retrieve on the child",
+    "planted Neo4j URI is scrubbed while missing embeddings degrade the child",
     { timeout: 60_000 },
     async () => {
       const planted = {
@@ -355,7 +323,7 @@ describe("host-smoke: real stdio MCP client against built server", () => {
             source_ref: "host-smoke-neo4j-scrub.md",
           },
         });
-        expect(ingested.isError).not.toBe(true);
+        expect(ingested.isError).toBe(true);
 
         const retrieved = await client.callTool({
           name: "retrieve",
@@ -370,10 +338,15 @@ describe("host-smoke: real stdio MCP client against built server", () => {
           .join("");
         const retrievePayload = JSON.parse(retrieveBody) as {
           degraded?: true;
+          degraded_reasons?: string[];
         };
-        expect(
-          Object.prototype.hasOwnProperty.call(retrievePayload, "degraded")
-        ).toBe(false);
+        expect(retrievePayload.degraded).toBe(true);
+        expect(retrievePayload.degraded_reasons).toContain(
+          "vector:unattempted"
+        );
+        expect(retrievePayload.degraded_reasons).toContain(
+          "graph_ppr:unattempted"
+        );
       } finally {
         for (const [k, v] of saved) {
           if (v === undefined) delete process.env[k];
@@ -384,15 +357,12 @@ describe("host-smoke: real stdio MCP client against built server", () => {
   );
 
   test(
-    "spawned server selects FakeEmbedder even when the parent env carries an embedding key",
+    "spawned server selects UnavailableEmbedder when credentials are scrubbed",
     { timeout: 30_000 },
     async () => {
-      // The `a4` round-trip below actually embeds. If a host or CI runner
-      // exports an embedding key, the child would build the real provider
-      // client and `npm test` would silently make paid network calls — the
-      // exact false signal `hostSmokeEnv` exists to prevent. Planting a key
-      // in the parent makes the check deterministic instead of depending on
-      // whatever the ambient environment happens to carry.
+      // If a host or CI runner exports an embedding key, the child must still
+      // use the unavailable typed embedder because hostSmokeEnv scrubs it.
+      // Planting a key in the parent makes this isolation check deterministic.
       const planted = {
         GRAPHRAG_MEMORY_EMBED_API_KEY: "planted-not-a-real-secret",
         GRAPHRAG_MEMORY_EMBED_API_KEY_ENV: "NINE_ROUTER_KEY",
@@ -407,7 +377,7 @@ describe("host-smoke: real stdio MCP client against built server", () => {
       }
 
       // The server announces its embedder choice on stderr at construction
-      // ("server constructed ... embedder: fake | 9router"). stdout is the
+      // ("server constructed ... embedder: unavailable | 9router"). stdout is the
       // JSON-RPC transport, so stderr is the only observation seam.
       let stderrText = "";
       try {
@@ -432,7 +402,7 @@ describe("host-smoke: real stdio MCP client against built server", () => {
         }
       }
 
-      expect(stderrText).toMatch(/"embedder":"fake"/);
+      expect(stderrText).toMatch(/"embedder":"unavailable"/);
       expect(stderrText).not.toMatch(/"embedder":"9router"/);
     }
   );

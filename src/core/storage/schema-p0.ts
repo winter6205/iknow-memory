@@ -18,6 +18,7 @@
 import type { PoolClient } from "pg";
 
 import { upSchemaProjection } from "./schema-projection.js";
+import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 
 /**
  * entities: canonical entity rows (+ soft-merge columns, #6 Q1-Q2).
@@ -183,6 +184,10 @@ export async function upSchemaP0(
 ): Promise<void> {
   await client.query("BEGIN");
   try {
+    if (await acquireSchemaBootstrapLock(client)) {
+      await client.query("COMMIT");
+      return;
+    }
     await client.query("CREATE EXTENSION IF NOT EXISTS vector");
     await createEntities(client, dimensions);
     await createEntityAliases(client);

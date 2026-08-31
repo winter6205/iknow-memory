@@ -21,6 +21,144 @@
 export type ArmName =
   "vector" | "bm25" | "graph" | "node-embedding" | "community-summary";
 
+/**
+ * Bounded capability names used by the degradation registry.
+ *
+ * The first eight names are the retrieval-stack capability vocabulary. The
+ * remaining names cover existing optional read paths so that every degraded
+ * response can still identify its failed capability without publishing a
+ * free-form string.
+ */
+export type DegradedCapability =
+  | "vector"
+  | "keyword_bm25"
+  | "cjk_segmentation"
+  | "phrase"
+  | "field_boost"
+  | "graph_ppr"
+  | "rrf"
+  | "rerank"
+  | "node_embedding"
+  | "community_summary"
+  | "neighbor_evidence"
+  | "projection_drain";
+
+export type CapabilityState =
+  "disabled" | "unattempted" | "attempted-and-failed" | "succeeded";
+
+/** One typed observation supplied to the central degradation decision. */
+export interface CapabilityObservation {
+  capability: DegradedCapability;
+  state: CapabilityState;
+}
+
+/**
+ * Wire-safe bounded reason values. The state suffix is part of each value, so
+ * consumers never have to infer whether a capability was skipped or failed.
+ */
+export const DEGRADED_REASON_CODES = [
+  "vector:unattempted",
+  "vector:attempted-and-failed",
+  "keyword_bm25:unattempted",
+  "keyword_bm25:attempted-and-failed",
+  "cjk_segmentation:unattempted",
+  "cjk_segmentation:attempted-and-failed",
+  "phrase:unattempted",
+  "phrase:attempted-and-failed",
+  "field_boost:unattempted",
+  "field_boost:attempted-and-failed",
+  "graph_ppr:unattempted",
+  "graph_ppr:attempted-and-failed",
+  "rrf:unattempted",
+  "rrf:attempted-and-failed",
+  "rerank:unattempted",
+  "rerank:attempted-and-failed",
+  "node_embedding:unattempted",
+  "node_embedding:attempted-and-failed",
+  "community_summary:unattempted",
+  "community_summary:attempted-and-failed",
+  "neighbor_evidence:unattempted",
+  "neighbor_evidence:attempted-and-failed",
+  "projection_drain:unattempted",
+  "projection_drain:attempted-and-failed",
+] as const;
+
+export type DegradedReason = (typeof DEGRADED_REASON_CODES)[number];
+
+interface CapabilityDefinition {
+  readonly defaultOn: boolean;
+  readonly unattempted: DegradedReason;
+  readonly attemptedAndFailed: DegradedReason;
+}
+
+/**
+ * Single capability registry. Envelope decisions use this table rather than
+ * arm-specific flag logic; future capability switches can extend this table
+ * without changing the wire shape.
+ */
+export const CAPABILITY_REGISTRY = {
+  vector: {
+    defaultOn: true,
+    unattempted: "vector:unattempted",
+    attemptedAndFailed: "vector:attempted-and-failed",
+  },
+  keyword_bm25: {
+    defaultOn: true,
+    unattempted: "keyword_bm25:unattempted",
+    attemptedAndFailed: "keyword_bm25:attempted-and-failed",
+  },
+  cjk_segmentation: {
+    defaultOn: true,
+    unattempted: "cjk_segmentation:unattempted",
+    attemptedAndFailed: "cjk_segmentation:attempted-and-failed",
+  },
+  phrase: {
+    defaultOn: true,
+    unattempted: "phrase:unattempted",
+    attemptedAndFailed: "phrase:attempted-and-failed",
+  },
+  field_boost: {
+    defaultOn: true,
+    unattempted: "field_boost:unattempted",
+    attemptedAndFailed: "field_boost:attempted-and-failed",
+  },
+  graph_ppr: {
+    defaultOn: true,
+    unattempted: "graph_ppr:unattempted",
+    attemptedAndFailed: "graph_ppr:attempted-and-failed",
+  },
+  rrf: {
+    defaultOn: true,
+    unattempted: "rrf:unattempted",
+    attemptedAndFailed: "rrf:attempted-and-failed",
+  },
+  rerank: {
+    defaultOn: true,
+    unattempted: "rerank:unattempted",
+    attemptedAndFailed: "rerank:attempted-and-failed",
+  },
+  node_embedding: {
+    defaultOn: false,
+    unattempted: "node_embedding:unattempted",
+    attemptedAndFailed: "node_embedding:attempted-and-failed",
+  },
+  community_summary: {
+    defaultOn: false,
+    unattempted: "community_summary:unattempted",
+    attemptedAndFailed: "community_summary:attempted-and-failed",
+  },
+  neighbor_evidence: {
+    defaultOn: false,
+    unattempted: "neighbor_evidence:unattempted",
+    attemptedAndFailed: "neighbor_evidence:attempted-and-failed",
+  },
+  projection_drain: {
+    defaultOn: false,
+    unattempted: "projection_drain:unattempted",
+    attemptedAndFailed: "projection_drain:attempted-and-failed",
+  },
+} as const satisfies Record<DegradedCapability, CapabilityDefinition>;
+
 /** Named retrieval mode bundles exposed by the retrieve tool. */
 export type RetrievePreset = "conservative" | "balanced" | "tokenmax";
 
@@ -110,8 +248,8 @@ export interface ArmResult {
    * True when this arm was attempted and could not deliver — any optional
    * arm, not just graph. The graph arm sets it on a throw OR on missing
    * `graphArmFloor`; the BM25 arm sets it on a throw. It is what flips
-   * `degraded` on the envelope, so an arm that merely found nothing leaves
-   * it false.
+   * the central capability observation to attempted-and-failed, so an arm
+   * that merely found nothing leaves the envelope non-degraded.
    */
   belowFloor: boolean;
   /** Human-readable failure reason when the arm is unavailable. */
@@ -350,14 +488,16 @@ export interface RetrieveOutputEnvelope {
       communityId: string;
     };
   }>;
+  /** Optional: true only when the central capability decision finds reasons. */
+  degraded?: boolean;
   /**
-   * Optional: present (true) when an optional arm was ATTEMPTED and could
-   * not deliver — the graph arm under-flooring or erroring, or the BM25
-   * arm throwing. Deliberately absent when BM25 is simply disabled by
-   * config: "you turned it off" is not a degradation.
+   * Optional bounded reasons. An absent list is equivalent to `[]`.
+   *
+   * `debug` is internal, non-enumerable diagnostics retained for the offline
+   * evaluator; it is not part of the retrieve JSON wire shape.
    */
-  degraded?: true;
-  /** Optional debug payload, only present when DEBUG=1 is set. */
+  degraded_reasons?: DegradedReason[];
+  /** Internal diagnostics, never serialized into the retrieve response. */
   debug?: Record<string, unknown>;
 }
 

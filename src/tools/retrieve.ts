@@ -4,11 +4,9 @@
  * Pipeline: embed query → vector search with valid_window filter → return
  * ranked chunks. Stage 3 (spec-3 p0-integration T5): when a graph-arm seam
  * (`graphArmSeed`) AND a `graphConfig` are both present, the results are
- * fused with the graph arm via RRF and the envelope gains an optional
- * `degraded` flag. When either is absent, the tool degrades to vector-only
- * and the envelope is EXACTLY `{ chunks: [...] }` (no `degraded` / `debug`
- * keys — Success Criterion #4). Input shape and `chunks[]` shape are
- * unchanged.
+ * fused with the graph arm via RRF. The wire envelope contains `chunks` plus
+ * only the optional `degraded` and `degraded_reasons` fields; internal debug
+ * diagnostics are not serialized.
  */
 import { z } from "zod";
 import {
@@ -19,6 +17,7 @@ import {
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { SearchOptions, StorageBackend } from "../core/types.js";
 import type {
+  CapabilityObservation,
   ChunkReranker,
   RetrievePreset,
   GraphRanker,
@@ -78,6 +77,8 @@ export interface RetrieveDeps {
   reranker?: ChunkReranker;
   /** Debug gate; wired to `DEBUG=1` by the caller. */
   debug?: boolean;
+  /** Internal seam for injected capability observations. */
+  capabilityObservations?: readonly CapabilityObservation[];
   /** Optional read-only projection outbox wait seam. */
   projectionDrain?: ProjectionDrainWaiter;
 }
@@ -115,6 +116,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         graphRanker: deps.graphRanker,
         reranker: deps.reranker,
         debug: deps.debug,
+        capabilityObservations: deps.capabilityObservations,
         projectionDrain: deps.projectionDrain,
       }
     );

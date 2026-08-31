@@ -27,19 +27,18 @@
  * skipped, empty, or failed — ranks by that same fusion, so an arm that
  * contributed nothing never votes.
  *
- * When no optional arm is active the envelope is EXACTLY
- * `{ chunks: RetrievedChunk[] }` — no `degraded`, no `debug`, even under the
- * debug gate. That covers a chunk-only backend AND an operator who switched
- * BM25 off: turning an arm off is a choice, not a degradation, so it must
- * not show up as one on the wire.
+ * The wire envelope contains only `chunks` plus optional degradation fields.
+ * Debug diagnostics are retained as non-enumerable internal metadata for the
+ * offline evaluator, so they cannot leak into the MCP JSON payload.
  *
  * The query is embedded once and the vector feeds every arm that needs it.
  * An embedder that yields no usable vector raises `GraphragError`
  * ("EMBEDDING_FAILED") before any arm starts — never fail-open.
  *
  * Optional arms are fail-open: each is wrapped so a throw becomes an empty
- * `ArmResult` carrying a `failureReason`, which surfaces as `degraded: true`
- * on the envelope while the vector results still reach the caller.
+ * `ArmResult` carrying a `failureReason`; the central capability registry
+ * turns that observation into a named `degraded_reasons` entry while the
+ * vector results still reach the caller.
  */
 import { assembleGraphPriority } from "./graph-priority.js";
 import { RRF_K } from "./rrf.js";
@@ -51,9 +50,14 @@ import {
   selectRetrievalResults,
 } from "./optional-arms.js";
 import type { OptionalArmResults } from "./optional-arms.js";
+import { CAPABILITY_REGISTRY } from "./types.js";
 import type {
   ArmResult,
+  ArmName,
+  CapabilityObservation,
+  DegradedCapability,
   ChunkReranker,
+  DegradedReason,
   FusedHit,
   GraphRanker,
   NeighborChunkRow,
@@ -131,9 +135,29 @@ export interface AssembleDeps {
   reranker?: ChunkReranker;
   /** Injectable debug gate; wired to `DEBUG=1` by the tool. */
   debug?: boolean;
+  /**
+   * Injected capability observations make unavailable/failing capabilities
+   * testable without changing production arm defaults. The final envelope
+   * decision still comes from the central registry below.
+   */
+  capabilityObservations?: readonly CapabilityObservation[];
   /** Optional read-only projection outbox wait seam. */
   projectionDrain?: ProjectionDrainWaiter;
 }
+
+interface AssemblyResult {
+  hits: FusedHit[];
+  observations: CapabilityObservation[];
+  debug: Record<string, unknown> | undefined;
+}
+
+const ARM_CAPABILITY: Readonly<Record<ArmName, DegradedCapability>> = {
+  vector: "vector",
+  bm25: "keyword_bm25",
+  graph: "graph_ppr",
+  "node-embedding": "node_embedding",
+  "community-summary": "community_summary",
+};
 
 export async function assembleRetrievalResult(
   args: AssembleArgs,
@@ -177,7 +201,12 @@ export async function assembleRetrievalResult(
       deps,
       reranker
     );
-    return waitForProjectionDrain(result, deps);
+    const waited = await waitForProjectionDrain(result, deps);
+    return buildEnvelope(
+      waited.hits,
+      [...waited.observations, ...(deps.capabilityObservations ?? [])],
+      waited.debug
+    );
   }
 
   const [retrieved, optionalResults] = await Promise.all([
@@ -191,7 +220,12 @@ export async function assembleRetrievalResult(
     rerankWindow,
     weights,
   });
-  return waitForProjectionDrain(result, deps);
+  const waited = await waitForProjectionDrain(result, deps);
+  return buildEnvelope(
+    waited.hits,
+    [...waited.observations, ...(deps.capabilityObservations ?? [])],
+    waited.debug
+  );
 }
 
 /**
@@ -200,16 +234,16 @@ export async function assembleRetrievalResult(
  * another process owns the Neo4j-writing drain.
  */
 async function waitForProjectionDrain(
-  result: RetrieveOutputEnvelope,
+  result: AssemblyResult,
   deps: AssembleDeps
-): Promise<RetrieveOutputEnvelope> {
+): Promise<AssemblyResult> {
   if (deps.retrieveConfig?.waitForDrainEnabled !== true) return result;
 
   const waiter = deps.projectionDrain ?? getProjectionDrain(deps.storage);
   if (waiter === undefined) {
     // EXIT: configured wait without an observation seam cannot be fulfilled;
     // preserve the ranking and expose the optional-path degradation.
-    return { ...result, degraded: true };
+    return withObservation(result, "projection_drain", "attempted-and-failed");
   }
 
   const timeoutMs =
@@ -220,7 +254,7 @@ async function waitForProjectionDrain(
     return result;
   } catch {
     // EXIT: fail-open — return the pre-wait ranking and mark it degraded.
-    return { ...result, degraded: true };
+    return withObservation(result, "projection_drain", "attempted-and-failed");
   }
 }
 
@@ -269,7 +303,7 @@ async function assembleVectorOnlyResult(
   args: AssembleArgs,
   deps: AssembleDeps,
   reranker: ChunkReranker | undefined
-): Promise<RetrieveOutputEnvelope> {
+): Promise<AssemblyResult> {
   const retrieved = await vectorSearch;
   const reranked = await maybeRerank(
     toFusedFromRetrieved(retrieved),
@@ -283,18 +317,25 @@ async function assembleVectorOnlyResult(
     deps.retrieveConfig,
     deps.storage
   );
-  return buildEnvelope(
-    neighbors.hits,
-    mergeDegraded(reranked.degraded, neighbors.degraded),
-    undefined
-  );
+  return {
+    hits: neighbors.hits,
+    observations: [
+      ...(reranked.degraded === true
+        ? [observation("rerank", "attempted-and-failed")]
+        : []),
+      ...(neighbors.failed
+        ? [observation("neighbor_evidence", "attempted-and-failed")]
+        : []),
+    ],
+    debug: undefined,
+  };
 }
 
 async function assembleFusedResult(
   retrieved: RetrievedChunk[],
   optionalResults: OptionalArmResults,
   context: FusedAssemblyContext
-): Promise<RetrieveOutputEnvelope> {
+): Promise<AssemblyResult> {
   const { args, deps, reranker, rerankWindow, weights } = context;
   const { optional, communityPriority, graphPriority, remainder } =
     selectRetrievalResults(retrieved, optionalResults);
@@ -322,37 +363,57 @@ async function assembleFusedResult(
     deps.retrieveConfig,
     deps.storage
   );
-  return buildEnvelope(
-    neighbors.hits,
-    mergeDegraded(
-      mergeDegraded(degradedFlag(optional), reranked.degraded),
-      neighbors.degraded
-    ),
-    buildDebug(deps.debug, retrieved.length, optional)
-  );
+  return {
+    hits: neighbors.hits,
+    observations: [
+      ...observationsFromOptional(optional),
+      ...(reranked.degraded === true
+        ? [observation("rerank", "attempted-and-failed")]
+        : []),
+      ...(neighbors.failed
+        ? [observation("neighbor_evidence", "attempted-and-failed")]
+        : []),
+    ],
+    debug: buildDebug(deps.debug, retrieved.length, optional),
+  };
 }
 
 /**
- * `degraded` marks an arm that was ATTEMPTED and could not deliver: a
- * lexical arm that threw, a graph arm that threw or under-floored, or a
- * node-embedding read that threw. An arm that simply found nothing has not
- * degraded, and neither has one the
- * operator turned off — those never reach this function.
+ * Convert arm outcomes into typed observations. The arm implementations only
+ * report their local delivery outcome; this function does not decide the wire
+ * flag or construct a reason string.
  */
-function degradedFlag(optional: ArmResult[]): true | undefined {
-  return optional.some((arm) => arm.belowFloor) ? true : undefined;
+function observationsFromOptional(
+  optional: readonly ArmResult[]
+): CapabilityObservation[] {
+  return optional.flatMap((arm) =>
+    arm.belowFloor
+      ? [observation(ARM_CAPABILITY[arm.arm], "attempted-and-failed")]
+      : []
+  );
 }
 
-function mergeDegraded(
-  arm: true | undefined,
-  rerank: true | undefined
-): true | undefined {
-  return arm === true || rerank === true ? true : undefined;
+function observation(
+  capability: DegradedCapability,
+  state: CapabilityObservation["state"]
+): CapabilityObservation {
+  return { capability, state };
+}
+
+function withObservation(
+  result: AssemblyResult,
+  capability: DegradedCapability,
+  state: CapabilityObservation["state"]
+): AssemblyResult {
+  return {
+    ...result,
+    observations: [...result.observations, observation(capability, state)],
+  };
 }
 
 interface NeighborOutcome {
   hits: FusedHit[];
-  degraded: true | undefined;
+  failed: boolean;
 }
 
 /**
@@ -371,7 +432,7 @@ async function expandNeighborEvidence(
 ): Promise<NeighborOutcome> {
   const width = config?.neighborWidth ?? 0;
   if (width === 0 || hits.length === 0) {
-    return { hits: [...hits], degraded: undefined };
+    return { hits: [...hits], failed: false };
   }
   if (!Number.isInteger(width) || width < 0) {
     throw new GraphragError(
@@ -380,7 +441,7 @@ async function expandNeighborEvidence(
     );
   }
   if (!supportsNeighborChunks(storage)) {
-    return { hits: [...hits], degraded: undefined };
+    return { hits: [...hits], failed: false };
   }
 
   try {
@@ -408,11 +469,11 @@ async function expandNeighborEvidence(
     }
     return {
       hits: [...hits, ...evidence].slice(0, args.limit),
-      degraded: undefined,
+      failed: false,
     };
   } catch {
     // EXIT: fail-open — 保留已排名结果，并通过 degraded:true 告知调用方
-    return { hits: [...hits], degraded: true };
+    return { hits: [...hits], failed: true };
   }
 }
 
@@ -507,19 +568,58 @@ function prependCommunityPriority(
 }
 
 /**
- * Build the output envelope, adding `degraded` / `debug` keys only when
- * their values are non-undefined. This is what keeps the empty-DB /
- * vector-only path EXACTLY `{ chunks: [...] }` (Success Criterion #4).
+ * Build the output envelope from all observations in one place. This is the
+ * sole decision point for the four degraded rules and the only place that
+ * attaches the optional wire fields.
  */
 function buildEnvelope(
   fused: FusedHit[],
-  degraded: true | undefined,
+  observations: readonly CapabilityObservation[],
   debug: Record<string, unknown> | undefined
 ): RetrieveOutputEnvelope {
   const out: RetrieveOutputEnvelope = { chunks: fused.map(projectFused) };
-  if (degraded !== undefined) out.degraded = degraded;
-  if (debug !== undefined) out.debug = debug;
+  const degradedReasons = resolveDegradedReasons(observations);
+  if (degradedReasons.length > 0) {
+    out.degraded = true;
+    out.degraded_reasons = degradedReasons;
+  }
+  if (debug !== undefined) {
+    Object.defineProperty(out, "debug", {
+      configurable: true,
+      enumerable: false,
+      value: debug,
+    });
+  }
   return out;
+}
+
+/**
+ * Apply the registry's only four set rules. `disabled` and `succeeded`
+ * observations intentionally produce no reason; an unattempted observation
+ * qualifies only when the registry declares that capability default-on.
+ */
+function resolveDegradedReasons(
+  observations: readonly CapabilityObservation[]
+): DegradedReason[] {
+  const selected = new Set<DegradedReason>();
+  for (const item of observations) {
+    const definition = CAPABILITY_REGISTRY[item.capability];
+    if (definition === undefined) continue;
+    if (item.state === "attempted-and-failed") {
+      selected.add(definition.attemptedAndFailed);
+    } else if (item.state === "unattempted" && definition.defaultOn) {
+      selected.add(definition.unattempted);
+    }
+  }
+
+  return (Object.keys(CAPABILITY_REGISTRY) as DegradedCapability[]).flatMap(
+    (capability) => {
+      const definition = CAPABILITY_REGISTRY[capability];
+      return [definition.unattempted, definition.attemptedAndFailed].filter(
+        (reason) => selected.has(reason)
+      );
+    }
+  );
 }
 
 /**

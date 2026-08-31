@@ -421,7 +421,7 @@ describe("retrieve config boundary validation (T5)", () => {
         bm25Enabled: true,
         graphEnabled: true,
         nodeEmbeddingEnabled: false,
-        rerankEnabled: false,
+        rerankEnabled: true,
         preset: "balanced",
         rrfK: 60,
         // Seed / traversal knobs keep their P0 values.

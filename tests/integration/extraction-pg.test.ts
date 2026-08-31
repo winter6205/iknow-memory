@@ -129,7 +129,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
         content text NOT NULL
       )
     `);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, 2000);
   }
 
   /** Mint one entity row with a unique canonical_name; returns its id. */

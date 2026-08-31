@@ -55,6 +55,7 @@ const distEntry = path.join(pkgRoot, "dist", "index.js");
  */
 const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "GRAPHRAG_MEMORY_DB_URL",
+  "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
   "GRAPHRAG_MEMORY_EMBED_API_KEY",
   "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
   "GRAPHRAG_MEMORY_VECTOR_API_KEY",
@@ -87,6 +88,7 @@ function hostSmokeEnv(): Record<string, string> {
   // positive integer works.
   env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   for (const key of HOST_SMOKE_SCRUBBED_ENV_KEYS) env[key] = "";
+  env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
   return env;
 }
 

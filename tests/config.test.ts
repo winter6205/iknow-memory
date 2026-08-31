@@ -234,8 +234,9 @@ const DOTENV_MASK_KEYS = [
 
 /**
  * Run `fn` with STAGE1_KEYS cleared, then patched by `patch`.
- * GRAPHRAG_MEMORY_EMBED_DIMENSIONS defaults to "1536" so existing tests
- * that don't care about dimensions don't need to set it explicitly.
+ * The test harness sets GRAPHRAG_MEMORY_EMBED_DIMENSIONS to "1536" so
+ * existing tests that don't care about dimensions don't need to set it
+ * explicitly. It also supplies the required ANN ceiling.
  */
 function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
   withIsolatedEnv(
@@ -301,9 +302,15 @@ describe("loadEnv — stage 1 storage + embedding contract", () => {
   });
 
   it("reads embedDimensions from GRAPHRAG_MEMORY_EMBED_DIMENSIONS as an integer", () => {
-    withEnv({ GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "2048" }, () => {
-      expect(loadEnv().embedDimensions).toBe(2048);
-    });
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "2048",
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2048",
+      },
+      () => {
+        expect(loadEnv().embedDimensions).toBe(2048);
+      }
+    );
   });
 
   it("reads embedApiKey from the var named by GRAPHRAG_MEMORY_EMBED_API_KEY_ENV", () => {
@@ -394,11 +401,14 @@ describe("loadEnv — embed config boundary cases", () => {
     ["negative", "-1"],
     ["decimal", "3.14"],
     ["non-numeric", "abc"],
+    ["NaN", "NaN"],
+    ["Infinity", "Infinity"],
   ];
 
   for (const [label, value] of DIM_BAD_VALUES) {
     it(`throws on GRAPHRAG_MEMORY_EMBED_DIMENSIONS = "${value}" (${label})`, () => {
       withRawEnv({ GRAPHRAG_MEMORY_EMBED_DIMENSIONS: value }, () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
         expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_EMBED_DIMENSIONS/);
       });
     });
@@ -406,12 +416,14 @@ describe("loadEnv — embed config boundary cases", () => {
 
   it("throws when GRAPHRAG_MEMORY_EMBED_DIMENSIONS is unset", () => {
     withRawEnv({}, () => {
+      expect(() => loadEnv()).toThrow(ConfigError);
       expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_EMBED_DIMENSIONS/);
     });
   });
 
   it("throws when GRAPHRAG_MEMORY_EMBED_DIMENSIONS is whitespace-only", () => {
     withRawEnv({ GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "   " }, () => {
+      expect(() => loadEnv()).toThrow(ConfigError);
       expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_EMBED_DIMENSIONS/);
     });
   });
@@ -530,34 +542,20 @@ describe("loadEnv — embed config boundary cases", () => {
     });
   });
 
-  it("uses the pgvector ANN dimension ceiling default when it is absent", () => {
-    const key = PGVECTOR_VARS[0];
-    const saved = process.env[key];
-    delete process.env[key];
-    try {
-      withIsolatedEnv(
-        DOTENV_MASK_KEYS.filter((masked) => masked !== key),
-        {
-          GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
-          GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: "60",
-          GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
-          GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
-          GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
-        },
-        () => {
-          expect(loadEnv().pgvectorAnnMaxDimensions).toBe(2000);
-        }
+  it("throws ConfigError when the pgvector ANN dimension ceiling is unset", () => {
+    withRawEnv({ GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536" }, () => {
+      delete process.env[PGVECTOR_VARS[0]];
+      expect(() => loadEnv()).toThrow(ConfigError);
+      expect(() => loadEnv()).toThrow(
+        /GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS/
       );
-    } finally {
-      if (saved === undefined) delete process.env[key];
-      else process.env[key] = saved;
-    }
+    });
   });
 
   it("reads the pgvector ANN dimension ceiling from config", () => {
     withRawEnv(
       {
-        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "512",
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "1024",
       },
       () => {
@@ -571,7 +569,9 @@ describe("loadEnv — embed config boundary cases", () => {
     ["zero", "0"],
     ["negative", "-1"],
     ["non-numeric", "not-a-number"],
-    ["non-finite", "Infinity"],
+    ["placeholder", "<ann-dimension-ceiling>"],
+    ["non-finite NaN", "NaN"],
+    ["non-finite Infinity", "Infinity"],
   ] as const) {
     it(`rejects a ${label} pgvector ANN dimension ceiling`, () => {
       withRawEnv(
@@ -588,6 +588,21 @@ describe("loadEnv — embed config boundary cases", () => {
       );
     });
   }
+
+  it("throws ConfigError when embedding dimensions exceed the configured ANN ceiling", () => {
+    withRawEnv(
+      {
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "2048",
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "1536",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_EMBED_DIMENSIONS \(2048\) exceeds configured pgvector ANN limit \(1536\)/
+        );
+      }
+    );
+  });
 });
 
 /**
@@ -1343,13 +1358,18 @@ describe("loadEnv — Neo4j sidecar config", () => {
     patch: Record<string, string | undefined>,
     fn: () => void
   ) {
-    const keys = [...NEO4J_VARS, "GRAPHRAG_MEMORY_EMBED_DIMENSIONS"];
+    const keys = [
+      ...NEO4J_VARS,
+      ...PGVECTOR_VARS,
+      "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
+    ];
     const saved = new Map<string, string | undefined>();
     for (const k of keys) {
       saved.set(k, process.env[k]);
       delete process.env[k];
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+    process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
     for (const [k, v] of Object.entries(patch)) {
       if (!saved.has(k)) saved.set(k, process.env[k]);
       if (v === undefined) delete process.env[k];

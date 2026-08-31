@@ -76,7 +76,7 @@ describePg("consolidate CLI against Postgres", () => {
         content text NOT NULL
       )
     `);
-    await upSchemaP0(client, DIM);
+    await upSchemaP0(client, DIM, 2000);
   }
 
   async function seedConflictingFacts(client: pg.Client): Promise<void> {

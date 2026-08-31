@@ -45,16 +45,27 @@ import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
 import type { RetrieveConfig } from "../../src/core/retrieval/types.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
+import { redactDiagnostic } from "../../src/logging.js";
+import {
+  createPgIntegrationHarness,
+  redactPgConnectionString,
+} from "./pg-test-harness.js";
 
 const DIM = 8;
-const BASE_DB_URL =
-  process.env["GRAPHRAG_MEMORY_DB_URL"] ??
-  "postgresql://postgres@localhost:5432/postgres";
-const SCHEMA = `neo4j_ppr_${randomUUID().slice(0, 8).replace(/-/g, "")}`;
-const SCHEMA_URL =
-  BASE_DB_URL +
-  (BASE_DB_URL.includes("?") ? "&" : "?") +
-  `options=-c%20search_path%3D${SCHEMA},public`;
+const pgHarness = await createPgIntegrationHarness({
+  label: "neo4j-ppr-arm",
+  testPath: "tests/integration/neo4j-ppr-arm.test.ts",
+  expectedCommand: `GRAPHRAG_MEMORY_EMBED_DIMENSIONS=8 ${NEO4J_URI_VAR}=bolt://localhost:7687 npx vitest run tests/integration/neo4j-ppr-arm.test.ts`,
+  schemaPrefix: "neo4j_ppr",
+  defaultConnectionString: "postgresql://postgres@localhost:5432/postgres",
+  requiresVector: true,
+});
+const {
+  connectionString: BASE_DB_URL,
+  schema: SCHEMA,
+  schemaConnectionString: SCHEMA_URL,
+  describePg,
+} = pgHarness;
 
 /**
  * Production weights, one seed. `entityLinkTopK: 1` pins the anchor to
@@ -130,19 +141,16 @@ try {
     const probe = probeDriver(SETTINGS);
     await probe.verifyConnectivity();
     await probe.close();
-    const pgProbe = new pg.Client({ connectionString: BASE_DB_URL });
-    await pgProbe.connect();
-    await pgProbe.end();
     READY = true;
   }
 } catch (err) {
   skipLoudly(
     SETTINGS === undefined
       ? `the environment does not load: ${(err as Error).message}`
-      : `cannot reach Neo4j at ${SETTINGS.uri} or Postgres at ${BASE_DB_URL}: ${(err as Error).message}`
+      : `cannot reach Neo4j at ${redactDiagnostic(SETTINGS.uri)} or Postgres at ${redactPgConnectionString(BASE_DB_URL)}: ${(err as Error).message}`
   );
 }
-const describeGraph = READY ? describe : describe.skip;
+const describeGraph = READY ? describePg : describe.skip;
 
 function probeDriver(settings: Neo4jConfig): Driver {
   const auth =
@@ -160,11 +168,10 @@ describeGraph(
     let ranker: ReturnType<typeof createNeo4jPprRanker>;
 
     beforeAll(async () => {
-      client = new pg.Client({ connectionString: BASE_DB_URL });
+      client = pgHarness.createClient(SCHEMA_URL);
       await client.connect();
       await client.query("CREATE EXTENSION IF NOT EXISTS vector");
-      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-      await client.query(`CREATE SCHEMA "${SCHEMA}"`);
+      await pgHarness.resetSchema(client);
       await client.query(`SET search_path TO "${SCHEMA}", public`);
 
       // The backend owns the DDL (chunks + P0 tables); one search call is
@@ -184,7 +191,7 @@ describeGraph(
       await ranker?.close();
       await backend?.close();
       await dropProjectedEntities();
-      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await pgHarness.dropSchema(client);
       await client.end();
     });
 

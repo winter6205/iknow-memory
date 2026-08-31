@@ -4,7 +4,7 @@
  * Pipeline: validate → size check → embed → store.
  * Stage 1: no triple extraction, no entity resolution (stage 3).
  */
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import {
   textResult,
@@ -36,10 +36,74 @@ export const IngestInputSchema = z.object({
 /** Inferred TypeScript type for the parsed ingest input. */
 export type IngestInput = z.infer<typeof IngestInputSchema>;
 
+/**
+ * Version components of the content identity.
+ *
+ * These are service-owned rather than caller-owned: changing any component
+ * deliberately creates a new key because the pushed text may have been
+ * produced by a different normalization, parser, or parameter table.
+ */
+export interface ContentIdentityVersions {
+  normalizationRuleVersion: string;
+  parseRuleVersion: string;
+  parameterTableVersion: string;
+}
+
+export const DEFAULT_CONTENT_IDENTITY_VERSIONS: ContentIdentityVersions = {
+  normalizationRuleVersion: "normalization-v1",
+  parseRuleVersion: "parse-v1",
+  parameterTableVersion: "parameters-v1",
+};
+
+/** Deterministic content identity required by the cross-repo ingest contract. */
+export function computeContentIdentity(
+  content: string,
+  versions: ContentIdentityVersions = DEFAULT_CONTENT_IDENTITY_VERSIONS
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        content,
+        versions.normalizationRuleVersion,
+        versions.parseRuleVersion,
+        versions.parameterTableVersion,
+      ]),
+      "utf8"
+    )
+    .digest("hex");
+}
+
+/**
+ * Derive a UUID-shaped stable chunk id from the full idempotency key.
+ *
+ * The version/variant bits preserve the UUID shape exposed by the existing
+ * tool while the remaining bits come from SHA-256, so no random state can
+ * make a retry address a different row.
+ */
+export function computeChunkId(
+  sourceRef: string,
+  contentIdentity: string
+): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([sourceRef, contentIdentity]), "utf8")
+    .digest();
+  digest[6] = (digest[6]! & 0x0f) | 0x40;
+  digest[8] = (digest[8]! & 0x3f) | 0x80;
+  const hex = digest.subarray(0, 16).toString("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join("-");
+}
+
 /** Dependencies injected at wiring time (T7). */
 export interface IngestDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
+  identityVersions?: Partial<ContentIdentityVersions>;
 }
 
 /**
@@ -110,9 +174,17 @@ export function createIngestHandler(deps: IngestDeps) {
     const now = new Date().toISOString();
     const validFrom = input.valid_from ?? now;
     const validUntil = input.valid_until ?? null;
+    const identityVersions = {
+      ...DEFAULT_CONTENT_IDENTITY_VERSIONS,
+      ...deps.identityVersions,
+    };
+    const contentIdentity = computeContentIdentity(
+      input.content,
+      identityVersions
+    );
     const records: ChunkRecord[] = [
       {
-        id: randomUUID(),
+        id: computeChunkId(input.source_ref, contentIdentity),
         content: input.content,
         embedding: embeddings[0]!,
         source_ref: input.source_ref,

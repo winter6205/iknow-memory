@@ -335,11 +335,8 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   // `degraded`; the default wiring now withholds `graphConfig`, so the
   // chunk list stays empty.
   //
-  // The DEBUG payload is what makes this a two-sided proof rather than a
-  // "nothing ran" tautology. Only arms that actually executed get keys,
-  // so `bm25Hits` present with no `graphHits` / `graphBelowFloor` says
-  // the stock server ran vector ∥ BM25 (#66) and skipped the archived
-  // arm — an all-quiet server would show no arm keys at all.
+  // Diagnostics are internal to the evaluator and are deliberately not
+  // serialized by the MCP tool; SC-9 constrains the host-visible envelope.
   // ============================================================
   it(
     "Case 4: DEBUG=1 spawn of dist/index.js (pgvector) → default path runs no SQL graph arm",
@@ -373,12 +370,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         // Neither arm failed, and an arm that is simply not wired is not
         // a degradation.
         expect(payload).not.toHaveProperty("degraded");
-        // Spelled out separately so a failure names the archived arm
-        // rather than just diffing an object.
-        expect(payload.debug).toEqual({ vectorHits: 0, bm25Hits: 0 });
-        expect(payload.debug).not.toHaveProperty("graphHits");
-        expect(payload.debug).not.toHaveProperty("graphBelowFloor");
-        expect(payload.debug).not.toHaveProperty("failureReason");
+        expect(Object.keys(payload)).toEqual(["chunks"]);
       } finally {
         await close();
       }

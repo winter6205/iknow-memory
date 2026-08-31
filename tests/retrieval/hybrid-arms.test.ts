@@ -371,7 +371,8 @@ describe("retrieve tool — BM25 wiring", () => {
         .map((b) => b.text ?? "")
         .join("")
     ) as { chunks: Array<{ id: string }>; debug?: Record<string, unknown> };
-    expect(body.debug?.bm25Hits).toBe(1);
+    expect(Object.keys(body)).toEqual(["chunks"]);
+    expect(body).not.toHaveProperty("debug");
     expect(body.chunks[0]?.id).toBe("lex");
   });
 });

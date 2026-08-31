@@ -37,6 +37,7 @@ import type {
   RankedEntity,
   RetrieveConfig,
 } from "./types.js";
+import { redactDiagnostic, writeStderr } from "../../logging.js";
 
 /** Runtime deps injected by the retrieve orchestrator. */
 export interface Neo4jGraphArmDeps {
@@ -147,9 +148,9 @@ function toHit(row: EntityChunkRow, score: number, i: number): ArmHit {
 
 /** Degrade to an empty result carrying the failure reason. */
 function degraded(err: unknown): ArmResult {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = redactDiagnostic(err instanceof Error ? err.message : err);
   // Log at warn; the envelope's `degraded` flag is what the caller sees.
-  console.warn(`neo4j-graph-arm degraded: ${message}`);
+  writeStderr(`neo4j-graph-arm degraded: ${message}\n`);
   return {
     arm: "graph",
     hits: [],

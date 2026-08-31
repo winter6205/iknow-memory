@@ -37,6 +37,7 @@ import { mergeEntitiesWithGating } from "../../src/core/entities/merge.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
 import type { ExtractionResponse } from "../../src/core/extraction/types.js";
+import { warnPgUnavailable } from "./pg-test-harness.js";
 
 /**
  * Wide enough that two FakeEmbedder vectors for unrelated descriptions land
@@ -133,15 +134,15 @@ try {
   await probe.end();
   PG_AVAILABLE = true;
 } catch (err) {
-  console.warn(
-    `\n[extract-persist-pg] Postgres unreachable at ${BASE_DB_URL}: ${(err as Error).message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/extract-persist-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/extract-persist-pg.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${BASE_DB_URL}\n`
-  );
+  warnPgUnavailable({
+    label: "extract-persist-pg",
+    testPath: "tests/integration/extract-persist-pg.test.ts",
+    expectedCommand:
+      "npx vitest run tests/integration/extract-persist-pg.test.ts",
+    connectionString: BASE_DB_URL,
+    error: err,
+    requiresVector: false,
+  });
 }
 const describePg = PG_AVAILABLE ? describe : describe.skip;
 

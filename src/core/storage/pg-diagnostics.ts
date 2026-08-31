@@ -6,9 +6,28 @@
  * bare key/value pair, so redacting only a URL is not sufficient.
  */
 
-const POSTGRES_URL_PATTERN = /\bpostgres(?:ql)?:\/\/[^\s"'`<>]+/gi;
-const KEY_VALUE_SECRET_PATTERN =
-  /((?:["']?\b(?:user|username|password|passwd|pwd|pass|sslpassword|ssl_pass(?:word)?|ssl-pass(?:word)?)\b["']?)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;)}\]]+)/gi;
+const SECRET_KEYS = [
+  "user",
+  "username",
+  "password",
+  "passwd",
+  "pwd",
+  "pass",
+  "sslpassword",
+  "ssl_password",
+  "ssl-pass",
+  "ssl_pass",
+  "ssl-password",
+] as const;
+const SECRET_KEY_PATTERN = SECRET_KEYS.join("|");
+const POSTGRES_URL_PATTERN =
+  /\bpostgres(?:ql)?:\/\/[^\s"'`<>]*(?:(?<=[/:@?&=%.])\r?\n[ \t]*[^\s"'`<>]+|\r?\n[ \t]*(?=[^\s"'`<>]*[@:/?&=%])[^\s"'`<>]+)*/gi;
+const POSTGRES_CREDENTIAL_PATTERN =
+  /(\bpostgres(?:ql)?:\/\/)(?:[^/?#\s"'`<>]|\r?\n[ \t]*)*@/gi;
+const KEY_VALUE_SECRET_PATTERN = new RegExp(
+  `((?<![-\\w])(?:["']?\\b(?:${SECRET_KEY_PATTERN})\\b["']?)\\s*[=:]\\s*)(?:"[^"]*"|'[^']*'|[^\\s,;)}\\]]+(?:\\r?\\n[ \\t]*(?!at\\b)[^\\s,;)}\\]]+)*)`,
+  "gi"
+);
 
 function parseConnectionUrl(connectionString: string): URL | undefined {
   if (!URL.canParse(connectionString)) return undefined;
@@ -26,8 +45,8 @@ function decodeUrlComponent(value: string): string {
 }
 
 function isSecretKey(key: string): boolean {
-  return /^(?:user|username|password|passwd|pwd|pass|sslpassword|ssl_pass(?:word)?|ssl-pass(?:word)?)$/i.test(
-    key
+  return SECRET_KEYS.some(
+    (secretKey) => secretKey.toLowerCase() === key.toLowerCase()
   );
 }
 
@@ -75,9 +94,14 @@ export function redactPgConnectionString(connectionString: string): string {
 }
 
 function redactPostgresUrls(diagnostic: string): string {
-  return diagnostic.replace(POSTGRES_URL_PATTERN, (candidate) => {
-    const trailing = candidate.match(/[.,;:!?)}\]]+$/)?.[0] ?? "";
-    const url = trailing ? candidate.slice(0, -trailing.length) : candidate;
+  const credentialsRedacted = diagnostic.replace(
+    POSTGRES_CREDENTIAL_PATTERN,
+    "$1[redacted]@"
+  );
+  return credentialsRedacted.replace(POSTGRES_URL_PATTERN, (candidate) => {
+    const normalized = candidate.replace(/\r?\n[ \t]*/g, "");
+    const trailing = normalized.match(/[.,;:!?)}\]]+$/)?.[0] ?? "";
+    const url = trailing ? normalized.slice(0, -trailing.length) : normalized;
     return `${redactPgConnectionString(url)}${trailing}`;
   });
 }
@@ -104,10 +128,11 @@ export function redactPgDiagnostic(
   let diagnostic =
     error instanceof Error ? (error.stack ?? error.message) : String(error);
 
-  diagnostic = redactPostgresUrls(diagnostic);
   const secrets = connectionString ? collectSecretValues(connectionString) : [];
   for (const secret of secrets) {
     diagnostic = diagnostic.split(secret).join("[redacted]");
   }
+  diagnostic = redactKeyValueSecrets(diagnostic);
+  diagnostic = redactPostgresUrls(diagnostic);
   return redactKeyValueSecrets(diagnostic);
 }

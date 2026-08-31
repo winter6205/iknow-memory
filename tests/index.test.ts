@@ -13,7 +13,7 @@ import { MemoryBackend } from "../src/core/storage/memory-backend.ts";
  * let that through, `createServer()` builds a NineRouterEmbedder and these
  * tests silently start making paid network calls — which is both slow and a
  * false signal. Clearing the vars for the duration of the call pins the
- * memory + FakeEmbedder path these tests are written against.
+ * memory + UnavailableEmbedder path required when credentials are absent.
  *
  * All embedding key knobs must be scrubbed, not just the legacy
  * `NINE_ROUTER_KEY`: direct key values and
@@ -42,8 +42,7 @@ async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
     saved.set(k, process.env[k]);
     delete process.env[k];
   }
-  // Dimensions is always required; FakeEmbedder path only needs this single
-  // field to construct successfully.
+  // Dimensions is always required by the memory backend.
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   try {
     return await createServer();
@@ -81,7 +80,8 @@ describe("createServer", () => {
  * process. Spawning would also require a build step per run.
  *
  * Default env (no NINE_ROUTER_KEY, no GRAPHRAG_MEMORY_STORAGE) puts the
- * server in memory + FakeEmbedder mode, so nothing here touches the network.
+ * server in memory + UnavailableEmbedder mode, so nothing here touches the
+ * network and embedding-dependent ingest is rejected explicitly.
  */
 async function connectInProcess(): Promise<{
   client: Client;
@@ -133,7 +133,7 @@ describe("createServer — registered tool set (T7)", () => {
     }
   });
 
-  it("tools/call ingest returns chunk_ids", async () => {
+  it("tools/call ingest reports missing embedding credentials", async () => {
     const { client, close } = await connectInProcess();
     try {
       const result = await client.callTool({
@@ -143,14 +143,12 @@ describe("createServer — registered tool set (T7)", () => {
           source_ref: "test://ingest-round-trip",
         },
       });
-      expect(result.isError).not.toBe(true);
-
-      const payload = JSON.parse(textOf(result)) as { chunk_ids: string[] };
-      expect(Array.isArray(payload.chunk_ids)).toBe(true);
-      expect(payload.chunk_ids.length).toBeGreaterThan(0);
-      for (const id of payload.chunk_ids) {
-        expect(typeof id).toBe("string");
-      }
+      // T12 removes the production FakeEmbedder fallback. Ingest cannot
+      // manufacture vectors when the embedding credentials are absent.
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toMatch(
+        /embedding credentials are not configured/
+      );
     } finally {
       await close();
     }
@@ -175,7 +173,7 @@ describe("createServer — registered tool set (T7)", () => {
     }
   });
 
-  it("ingest -> retrieve round-trips within one server instance", async () => {
+  it("ingest does not create pseudo-vector-backed data without credentials", async () => {
     const { client, close } = await connectInProcess();
     try {
       const content = "GraphRAG stores chunks with temporal validity windows.";
@@ -183,44 +181,12 @@ describe("createServer — registered tool set (T7)", () => {
         name: "ingest",
         arguments: { content, source_ref: "test://e2e", metadata: { k: "v" } },
       });
-      expect(ingested.isError).not.toBe(true);
-      const { chunk_ids } = JSON.parse(textOf(ingested)) as {
-        chunk_ids: string[];
-      };
-
-      const retrieved = await client.callTool({
-        name: "retrieve",
-        arguments: { query: content, limit: 5 },
-      });
-      expect(retrieved.isError).not.toBe(true);
-      const { chunks } = JSON.parse(textOf(retrieved)) as {
-        chunks: Array<{
-          id: string;
-          content: string;
-          source_ref: string;
-          valid_window: [string, string | null];
-          score: number;
-        }>;
-      };
-
-      expect(chunks.length).toBeGreaterThan(0);
-      // FakeEmbedder is deterministic, so embedding the same text twice
-      // yields the same vector — the ingested chunk must be the top hit.
-      expect(chunks[0]!.content).toBe(content);
-      expect(chunks[0]!.source_ref).toBe("test://e2e");
-      expect(chunk_ids).toContain(chunks[0]!.id);
-      expect(chunks[0]!.valid_window[1]).toBeNull();
-
-      // The stock server now fuses vector ∥ BM25 (#66), so `score` is the
-      // RRF score, not the cosine it used to be. Both arms rank this sole
-      // chunk first, so the fused score is exactly
-      // (w_vec + w_bm25) / (k + 1) = 0.85 / 61 at the production defaults
-      // (#69/#70 rebalanced them to 0.7 / 0.15; the graph arm is not wired
-      // into the stock server yet, so it contributes nothing here).
-      // Asserting the value rather than "> 0" is what makes this the
-      // end-to-end proof that the BM25 arm really runs on the default
-      // wiring: with BM25 off the score would be the cosine ~1 instead.
-      expect(chunks[0]!.score).toBeCloseTo(0.85 / 61, 10);
+      // T12 requires server wiring to reject ingest rather than use
+      // deterministic pseudo-vectors as a production substitute.
+      expect(ingested.isError).toBe(true);
+      expect(textOf(ingested)).toMatch(
+        /embedding credentials are not configured/
+      );
     } finally {
       await close();
     }
@@ -334,9 +300,9 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
  *
  * The Neo4j arm IS production, so the ranker travels whenever one was
  * built. Whether one was built is decided by `loadEnv().neo4j`, i.e. by
- * whether the operator configured a sidecar URI; withholding the key is
- * exactly how `assembleRetrievalResult` learns to SKIP the arm instead of
- * degrading the envelope (spec SC7).
+ * whether the operator configured a sidecar URI; withholding the key leaves
+ * the default-on graph capability unattempted, which the orchestrator marks
+ * as degraded (T10 / §B3 rule 1).
  */
 describe("buildRetrieveDeps — Neo4j graph arm wiring (#70)", () => {
   const embedder = new FakeEmbedder(1536);

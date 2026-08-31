@@ -12,6 +12,12 @@ import { GraphragError } from "./errors.js";
 
 /** Abstraction over any embedding provider. */
 export interface EmbeddingClient {
+  /**
+   * Whether the provider can be used for this process. Test doubles that do
+   * not set this property are treated as available; production wiring sets
+   * it to false when embedding credentials are absent.
+   */
+  readonly available?: boolean;
   embed(texts: string[]): Promise<number[][]>;
 }
 
@@ -32,6 +38,7 @@ export interface NineRouterEmbedderOpts {
  * NAME and passed in by the caller (config.ts) — never stored in source.
  */
 export class NineRouterEmbedder implements EmbeddingClient {
+  readonly available = true;
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly apiKey: string;
@@ -110,6 +117,25 @@ export class NineRouterEmbedder implements EmbeddingClient {
 }
 
 /**
+ * Production placeholder used when embedding credentials are absent.
+ *
+ * Ingest still receives an EmbeddingClient so its existing typed error path
+ * remains intact, while retrieve can inspect `available` and avoid calling
+ * this object altogether. This is deliberately not a deterministic
+ * substitute: missing credentials must never manufacture vector evidence.
+ */
+export class UnavailableEmbedder implements EmbeddingClient {
+  readonly available = false;
+
+  async embed(_texts: string[]): Promise<number[][]> {
+    throw new GraphragError(
+      "embedding credentials are not configured",
+      "EMBEDDING_FAILED"
+    );
+  }
+}
+
+/**
  * Test double: returns deterministic vectors derived from text content.
  * No network, no randomness. Same text → same vector, always.
  *
@@ -120,6 +146,8 @@ export class NineRouterEmbedder implements EmbeddingClient {
  * specific distribution is not.
  */
 export class FakeEmbedder implements EmbeddingClient {
+  readonly available = true;
+
   constructor(private readonly dimensions: number) {}
 
   async embed(texts: string[]): Promise<number[][]> {

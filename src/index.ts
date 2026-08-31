@@ -175,7 +175,11 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
         `GRAPHRAG_MEMORY_STORAGE=pgvector requires the optional "pg" dependency — \`npm install pg\` (${(err as Error).message})`
       );
     }
-    storage = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions);
+    const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions);
+    // Fail before the stdio transport opens: dimension and ANN-index
+    // bootstrap errors are server-startup failures, not tool responses.
+    await backend.initialize();
+    storage = backend;
   } else {
     storage = new MemoryBackend(env.embedDimensions);
   }

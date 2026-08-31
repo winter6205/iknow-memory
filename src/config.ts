@@ -59,10 +59,12 @@ function isStorageMode(value: string): value is StorageMode {
  *      or any other var a generic host uses). config.ts just reads whatever
  *      name it is handed.
  *
- * Neither set → undefined → FakeEmbedder path. There is deliberately NO
- * default var name here — a default would re-hardcode a provider choice
- * into config, which is exactly what this indirection removes. The secret
- * VALUE never lives in source; the var NAME is supplied by the operator.
+ * Neither set → undefined. Production wiring turns that into an unavailable
+ * embedder; the offline evaluation CLI may explicitly choose FakeEmbedder.
+ * There is deliberately NO default var name here — a default would
+ * re-hardcode a provider choice into config, which is exactly what this
+ * indirection removes. The secret VALUE never lives in source; the var NAME
+ * is supplied by the operator.
  */
 const EMBED_API_KEY_VALUE_VAR = "GRAPHRAG_MEMORY_EMBED_API_KEY";
 const EMBED_API_KEY_NAME_VAR = "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV";
@@ -94,11 +96,10 @@ export class ConfigError extends Error {
 /**
  * Neo4j sidecar connection settings (#70).
  *
- * Present only when a URI is configured. Absence is the operator saying
- * "no sidecar here": the graph arm is skipped rather than attempted, so
- * retrieve stays non-degraded (spec SC7 — cannot attempt ≠ failed
- * attempt). Credentials are optional because a local Neo4j may run with
- * auth disabled, but a half-declared pair is rejected at startup.
+ * Present only when a URI is configured. Absence leaves the default-on graph
+ * capability unattempted; the retrieval envelope reports that state.
+ * Credentials are optional because a local Neo4j may run with auth disabled,
+ * but a half-declared pair is rejected at startup.
  */
 export interface Neo4jConfig {
   /** Driver URI; scheme restricted to the bolt / neo4j family. */
@@ -118,7 +119,7 @@ export interface GraphragEnv {
   /**
    * Embedding endpoint base URL (trailing slash stripped). Convention
    * includes /v1 — only /embeddings is appended at call time. Undefined
-   * when no embedding API key is configured (FakeEmbedder path).
+   * when no embedding API key is configured.
    */
   embedBaseUrl: string | undefined;
   /**
@@ -126,13 +127,13 @@ export interface GraphragEnv {
    * Undefined when no embedding API key is configured.
    */
   embedModel: string | undefined;
-  /** Vector dimension. Always set — every code path (real + fake) needs it. */
+  /** Vector dimension. Always set — storage and embedder paths need it. */
   embedDimensions: number;
   /** Maximum vector width accepted by the configured ANN index. */
   pgvectorAnnMaxDimensions: number;
   /**
-   * Resolved embedding API key value; undefined means "fall back to
-   * FakeEmbedder". See the EMBED_API_KEY_* constants for resolution order.
+   * Resolved embedding API key value; undefined means production embedding is
+   * unavailable. The offline evaluation CLI may opt into FakeEmbedder.
    */
   embedApiKey: string | undefined;
   /**
@@ -142,9 +143,8 @@ export interface GraphragEnv {
    */
   retrieval: RetrieveConfig;
   /**
-   * Neo4j sidecar connection block, or undefined when no URI is
-   * configured. Undefined means "skip the graph arm", not "the graph arm
-   * failed" — see Neo4jConfig.
+   * Neo4j sidecar connection block, or undefined when no URI is configured.
+   * Undefined is surfaced as an unattempted default-on graph capability.
    */
   neo4j: Neo4jConfig | undefined;
   /**
@@ -220,9 +220,8 @@ function readRawEnv(key: string): string | undefined {
 
 /**
  * Read an env var and normalize: trim whitespace, treat empty/whitespace-only
- * as absent (undefined). Keeps config.ts and index.ts in agreement — both
- * treat a blank key as "no key" (FakeEmbedder path) without relying on JS
- * truthiness semantics at the consumption site.
+ * as absent (undefined). Keeps config.ts and index.ts in agreement without
+ * relying on JS truthiness semantics at the consumption site.
  */
 function readTrimmed(key: string): string | undefined {
   const raw = readEnv(key);
@@ -234,8 +233,8 @@ function readTrimmed(key: string): string | undefined {
 /**
  * Parse and validate GRAPHRAG_MEMORY_EMBED_DIMENSIONS.
  *
- * Always required — every code path (real + FakeEmbedder, MemoryBackend,
- * PgvectorBackend DDL) needs the dimension as a positive integer. We
+ * Always required — every storage and embedding code path needs the
+ * dimension as a positive integer. We
  * reject empty strings, 0, negatives, non-integers, and decimal values
  * at startup rather than letting a surprising 0-length vector hit the
  * DDL or the embedding provider downstream.
@@ -452,7 +451,7 @@ function parseRetrievalConfig(): RetrieveConfig {
     rerankEnabled: parseBoolean(
       RETRIEVAL_RERANK_ENABLED_VAR,
       readEnv(RETRIEVAL_RERANK_ENABLED_VAR),
-      false
+      true
     ),
     waitForDrainEnabled: parseBoolean(
       RETRIEVAL_WAIT_FOR_DRAIN_ENABLED_VAR,
@@ -498,8 +497,8 @@ const NEO4J_URI_SCHEMES: readonly string[] = [
 /**
  * Load + validate the GRAPHRAG_MEMORY_NEO4J_* family.
  *
- * No URI → undefined, and the graph arm is skipped without degrading the
- * envelope (spec SC7). Anything the operator DID declare must be usable:
+ * No URI → undefined, leaving the default-on graph capability unattempted.
+ * Anything the operator DID declare must be usable:
  * a URI the driver cannot dial, credentials with nothing to connect to,
  * or half a credential pair all abort at startup. Silently ignoring them
  * would hand an operator a server they believe is graph-backed while it
@@ -539,7 +538,8 @@ function parseNeo4jConfig(): Neo4jConfig | undefined {
  *
  * Key is `ANTHROPIC_AUTH_TOKEN`. Model / base URL default to China MiniMax
  * M3 (`MiniMax-M3` at `https://api.minimaxi.com/anthropic`) when unset.
- * No key → undefined (skip). Explicit MODEL / BASE_URL still override.
+ * No key → undefined; the retrieval orchestrator marks default-on rerank as
+ * unattempted. Explicit MODEL / BASE_URL still override when a key exists.
  */
 function parseRerankConfig(): RerankConfig | undefined {
   const apiKey = readTrimmed(LLM_AUTH_TOKEN_VAR);
@@ -568,8 +568,8 @@ function uriScheme(uri: string): string | undefined {
  * is deliberate: silently coercing an unknown storage mode to "memory" would
  * hand an operator a server that answers queries from an empty in-process
  * store while they believe it is talking to Postgres. Same logic applies to
- * missing embedding config: the operator's mental model and the running
- * server must agree or the server must refuse to start.
+ * missing embedding credentials: the server starts, but production retrieval
+ * must expose the unavailable vector capability instead of fabricating one.
  */
 export function loadEnv(): GraphragEnv {
   // Stage 0 is stdio-only (map #33 defers HTTP to T-005/#36). Transport is
@@ -594,8 +594,7 @@ export function loadEnv(): GraphragEnv {
   }
 
   // Embedding config: dimensions is ALWAYS required (every backend needs it);
-  // baseUrl and model are only required when a key resolves, because the
-  // FakeEmbedder path takes the operator offline without one. All string
+  // baseUrl and model are only required when a key resolves. All string
   // fields are normalized through readTrimmed so empty / whitespace-only
   // values collapse to undefined — a blank key does not silently drag an
   // operator into the real-embedder path.
@@ -647,7 +646,7 @@ export function loadEnv(): GraphragEnv {
  *   2. GRAPHRAG_MEMORY_VECTOR_API_KEY   — preferred vector alias
  *   3. GRAPHRAG_MEMORY_ANTHROPIC_API_KEY — legacy vector alias (not LLM)
  *   4. process.env[GRAPHRAG_MEMORY_EMBED_API_KEY_ENV] — indirect by name
- *   5. undefined → FakeEmbedder path
+ *   5. undefined → production embedding is unavailable
  *
  * `ANTHROPIC_AUTH_TOKEN` is the LLM key and is never consulted here.
  */

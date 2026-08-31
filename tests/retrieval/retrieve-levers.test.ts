@@ -229,15 +229,16 @@ describe("assembleRetrievalResult — concurrent arms (SC12b)", () => {
     expect(out.chunks.map((c) => c.id)).toContain("v1");
   });
 
-  it("SC12b: a vector-arm rejection still propagates while the graph arm runs", async () => {
+  it("SC12b: graph hits release when the vector arm rejects", async () => {
     const backend = activeGraphBackend();
     backend.searchError = new Error("vector down");
-    await expect(
-      assembleRetrievalResult(ARGS, {
-        embedder: new CountingEmbedder(),
-        storage: backend,
-        graphConfig: CFG,
-      })
-    ).rejects.toThrow("vector down");
+    const out = await assembleRetrievalResult(ARGS, {
+      embedder: new CountingEmbedder(),
+      storage: backend,
+      graphConfig: CFG,
+    });
+    expect(out.chunks.map((chunk) => chunk.id)).toEqual(["g1", "g2", "g3"]);
+    expect(out.degraded).toBe(true);
+    expect(out.degraded_reasons).toEqual(["vector:attempted-and-failed"]);
   });
 });

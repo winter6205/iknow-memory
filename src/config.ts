@@ -17,6 +17,7 @@ import {
   type RetrieveConfig,
   type RetrievePreset,
 } from "./core/retrieval/types.js";
+import { RRF_K } from "./core/retrieval/rrf.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -58,10 +59,12 @@ function isStorageMode(value: string): value is StorageMode {
  *      or any other var a generic host uses). config.ts just reads whatever
  *      name it is handed.
  *
- * Neither set → undefined → FakeEmbedder path. There is deliberately NO
- * default var name here — a default would re-hardcode a provider choice
- * into config, which is exactly what this indirection removes. The secret
- * VALUE never lives in source; the var NAME is supplied by the operator.
+ * Neither set → undefined. Production wiring turns that into an unavailable
+ * embedder; the offline evaluation CLI may explicitly choose FakeEmbedder.
+ * There is deliberately NO default var name here — a default would
+ * re-hardcode a provider choice into config, which is exactly what this
+ * indirection removes. The secret VALUE never lives in source; the var NAME
+ * is supplied by the operator.
  */
 const EMBED_API_KEY_VALUE_VAR = "GRAPHRAG_MEMORY_EMBED_API_KEY";
 const EMBED_API_KEY_NAME_VAR = "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV";
@@ -72,6 +75,24 @@ const LEGACY_VECTOR_API_KEY_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY";
 
 /** Env-var name for the required embedding dimension integer. */
 const EMBED_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_EMBED_DIMENSIONS";
+/** Env-var name for the pgvector ANN dimension ceiling. */
+export const PGVECTOR_ANN_MAX_DIMENSIONS_VAR =
+  "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+/** Environment variable for the maximum number of items in one ingest call. */
+export const INGEST_BATCH_LIMIT_VAR = "GRAPHRAG_MEMORY_INGEST_BATCH_LIMIT";
+/** A bounded default keeps embedding requests and writes reasonably sized. */
+export const DEFAULT_INGEST_BATCH_LIMIT = 100;
+/** Environment variable for the PostgreSQL pool connection cap. */
+export const PGVECTOR_POOL_MAX_VAR = "GRAPHRAG_MEMORY_PGVECTOR_POOL_MAX";
+/** A conservative default avoids exhausting a local PostgreSQL instance. */
+export const DEFAULT_PGVECTOR_POOL_MAX = 10;
+/**
+ * Maximum time a pool acquisition may wait before the request fails.
+ * `pg` receives this value as its connectionTimeoutMillis setting too.
+ */
+export const PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS_VAR =
+  "GRAPHRAG_MEMORY_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS";
+export const DEFAULT_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS = 5_000;
 
 /**
  * Startup configuration failure. Distinct from GraphragError (core/errors.ts),
@@ -88,11 +109,10 @@ export class ConfigError extends Error {
 /**
  * Neo4j sidecar connection settings (#70).
  *
- * Present only when a URI is configured. Absence is the operator saying
- * "no sidecar here": the graph arm is skipped rather than attempted, so
- * retrieve stays non-degraded (spec SC7 — cannot attempt ≠ failed
- * attempt). Credentials are optional because a local Neo4j may run with
- * auth disabled, but a half-declared pair is rejected at startup.
+ * Present only when a URI is configured. Absence leaves the default-on graph
+ * capability unattempted; the retrieval envelope reports that state.
+ * Credentials are optional because a local Neo4j may run with auth disabled,
+ * but a half-declared pair is rejected at startup.
  */
 export interface Neo4jConfig {
   /** Driver URI; scheme restricted to the bolt / neo4j family. */
@@ -112,7 +132,7 @@ export interface GraphragEnv {
   /**
    * Embedding endpoint base URL (trailing slash stripped). Convention
    * includes /v1 — only /embeddings is appended at call time. Undefined
-   * when no embedding API key is configured (FakeEmbedder path).
+   * when no embedding API key is configured.
    */
   embedBaseUrl: string | undefined;
   /**
@@ -120,11 +140,19 @@ export interface GraphragEnv {
    * Undefined when no embedding API key is configured.
    */
   embedModel: string | undefined;
-  /** Vector dimension. Always set — every code path (real + fake) needs it. */
+  /** Vector dimension. Always set — storage and embedder paths need it. */
   embedDimensions: number;
+  /** Maximum vector width accepted by the configured ANN index. */
+  pgvectorAnnMaxDimensions: number;
+  /** Maximum number of items accepted by one ingest call. */
+  ingestBatchLimit: number;
+  /** Maximum number of concurrent PostgreSQL pool clients. */
+  pgvectorPoolMax: number;
+  /** Maximum pool-acquisition wait before a typed failure. */
+  pgvectorConnectionWaitTimeoutMs: number;
   /**
-   * Resolved embedding API key value; undefined means "fall back to
-   * FakeEmbedder". See the EMBED_API_KEY_* constants for resolution order.
+   * Resolved embedding API key value; undefined means production embedding is
+   * unavailable. The offline evaluation CLI may opt into FakeEmbedder.
    */
   embedApiKey: string | undefined;
   /**
@@ -134,9 +162,8 @@ export interface GraphragEnv {
    */
   retrieval: RetrieveConfig;
   /**
-   * Neo4j sidecar connection block, or undefined when no URI is
-   * configured. Undefined means "skip the graph arm", not "the graph arm
-   * failed" — see Neo4jConfig.
+   * Neo4j sidecar connection block, or undefined when no URI is configured.
+   * Undefined is surfaced as an unattempted default-on graph capability.
    */
   neo4j: Neo4jConfig | undefined;
   /**
@@ -197,10 +224,23 @@ function readEnv(key: string): string | undefined {
 }
 
 /**
+ * Read an environment value without collapsing an explicit blank to absent.
+ * Numeric configuration needs this distinction so `KEY=` cannot silently
+ * select a fallback while an actually absent key still gets its documented
+ * default.
+ */
+function readRawEnv(key: string): string | undefined {
+  if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+    return process.env[key];
+  }
+  const file = parseEnvFile(join(process.cwd(), ".env.local"));
+  return file[key];
+}
+
+/**
  * Read an env var and normalize: trim whitespace, treat empty/whitespace-only
- * as absent (undefined). Keeps config.ts and index.ts in agreement — both
- * treat a blank key as "no key" (FakeEmbedder path) without relying on JS
- * truthiness semantics at the consumption site.
+ * as absent (undefined). Keeps config.ts and index.ts in agreement without
+ * relying on JS truthiness semantics at the consumption site.
  */
 function readTrimmed(key: string): string | undefined {
   const raw = readEnv(key);
@@ -212,8 +252,8 @@ function readTrimmed(key: string): string | undefined {
 /**
  * Parse and validate GRAPHRAG_MEMORY_EMBED_DIMENSIONS.
  *
- * Always required — every code path (real + FakeEmbedder, MemoryBackend,
- * PgvectorBackend DDL) needs the dimension as a positive integer. We
+ * Always required — every storage and embedding code path needs the
+ * dimension as a positive integer. We
  * reject empty strings, 0, negatives, non-integers, and decimal values
  * at startup rather than letting a surprising 0-length vector hit the
  * DDL or the embedding provider downstream.
@@ -233,11 +273,86 @@ function parseEmbedDimensions(raw: string | undefined): number {
   return n;
 }
 
+/**
+ * Load the pgvector ANN width ceiling from configuration. The extension's
+ * current ceiling must be declared explicitly; a missing, blank, or malformed
+ * value is rejected before schema bootstrap can silently skip an index.
+ */
+export function readPgvectorAnnMaxDimensions(): number {
+  const raw = readRawEnv(PGVECTOR_ANN_MAX_DIMENSIONS_VAR);
+  if (raw === undefined || raw.trim() === "") {
+    throw new ConfigError(
+      `${PGVECTOR_ANN_MAX_DIMENSIONS_VAR} is required (finite positive integer)`
+    );
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    throw new ConfigError(
+      `${PGVECTOR_ANN_MAX_DIMENSIONS_VAR} must be a finite positive integer, got "${raw}"`
+    );
+  }
+  return n;
+}
+
+/**
+ * Parse a positive integer with an explicit default for an absent env var.
+ * A present blank value is rejected as a missing configuration value rather
+ * than silently selecting the default.
+ */
+function parseConfiguredPositiveInt(
+  name: string,
+  raw: string | undefined,
+  fallback: number
+): number {
+  if (raw === undefined) return fallback;
+  if (raw.trim() === "") {
+    throw new ConfigError(`${name} is required and must be a positive integer`);
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
+    throw new ConfigError(
+      `${name} must be a finite positive integer, got "${raw}"`
+    );
+  }
+  return n;
+}
+
+/** Read the batch limit used by the ingest surface. */
+export function readIngestBatchLimit(): number {
+  return parseConfiguredPositiveInt(
+    INGEST_BATCH_LIMIT_VAR,
+    readRawEnv(INGEST_BATCH_LIMIT_VAR),
+    DEFAULT_INGEST_BATCH_LIMIT
+  );
+}
+
+export interface PgvectorPoolConfig {
+  max: number;
+  connectionWaitTimeoutMs: number;
+}
+
+/** Read the PostgreSQL pool cap and acquisition timeout. */
+export function readPgvectorPoolConfig(): PgvectorPoolConfig {
+  return {
+    max: parseConfiguredPositiveInt(
+      PGVECTOR_POOL_MAX_VAR,
+      readRawEnv(PGVECTOR_POOL_MAX_VAR),
+      DEFAULT_PGVECTOR_POOL_MAX
+    ),
+    connectionWaitTimeoutMs: parseConfiguredPositiveInt(
+      PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS_VAR,
+      readRawEnv(PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS_VAR),
+      DEFAULT_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS
+    ),
+  };
+}
+
 // --- Retrieval config (spec-3 p0-integration T5) ---
 
 const RETRIEVAL_W_VEC_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC";
 const RETRIEVAL_W_BM25_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25";
 const RETRIEVAL_W_GRAPH_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH";
+const RETRIEVAL_RRF_K_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RRF_K";
 const RETRIEVAL_BM25_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED";
 const RETRIEVAL_GRAPH_ENABLED_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED";
 const RETRIEVAL_NODE_EMBEDDING_ENABLED_VAR =
@@ -293,7 +408,12 @@ function parseFinitePositive(
   raw: string | undefined,
   fallback: number
 ): number {
-  const value = raw !== undefined && raw.trim() !== "" ? raw : String(fallback);
+  if (raw !== undefined && raw.trim() === "") {
+    throw new ConfigError(
+      `${name} must be a finite positive number, got "${raw}"`
+    );
+  }
+  const value = raw !== undefined ? raw : String(fallback);
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
     throw new ConfigError(
@@ -365,19 +485,24 @@ function parseRetrievalConfig(): RetrieveConfig {
   }
   return {
     preset,
+    rrfK: parseFinitePositive(
+      RETRIEVAL_RRF_K_VAR,
+      readRawEnv(RETRIEVAL_RRF_K_VAR),
+      RRF_K
+    ),
     w_vec: parseFinitePositive(
       RETRIEVAL_W_VEC_VAR,
-      readEnv(RETRIEVAL_W_VEC_VAR),
+      readRawEnv(RETRIEVAL_W_VEC_VAR),
       bundle.w_vec
     ),
     w_bm25: parseFinitePositive(
       RETRIEVAL_W_BM25_VAR,
-      readEnv(RETRIEVAL_W_BM25_VAR),
+      readRawEnv(RETRIEVAL_W_BM25_VAR),
       bundle.w_bm25
     ),
     w_graph: parseFinitePositive(
       RETRIEVAL_W_GRAPH_VAR,
-      readEnv(RETRIEVAL_W_GRAPH_VAR),
+      readRawEnv(RETRIEVAL_W_GRAPH_VAR),
       0.15
     ),
     bm25Enabled: parseBoolean(
@@ -398,7 +523,7 @@ function parseRetrievalConfig(): RetrieveConfig {
     rerankEnabled: parseBoolean(
       RETRIEVAL_RERANK_ENABLED_VAR,
       readEnv(RETRIEVAL_RERANK_ENABLED_VAR),
-      false
+      true
     ),
     waitForDrainEnabled: parseBoolean(
       RETRIEVAL_WAIT_FOR_DRAIN_ENABLED_VAR,
@@ -444,8 +569,8 @@ const NEO4J_URI_SCHEMES: readonly string[] = [
 /**
  * Load + validate the GRAPHRAG_MEMORY_NEO4J_* family.
  *
- * No URI → undefined, and the graph arm is skipped without degrading the
- * envelope (spec SC7). Anything the operator DID declare must be usable:
+ * No URI → undefined, leaving the default-on graph capability unattempted.
+ * Anything the operator DID declare must be usable:
  * a URI the driver cannot dial, credentials with nothing to connect to,
  * or half a credential pair all abort at startup. Silently ignoring them
  * would hand an operator a server they believe is graph-backed while it
@@ -485,7 +610,8 @@ function parseNeo4jConfig(): Neo4jConfig | undefined {
  *
  * Key is `ANTHROPIC_AUTH_TOKEN`. Model / base URL default to China MiniMax
  * M3 (`MiniMax-M3` at `https://api.minimaxi.com/anthropic`) when unset.
- * No key → undefined (skip). Explicit MODEL / BASE_URL still override.
+ * No key → undefined; the retrieval orchestrator marks default-on rerank as
+ * unattempted. Explicit MODEL / BASE_URL still override when a key exists.
  */
 function parseRerankConfig(): RerankConfig | undefined {
   const apiKey = readTrimmed(LLM_AUTH_TOKEN_VAR);
@@ -514,8 +640,8 @@ function uriScheme(uri: string): string | undefined {
  * is deliberate: silently coercing an unknown storage mode to "memory" would
  * hand an operator a server that answers queries from an empty in-process
  * store while they believe it is talking to Postgres. Same logic applies to
- * missing embedding config: the operator's mental model and the running
- * server must agree or the server must refuse to start.
+ * missing embedding credentials: the server starts, but production retrieval
+ * must expose the unavailable vector capability instead of fabricating one.
  */
 export function loadEnv(): GraphragEnv {
   // Stage 0 is stdio-only (map #33 defers HTTP to T-005/#36). Transport is
@@ -540,12 +666,19 @@ export function loadEnv(): GraphragEnv {
   }
 
   // Embedding config: dimensions is ALWAYS required (every backend needs it);
-  // baseUrl and model are only required when a key resolves, because the
-  // FakeEmbedder path takes the operator offline without one. All string
+  // baseUrl and model are only required when a key resolves. All string
   // fields are normalized through readTrimmed so empty / whitespace-only
   // values collapse to undefined — a blank key does not silently drag an
   // operator into the real-embedder path.
   const embedDimensions = parseEmbedDimensions(readEnv(EMBED_DIMENSIONS_VAR));
+  const pgvectorAnnMaxDimensions = readPgvectorAnnMaxDimensions();
+  if (embedDimensions > pgvectorAnnMaxDimensions) {
+    throw new ConfigError(
+      `${EMBED_DIMENSIONS_VAR} (${embedDimensions}) exceeds configured pgvector ANN limit (${pgvectorAnnMaxDimensions})`
+    );
+  }
+  const ingestBatchLimit = readIngestBatchLimit();
+  const pgvectorPool = readPgvectorPoolConfig();
   const embedApiKey = resolveEmbedApiKey();
 
   const embedBaseUrl = readTrimmed("GRAPHRAG_MEMORY_EMBED_BASE_URL");
@@ -571,6 +704,10 @@ export function loadEnv(): GraphragEnv {
     storage: rawStorage,
     dbUrl,
     embedDimensions,
+    pgvectorAnnMaxDimensions,
+    ingestBatchLimit,
+    pgvectorPoolMax: pgvectorPool.max,
+    pgvectorConnectionWaitTimeoutMs: pgvectorPool.connectionWaitTimeoutMs,
     embedBaseUrl: embedBaseUrl?.replace(/\/$/, ""),
     embedModel,
     // Looked up by NAME — the secret value only ever exists in the process
@@ -591,7 +728,7 @@ export function loadEnv(): GraphragEnv {
  *   2. GRAPHRAG_MEMORY_VECTOR_API_KEY   — preferred vector alias
  *   3. GRAPHRAG_MEMORY_ANTHROPIC_API_KEY — legacy vector alias (not LLM)
  *   4. process.env[GRAPHRAG_MEMORY_EMBED_API_KEY_ENV] — indirect by name
- *   5. undefined → FakeEmbedder path
+ *   5. undefined → production embedding is unavailable
  *
  * `ANTHROPIC_AUTH_TOKEN` is the LLM key and is never consulted here.
  */

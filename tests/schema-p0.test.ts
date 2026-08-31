@@ -105,11 +105,11 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     `);
 
     // First invocation.
-    await upSchemaP0(c, 1536);
+    await upSchemaP0(c, 1536, 2000);
     const firstCount = await countPgTables(c);
 
     // Second invocation must not throw AND must not change the table count.
-    await expect(upSchemaP0(c, 1536)).resolves.toBeUndefined();
+    await expect(upSchemaP0(c, 1536, 2000)).resolves.toBeUndefined();
     const secondCount = await countPgTables(c);
 
     expect(secondCount).toBe(firstCount);

@@ -45,6 +45,8 @@ import type { ExtractionResponse } from "../../src/core/extraction/types.js";
 const DIM = 256;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
 const SCHEMA = `extract_persist_${randomUUID().slice(0, 8)}`;
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
 /** Per-connection search_path targeting SCHEMA via the libpq `options=` string. */
 function schemaDbUrl(): string {
@@ -147,6 +149,7 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
   let client: pg.Client | undefined;
 
   beforeAll(async () => {
+    process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     client = new pg.Client({ connectionString: BASE_DB_URL });
     await client.connect();
     // Install pgvector into `public` (the default search_path here) so the
@@ -156,9 +159,15 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
   });
 
   afterAll(async () => {
-    if (!client) return;
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.end();
+    if (client) {
+      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await client.end();
+    }
+    if (savedAnnMaxDimensions === undefined) {
+      delete process.env[ANN_MAX_DIMENSIONS_VAR];
+    } else {
+      process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+    }
   });
 
   /**
@@ -182,7 +191,7 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, 2000);
   }
 
   /** Seed `contents.length` chunks in a deterministic created_at order. */
@@ -251,7 +260,7 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
     );
     expect(Number(total.rows[0]?.n ?? "0")).toBe(2); // head + tail
 
-    const backend = new PgvectorBackend(schemaDbUrl(), DIM);
+    const backend = new PgvectorBackend(schemaDbUrl(), DIM, 2000);
     try {
       const [probe] = await new FakeEmbedder(DIM).embed(["Alice Smith"]);
       const seeds = await backend.graphArmSeed.seedEntitiesByEmbedding(

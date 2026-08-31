@@ -5,6 +5,7 @@
 > **Wayfinder parent:** winter6205/iknow-memory#1.
 > **Predecessor:** `specs/p0-integration.md`, `specs/p0-wiring-closure.md` (graph arm + RRF exist; this spec re-routes production retrieve).
 > **Assumption gate:** confirmed 2026-08-26 (A1–A14 below), plus operator addendum: **SQL 图臂归档清理写进本契约**.
+> **Partially superseded by `specs/retrieval-stack.md` (C-1, C-11):** the production shape of the lexical arm moved from a Postgres `tsvector` column to the Elasticsearch **precision layer** (CJK segmentation, Okapi BM25 with configurable k1 / b, phrase queries, field boosting) **(C-1)**; the out-of-scope entry "multi-granularity chunking" is upgraded to **chunking in any form**, because splitting belongs to fin in full **(C-11)**. Only the clauses marked **Superseded (C-1)** / **(C-11)** below change; the rest of this spec stands.
 
 ## Objective
 
@@ -22,7 +23,7 @@ Make production `retrieve` a **vector + BM25** hybrid (RRF), and **archive the P
 
 Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here:
 
-- **BM25** — Okapi BM25 lexical ranking (k1=1.2, b=0.75) over tokenized chunk text; query↔chunk lexical relevance. Production shape: Postgres `tsvector`+rank at ingest; MemoryBackend same-contract lightweight inverted index; default on, configurable off, fail-open to vector-only. (_Stage: decided #59; this spec implements._)
+- **BM25** — Okapi BM25 lexical ranking (k1 / b configurable) over tokenized chunk text; query↔chunk lexical relevance. **Superseded (C-1, `specs/retrieval-stack.md`):** production shape is the Elasticsearch **precision layer**, which also carries CJK segmentation, phrase queries, and field boosting; Postgres keeps no second lexical ranking implementation. Default on, configurable off, fail-open to vector-only. (_Stage: decided #59; production shape re-decided by `specs/retrieval-stack.md`._)
 - **hybrid retrieval** — multi-arm recall fused by RRF (k=60). Near-term production: vector + BM25 at 0.8 / 0.2. (_#59_)
 - **RRF fusion (k=60)** — rank-based fusion; this spec extends the arm set (not the algorithm).
 - **vector search** — cosine over chunk embeddings.
@@ -35,15 +36,15 @@ Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here:
 
 1. This PR delivers **`specs/bm25-retrieve.md` + `plans/bm25-retrieve.md`** (+ CONTEXT/map pointers as needed). Implementation lands in follow-up commits/PRs against the plan bullets — **except** the contract below is the buildable source of truth for both BM25 and SQL-arm cleanup.
 2. Stack unchanged: TS strict ESM · Node ≥20 · Vitest · existing `pg.Pool` / `StorageBackend`. **No** wink/minisearch runtime deps.
-3. Production BM25 = Postgres `tsvector` + `ts_rank` / `ts_rank_cd`. Okapi k1/b aligned when expressible; else document approximation in Success Criteria (not a fail).
-4. Text config: built-in Postgres config, prefer **`simple`** (no `english` stem lock-in). **No** Chinese segmenter extension in this spec.
-5. Index: `chunks` gains `content_tsv` (generated column or ingest-maintained) + GIN; maintained on ingest; existing rows backfilled via `ensureTable` / one-shot SQL. Retrieve does not full-scan to build the index.
+3. ~~Production BM25 = Postgres `tsvector` + `ts_rank` / `ts_rank_cd`; Okapi k1/b aligned when expressible.~~ **Superseded (C-1, `specs/retrieval-stack.md`):** Okapi BM25 with configurable k1 / b is provided natively by the Elasticsearch **precision layer**.
+4. ~~Text config: built-in Postgres config, prefer `simple`. No Chinese segmenter extension in this spec.~~ **Superseded (C-1, `specs/retrieval-stack.md`):** CJK segmentation is the precision layer's job, not a Postgres text-configuration choice; Postgres keeps no second lexical ranking implementation.
+5. ~~Index: `chunks` gains `content_tsv` + GIN, maintained on ingest.~~ **Superseded (C-1, `specs/retrieval-stack.md`):** the lexical index lives in the **precision layer** and is a **derived index** — deletable and re-builtable from the authoritative source (ADR-0003).
 6. Orchestrator: RRF / `ArmHit.arm` become **N-arm**-capable (`"vector" | "bm25"` required; `"graph"` type may remain for archived code / tests but **must not** drive default production retrieve).
 7. Defaults: `w_vec=0.8`, `w_bm25=0.2`; BM25 **enabled by default**; env-configurable off → vector-only. Changing defaults post-ship is Ask-first.
 8. BM25 fail-open → vector results; set `degraded=true` when BM25 was attempted and failed. Vector-only (BM25 disabled) must **not** set `degraded` solely for that reason.
 9. MemoryBackend: same-contract lightweight BM25 for tests; score distribution need not match Postgres.
 10. MCP wire: `retrieve` still primarily `{ chunks[] }`; no new tool; ingest public fields unchanged (storage may maintain tsv internally).
-11. Out of scope: Neo4j, reopening SQL fake-graph as a product arm, #15 eval, multi-granularity chunking, cross-encoder rerank, cosine re-score polish.
+11. Out of scope: Neo4j, reopening SQL fake-graph as a product arm, #15 eval, ~~multi-granularity chunking~~ **chunking in any form** (**Superseded (C-11, `specs/retrieval-stack.md` §B4):** splitting belongs to fin in full; this repo stores and recalls the pushed text verbatim and keeps no chunking path), cross-encoder rerank, cosine re-score polish.
 12. **SQL graph-arm cleanup is in scope** (operator addendum + #58): production path must stop running the SQL one-hop arm; minimal proven approach from #61 is stop passing `graphConfig` at server wiring (or equivalent explicit default-off). Ledger (`entities` / `triples` / …) **retained**.
 13. Tests: `npm test` green; RRF N-arm unit tests; MemoryBackend hybrid unit tests; ≥1 real Postgres integration test proving literal BM25 hit after ingest; no real LLM.
 14. Branch/PR targets #62 (and references #58); artifacts at `specs/bm25-retrieve.md`, `plans/bm25-retrieve.md`.
@@ -57,10 +58,10 @@ Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here:
      - Do **not** drop ledger tables; do **not** polish confidence ranking / candidateCap “fake graph” behavior.
      - Existing graph-arm unit tests may remain if they inject `graphConfig` explicitly; production default must be graph-off.
   2. **BM25 production arm** (#59/#62):
-     - Ingest-maintained lexical index; retrieve BM25 arm; RRF fuse with vector; defaults and fail-open as assumed.
+     - **Superseded (C-1, `specs/retrieval-stack.md`):** the lexical index is maintained in the **precision layer**, not as an ingest-maintained Postgres column; retrieve BM25 arm calls it; RRF fuse with vector; defaults and fail-open as assumed.
      - MemoryBackend parity for hybrid tests.
      - `RetrieveConfig` gains BM25 weight + enable switch; vector default weight becomes 0.8 when BM25 path is the production hybrid story (graph weights unused on default path).
-- **Confirms with human:** changing default weights after ship; adding Chinese text-search extensions; deleting `graph-arm.ts` entirely (Ask-first — default is archive-in-place, not hard delete).
+- **Confirms with human:** changing default weights after ship; ~~adding Chinese text-search extensions~~ — **decided (C-1, `specs/retrieval-stack.md`)**: CJK segmentation rides on the Elasticsearch precision layer, no Postgres extension; deleting `graph-arm.ts` entirely (Ask-first — default is archive-in-place, not hard delete).
 - **Out of this spec:** Neo4j projection/PPR; #15 eval; chunker multi-granularity; re-enabling SQL graph as product; new MCP tools; new npm BM25 libraries.
 
 ## Success Criteria
@@ -71,8 +72,8 @@ Binary; each maps to a command or measurable check.
 2. **Ledger preserved:** After cleanup, `entities` / `triples` / `entity_aliases` / `extraction_records` still exist and extraction CLI still writes them (`ensureTable` / schema-p0 unchanged in intent). No migration drops those tables.
 3. **Archive note present:** A short “SQL graph arm archived” note exists in-repo (runbook section or `docs/` pointer linked from map/CONTEXT) stating production retrieve no longer uses the SQL one-hop arm; Neo4j remains the future graph home.
 4. **RRF is N-arm:** `rrfFuse` accepts vector + BM25 (and may ignore unused graph). Unit tests cover: BM25-only contribution ranks into fusion; dual-arm soft-merge on shared chunk ids; `limit<=0` → `[]`.
-5. **Postgres BM25 path:** On real Postgres, ingest ≥1 chunk containing a distinctive token; retrieve with a query that is a poor semantic neighbor but shares that token returns that chunk among top results when BM25 is enabled (FakeEmbedder allowed). Exit 0; loud skip if Postgres unreachable (project convention).
-6. **Ingest maintains tsv:** After upsert, `content_tsv` (or equivalent) is non-null for new chunks; backfill leaves pre-existing rows searchable without manual DBA steps beyond starting the backend (`ensureTable` or documented auto-backfill).
+5. **Precision-layer BM25 path** (**Superseded C-1, `specs/retrieval-stack.md`** — was "Postgres BM25 path"): ingest ≥1 chunk containing a distinctive token; retrieve with a query that is a poor semantic neighbor but shares that token returns that chunk among top results when BM25 is enabled. Exit 0; loud skip when the precision layer is not configured at the config level (project convention).
+6. **Lexical index is derived** (**Superseded C-1, `specs/retrieval-stack.md`** — was "Ingest maintains tsv"): the lexical index is a **derived index**; deleting it and re-building from the authoritative source restores searchability without changing authoritative data (ADR-0003).
 7. **Default hybrid weights:** Fresh env (no override) yields `w_vec=0.8`, `w_bm25=0.2`, BM25 enabled. Asserted in config unit tests.
 8. **Disable BM25 → vector-only:** With BM25 disabled via config, envelope is exactly `{ chunks: [...] }` (no `degraded` solely from disable). Existing vector ranking behavior remains.
 9. **BM25 fail-open:** Injected BM25 failure yields vector chunks + `degraded: true`; call does not throw.
@@ -111,7 +112,7 @@ Binary; each maps to a command or measurable check.
 | Runtime  | Node ≥20                                      | `package.json#engines`   |
 | Tests    | Vitest; FakeEmbedder; real Postgres for one   | Existing                 |
 | Storage  | Postgres + pgvector; in-process MemoryBackend | Existing                 |
-| Lexical  | PG `tsvector` / in-memory inverted index      | #59; no new npm BM25 lib |
+| Lexical  | Elasticsearch **precision layer** (CJK segmentation, Okapi BM25 k1/b, phrase, field boost) | Superseded C-1, `specs/retrieval-stack.md` — was PG `tsvector`; no new npm BM25 lib |
 | Graph    | SQL arm archived off prod; Neo4j out of scope | #57/#58                  |
 
 ## Commands
@@ -158,6 +159,7 @@ OVERALL: PASS — hand to `writing-plans`.
 ## 待写入 (persist)
 
 - CONTEXT already updated for BM25/hybrid/RRF stage after #59; after implementation, refresh **graph arm** stage line to “archived off production retrieve (#58/#62)” if still saying it fires on production.
+- **Flushed 2026-08-31 (C-1, `specs/retrieval-stack.md`):** CONTEXT **BM25** production shape now reads “precision layer (Elasticsearch)”, plus new terms **precision layer** / **authoritative source** / **derived index**; ADR-0003 records the derived-index rule.
 - No new ADR required for this contract (reversible archive-in-place + tsvector choice recorded in #59 + this spec).
 
 ## Hand-off

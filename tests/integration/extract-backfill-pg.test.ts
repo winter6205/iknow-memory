@@ -39,6 +39,7 @@ import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
+import { warnPgUnavailable } from "./pg-test-harness.js";
 
 const DIM = 8;
 const ANN_MAX_DIMENSIONS = 2000;
@@ -186,15 +187,15 @@ try {
   await probe.end();
   PG_AVAILABLE = true;
 } catch (err) {
-  console.warn(
-    `\n[extract-backfill-pg] Postgres unreachable at ${BASE_DB_URL}: ${(err as Error).message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/extract-backfill-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/extract-backfill-pg.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${BASE_DB_URL}\n`
-  );
+  warnPgUnavailable({
+    label: "extract-backfill-pg",
+    testPath: "tests/integration/extract-backfill-pg.test.ts",
+    expectedCommand:
+      "npx vitest run tests/integration/extract-backfill-pg.test.ts",
+    connectionString: BASE_DB_URL,
+    error: err,
+    requiresVector: false,
+  });
 }
 const describePg = PG_AVAILABLE ? describe : describe.skip;
 

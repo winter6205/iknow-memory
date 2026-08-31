@@ -51,6 +51,10 @@ import {
 import { DEFAULT_MERGE_CONFIG } from "../../src/core/entities/types.js";
 import { resolveCanonicalId } from "../../src/core/entities/resolve.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
+import {
+  redactPgConnectionString,
+  warnPgUnavailable,
+} from "./pg-test-harness.js";
 
 /** Embedding width for the schema — mirrors schema-p0.test.ts. */
 const DIM = 1536;
@@ -74,15 +78,15 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
       // re-established inside bootstrapSchema on every schema reset.
       await client.query(`SET search_path TO "${SCHEMA}"`);
     } catch (err) {
-      console.warn(
-        `\n[extraction-pg] Postgres unreachable at ${DB_URL}: ${(err as Error).message}\n`
-      );
-      console.warn(
-        "Validation:\n" +
-          "- Not run: tests/integration/extraction-pg.test.ts\n" +
-          `- Expected command: npx vitest run tests/integration/extraction-pg.test.ts\n` +
-          `- Blocking issue: cannot connect to Postgres at ${DB_URL}\n`
-      );
+      warnPgUnavailable({
+        label: "extraction-pg",
+        testPath: "tests/integration/extraction-pg.test.ts",
+        expectedCommand:
+          "npx vitest run tests/integration/extraction-pg.test.ts",
+        connectionString: DB_URL,
+        error: err,
+        requiresVector: false,
+      });
       client = undefined;
       return;
     }
@@ -100,7 +104,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
   function requireClient(): pg.Client {
     if (!client) {
       throw new Error(
-        `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+        `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
       );
     }
     return client;

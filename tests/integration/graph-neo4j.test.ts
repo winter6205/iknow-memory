@@ -41,6 +41,7 @@ import {
 import { connectNeo4j } from "../../src/core/graph/neo4j-writer.js";
 import { NEO4J_URI_VAR, loadEnv, type Neo4jConfig } from "../../src/config.js";
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { redactDiagnostic } from "../../src/logging.js";
 
 const DIM = 8;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
@@ -92,13 +93,19 @@ try {
     READY = true;
   }
 } catch (err) {
+  const safeError = redactDiagnostic(err instanceof Error ? err.message : err);
   // SETTINGS is still undefined only if loadEnv() itself threw — the no-URI
   // case already skipped above without reaching here. Keep the two apart so a
   // ConfigError is not reported as an unreachable database.
   skipLoudly(
     SETTINGS === undefined
-      ? `the environment does not load: ${(err as Error).message}`
-      : `cannot reach Neo4j at ${SETTINGS.uri} or Postgres at ${BASE_DB_URL}: ${(err as Error).message}`
+      ? `the environment does not load: ${safeError}`
+      : "cannot reach Neo4j at " +
+          redactDiagnostic(SETTINGS.uri) +
+          " or Postgres at " +
+          redactDiagnostic(BASE_DB_URL) +
+          ": " +
+          safeError
   );
 }
 const describeGraph = READY ? describe : describe.skip;

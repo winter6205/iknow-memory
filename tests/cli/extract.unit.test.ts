@@ -8,7 +8,7 @@
  * The fake pool records every query so assertions can assert "zero INSERTs"
  * without any real Postgres or subprocess involvement.
  */
-import { afterAll, beforeAll, describe, it, expect } from "vitest";
+import { afterAll, beforeAll, describe, it, expect, vi } from "vitest";
 
 import {
   loadEntities,
@@ -91,6 +91,36 @@ describe("runCli — flag parsing", () => {
     const deps = makeDeps(client, llm);
     const code = await runCli(["--no-such-flag"], deps);
     expect(code).toBe(2);
+  });
+
+  it("does not emit a PostgreSQL password in a direct fatal stderr path", async () => {
+    const secret = "extract-postgres-secret";
+    const client = new FakeClient();
+    client.rowsOverride = () => {
+      throw new Error(
+        `driver failed for postgresql://ci-user:${secret}@db.example.test:5432/graph`
+      );
+    };
+    const output: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: unknown) => {
+        output.push(String(chunk));
+        return true;
+      });
+
+    try {
+      expect(
+        await runCli(
+          ["--dry-run"],
+          makeDeps(client, new FakeLLMClient({ queue: [] }))
+        )
+      ).toBe(1);
+    } finally {
+      stderr.mockRestore();
+    }
+
+    expect(output.join("")).not.toContain(secret);
   });
 
   it("--batch-size requires a positive integer; otherwise exit 2", async () => {

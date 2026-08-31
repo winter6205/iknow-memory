@@ -558,6 +558,34 @@ describe("graph-drain reports failure and stays retryable (SC4)", () => {
     expect(String(stderr.mock.calls[0]?.[0])).toContain("Validation:");
   });
 
+  it("does not persist or emit a BOLT password from a graph failure", async () => {
+    const secret = "graph-drain-bolt-secret";
+    const h = harness();
+    h.db.outbox.push(intent("entity", ALICE));
+    h.writer.mergeNodes = async () => {
+      throw new GraphUnavailableError(
+        `neo4j://neo4j-user:${secret}@db.example.test:7687`,
+        new Error("connection reset")
+      );
+    };
+    const output: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: unknown) => {
+        output.push(String(chunk));
+        return true;
+      });
+
+    try {
+      expect(await runCli([], h.deps)).toBe(3);
+    } finally {
+      stderr.mockRestore();
+    }
+
+    expect(h.db.find(ALICE).last_error).not.toContain(secret);
+    expect(output.join("")).not.toContain(secret);
+  });
+
   it("leaves the queue pending when Neo4j refuses the connection", async () => {
     const h = harness({
       connectGraph: async () => Promise.reject(unreachable()),

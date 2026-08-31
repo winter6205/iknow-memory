@@ -2,10 +2,14 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { describe } from "vitest";
 
+import {
+  redactPgConnectionString,
+  redactPgDiagnostic,
+} from "../../src/core/storage/pg-diagnostics.js";
+
+export { redactPgConnectionString, redactPgDiagnostic };
+
 const DEFAULT_CONNECTION_STRING = "postgresql://postgres@localhost/postgres";
-const POSTGRES_URL_PATTERN = /\bpostgres(?:ql)?:\/\/[^\s"'`<>]+/gi;
-const KEY_VALUE_SECRET_PATTERN =
-  /(\b(?:user|username|password|passwd|pwd)\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s]+)/gi;
 
 export interface PgIntegrationHarnessOptions {
   label: string;
@@ -35,62 +39,6 @@ export interface PgUnavailableWarningOptions {
   requiresVector: boolean;
 }
 
-function parseConnectionUrl(connectionString: string): URL | undefined {
-  if (!URL.canParse(connectionString)) return undefined;
-  return new URL(connectionString);
-}
-
-function decodeUrlComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch (error: unknown) {
-    if (error instanceof URIError) return value;
-    throw error;
-  }
-}
-
-export function redactPgConnectionString(connectionString: string): string {
-  const url = parseConnectionUrl(connectionString);
-  if (!url) return "postgresql://[redacted]";
-
-  const host = url.hostname || "unknown-host";
-  const database =
-    decodeUrlComponent(url.pathname.replace(/^\/+/, "").split("/")[0] ?? "") ||
-    "unknown-database";
-  return `postgresql://${host}/${encodeURIComponent(database)}`;
-}
-
-function connectionSecrets(connectionString: string): string[] {
-  const url = parseConnectionUrl(connectionString);
-  if (!url) return [connectionString].filter(Boolean);
-
-  return [connectionString, url.username, url.password]
-    .flatMap((value) => [value, decodeUrlComponent(value)])
-    .filter(
-      (value, index, values) =>
-        value.length > 0 && values.indexOf(value) === index
-    );
-}
-
-export function redactPgDiagnostic(
-  error: unknown,
-  connectionString: string
-): string {
-  let diagnostic = error instanceof Error ? error.message : String(error);
-  const redactedConnectionString = redactPgConnectionString(connectionString);
-
-  for (const secret of connectionSecrets(connectionString)) {
-    diagnostic = diagnostic.split(secret).join(redactedConnectionString);
-  }
-
-  diagnostic = diagnostic.replace(POSTGRES_URL_PATTERN, (candidate) => {
-    const trailing = candidate.match(/[.,;:!?)}\]]+$/)?.[0] ?? "";
-    const url = trailing ? candidate.slice(0, -trailing.length) : candidate;
-    return `${redactPgConnectionString(url)}${trailing}`;
-  });
-  return diagnostic.replace(KEY_VALUE_SECRET_PATTERN, "$1[redacted]");
-}
-
 export function warnPgUnavailable(options: PgUnavailableWarningOptions): void {
   const {
     label,
@@ -101,7 +49,10 @@ export function warnPgUnavailable(options: PgUnavailableWarningOptions): void {
     requiresVector,
   } = options;
   const safeConnectionString = redactPgConnectionString(connectionString);
-  const safeError = redactPgDiagnostic(error, connectionString);
+  const safeError = redactPgDiagnostic(
+    error instanceof Error ? error.message : error,
+    connectionString
+  );
   const dependency = requiresVector ? "Postgres/pgvector" : "Postgres";
   const blockingIssue = requiresVector
     ? "cannot use Postgres with pgvector"
@@ -127,12 +78,13 @@ async function probePostgres(
   connectionString: string,
   requiresVector: boolean
 ): Promise<ProbeResult> {
-  const probe = new pg.Client({ connectionString });
+  let probe: pg.Client | undefined;
   let connected = false;
   let available = false;
   let error: unknown;
 
   try {
+    probe = new pg.Client({ connectionString });
     await probe.connect();
     connected = true;
     await probe.query("SELECT 1");
@@ -154,7 +106,7 @@ async function probePostgres(
   } catch (caught: unknown) {
     error = caught;
   } finally {
-    if (connected) {
+    if (connected && probe !== undefined) {
       try {
         await probe.end();
       } catch (endError: unknown) {

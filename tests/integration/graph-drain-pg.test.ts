@@ -123,7 +123,7 @@ describePg("graph-drain-pg: outbox lifecycle against real Postgres", () => {
         content text NOT NULL,
         embedding vector(${DIM}) NOT NULL
       )`);
-    await upSchemaP0(client, DIM);
+    await upSchemaP0(client, DIM, 2000);
     await seedLedger();
   });
 

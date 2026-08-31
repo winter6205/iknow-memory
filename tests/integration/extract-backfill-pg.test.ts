@@ -41,9 +41,12 @@ import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
 
 const DIM = 8;
+const ANN_MAX_DIMENSIONS = 2000;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
 const SCHEMA = `extract_backfill_${randomUUID().slice(0, 8)}`;
 const CLI_PATH = join(process.cwd(), "dist/cli/extract.js");
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
 /** Per-connection search_path targeting SCHEMA via the libpq `options=` string. */
 function schemaDbUrl(): string {
@@ -68,6 +71,7 @@ function runCliSubprocess(args: string[]): Promise<ProcResult> {
       env: {
         GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: String(ANN_MAX_DIMENSIONS),
         GRAPHRAG_MEMORY_LOG_LEVEL: "info",
         PATH: process.env.PATH ?? "",
         // Present-but-blank beats `.env.local` (same seam as host-smoke).
@@ -198,6 +202,7 @@ describePg("extract-backfill-pg: --backfill-embeddings (T6 / SC5)", () => {
   let client: pg.Client | undefined;
 
   beforeAll(async () => {
+    process.env[ANN_MAX_DIMENSIONS_VAR] = String(ANN_MAX_DIMENSIONS);
     client = new pg.Client({ connectionString: BASE_DB_URL });
     await client.connect();
     // pgvector lives in `public` so the per-test schema's vector(N) columns
@@ -207,9 +212,15 @@ describePg("extract-backfill-pg: --backfill-embeddings (T6 / SC5)", () => {
   });
 
   afterAll(async () => {
-    if (!client) return;
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.end();
+    if (client) {
+      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await client.end();
+    }
+    if (savedAnnMaxDimensions === undefined) {
+      delete process.env[ANN_MAX_DIMENSIONS_VAR];
+    } else {
+      process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+    }
   });
 
   async function resetSchema(c: pg.Client): Promise<void> {
@@ -224,7 +235,7 @@ describePg("extract-backfill-pg: --backfill-embeddings (T6 / SC5)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, ANN_MAX_DIMENSIONS);
   }
 
   async function seedEntity(c: pg.Client, entity: SeedEntity): Promise<void> {

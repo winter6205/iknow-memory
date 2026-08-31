@@ -15,7 +15,7 @@ Ship the next retrieve stop after BM25: **Postgres → Neo4j read-only projectio
 **Success looks like:**
 
 - With Neo4j configured and projection populated, default retrieve fuses **vector + BM25 + Neo4j graph**.
-- Without Neo4j URI / when the arm fails: vector+BM25 still return; configured-but-failed attempts set `degraded=true`.
+- Without Neo4j URI / when the arm fails: vector+BM25 still return, and both cases set `degraded=true` — **Superseded (C-6, `specs/retrieval-stack.md` §B3 rule 1)**: a missing URI leaves a default-on capability unattempted, which now degrades; the graph arm is named in `degraded_reasons`.
 - Postgres remains the only SoR for entities/triples; Neo4j never accepts product writes outside the projection path.
 - `npm test` green on paths that do not require a live Neo4j; ≥1 loud-skip integration path proves projection and/or PPR when Neo4j is reachable.
 
@@ -41,7 +41,7 @@ Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here. S
 7. Retrieve path: embed once → entity **seeds** (reuse archived SQL arm’s linking _idea_; implementation may share helpers without re-enabling SQL JOIN fusion) → Neo4j GDS **PPR** → map ranked entities to chunks via Postgres `source_chunk_id` → RRF third arm. **No LangGraph.**
 8. Defaults: `w_vec=0.7`, `w_bm25=0.15`, `w_graph=0.15`; Neo4j graph arm **enabled by default** when Neo4j is configured; Ask-first to change defaults post-ship.
 9. Failure / absence:
-   - Neo4j **URI/config absent** → do **not** attempt the arm; envelope stays non-degraded for that reason alone (cannot attempt ≠ failed attempt).
+   - Neo4j **URI/config absent** → do **not** attempt the arm. ~~Envelope stays non-degraded for that reason alone.~~ **Superseded (C-6, `specs/retrieval-stack.md` §B3 rule 1):** the arm is on by default, so a missing URI means it could not be attempted → set `degraded=true` and name graph multi-hop in `degraded_reasons`. Other arms still return.
    - Neo4j **configured** but call/projection errors → **fail-open**; set `degraded=true`; vector+BM25 still returned.
 10. Content without entities/triples: graph arm contributes nothing; vector+BM25 remain the path (hybrid, not graph-only).
 11. `triples.confidence` may project onto edges; **must not** become the primary graph ranking algorithm (#57).
@@ -53,7 +53,7 @@ Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here. S
 
 - **Does:**
   1. Outbox (or equivalent schema) + extract-path emit; idempotent Neo4j MERGE projection; full backfill/reconcile CLI; projector drain path.
-  2. Production retrieve third arm: seed → PPR → chunks → RRF with defaults above; `graphEnabled`-class switch; fail-open / skip-without-degraded rules above.
+  2. Production retrieve third arm: seed → PPR → chunks → RRF with defaults above; `graphEnabled`-class switch; fail-open on configured failure, and `degraded` on a missing URI per the superseded rule above (C-6, `specs/retrieval-stack.md` §B3).
   3. Config + CONTEXT stage refresh for hybrid weights and Neo4j arm morphology.
 - **Confirms with human:** changing default weights after ship; hard-deleting archived SQL `graph-arm.ts`; requiring Neo4j in CI as non-skippable; choosing a specific GDS PPR hyperparameter set as the forever default.
 - **Out of this spec:** map-level Out of scope SQL fake-graph productization; #15; node embedding; Louvain; causal edges; mode bundle; read-your-writes; MCP dual-write to Neo4j; LangGraph orchestration.
@@ -68,7 +68,7 @@ Binary; each maps to a command or measurable check.
 4. **Projector drain:** Pending outbox intents can be applied to Neo4j and marked done/failed observably (status column or equivalent); failed rows are visible for retry.
 5. **PPR arm returns chunks:** With a seeded Neo4j graph and Postgres `source_chunk_id` links, retrieve with graph enabled includes graph-arm contribution into RRF (observable via debug/arm hits or ranking change vs graph-disabled). Loud-skip without Neo4j.
 6. **Default weights:** Fresh env yields `w_vec=0.7`, `w_bm25=0.15`, `w_graph=0.15` (and graph enable default on). Config unit tests.
-7. **Skip without URI:** No Neo4j URI → retrieve does not throw; no `degraded` solely for missing URI; vector+BM25 still run when enabled.
+7. **Unattempted without URI** (**Superseded C-6, `specs/retrieval-stack.md` §B3 rule 1** — was "no `degraded` solely for missing URI"): No Neo4j URI → retrieve does not throw, `degraded: true` with graph multi-hop named in `degraded_reasons`; vector+BM25 still run when enabled.
 8. **Fail-open:** Injected Neo4j/PPR failure with URI configured → chunks from other arms + `degraded: true`; call does not throw.
 9. **Disable graph → dual-arm:** Graph disabled via config → vector+BM25 only; no `degraded` solely from disable.
 10. **RRF still N-arm:** Graph arm participates as a weighted arm; k=60 unchanged; unit tests cover three-arm soft-merge on shared chunk ids.
@@ -154,6 +154,7 @@ OVERALL: PASS — hand to `writing-plans`.
 ## 待写入 (persist)
 
 - ~~CONTEXT hybrid / RetrieveConfig / retrieve / Neo4j sidecar / PPR; add Neo4j graph arm + projection outbox.~~ Flushed 2026-08-26 with this docs PR.
+- **Flushed 2026-08-31 (C-6, `specs/retrieval-stack.md` §B3):** CONTEXT **degraded=true** now carries the four set rules, and **Neo4j graph arm** no longer says "missing URI skips without `degraded`".
 - No new ADR required (outbox already ADR-0001); weights Ask-first reversible.
 
 ## Hand-off

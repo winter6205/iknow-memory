@@ -12,7 +12,15 @@ import type {
   SearchOptions,
   StorageBackend,
 } from "../types.js";
-import type { LexicalStorageBackend } from "./backend.js";
+import {
+  appendContentInvalidation,
+  CONTENT_INVALIDATIONS_METADATA_KEY,
+  normalizeContentInvalidationRequest,
+  readContentInvalidations,
+  type ContentInvalidationRecord,
+  type ContentInvalidationStorage,
+  type LexicalStorageBackend,
+} from "./backend.js";
 import { cosineSimilarity } from "../cosine.js";
 import { GraphragError } from "../errors.js";
 
@@ -61,7 +69,9 @@ interface LexicalDoc {
  * overwrite semantics for "last write wins" on re-ingestion of the same
  * chunk id, and O(1) clear() on close().
  */
-export class MemoryBackend implements StorageBackend, LexicalStorageBackend {
+export class MemoryBackend
+  implements StorageBackend, LexicalStorageBackend, ContentInvalidationStorage
+{
   private readonly store = new Map<string, ChunkRecord>();
 
   /**
@@ -101,11 +111,72 @@ export class MemoryBackend implements StorageBackend, LexicalStorageBackend {
     const ids: string[] = [];
     for (const chunk of chunks) {
       // Last-write-wins: a re-ingestion of the same id replaces the old record.
-      this.store.set(chunk.id, chunk);
-      this.reindex(chunk);
+      const stored = preserveInvalidationState(this.store.get(chunk.id), chunk);
+      this.store.set(chunk.id, stored);
+      this.reindex(stored);
       ids.push(chunk.id);
     }
     return ids;
+  }
+
+  async invalidateSourceRef(
+    sourceRef: string,
+    invalidatedAt: string,
+    triggeredBy: string
+  ): Promise<ContentInvalidationRecord[]> {
+    const request = normalizeContentInvalidationRequest(
+      sourceRef,
+      invalidatedAt,
+      triggeredBy
+    );
+    const matching = [...this.store.values()].filter(
+      (chunk) => chunk.source_ref === request.sourceRef
+    );
+    if (matching.length === 0) {
+      throw new GraphragError(
+        `content invalidation: unknown source_ref "${request.sourceRef}"`,
+        "INVALID_INPUT"
+      );
+    }
+
+    const records: ContentInvalidationRecord[] = [];
+    for (const chunk of matching) {
+      const record: ContentInvalidationRecord = {
+        chunk_id: chunk.id,
+        invalidated_at: request.invalidatedAt,
+        triggered_by: request.triggeredBy,
+      };
+      const metadata = appendContentInvalidation(chunk.metadata, record);
+      this.store.set(chunk.id, {
+        ...chunk,
+        metadata,
+        valid_until: closeValidityWindow(
+          chunk.valid_until,
+          request.invalidatedAt
+        ),
+      });
+      records.push(record);
+    }
+    return sortInvalidationRecords(records);
+  }
+
+  async listInvalidations(
+    sourceRef?: string
+  ): Promise<ContentInvalidationRecord[]> {
+    if (sourceRef !== undefined && sourceRef.trim() === "") {
+      throw new GraphragError(
+        "content invalidation: source_ref must be a non-empty string",
+        "INVALID_INPUT"
+      );
+    }
+    const records: ContentInvalidationRecord[] = [];
+    for (const chunk of this.store.values()) {
+      if (sourceRef !== undefined && chunk.source_ref !== sourceRef) {
+        continue;
+      }
+      records.push(...readContentInvalidations(chunk.metadata));
+    }
+    return sortInvalidationRecords(records);
   }
 
   /**
@@ -354,6 +425,53 @@ export class MemoryBackend implements StorageBackend, LexicalStorageBackend {
 function compareIngestOrder(a: ChunkRecord, b: ChunkRecord): number {
   const createdAt = Date.parse(a.created_at) - Date.parse(b.created_at);
   return createdAt !== 0 ? createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+function preserveInvalidationState(
+  previous: ChunkRecord | undefined,
+  incoming: ChunkRecord
+): ChunkRecord {
+  if (previous === undefined) return incoming;
+  const records = readContentInvalidations(previous.metadata);
+  if (records.length === 0) return incoming;
+  return {
+    ...incoming,
+    valid_until: earlierValidityEnd(previous.valid_until, incoming.valid_until),
+    metadata: {
+      ...incoming.metadata,
+      [CONTENT_INVALIDATIONS_METADATA_KEY]: records,
+    },
+  };
+}
+
+function earlierValidityEnd(
+  current: string | null,
+  incoming: string | null
+): string | null {
+  if (current === null) return incoming;
+  if (incoming === null) return current;
+  return Date.parse(current) <= Date.parse(incoming) ? current : incoming;
+}
+
+function closeValidityWindow(
+  current: string | null,
+  invalidatedAt: string
+): string {
+  if (current === null || Date.parse(invalidatedAt) < Date.parse(current)) {
+    return invalidatedAt;
+  }
+  return current;
+}
+
+function sortInvalidationRecords(
+  records: ContentInvalidationRecord[]
+): ContentInvalidationRecord[] {
+  return records.sort(
+    (a, b) =>
+      a.chunk_id.localeCompare(b.chunk_id) ||
+      a.invalidated_at.localeCompare(b.invalidated_at) ||
+      a.triggered_by.localeCompare(b.triggered_by)
+  );
 }
 
 /** Project a stored chunk into the retrieve shape with a given score. */

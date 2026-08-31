@@ -1,7 +1,8 @@
 /**
  * Pure Reciprocal Rank Fusion (RRF).
  *
- * Formula: score = w_arm / (k + rank) per (Cormack et al., 2009), k=60.
+ * Formula: score = w_arm / (k + rank) per (Cormack et al., 2009), with
+ * k=60 as the default.
  * When the same chunk.id surfaces in more than one arm the scores sum —
  * cross-arm agreement is signal, so the double-count is intentional.
  *
@@ -28,6 +29,11 @@ import type {
  * there would let the two drift apart.
  */
 export const RRF_K = 60;
+
+/** Resolve the configured denominator while keeping legacy callers at k=60. */
+export function resolveRrfK(cfg: Pick<RetrieveConfig, "rrfK">): number {
+  return cfg.rrfK ?? RRF_K;
+}
 
 /** Per-arm weight lookup. Exhaustive over ArmName by construction. */
 const ARM_WEIGHT: Record<ArmName, (cfg: RetrieveConfig) => number> = {
@@ -57,9 +63,14 @@ function armRank(arm: ArmName | undefined): number {
   return i === -1 ? ARM_ORDER.length : i;
 }
 
-function addHit(acc: Map<string, FusedHit>, hit: ArmHit, weight: number): void {
+function addHit(
+  acc: Map<string, FusedHit>,
+  hit: ArmHit,
+  weight: number,
+  k: number
+): void {
   if (hit.rank < 1) return;
-  const score = weight / (RRF_K + hit.rank);
+  const score = weight / (k + hit.rank);
   const previous = acc.get(hit.id);
   if (previous) {
     previous.rrfScore += score;
@@ -95,13 +106,14 @@ export function rrfFuse(
 ): FusedHit[] {
   if (limit <= 0) return [];
   const acc = new Map<string, FusedHit>();
+  const k = resolveRrfK(cfg);
   // Iterate in ARM_ORDER, not caller order, so `arms[0].arms[0]` — the
   // tie-break key — does not depend on how the orchestrator happened to
   // assemble the array.
   const ordered = [...arms].sort((x, y) => armRank(x.arm) - armRank(y.arm));
   for (const arm of ordered) {
     const weight = ARM_WEIGHT[arm.arm](cfg);
-    for (const hit of arm.hits) addHit(acc, hit, weight);
+    for (const hit of arm.hits) addHit(acc, hit, weight, k);
   }
   return [...acc.values()].sort(compareFusedHits).slice(0, limit);
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PoolClient } from "pg";
+import { ConfigError } from "../../src/config.js";
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
 
 function recordingClient(): { client: PoolClient; queries: string[] } {
@@ -14,10 +15,12 @@ function recordingClient(): { client: PoolClient; queries: string[] } {
 }
 
 describe("upSchemaP0 community summary index", () => {
-  it("does not create an unsupported HNSW index for 2048 dimensions", async () => {
+  it("rejects dimensions above the configured ANN limit instead of skipping HNSW", async () => {
     const { client, queries } = recordingClient();
 
-    await upSchemaP0(client, 2048);
+    await expect(upSchemaP0(client, 2048, 2000)).rejects.toBeInstanceOf(
+      ConfigError
+    );
 
     expect(
       queries.some((query) => /community_summaries_embedding_idx/.test(query))
@@ -27,7 +30,7 @@ describe("upSchemaP0 community summary index", () => {
   it("keeps the HNSW index for dimensions supported by pgvector", async () => {
     const { client, queries } = recordingClient();
 
-    await upSchemaP0(client, 1536);
+    await upSchemaP0(client, 1536, 2000);
 
     expect(
       queries.some((query) => /community_summaries_embedding_idx/.test(query))

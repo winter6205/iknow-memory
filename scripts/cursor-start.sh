@@ -49,14 +49,15 @@ test -f "$REPO_ROOT/dist/index.js"
 # Dedicated secret — do NOT reuse ANTHROPIC_AUTH_TOKEN (MiniMax chat).
 # Official API: POST {base}/embeddings
 #   https://open.bigmodel.cn/api/paas/v4/embeddings
-#   model embedding-3, Bearer, dimensions 2048 (provider default).
+#   model embedding-3, Bearer, dimensions 1536 (within pgvector's 2000 limit).
 # NineRouterEmbedder appends /embeddings onto a base that already includes
 # the version segment (local 9router uses /v1; Zhipu official uses /v4).
 BASHRC_EMBED_MARKER="# cursor-start: iknow-memory Zhipu embedding-3"
 log "embed env defaults"
 export GRAPHRAG_MEMORY_EMBED_BASE_URL="${GRAPHRAG_MEMORY_EMBED_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}"
 export GRAPHRAG_MEMORY_EMBED_MODEL="${GRAPHRAG_MEMORY_EMBED_MODEL:-embedding-3}"
-export GRAPHRAG_MEMORY_EMBED_DIMENSIONS="${GRAPHRAG_MEMORY_EMBED_DIMENSIONS:-2048}"
+export GRAPHRAG_MEMORY_EMBED_DIMENSIONS="${GRAPHRAG_MEMORY_EMBED_DIMENSIONS:-1536}"
+export GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS="${GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS:-2000}"
 if [ -n "${GRAPHRAG_MEMORY_EMBED_API_KEY:-}" ]; then
   log "GRAPHRAG_MEMORY_EMBED_API_KEY=SET"
 else
@@ -68,7 +69,8 @@ if ! grep -qF "$BASHRC_EMBED_MARKER" "$HOME/.bashrc" 2>/dev/null; then
     printf '%s\n' "$BASHRC_EMBED_MARKER"
     printf '%s\n' 'export GRAPHRAG_MEMORY_EMBED_BASE_URL="${GRAPHRAG_MEMORY_EMBED_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}"'
     printf '%s\n' 'export GRAPHRAG_MEMORY_EMBED_MODEL="${GRAPHRAG_MEMORY_EMBED_MODEL:-embedding-3}"'
-    printf '%s\n' 'export GRAPHRAG_MEMORY_EMBED_DIMENSIONS="${GRAPHRAG_MEMORY_EMBED_DIMENSIONS:-2048}"'
+    printf '%s\n' 'export GRAPHRAG_MEMORY_EMBED_DIMENSIONS="${GRAPHRAG_MEMORY_EMBED_DIMENSIONS:-1536}"'
+    printf '%s\n' 'export GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS="${GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS:-2000}"'
   } >>"$HOME/.bashrc"
 fi
 

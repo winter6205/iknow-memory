@@ -33,16 +33,17 @@ import { echoTool } from "./tools/echo.js";
 import { ingestTool } from "./tools/ingest.js";
 import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
 import {
-  FakeEmbedder,
   NineRouterEmbedder,
+  UnavailableEmbedder,
   type EmbeddingClient,
 } from "./core/embedder.js";
+import { redactPgDiagnostic } from "./core/storage/pg-diagnostics.js";
 import { MemoryBackend } from "./core/storage/memory-backend.js";
 import {
   createNeo4jPprRanker,
   type PprRanker,
 } from "./core/graph/neo4j-ppr.js";
-import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
+import { createAnthropicChunkReranker } from "./core/rerank/anthropic-reranker.js";
 import type { StorageBackend } from "./core/types.js";
 
 const SERVER_NAME = "iknow-memory";
@@ -84,11 +85,12 @@ interface ServerDeps {
   retrieval: GraphragEnv["retrieval"];
   /**
    * Neo4j PPR ranker for the production graph arm, built only when a
-   * sidecar URI is configured. Undefined is the SC7 case and is passed on
-   * as an ABSENT key, not an empty one — see `buildRetrieveDeps`.
+   * sidecar URI is configured. Undefined is passed on as an ABSENT key,
+   * allowing retrieval to mark the default-on graph capability unattempted.
+   * See `buildRetrieveDeps`.
    */
   graphRanker?: PprRanker;
-  /** Dedicated HTTP retrieve rerank adapter, absent when its URL is unset. */
+  /** Anthropic retrieve rerank adapter, absent when its token is unset. */
   reranker?: {
     permute(
       query: string,
@@ -116,9 +118,8 @@ interface ServerDeps {
  * The Neo4j PPR arm (#70) is wired the opposite way round: it IS the
  * production third arm, so the ranker travels whenever one was built —
  * that is, whenever the operator configured a sidecar URI. No URI means no
- * key at all, which is how `assembleRetrievalResult` tells "no graph
- * engine here" (skip, stay non-degraded) from "the graph call failed"
- * (fail open, `degraded: true`).
+ * ranker, which lets `assembleRetrievalResult` report the default-on
+ * capability as unattempted (`degraded: true`).
  *
  * Exported so both halves are directly assertable without a live Postgres
  * (tests/index.test.ts); reintroducing `graphConfig` here, or dropping
@@ -148,9 +149,9 @@ export function buildRetrieveDeps(
  *
  * Embedder selection is key-presence-driven rather than an explicit mode
  * knob: an operator who supplies an embedding API key wants real embeddings,
- * and one who does not cannot get them anyway. FakeEmbedder is deterministic and
- * offline, which is what dev/test/CI need — but its vectors are meaningless
- * for cross-text semantics, so the choice is logged at construction.
+ * and one who does not cannot get them anyway. The production server uses an
+ * unavailable typed embedder in that case: ingest fails visibly and retrieve
+ * can skip the vector arm without manufacturing evidence.
  *
  * Storage selection: pgvector (T8) is dynamically imported so a memory-mode
  * user never pays for the `pg` dependency. The dynamic import is wrapped in
@@ -175,7 +176,11 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
         `GRAPHRAG_MEMORY_STORAGE=pgvector requires the optional "pg" dependency — \`npm install pg\` (${(err as Error).message})`
       );
     }
-    storage = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions);
+    const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions);
+    // Fail before the stdio transport opens: dimension and ANN-index
+    // bootstrap errors are server-startup failures, not tool responses.
+    await backend.initialize();
+    storage = backend;
   } else {
     storage = new MemoryBackend(env.embedDimensions);
   }
@@ -197,12 +202,10 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
       apiKey: env.embedApiKey,
       dimensions: env.embedDimensions,
     });
-  } else {
-    embedder = new FakeEmbedder(env.embedDimensions);
-  }
+  } else embedder = new UnavailableEmbedder();
 
-  // T7 wiring: thread the validated retrieval config into the server deps so
-  // createServer() can pass it as graphConfig to retrieveTool.
+  // Thread the validated retrieval config into the server deps so
+  // createServer() can pass it as retrieveConfig to retrieveTool.
   //
   // The ranker is constructed, not connected: `createNeo4jPprRanker` dials
   // Neo4j on the first ranking, so an unreachable sidecar degrades one
@@ -214,8 +217,8 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     ...(env.neo4j !== undefined
       ? { graphRanker: createNeo4jPprRanker(env.neo4j) }
       : {}),
-    ...(env.retrieval.rerankEnabled && env.rerankUrl !== undefined
-      ? { reranker: createHttpChunkReranker(env.rerankUrl) }
+    ...(env.retrieval.rerankEnabled && env.rerank !== undefined
+      ? { reranker: createAnthropicChunkReranker(env.rerank) }
       : {}),
   };
 }
@@ -248,7 +251,7 @@ export async function createServer(): Promise<McpServer> {
     tools: Array.from(registry.keys()),
     storage: env.storage,
     // Never log the key itself — only whether one was supplied.
-    embedder: env.embedApiKey ? "9router" : "fake",
+    embedder: env.embedApiKey ? "9router" : "unavailable",
   });
   return server;
 }
@@ -276,7 +279,9 @@ function registerOne(
         // (server/src/server/mcp.ts createToolError), but we keep the
         // try/catch to also surface stderr via the logger — hosts without
         // structured logging benefit from the observation.
-        const message = err instanceof Error ? err.message : String(err);
+        const message = redactPgDiagnostic(
+          err instanceof Error ? err.message : err
+        );
         logger.error("handler threw", { tool: tool.name, error: message });
         return textResult(message, true);
       }
@@ -296,7 +301,9 @@ export async function main(): Promise<void> {
   } catch (err) {
     if (err instanceof ConfigError) {
       // stderr only; stdout is reserved for the MCP transport.
-      process.stderr.write(`iknow-memory config error: ${err.message}\n`);
+      process.stderr.write(
+        `iknow-memory config error: ${redactPgDiagnostic(err.message)}\n`
+      );
       process.exit(EXIT_CODES.BAD_CONFIG);
     }
     throw err;
@@ -310,7 +317,9 @@ export async function main(): Promise<void> {
     server = await createServer();
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`iknow-memory config error: ${err.message}\n`);
+      process.stderr.write(
+        `iknow-memory config error: ${redactPgDiagnostic(err.message)}\n`
+      );
       process.exit(EXIT_CODES.BAD_CONFIG);
     }
     throw err;
@@ -333,9 +342,7 @@ const isMain = (() => {
 if (isMain) {
   main().catch((err) => {
     // stderr only; never write to stdout (reserved for MCP transport).
-    process.stderr.write(
-      `iknow-memory fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`
-    );
+    process.stderr.write(`iknow-memory fatal: ${redactPgDiagnostic(err)}\n`);
     process.exit(EXIT_CODES.FATAL_RUNTIME);
   });
 }

@@ -17,7 +17,10 @@
  */
 import type { PoolClient } from "pg";
 
+import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
+import { GraphragError } from "../errors.js";
 import { upSchemaProjection } from "./schema-projection.js";
+import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 
 /**
  * entities: canonical entity rows (+ soft-merge columns, #6 Q1-Q2).
@@ -138,8 +141,40 @@ async function createExtractionRecords(client: PoolClient): Promise<void> {
       ON extraction_records (created_at)`);
 }
 
-/** Index-time summaries keyed by the community id returned by GDS Louvain. */
-const MAX_PGVECTOR_ANN_DIMENSIONS = 2000;
+/**
+ * Validate the single vector width used by every ANN index in this schema.
+ * A dimension change is a full re-embed operation; accepting a width that
+ * pgvector cannot index would otherwise leave a mixed or partially indexed
+ * store.
+ */
+export function assertPgvectorAnnDimensions(
+  dimensions: number,
+  annMaxDimensions: number
+): void {
+  if (
+    !Number.isFinite(annMaxDimensions) ||
+    !Number.isInteger(annMaxDimensions) ||
+    annMaxDimensions <= 0
+  ) {
+    throw new ConfigError(
+      `GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS must be a finite positive integer, got "${annMaxDimensions}"`
+    );
+  }
+  if (
+    !Number.isFinite(dimensions) ||
+    !Number.isInteger(dimensions) ||
+    dimensions <= 0
+  ) {
+    throw new ConfigError(
+      `GRAPHRAG_MEMORY_EMBED_DIMENSIONS must be a finite positive integer, got "${dimensions}"`
+    );
+  }
+  if (dimensions > annMaxDimensions) {
+    throw new ConfigError(
+      `GRAPHRAG_MEMORY_EMBED_DIMENSIONS (${dimensions}) exceeds configured pgvector ANN limit (${annMaxDimensions})`
+    );
+  }
+}
 
 async function createCommunitySummaries(
   client: PoolClient,
@@ -155,11 +190,6 @@ async function createCommunitySummaries(
       created_at   timestamptz NOT NULL DEFAULT now(),
       updated_at   timestamptz NOT NULL DEFAULT now()
     )`);
-  // pgvector's ANN indexes cap vector dimensions at 2000. The table remains
-  // searchable by the exact cosine-distance query when the configured
-  // embedding width is larger, so do not make bootstrap fail for valid
-  // high-dimensional embeddings.
-  if (dimensions > MAX_PGVECTOR_ANN_DIMENSIONS) return;
   await client.query(`
     CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx
       ON community_summaries USING hnsw (embedding vector_cosine_ops)`);
@@ -179,10 +209,16 @@ async function createCommunitySummaries(
  */
 export async function upSchemaP0(
   client: PoolClient,
-  dimensions: number
+  dimensions: number,
+  annMaxDimensions = readPgvectorAnnMaxDimensions()
 ): Promise<void> {
+  assertPgvectorAnnDimensions(dimensions, annMaxDimensions);
   await client.query("BEGIN");
   try {
+    if (await acquireSchemaBootstrapLock(client)) {
+      await client.query("COMMIT");
+      return;
+    }
     await client.query("CREATE EXTENSION IF NOT EXISTS vector");
     await createEntities(client, dimensions);
     await createEntityAliases(client);
@@ -193,6 +229,13 @@ export async function upSchemaP0(
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");
-    throw err;
+    if (err instanceof ConfigError || err instanceof GraphragError) {
+      throw err;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    throw new GraphragError(
+      `P0 schema bootstrap failed: ${message}`,
+      "STORAGE_ERROR"
+    );
   }
 }

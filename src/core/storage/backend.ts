@@ -17,6 +17,7 @@ export type {
   CommunitySummaryStorage,
   ProjectionDrainWaiter,
 } from "../retrieval/types.js";
+import { GraphragError } from "../errors.js";
 import type {
   RetrievedChunk,
   SearchOptions,
@@ -149,5 +150,125 @@ export function supportsNeighborChunks(
   return (
     typeof (storage as Partial<NeighborChunkStorage>).chunksByChunkIds ===
     "function"
+  );
+}
+
+/**
+ * Content invalidation is stored inside the existing authoritative chunk row
+ * so the action needs no new table or column. The key is namespaced to avoid
+ * colliding with caller metadata.
+ */
+export const CONTENT_INVALIDATIONS_METADATA_KEY =
+  "__iknow_content_invalidations";
+
+export interface ContentInvalidationRecord {
+  chunk_id: string;
+  invalidated_at: string;
+  triggered_by: string;
+}
+
+export interface ContentInvalidationStorage extends StorageBackend {
+  /**
+   * Close every chunk for `sourceRef` and return this request's records.
+   * Repeating the same request returns the same record set.
+   */
+  invalidateSourceRef(
+    sourceRef: string,
+    invalidatedAt: string,
+    triggeredBy: string
+  ): Promise<ContentInvalidationRecord[]>;
+  listInvalidations(sourceRef?: string): Promise<ContentInvalidationRecord[]>;
+}
+
+export function supportsContentInvalidation(
+  storage: StorageBackend
+): storage is ContentInvalidationStorage {
+  const candidate = storage as Partial<ContentInvalidationStorage>;
+  return (
+    typeof candidate.invalidateSourceRef === "function" &&
+    typeof candidate.listInvalidations === "function"
+  );
+}
+
+/** Validate and canonicalize the shared invalidation request shape. */
+export function normalizeContentInvalidationRequest(
+  sourceRef: string,
+  invalidatedAt: string,
+  triggeredBy: string
+): {
+  sourceRef: string;
+  invalidatedAt: string;
+  triggeredBy: string;
+} {
+  if (sourceRef.trim() === "") {
+    throw new GraphragError(
+      "content invalidation: source_ref must be a non-empty string",
+      "INVALID_INPUT"
+    );
+  }
+  if (triggeredBy.trim() === "") {
+    throw new GraphragError(
+      "content invalidation: triggered_by must be a non-empty string",
+      "INVALID_INPUT"
+    );
+  }
+  const timestamp = Date.parse(invalidatedAt);
+  if (Number.isNaN(timestamp)) {
+    throw new GraphragError(
+      `content invalidation: invalid invalidated_at timestamp "${invalidatedAt}"`,
+      "INVALID_INPUT"
+    );
+  }
+  return {
+    sourceRef,
+    invalidatedAt: new Date(timestamp).toISOString(),
+    triggeredBy,
+  };
+}
+
+/** Read valid invalidation records from the reserved metadata key. */
+export function readContentInvalidations(
+  metadata: Record<string, unknown>
+): ContentInvalidationRecord[] {
+  const raw = metadata[CONTENT_INVALIDATIONS_METADATA_KEY];
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(isContentInvalidationRecord)
+    .map((record) => ({ ...record }));
+}
+
+/** Add one record without duplicating an identical invalidation request. */
+export function appendContentInvalidation(
+  metadata: Record<string, unknown>,
+  record: ContentInvalidationRecord
+): Record<string, unknown> {
+  const records = readContentInvalidations(metadata);
+  if (
+    !records.some(
+      (existing) =>
+        existing.chunk_id === record.chunk_id &&
+        existing.invalidated_at === record.invalidated_at &&
+        existing.triggered_by === record.triggered_by
+    )
+  ) {
+    records.push(record);
+  }
+  return {
+    ...metadata,
+    [CONTENT_INVALIDATIONS_METADATA_KEY]: records,
+  };
+}
+
+function isContentInvalidationRecord(
+  value: unknown
+): value is ContentInvalidationRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.chunk_id === "string" &&
+    typeof record.invalidated_at === "string" &&
+    typeof record.triggered_by === "string"
   );
 }

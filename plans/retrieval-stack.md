@@ -57,11 +57,11 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
 | T2  | ADR: chunking exits the retrieval service (no re-chunking)                           | `[decision]`       | T1                 | Yes      | Done    |
 | T3  | ADR: degraded signal and partial-failure semantics                                   | `[decision]`       | T1                 | Yes      | Done    |
 | T4  | Ingest stores pushed text as-is (no re-chunking)                                     | `[implementation]` | T2                 | —        | Done    |
-| T5  | Ingest idempotency on (`source_ref`, content identity)                               | `[implementation]` | T1, T4             | Yes      | Pending |
-| T6  | Content invalidation (close the validity window, never delete)                       | `[implementation]` | T1, T4             | Yes      | Pending |
+| T5  | Ingest idempotency on (`source_ref`, content identity)                               | `[implementation]` | T1, T4             | Yes      | Done    |
+| T6  | Content invalidation (close the validity window, never delete)                       | `[implementation]` | T1, T4             | Yes      | Done    |
 | T7  | Batch ingest + connection pool parameters                                            | `[implementation]` | T5                 | —        | Pending |
 | T8  | Degraded envelope with the four set rules                                            | `[implementation]` | T3                 | —        | Done    |
-| T9  | Partial-failure semantics, and invalid input vs legal empty                          | `[implementation]` | T8                 | —        | Pending |
+| T9  | Partial-failure semantics, and invalid input vs legal empty                          | `[implementation]` | T8                 | —        | Done    |
 | T10 | Graph multi-hop is on by default; a missing address degrades                         | `[implementation]` | T8                 | Yes      | Pending |
 | T11 | Rerank on by default; fail-open keeps the mark                                       | `[implementation]` | T8                 | Yes      | Pending |
 | T12 | No deterministic pseudo-vectors when credentials are missing                         | `[implementation]` | T8                 | Yes      | Pending |
@@ -111,7 +111,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
    - **Inherits:** spec SC-15; §B4 幂等键 — "=（source_ref，内容标识）二元组；内容标识 =（块文本 + 归一化规则版本 + 解析规则版本 + 参数表版本）的确定性哈希。同一幂等键重复推送不产生第二份写入，返回同一批块标识"; §B1 幂等基准 — the same batch pushed the number of times the baseline names: chunk total delta = 0 and the chunk id set is unchanged; a failed push is returned by name and is not counted against the idempotency assertion.
    - **Surface:** storage + tools (the `ingest` MCP tool); idempotency mechanism (lookup-then-insert vs unique constraint) is implementer headroom — a unique constraint touches `chunks` and follows the Ask-first rule from `specs/p0-schema.md`.
    - **Acceptance:** repeating the batch per the baseline produces a chunk row delta of 0 — not one row, not one per repetition — and every call returns the identical chunk id set; content identity follows the pushed text, so text that differs only by a version in the hash component is a different key; SC-46 empty-content push is a typed error with row delta 0 and is excluded from the idempotency count.
-   - Status: [ ] pending
+   - Status: [x] done
    - [parallel] with T6
    - [blocks: T1, T4]
 
@@ -119,7 +119,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
    - **Inherits:** spec SC-16; §B4 内容失效语义 — "关闭时间有效区间，使该内容不再被任何查询时刻命中；不物理删除；失效幂等、可重复执行，并留下可查询的失效记录"; fin owns the trigger obligation, this repo owns the action and the record; §B4 内容失效触发条件 defines when fin must invalidate.
    - **Surface:** storage + tools (invalidation action on the ingest-side surface — no new MCP tool)
    - **Acceptance:** after invalidating an ingested chunk, `retrieve` at any `valid_at` at or after the invalidation instant returns it 0 times; the row is still present (row count unchanged) and no longer appears in results; repeating the same invalidation request is idempotent; each invalidation leaves a queryable record carrying chunk id, invalidation instant, and triggering party; an unknown `source_ref` is a typed error, not a silent no-op; no physical-delete path is exposed.
-   - Status: [ ] pending
+   - Status: [x] done
    - [parallel] with T5
    - [blocks: T1, T4]
 
@@ -141,7 +141,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
    - **Inherits:** spec §B2 — one arm succeeding releases the response with a mark; all arms failing is a typed error; vector-arm failure with an empty graph is all-failed; §B2.5 — invalid input (empty query, empty content, empty batch) is a typed error and must **not** set `degraded`, while a legal query that matches nothing is a success with an empty list and must not set `degraded` or throw; SC-9, SC-37, SC-43, SC-48.
    - **Surface:** retrieval assembler + tools input validation
    - **Acceptance:** three constructions all hold — one arm failing while others succeed releases the response, sets `degraded`, names the failed item, and returns only the successful arms' hits; all arms failing returns a typed error that is neither an empty result nor an unmarked partial result; vector-arm failure with no graph hit is treated as all-failed. Empty / whitespace-only query returns a typed error, exits non-zero, returns no empty list and no partial result, does not set `degraded`, and increments an input-validation-failure counter that is > 0. A syntactically legal query with no match exits 0 with an empty list, sets `degraded` 0 times, and is counted 0 times by that same validation counter — and the two cases must differ within the same run.
-   - Status: [ ] pending
+   - Status: [x] done
    - [blocks: T8]
 
 10. **Graph multi-hop is on by default; a missing address degrades** — tag: `[implementation]`

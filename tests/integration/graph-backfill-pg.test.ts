@@ -124,7 +124,7 @@ describePg("graph-backfill-pg: ledger scans + reconcile idempotence", () => {
         content text NOT NULL,
         embedding vector(${DIM}) NOT NULL
       )`);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, 2000);
   }
 
   /** Two live entities with one edge, plus a retired entity with a dead edge. */

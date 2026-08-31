@@ -310,7 +310,7 @@ describe("retrieve graph-arm envelope (T5)", () => {
     expect(body).not.toHaveProperty("debug");
   });
 
-  it("debug gate on → debug key present with arm hit counts", async () => {
+  it("debug gate on → diagnostics stay out of the wire envelope", async () => {
     const backend = new FakeGraphBackend();
     backend.searchResults = [vecChunk("v1")];
     backend.seeds = [
@@ -325,11 +325,8 @@ describe("retrieve graph-arm envelope (T5)", () => {
       debug: true,
     });
     const body = parseBody(await handler({ query: "q" }));
-    expect(body.debug).toBeDefined();
-    const dbg = body.debug as Record<string, unknown>;
-    expect(dbg.vectorHits).toBe(1);
-    expect(dbg.graphHits).toBe(3);
-    expect(dbg.graphBelowFloor).toBe(false);
+    expect(Object.keys(body)).toEqual(["chunks"]);
+    expect(body).not.toHaveProperty("debug");
   });
 });
 
@@ -388,6 +385,7 @@ function withRetrievalEnv(
   const kevs = [
     ...RETRIEVAL_VARS,
     "GRAPHRAG_MEMORY_EMBED_DIMENSIONS" as string,
+    "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
   ];
   const saved = new Map<string, string | undefined>();
   for (const k of kevs) {
@@ -395,6 +393,7 @@ function withRetrievalEnv(
     delete process.env[k];
   }
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+  process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
@@ -424,8 +423,9 @@ describe("retrieve config boundary validation (T5)", () => {
         bm25Enabled: true,
         graphEnabled: true,
         nodeEmbeddingEnabled: false,
-        rerankEnabled: false,
+        rerankEnabled: true,
         preset: "balanced",
+        rrfK: 60,
         // Seed / traversal knobs keep their P0 values.
         entityLinkTopK: 8,
         candidateCap: 50,

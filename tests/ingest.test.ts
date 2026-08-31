@@ -4,6 +4,7 @@ import {
   createIngestHandler,
   ingestTool,
 } from "../src/tools/ingest.js";
+import { createRetrieveHandler } from "../src/tools/retrieve.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../src/core/errors.js";
 import { FakeEmbedder } from "../src/core/embedder.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
@@ -25,6 +26,13 @@ function makeDeps(): IngestDeps & {
   const embedder = new FakeEmbedder(TEST_DIM);
   const storage = new MemoryBackend(TEST_DIM);
   return { embedder, storage };
+}
+
+function expectByteIdentical(actual: string, expected: string): void {
+  const actualBytes = Buffer.from(actual, "utf8");
+  const expectedBytes = Buffer.from(expected, "utf8");
+  expect(actualBytes).toHaveLength(expectedBytes.length);
+  expect(actualBytes).toEqual(expectedBytes);
 }
 
 describe("IngestInputSchema", () => {
@@ -121,8 +129,8 @@ describe("ingestHandler — normal write", () => {
     expect(parsed.chunk_ids).toHaveLength(1);
   });
 
-  it("returns multiple chunk_ids when content exceeds the default chunk size", async () => {
-    // 5000 chars > DEFAULT_CHUNK_SIZE (2048) → at least 3 chunks
+  it("returns exactly one chunk_id for content exceeding the old chunk size", async () => {
+    // 5000 chars used to produce multiple chunks; pushed text is now final.
     const long = "x".repeat(5000);
     const result = await handler({
       content: long,
@@ -131,7 +139,38 @@ describe("ingestHandler — normal write", () => {
     const parsed = JSON.parse(result.content[0]!.text) as {
       chunk_ids: string[];
     };
-    expect(parsed.chunk_ids.length).toBeGreaterThan(1);
+    expect(parsed.chunk_ids).toHaveLength(1);
+
+    const queryVec = await deps.embedder.embed([long]);
+    const hits = await (deps.storage as MemoryBackend).search(queryVec[0]!, {
+      limit: 10,
+      validAt: "2099-01-01T00:00:00Z",
+    });
+    expect(hits).toHaveLength(1);
+    expectByteIdentical(hits[0]!.content, long);
+  });
+
+  it("retrieves CJK text with whitespace and newlines byte-for-byte", async () => {
+    const content = "  你好，世界！\r\n\t第二行\n\n结尾  ";
+    const result = await handler({
+      content,
+      source_ref: "docs/cjk.md",
+    });
+    const parsed = JSON.parse(result.content[0]!.text) as {
+      chunk_ids: string[];
+    };
+    expect(parsed.chunk_ids).toHaveLength(1);
+
+    const retrieve = createRetrieveHandler({
+      embedder: deps.embedder,
+      storage: deps.storage,
+    });
+    const retrieved = await retrieve({ query: content, limit: 10 });
+    const body = JSON.parse(retrieved.content[0]!.text) as {
+      chunks: Array<{ content: string }>;
+    };
+    expect(body.chunks).toHaveLength(1);
+    expectByteIdentical(body.chunks[0]!.content, content);
   });
 
   it("returns chunk_ids that are unique strings (UUIDs)", async () => {
@@ -252,6 +291,26 @@ describe("ingestHandler — validation errors", () => {
         source_ref: "docs/x.md",
       })
     ).rejects.toMatchObject({ code: "CONTENT_TOO_LARGE" });
+  });
+
+  it("throws typed INVALID_INPUT for empty content without persisting a chunk", async () => {
+    const error = await handler({
+      content: "",
+      source_ref: "docs/empty.md",
+    }).then(
+      () => undefined,
+      (caught: unknown) => caught
+    );
+
+    expect(error).toBeInstanceOf(GraphragError);
+    expect(error).toMatchObject({ code: "INVALID_INPUT" });
+
+    const queryVec = await deps.embedder.embed(["empty content probe"]);
+    const hits = await (deps.storage as MemoryBackend).search(queryVec[0]!, {
+      limit: 10,
+      validAt: "2099-01-01T00:00:00Z",
+    });
+    expect(hits).toHaveLength(0);
   });
 
   it("accepts content at exactly MAX_CONTENT_BYTES (boundary)", async () => {

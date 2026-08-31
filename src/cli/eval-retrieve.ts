@@ -17,10 +17,10 @@
  *
  * Three contracts worth naming:
  *
- *   - **No Neo4j URI is not a failure.** The graph arm is simply not
- *     among the arms that ran; the baseline records `armSet` as
- *     `vector+bm25` and the process exits 0 (SC5). Nothing here treats a
- *     skipped arm as a degraded run.
+ *   - **The offline evaluator disables unavailable production adapters.**
+ *     The seeded MemoryBackend has no Neo4j sidecar or rerank token, so this
+ *     CLI explicitly switches those capabilities off. The baseline records
+ *     `armSet` as `vector+bm25` and the process exits 0 (SC5).
  *   - **A failed query fails the run.** If the assembler throws, the run
  *     stops with a typed error naming the query. Recording an empty
  *     top-5 instead would publish a lower P@5 that looks exactly like a
@@ -47,8 +47,9 @@
  *
  * Env: the same block every entry point in this package reads, via
  * `loadEnv()` — `GRAPHRAG_MEMORY_EMBED_DIMENSIONS` is required, and an
- * embedding API key is optional (absent → the deterministic FakeEmbedder,
- * which is what makes a second run byte-stable).
+ * embedding API key is optional. The offline evaluator deliberately keeps
+ * its deterministic FakeEmbedder exception so a second run is byte-stable;
+ * the production server never wires that exception into retrieve.
  */
 import { ConfigError, loadEnv } from "../config.js";
 import { createLogger, type Logger } from "../logging.js";
@@ -112,10 +113,9 @@ export interface EvalDeps {
   retrieveConfig: RetrieveConfig;
   /**
    * Graph ranker for the Neo4j arm — the arm that LEADS the ranking when
-   * it returns anything, rather than voting at `w_graph`. Absent on the
-   * default path: the seeded corpus is chunks-only, so there is no ledger
-   * for a graph arm to seed from, and "no graph arm ran" is recorded in
-   * `armSet` rather than treated as a degradation (SC5).
+   * it returns anything, rather than voting at `w_graph`. The offline
+   * default disables this production adapter; callers testing graph-priority
+   * explicitly enable it in `retrieveConfig`.
    */
   graphRanker?: GraphRanker;
   logger: Logger;
@@ -357,10 +357,9 @@ function reconcileArmSet(
  * Wire real deps from env and run; used by main().
  *
  * No Neo4j ranker is constructed. The eval searches the corpus this CLI
- * just seeded into a chunk-only backend, which exposes no entity seam for
- * a graph arm to start from — building a ranker that could never be
- * consulted would put a Neo4j connection in an offline scorer for no
- * behaviour, and SC11 asks the opposite.
+ * just seeded into a chunk-only backend, and explicitly disables the
+ * production graph and rerank adapters so missing offline integrations do
+ * not become part of the frozen SC-29 baseline.
  */
 export async function runCliFromEnv(argv: string[]): Promise<number> {
   let embedder: EmbeddingClient;
@@ -370,7 +369,15 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
   try {
     const env = loadEnv();
     logger = createLogger(env.logLevel);
-    retrieveConfig = env.retrieval;
+    // SC-29 freezes this CLI as a local, chunk-only evaluator. Its seeded
+    // MemoryBackend has no Neo4j or rerank adapter, so switch those
+    // default-on production capabilities off explicitly rather than
+    // publishing a degraded baseline.
+    retrieveConfig = {
+      ...env.retrieval,
+      graphEnabled: false,
+      rerankEnabled: false,
+    };
     storage = new MemoryBackend(env.embedDimensions);
     embedder = buildEmbedder(env);
   } catch (err) {
@@ -388,9 +395,9 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
 }
 
 /**
- * FakeEmbedder unless the operator configured a real endpoint. The fake
- * is the byte-stable path SC6 names; a real embedder still works and
- * simply produces a different (still reproducible) baseline.
+ * FakeEmbedder unless the operator configured a real endpoint. This
+ * exception is scoped to the offline evaluator; the production server
+ * wires UnavailableEmbedder when credentials are absent.
  */
 function buildEmbedder(env: ReturnType<typeof loadEnv>): EmbeddingClient {
   if (

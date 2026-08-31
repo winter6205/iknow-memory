@@ -12,11 +12,24 @@
  * row and the ledger rows commit or vanish together lives in
  * tests/integration/extract-outbox-pg.test.ts.
  */
-import { describe, it, expect } from "vitest";
+import { afterAll, beforeAll, describe, it, expect } from "vitest";
 
 import { runCli, type CliClient, type CliDeps } from "../../src/cli/extract.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
+
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
+
+beforeAll(() => {
+  process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
+});
+
+afterAll(() => {
+  if (savedAnnMaxDimensions === undefined)
+    delete process.env[ANN_MAX_DIMENSIONS_VAR];
+  else process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+});
 
 const CHUNK_ID = "00000000-0000-4000-8000-000000000000";
 

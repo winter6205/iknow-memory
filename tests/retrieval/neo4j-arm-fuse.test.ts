@@ -369,8 +369,8 @@ describe("assembleRetrievalResult — graph-priority ranking (SC1–SC3)", () =>
   });
 });
 
-describe("assembleRetrievalResult — no sidecar configured (SC7)", () => {
-  it("does not attempt the arm and emits no degraded key", async () => {
+describe("assembleRetrievalResult — no sidecar configured (T10)", () => {
+  it("does not attempt the arm but marks the default-on capability unattempted", async () => {
     const { storage } = seededGraph();
 
     const out = await assembleRetrievalResult(
@@ -380,7 +380,8 @@ describe("assembleRetrievalResult — no sidecar configured (SC7)", () => {
       { embedder, storage, retrieveConfig: CFG, debug: true }
     );
 
-    expect(Object.hasOwn(out, "degraded")).toBe(false);
+    expect(out.degraded).toBe(true);
+    expect(out.degraded_reasons).toContain("graph_ppr:unattempted");
     // Not attempted: the seed query never ran, and the debug payload has
     // no graph key at all — "the arm found nothing" would be `graphHits: 0`.
     expect(storage.seedCalls).toBe(0);
@@ -388,7 +389,7 @@ describe("assembleRetrievalResult — no sidecar configured (SC7)", () => {
     expect(out.chunks.map((c) => c.id)).toEqual(["v1", "v2"]);
   });
 
-  it("does not attempt the arm when the backend has no neo4jArmSeed seam", async () => {
+  it("marks the default-on capability when the backend has no neo4jArmSeed seam", async () => {
     const { ranker } = seededGraph();
     const chunkOnly = {
       upsert: async () => [],
@@ -407,7 +408,8 @@ describe("assembleRetrievalResult — no sidecar configured (SC7)", () => {
       }
     );
 
-    expect(Object.hasOwn(out, "degraded")).toBe(false);
+    expect(out.degraded).toBe(true);
+    expect(out.degraded_reasons).toContain("graph_ppr:unattempted");
     expect(ranker.calls).toBe(0);
   });
 });

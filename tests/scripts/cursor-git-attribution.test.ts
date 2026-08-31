@@ -23,16 +23,53 @@ const SCRIPT = join(
   "../../scripts/cursor-git-attribution.sh"
 );
 
-function isolatedGitEnv(home: string): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
+const LOCAL_GIT_ENV_VARS = execFileSync(
+  "git",
+  ["rev-parse", "--local-env-vars"],
+  {
+    encoding: "utf8",
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+  }
+)
+  .trim()
+  .split(/\s+/)
+  .filter(Boolean);
+
+function isolatedGitEnv(
+  home: string,
+  inheritedEnv: NodeJS.ProcessEnv = process.env
+): NodeJS.ProcessEnv {
+  const env = {
+    ...inheritedEnv,
     HOME: home,
     GIT_CONFIG_GLOBAL: join(home, "gitconfig"),
     GIT_CONFIG_NOSYSTEM: "1",
   };
+
+  for (const variable of LOCAL_GIT_ENV_VARS) {
+    delete env[variable];
+  }
+
+  return env;
 }
 
 describe("cursor-git-attribution.sh apply — worktree .husky", () => {
+  it("strips all Git repository variables from inherited environments", () => {
+    const pollutedEnv = { ...process.env };
+    for (const variable of LOCAL_GIT_ENV_VARS) {
+      pollutedEnv[variable] = `polluted-${variable}`;
+    }
+
+    const env = isolatedGitEnv("/tmp/isolated-git-home", pollutedEnv);
+    for (const variable of LOCAL_GIT_ENV_VARS) {
+      assert.equal(
+        env[variable],
+        undefined,
+        `${variable} must not leak into fixture Git commands`
+      );
+    }
+  });
+
   it("writes strip commit-msg hooks, not *.cursor.* files", () => {
     const tmp = mkdtempSync(join(tmpdir(), "iknow-memory-git-attr-"));
     try {

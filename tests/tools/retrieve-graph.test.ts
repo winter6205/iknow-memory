@@ -426,6 +426,7 @@ describe("retrieve config boundary validation (T5)", () => {
         nodeEmbeddingEnabled: false,
         rerankEnabled: false,
         preset: "balanced",
+        rrfK: 60,
         // Seed / traversal knobs keep their P0 values.
         entityLinkTopK: 8,
         candidateCap: 50,

@@ -14,7 +14,7 @@
  * to the same name (#58) and must keep voting at `w_graph` rather than
  * inheriting a lead it was never granted.
  */
-import { rrfFuse, RRF_K } from "./rrf.js";
+import { resolveRrfK, rrfFuse } from "./rrf.js";
 import type { ArmHit, ArmResult, FusedHit, RetrieveConfig } from "./types.js";
 
 /**
@@ -34,7 +34,8 @@ export function assembleGraphPriority(
   const lead = (graph?.hits ?? []).slice(0, limit);
   if (lead.length === 0) return rrfFuse(remainder, cfg, limit);
   const fill = fillRemainingSlots(remainder, cfg, limit, lead);
-  return [...lead.map((hit, i) => toLeadHit(hit, i, fill)), ...fill];
+  const k = resolveRrfK(cfg);
+  return [...lead.map((hit, i) => toLeadHit(hit, i, fill, k)), ...fill];
 }
 
 /**
@@ -71,7 +72,8 @@ function fillRemainingSlots(
 function toLeadHit(
   hit: ArmHit,
   i: number,
-  fill: readonly FusedHit[]
+  fill: readonly FusedHit[],
+  k: number
 ): FusedHit {
   const top = fill[0]?.rrfScore ?? 0;
   return {
@@ -79,7 +81,7 @@ function toLeadHit(
     content: hit.content,
     source_ref: hit.source_ref,
     valid_window: hit.valid_window,
-    rrfScore: top + 1 / (RRF_K + i + 1),
+    rrfScore: top + 1 / (k + i + 1),
     arms: [hit.arm],
   };
 }

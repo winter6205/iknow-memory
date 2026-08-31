@@ -32,6 +32,8 @@ import { NEO4J_URI_VAR } from "../../src/config.js";
 const DIM = 32;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
 const SCHEMA = `extract_outbox_${randomUUID().slice(0, 8)}`;
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
 function schemaDbUrl(): string {
   return `${BASE_DB_URL}?options=-c%20search_path%3D${SCHEMA}%2Cpublic`;
@@ -83,6 +85,7 @@ describePg("extract-outbox-pg: outbox emit rides the chunk transaction", () => {
   let client: pg.Client | undefined;
 
   beforeAll(async () => {
+    process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     client = new pg.Client({ connectionString: BASE_DB_URL });
     await client.connect();
     await client.query("CREATE EXTENSION IF NOT EXISTS vector");
@@ -90,9 +93,15 @@ describePg("extract-outbox-pg: outbox emit rides the chunk transaction", () => {
   });
 
   afterAll(async () => {
-    if (!client) return;
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.end();
+    if (client) {
+      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await client.end();
+    }
+    if (savedAnnMaxDimensions === undefined) {
+      delete process.env[ANN_MAX_DIMENSIONS_VAR];
+    } else {
+      process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+    }
   });
 
   async function resetSchema(c: pg.Client): Promise<void> {
@@ -107,7 +116,7 @@ describePg("extract-outbox-pg: outbox emit rides the chunk transaction", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, 2000);
   }
 
   async function seedChunk(c: pg.Client, content: string): Promise<string> {

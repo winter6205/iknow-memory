@@ -78,8 +78,6 @@ const EMBED_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_EMBED_DIMENSIONS";
 /** Env-var name for the pgvector ANN dimension ceiling. */
 export const PGVECTOR_ANN_MAX_DIMENSIONS_VAR =
   "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
-/** pgvector's HNSW / IVFFlat dimension ceiling for the supported extension. */
-export const DEFAULT_PGVECTOR_ANN_MAX_DIMENSIONS = 2000;
 /** Environment variable for the maximum number of items in one ingest call. */
 export const INGEST_BATCH_LIMIT_VAR = "GRAPHRAG_MEMORY_INGEST_BATCH_LIMIT";
 /** A bounded default keeps embedding requests and writes reasonably sized. */
@@ -277,18 +275,18 @@ function parseEmbedDimensions(raw: string | undefined): number {
 
 /**
  * Load the pgvector ANN width ceiling from configuration. The extension's
- * current ceiling is an explicit default, while a present blank or malformed
- * override is rejected before schema bootstrap can silently skip an index.
+ * current ceiling must be declared explicitly; a missing, blank, or malformed
+ * value is rejected before schema bootstrap can silently skip an index.
  */
 export function readPgvectorAnnMaxDimensions(): number {
   const raw = readRawEnv(PGVECTOR_ANN_MAX_DIMENSIONS_VAR);
-  const value =
-    raw === undefined ? String(DEFAULT_PGVECTOR_ANN_MAX_DIMENSIONS) : raw;
-  const n = Number(value);
-  if (
-    raw !== undefined &&
-    (raw.trim() === "" || !Number.isFinite(n) || !Number.isInteger(n) || n <= 0)
-  ) {
+  if (raw === undefined || raw.trim() === "") {
+    throw new ConfigError(
+      `${PGVECTOR_ANN_MAX_DIMENSIONS_VAR} is required (finite positive integer)`
+    );
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) {
     throw new ConfigError(
       `${PGVECTOR_ANN_MAX_DIMENSIONS_VAR} must be a finite positive integer, got "${raw}"`
     );
@@ -674,6 +672,11 @@ export function loadEnv(): GraphragEnv {
   // operator into the real-embedder path.
   const embedDimensions = parseEmbedDimensions(readEnv(EMBED_DIMENSIONS_VAR));
   const pgvectorAnnMaxDimensions = readPgvectorAnnMaxDimensions();
+  if (embedDimensions > pgvectorAnnMaxDimensions) {
+    throw new ConfigError(
+      `${EMBED_DIMENSIONS_VAR} (${embedDimensions}) exceeds configured pgvector ANN limit (${pgvectorAnnMaxDimensions})`
+    );
+  }
   const ingestBatchLimit = readIngestBatchLimit();
   const pgvectorPool = readPgvectorPoolConfig();
   const embedApiKey = resolveEmbedApiKey();

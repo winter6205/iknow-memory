@@ -39,6 +39,8 @@ const DIM = 8;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
 const SCHEMA = `extract_list_failed_${randomUUID().slice(0, 8)}`;
 const CLI_PATH = join(process.cwd(), "dist/cli/extract.js");
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
 const BATCH_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const BATCH_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -69,6 +71,7 @@ function runCliSubprocess(
       env: {
         GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         // The report lines ride the structured logger, same as --list-unmapped.
         GRAPHRAG_MEMORY_LOG_LEVEL: "info",
         ...envOverrides,
@@ -120,15 +123,22 @@ describePg("extract CLI --list-failed (T5 / SC11)", () => {
   let client: pg.Client | undefined;
 
   beforeAll(async () => {
+    process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     client = new pg.Client({ connectionString: BASE_DB_URL });
     await client.connect();
     await resetSchema(client);
   });
 
   afterAll(async () => {
-    if (!client) return;
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.end();
+    if (client) {
+      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await client.end();
+    }
+    if (savedAnnMaxDimensions === undefined) {
+      delete process.env[ANN_MAX_DIMENSIONS_VAR];
+    } else {
+      process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+    }
   });
 
   async function resetSchema(c: pg.Client): Promise<void> {
@@ -143,7 +153,7 @@ describePg("extract CLI --list-failed (T5 / SC11)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, 2000);
   }
 
   async function insertChunk(c: pg.Client, content: string): Promise<string> {

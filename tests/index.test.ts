@@ -25,6 +25,7 @@ const ENV_KEYS = [
   "GRAPHRAG_MEMORY_STORAGE",
   "GRAPHRAG_MEMORY_DB_URL",
   "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
+  "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
   "GRAPHRAG_MEMORY_EMBED_BASE_URL",
   "GRAPHRAG_MEMORY_EMBED_MODEL",
   "GRAPHRAG_MEMORY_EMBED_API_KEY",
@@ -44,6 +45,7 @@ async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
   }
   // Dimensions is always required by the memory backend.
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+  process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
   try {
     return await createServer();
   } finally {

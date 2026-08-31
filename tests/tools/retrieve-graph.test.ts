@@ -385,6 +385,7 @@ function withRetrievalEnv(
   const kevs = [
     ...RETRIEVAL_VARS,
     "GRAPHRAG_MEMORY_EMBED_DIMENSIONS" as string,
+    "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
   ];
   const saved = new Map<string, string | undefined>();
   for (const k of kevs) {
@@ -392,6 +393,7 @@ function withRetrievalEnv(
     delete process.env[k];
   }
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+  process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;

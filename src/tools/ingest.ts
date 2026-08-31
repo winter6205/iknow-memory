@@ -14,24 +14,86 @@ import {
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
+import {
+  normalizeContentInvalidationRequest,
+  supportsContentInvalidation,
+  type ContentInvalidationRecord,
+} from "../core/storage/backend.js";
 
 /**
  * Zod schema for the ingest input. Mirrors `IngestInput` in core/types.ts
  * but with validation rules attached.
  *
- * - `content` and `source_ref`: non-empty strings.
+ * - Normal ingest: `content` and `source_ref` are non-empty strings.
+ * - Invalidation action: `action: "invalidate"` plus `source_ref` and
+ *   `triggered_by`; it closes all chunks for that source without a new tool.
  * - `metadata`: optional string-keyed map of unknown values.
  * - `valid_from` / `valid_until`: optional ISO 8601 datetimes. The semantic
  *   check (valid_from < valid_until) lives in the handler, not the schema,
  *   because it depends on cross-field comparison.
  */
-export const IngestInputSchema = z.object({
-  content: z.string().min(1, "content must be a non-empty string"),
-  source_ref: z.string().min(1, "source_ref must be a non-empty string"),
-  metadata: z.record(z.string(), z.unknown()).optional(),
-  valid_from: z.string().datetime().optional(),
-  valid_until: z.string().datetime().optional(),
-});
+export const IngestInputSchema = z
+  .object({
+    action: z.enum(["ingest", "invalidate"]).optional(),
+    content: z.string().min(1, "content must be a non-empty string").optional(),
+    source_ref: z.string().min(1, "source_ref must be a non-empty string"),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    valid_from: z.string().datetime().optional(),
+    valid_until: z.string().datetime().optional(),
+    invalidated_at: z.string().datetime().optional(),
+    triggered_by: z.string().min(1).optional(),
+  })
+  .superRefine((input, ctx) => {
+    const action = input.action ?? "ingest";
+    if (action === "ingest" && input.content === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["content"],
+        message: "content is required for ingest",
+      });
+    }
+    if (action === "invalidate") {
+      if (input.content !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["content"],
+          message: "content is not allowed for invalidation",
+        });
+      }
+      if (input.triggered_by === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["triggered_by"],
+          message: "triggered_by is required for invalidation",
+        });
+      }
+      if (
+        input.metadata !== undefined ||
+        input.valid_from !== undefined ||
+        input.valid_until !== undefined
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["action"],
+          message: "invalidation cannot carry ingest fields",
+        });
+      }
+    }
+    if (action === "ingest" && input.invalidated_at !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["invalidated_at"],
+        message: "invalidated_at requires action invalidate",
+      });
+    }
+    if (action === "ingest" && input.triggered_by !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["triggered_by"],
+        message: "triggered_by requires action invalidate",
+      });
+    }
+  });
 
 /** Inferred TypeScript type for the parsed ingest input. */
 export type IngestInput = z.infer<typeof IngestInputSchema>;
@@ -119,7 +181,11 @@ export interface IngestDeps {
  */
 export function createIngestHandler(deps: IngestDeps) {
   return async function ingestHandler(input: IngestInput): Promise<ToolResult> {
-    if (input.content.length === 0) {
+    if (input.action === "invalidate") {
+      return handleInvalidation(deps, input);
+    }
+    const content = input.content;
+    if (content === undefined || content.length === 0) {
       throw new GraphragError(
         "ingest: content must be a non-empty string",
         "INVALID_INPUT"
@@ -129,7 +195,7 @@ export function createIngestHandler(deps: IngestDeps) {
     // 1. Size check: reject payloads above MAX_CONTENT_BYTES before doing
     //    any work. Buffer.byteLength gives UTF-8 byte count, not char count
     //    — which is what the cap actually limits.
-    const byteLength = Buffer.byteLength(input.content, "utf8");
+    const byteLength = Buffer.byteLength(content, "utf8");
     if (byteLength > MAX_CONTENT_BYTES) {
       throw new GraphragError(
         `ingest: content size ${byteLength} bytes exceeds limit ${MAX_CONTENT_BYTES} (1MB)`,
@@ -164,7 +230,7 @@ export function createIngestHandler(deps: IngestDeps) {
     // 3. Embed the pushed text as-is. The embedder is contractually
     //    responsible for throwing GraphragError(EMBEDDING_FAILED |
     //    EMBEDDING_DIM_MISMATCH) on failure.
-    const embeddings = await deps.embedder.embed([input.content]);
+    const embeddings = await deps.embedder.embed([content]);
 
     // 4. Build one ChunkRecord with ingest-time metadata.
     //    `valid_from` defaults to now (UTC ISO 8601) when not provided.
@@ -178,14 +244,11 @@ export function createIngestHandler(deps: IngestDeps) {
       ...DEFAULT_CONTENT_IDENTITY_VERSIONS,
       ...deps.identityVersions,
     };
-    const contentIdentity = computeContentIdentity(
-      input.content,
-      identityVersions
-    );
+    const contentIdentity = computeContentIdentity(content, identityVersions);
     const records: ChunkRecord[] = [
       {
         id: computeChunkId(input.source_ref, contentIdentity),
-        content: input.content,
+        content,
         embedding: embeddings[0]!,
         source_ref: input.source_ref,
         metadata: input.metadata ?? {},
@@ -204,6 +267,35 @@ export function createIngestHandler(deps: IngestDeps) {
     //    shape matches the host's text-content convention.
     return textResult(JSON.stringify({ chunk_ids: ids }));
   };
+}
+
+async function handleInvalidation(
+  deps: IngestDeps,
+  input: IngestInput
+): Promise<ToolResult> {
+  if (!supportsContentInvalidation(deps.storage)) {
+    throw new GraphragError(
+      "ingest: selected storage backend does not support content invalidation",
+      "STORAGE_ERROR"
+    );
+  }
+  const request = normalizeContentInvalidationRequest(
+    input.source_ref,
+    input.invalidated_at ?? new Date().toISOString(),
+    input.triggered_by ?? ""
+  );
+  const records: ContentInvalidationRecord[] =
+    await deps.storage.invalidateSourceRef(
+      request.sourceRef,
+      request.invalidatedAt,
+      request.triggeredBy
+    );
+  return textResult(
+    JSON.stringify({
+      invalidated_chunk_ids: records.map((record) => record.chunk_id),
+      invalidations: records,
+    })
+  );
 }
 
 /**

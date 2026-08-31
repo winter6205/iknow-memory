@@ -56,11 +56,11 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
 | T1  | Cross-repo baseline drift gate                                                       | `[implementation]` | —                  | —        | Done    |
 | T2  | ADR: chunking exits the retrieval service (no re-chunking)                           | `[decision]`       | T1                 | Yes      | Done    |
 | T3  | ADR: degraded signal and partial-failure semantics                                   | `[decision]`       | T1                 | Yes      | Done    |
-| T4  | Ingest stores pushed text as-is (no re-chunking)                                     | `[implementation]` | T2                 | —        | Pending |
+| T4  | Ingest stores pushed text as-is (no re-chunking)                                     | `[implementation]` | T2                 | —        | Done    |
 | T5  | Ingest idempotency on (`source_ref`, content identity)                               | `[implementation]` | T1, T4             | Yes      | Pending |
 | T6  | Content invalidation (close the validity window, never delete)                       | `[implementation]` | T1, T4             | Yes      | Pending |
 | T7  | Batch ingest + connection pool parameters                                            | `[implementation]` | T5                 | —        | Pending |
-| T8  | Degraded envelope with the four set rules                                            | `[implementation]` | T3                 | —        | Pending |
+| T8  | Degraded envelope with the four set rules                                            | `[implementation]` | T3                 | —        | Done    |
 | T9  | Partial-failure semantics, and invalid input vs legal empty                          | `[implementation]` | T8                 | —        | Pending |
 | T10 | Graph multi-hop is on by default; a missing address degrades                         | `[implementation]` | T8                 | Yes      | Pending |
 | T11 | Rerank on by default; fail-open keeps the mark                                       | `[implementation]` | T8                 | Yes      | Pending |
@@ -104,7 +104,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
    - **Inherits:** spec SC-14; §B4 不二次切分 (quoted in T2); C-11. Chunking is fin's; the ingest path stops carrying a chunking step and no dual path is kept.
    - **Surface:** storage + tools (the `ingest` MCP tool) + the chunking module this retires
    - **Acceptance:** ingesting one content produces exactly one chunk whose text is byte-identical to the input (length and content both asserted); a long single content produces no second chunk, is not truncated, and is not normalized or rewritten; `retrieve` returns that chunk's text byte-identical; `tools/list` is unchanged.
-   - Status: [ ] pending
+   - Status: [x] done
    - [blocks: T2]
 
 5. **Ingest idempotency on (`source_ref`, content identity)** — tag: `[implementation]`
@@ -134,7 +134,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
    - **Inherits:** spec §B3 — shape is an optional `degraded` boolean plus `degraded_reasons` (a bounded enum list, each entry naming the capability and whether it was unattempted or attempted-and-failed); default-absent means not degraded; the four set rules from T3's ADR; invalid caller input must not set it; SC-9 keeps the success payload's top level to `chunks` plus those two optional keys and nothing else.
    - **Surface:** retrieval envelope + config (capability registry) — one place that decides the flag, not a per-arm copy
    - **Acceptance:** each of the four rules is demonstrated by a test — unattemptable default-on capability sets; attempted-and-failed sets; attempted-with-no-hits does not set; caller-switched-off does not set; every set names the capability in `degraded_reasons`; a success response carries no top-level key beyond `chunks` and the two optional ones; absent `degraded` reads as false and absent `degraded_reasons` reads as empty.
-   - Status: [ ] pending
+   - Status: [x] done
    - [blocks: T3]
 
 9. **Partial-failure semantics, and invalid input vs legal empty** — tag: `[implementation]`

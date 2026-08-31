@@ -1,48 +1,32 @@
-import { randomUUID } from "node:crypto";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { createIngestHandler } from "../../src/tools/ingest.js";
+import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 32;
-const DB_URL =
-  process.env.GRAPHRAG_MEMORY_DB_URL ??
-  "postgresql://postgres@localhost/postgres";
-const SCHEMA = `content_invalidation_${randomUUID().replace(/-/g, "")}`;
-const SCHEMA_URL =
-  DB_URL +
-  (DB_URL.includes("?") ? "&" : "?") +
-  `options=${encodeURIComponent(`-c search_path=${SCHEMA},public`)}`;
+const pgHarness = await createPgIntegrationHarness({
+  label: "content-invalidation-pg",
+  testPath: "tests/integration/content-invalidation-pg.test.ts",
+  expectedCommand:
+    "npx vitest run tests/integration/content-invalidation-pg.test.ts",
+  schemaPrefix: "content_invalidation",
+  defaultConnectionString: "postgresql://postgres@localhost/postgres",
+  requiresVector: false,
+});
+const {
+  schema: SCHEMA,
+  schemaConnectionString: SCHEMA_URL,
+  describePg,
+} = pgHarness;
 
 const CONTENT = "content that is closed by invalidation";
 const SOURCE_REF = "t6/live-invalidation";
 const BEFORE_INVALIDATION = "2026-08-31T11:59:59.999Z";
 const INVALIDATED_AT = "2026-08-31T12:00:00.000Z";
 const AFTER_INVALIDATION = "2026-08-31T12:00:00.001Z";
-
-let PG_AVAILABLE = false;
-try {
-  const probe = new pg.Client({ connectionString: DB_URL });
-  await probe.connect();
-  await probe.query("SELECT 1");
-  await probe.end();
-  PG_AVAILABLE = true;
-} catch (err) {
-  const message = err instanceof Error ? err.message : String(err);
-  console.warn(
-    `\n[content-invalidation-pg] Postgres unavailable at ${DB_URL}: ${message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/content-invalidation-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/content-invalidation-pg.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${DB_URL}\n`
-  );
-}
-
-const describePg = PG_AVAILABLE ? describe : describe.skip;
 
 function textOf(result: { content: unknown }): string {
   return (result.content as Array<{ type: string; text?: string }>)
@@ -56,17 +40,16 @@ describePg("T6 content invalidation: live PostgreSQL", () => {
   let backend: PgvectorBackend | undefined;
 
   beforeAll(async () => {
-    client = new pg.Client({ connectionString: SCHEMA_URL });
+    client = pgHarness.createClient(SCHEMA_URL);
     await client.connect();
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.query(`CREATE SCHEMA "${SCHEMA}"`);
-    backend = new PgvectorBackend(SCHEMA_URL, DIM);
+    await pgHarness.resetSchema(client);
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
   });
 
   afterAll(async () => {
     if (backend) await backend.close();
     if (client) {
-      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await pgHarness.dropSchema(client);
       await client.end();
     }
   });

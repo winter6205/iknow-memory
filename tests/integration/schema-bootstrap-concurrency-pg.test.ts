@@ -5,17 +5,28 @@
  * Before the bootstrap lock exists, concurrent catalog DDL can deadlock.
  * Postgres is probed up front so an unavailable local service skips loudly.
  */
-import { randomUUID } from "node:crypto";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 8;
-const BASE_DB_URL =
-  process.env.GRAPHRAG_MEMORY_DB_URL ??
-  "postgresql://postgres@localhost/postgres";
-const SCHEMA = `schema_bootstrap_${randomUUID().replace(/-/g, "")}`;
+const pgHarness = await createPgIntegrationHarness({
+  label: "schema-bootstrap-concurrency",
+  testPath: "tests/integration/schema-bootstrap-concurrency-pg.test.ts",
+  expectedCommand:
+    "npx vitest run tests/integration/schema-bootstrap-concurrency-pg.test.ts",
+  schemaPrefix: "schema_bootstrap",
+  defaultConnectionString: "postgresql://postgres@localhost/postgres",
+  requiresVector: false,
+});
+const {
+  connectionString: BASE_DB_URL,
+  schema: SCHEMA,
+  schemaConnectionString: SCHEMA_URL,
+  describePg,
+} = pgHarness;
 const BOOTSTRAP_TABLES = [
   "entities",
   "entity_aliases",
@@ -25,41 +36,13 @@ const BOOTSTRAP_TABLES = [
   "projection_outbox",
 ] as const;
 
-function schemaDbUrl(): string {
-  const options = encodeURIComponent(`-c search_path=${SCHEMA},public`);
-  return `${BASE_DB_URL}${BASE_DB_URL.includes("?") ? "&" : "?"}options=${options}`;
-}
-
-let PG_AVAILABLE = false;
-try {
-  const probe = new pg.Client({ connectionString: BASE_DB_URL });
-  await probe.connect();
-  await probe.query("SELECT 1");
-  await probe.end();
-  PG_AVAILABLE = true;
-} catch (err) {
-  const message = err instanceof Error ? err.message : String(err);
-  console.warn(
-    `\n[schema-bootstrap-concurrency] Postgres unavailable at ${BASE_DB_URL}: ${message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/schema-bootstrap-concurrency-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/schema-bootstrap-concurrency-pg.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${BASE_DB_URL}\n`
-  );
-}
-
-const describePg = PG_AVAILABLE ? describe : describe.skip;
-
 describePg("P0 schema bootstrap concurrency", () => {
   let admin: pg.Client | undefined;
 
   beforeAll(async () => {
-    admin = new pg.Client({ connectionString: BASE_DB_URL });
+    admin = pgHarness.createClient(BASE_DB_URL);
     await admin.connect();
-    await admin.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await admin.query(`CREATE SCHEMA "${SCHEMA}"`);
+    await pgHarness.resetSchema(admin);
     await admin.query(`
       CREATE TABLE "${SCHEMA}".chunks (
         id uuid PRIMARY KEY,
@@ -70,13 +53,13 @@ describePg("P0 schema bootstrap concurrency", () => {
 
   afterAll(async () => {
     if (!admin) return;
-    await admin.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+    await pgHarness.dropSchema(admin);
     await admin.end();
   });
 
   it("completes eight concurrent bootstraps against one fresh schema", async () => {
     const pool = new pg.Pool({
-      connectionString: schemaDbUrl(),
+      connectionString: SCHEMA_URL,
       max: 8,
     });
 
@@ -85,7 +68,7 @@ describePg("P0 schema bootstrap concurrency", () => {
         Array.from({ length: 8 }, async () => {
           const client = await pool.connect();
           try {
-            await upSchemaP0(client, DIM);
+            await upSchemaP0(client, DIM, 2000);
             return undefined;
           } catch (err) {
             return err;

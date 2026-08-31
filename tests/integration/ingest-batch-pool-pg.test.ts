@@ -6,49 +6,31 @@
  * the same ingest surface and the pool cap against the real database.
  */
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 import { randomUUID } from "node:crypto";
 
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { GraphragError } from "../../src/core/errors.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { createIngestHandler } from "../../src/tools/ingest.js";
+import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 32;
 const BATCH_LIMIT = 3;
-const DB_URL =
-  process.env.GRAPHRAG_MEMORY_DB_URL ??
-  "postgresql://postgres@localhost:5432/postgres";
-const SCHEMA = `t7_batch_pool_${randomUUID().replace(/-/g, "")}`;
-const SCHEMA_URL =
-  DB_URL +
-  (DB_URL.includes("?") ? "&" : "?") +
-  `options=${encodeURIComponent(`-c search_path=${SCHEMA},public`)}`;
-
-let PGVECTOR_AVAILABLE = false;
-try {
-  const probe = new pg.Client({ connectionString: DB_URL });
-  await probe.connect();
-  await probe.query("SELECT 1");
-  const extension = await probe.query<{ installed_version: string | null }>(
-    "SELECT installed_version FROM pg_available_extensions WHERE name = 'vector'"
-  );
-  await probe.end();
-  PGVECTOR_AVAILABLE = extension.rows[0]?.installed_version !== undefined;
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error);
-  console.warn(
-    `\n[t7-batch-pool-pg] Postgres/pgvector unavailable at ${DB_URL}: ${message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/ingest-batch-pool-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/ingest-batch-pool-pg.test.ts\n" +
-      `- Blocking issue: cannot use Postgres with pgvector at ${DB_URL}\n`
-  );
-}
-
-const describePg = PGVECTOR_AVAILABLE ? describe : describe.skip;
+const pgHarness = await createPgIntegrationHarness({
+  label: "t7-batch-pool-pg",
+  testPath: "tests/integration/ingest-batch-pool-pg.test.ts",
+  expectedCommand:
+    "npx vitest run tests/integration/ingest-batch-pool-pg.test.ts",
+  schemaPrefix: "t7_batch_pool",
+  defaultConnectionString: "postgresql://postgres@localhost:5432/postgres",
+  requiresVector: true,
+});
+const {
+  schema: SCHEMA,
+  schemaConnectionString: SCHEMA_URL,
+  describePg,
+} = pgHarness;
 
 type PoolOptions = {
   max: number;
@@ -76,10 +58,9 @@ describePg("T7 batch ingest and pool: live PostgreSQL", () => {
   const embedder = new FakeEmbedder(DIM);
 
   beforeAll(async () => {
-    client = new pg.Client({ connectionString: SCHEMA_URL });
+    client = pgHarness.createClient(SCHEMA_URL);
     await client.connect();
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.query(`CREATE SCHEMA "${SCHEMA}"`);
+    await pgHarness.resetSchema(client);
     backend = new Backend(SCHEMA_URL, DIM, 2000, {
       max: 2,
       connectionWaitTimeoutMs: 5_000,
@@ -101,7 +82,7 @@ describePg("T7 batch ingest and pool: live PostgreSQL", () => {
 
   afterAll(async () => {
     await backend.close();
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+    await pgHarness.dropSchema(client);
     await client.end();
   });
 

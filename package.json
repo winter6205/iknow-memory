@@ -23,6 +23,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "check:retrieval-baseline": "tsx scripts/check-retrieval-baseline.ts",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "eval:retrieve": "node dist/cli/eval-retrieve.js",

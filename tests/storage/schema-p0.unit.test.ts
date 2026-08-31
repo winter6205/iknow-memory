@@ -30,7 +30,7 @@ describe("upSchemaP0 community summary index", () => {
   it("keeps the HNSW index for dimensions supported by pgvector", async () => {
     const { client, queries } = recordingClient();
 
-    await upSchemaP0(client, 1536);
+    await upSchemaP0(client, 1536, 2000);
 
     expect(
       queries.some((query) => /community_summaries_embedding_idx/.test(query))

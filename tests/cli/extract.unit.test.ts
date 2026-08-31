@@ -8,7 +8,7 @@
  * The fake pool records every query so assertions can assert "zero INSERTs"
  * without any real Postgres or subprocess involvement.
  */
-import { describe, it, expect } from "vitest";
+import { afterAll, beforeAll, describe, it, expect } from "vitest";
 
 import {
   loadEntities,
@@ -22,6 +22,19 @@ import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js";
 import { ALLOWED } from "../../src/core/extraction/vocabulary.js";
+
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
+
+beforeAll(() => {
+  process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
+});
+
+afterAll(() => {
+  if (savedAnnMaxDimensions === undefined)
+    delete process.env[ANN_MAX_DIMENSIONS_VAR];
+  else process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+});
 
 class FakeClient implements CliClient {
   queries: string[] = [];

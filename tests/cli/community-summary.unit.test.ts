@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   runCli,
   runCliFromEnv,
@@ -46,6 +46,19 @@ const COMMUNITY: Community = {
   entityIds: ["11111111-1111-4111-8111-111111111111"],
 };
 
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
+
+beforeAll(() => {
+  process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
+});
+
+afterAll(() => {
+  if (savedAnnMaxDimensions === undefined)
+    delete process.env[ANN_MAX_DIMENSIONS_VAR];
+  else process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+});
+
 const embedder: EmbeddingClient = {
   async embed() {
     return [[1]];
@@ -58,6 +71,7 @@ const COMMUNITY_SUMMARY_ENV_KEYS = [
   "GRAPHRAG_MEMORY_NEO4J_USER",
   "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
   "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
+  "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
   "GRAPHRAG_MEMORY_EMBED_BASE_URL",
   "GRAPHRAG_MEMORY_EMBED_MODEL",
   "GRAPHRAG_MEMORY_EMBED_API_KEY",
@@ -75,6 +89,7 @@ async function withMissingNeo4jEnv<T>(fn: () => Promise<T>): Promise<T> {
   }
   process.env["GRAPHRAG_MEMORY_DB_URL"] = "postgres://localhost:5432/test";
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+  process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
   try {
     return await fn();
   } finally {

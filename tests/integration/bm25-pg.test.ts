@@ -104,7 +104,7 @@ describePg("bm25-pg: Postgres lexical arm (#65)", () => {
     await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
     await client.query(`CREATE SCHEMA "${SCHEMA}"`);
     await client.query(`SET search_path TO "${SCHEMA}", public`);
-    backend = new PgvectorBackend(SCHEMA_URL, DIM);
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
   });
 
   afterAll(async () => {
@@ -359,7 +359,7 @@ describePg("bm25-pg: Postgres lexical arm (#65)", () => {
         ]
       );
 
-      legacyBackend = new PgvectorBackend(legacyUrl, DIM);
+      legacyBackend = new PgvectorBackend(legacyUrl, DIM, 2000);
       // Starting the backend is the only migration step an operator runs.
       const hits = await legacyBackend.searchLexical(RARE_TOKEN, {
         limit: 10,

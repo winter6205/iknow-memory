@@ -42,6 +42,8 @@ const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
 const SCHEMA = `graph_e2e_${randomUUID().slice(0, 8)}`;
 const CLI_PATH = join(process.cwd(), "dist/cli/extract.js");
 const SERVER_PATH = join(process.cwd(), "dist/index.js");
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
 /** Per-connection search_path targeting SCHEMA via libpq `options=`. */
 function schemaDbUrl(): string {
@@ -69,6 +71,7 @@ function runCliSubprocess(
       env: {
         GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_LOG_LEVEL: "error",
         ...envOverrides,
         PATH: process.env.PATH ?? "",
@@ -94,6 +97,7 @@ async function connectServer(envOverrides: Record<string, string>): Promise<{
     env: {
       GRAPHRAG_MEMORY_DB_URL: schemaDbUrl(),
       GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
+      GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
       GRAPHRAG_MEMORY_LOG_LEVEL: "error",
       ...envOverrides,
       PATH: process.env.PATH ?? "",
@@ -125,6 +129,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   let client: PgClient | undefined;
 
   beforeAll(async () => {
+    process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     try {
       client = new PgClient({ connectionString: BASE_DB_URL });
       await client.connect();
@@ -144,9 +149,15 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   });
 
   afterAll(async () => {
-    if (!client) return;
-    await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
-    await client.end();
+    if (client) {
+      await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
+      await client.end();
+    }
+    if (savedAnnMaxDimensions === undefined) {
+      delete process.env[ANN_MAX_DIMENSIONS_VAR];
+    } else {
+      process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
+    }
   });
 
   function requireClient(): PgClient {
@@ -187,7 +198,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         ) STORED
       )
     `);
-    await upSchemaP0(c, DIM);
+    await upSchemaP0(c, DIM, 2000);
   }
 
   /**

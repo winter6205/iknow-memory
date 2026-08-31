@@ -55,6 +55,8 @@ const SCHEMA_URL =
   DB_URL +
   (DB_URL.includes("?") ? "&" : "?") +
   `options=-c%20search_path%3D${SCHEMA},public`;
+const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
+const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
 /** Default RetrieveConfig (locked by T5 + spec glossary): w=1/1, topK=8, cap=50, floor=3. */
 const CFG: RetrieveConfig = {
@@ -137,7 +139,7 @@ async function resetSchema(c: pg.Client): Promise<void> {
       ) STORED
     )
   `);
-  await upSchemaP0(c, DIM);
+  await upSchemaP0(c, DIM, 2000);
 }
 
 async function seedChunk(
@@ -384,10 +386,11 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
   let backend: PgvectorBackend | undefined;
 
   beforeAll(async () => {
+    process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     client = new pg.Client({ connectionString: SCHEMA_URL });
     await client.connect();
     await resetSchema(client);
-    backend = new PgvectorBackend(SCHEMA_URL, DIM);
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
   });
 
   afterAll(async () => {
@@ -395,6 +398,11 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
     if (client) {
       await client.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
       await client.end();
+    }
+    if (savedAnnMaxDimensions === undefined) {
+      delete process.env[ANN_MAX_DIMENSIONS_VAR];
+    } else {
+      process.env[ANN_MAX_DIMENSIONS_VAR] = savedAnnMaxDimensions;
     }
   });
 

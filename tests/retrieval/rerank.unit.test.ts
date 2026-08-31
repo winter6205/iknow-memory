@@ -249,7 +249,7 @@ describe("assembleRetrievalResult — rerank gate", () => {
     expect(out).not.toHaveProperty("degraded");
   });
 
-  it("SC2: enable-on without a wired reranker skips and is not degraded", async () => {
+  it("SC2: enable-on without a wired reranker is unattempted and degraded", async () => {
     const storage = new SearchBackend();
     storage.searchResults = [vec("a"), vec("b")];
     const out = await assembleRetrievalResult(ARGS, {
@@ -258,7 +258,8 @@ describe("assembleRetrievalResult — rerank gate", () => {
       retrieveConfig: CFG,
     });
     expect(out.chunks.map((c) => c.id)).toEqual(["a", "b"]);
-    expect(out).not.toHaveProperty("degraded");
+    expect(out.degraded).toBe(true);
+    expect(out.degraded_reasons).toContain("rerank:unattempted");
   });
 
   it("SC3: a valid fake permutation is visible on chunks[] after limit", async () => {

@@ -4,7 +4,7 @@
  *
  * The orchestrator calls this AFTER graph-priority (or vector-only) ranking
  * and BEFORE the Host `limit` cut when a reranker is actually wired.
- * Missing credentials are a skip at the gate, not this helper.
+ * Missing credentials are reported as an unattempted outcome at the gate.
  */
 import type { ChunkReranker, FusedHit, RetrieveConfig } from "./types.js";
 
@@ -18,6 +18,7 @@ export interface ApplyRerankArgs {
 export interface RerankOutcome {
   hits: FusedHit[];
   degraded: true | undefined;
+  unattempted?: true;
 }
 
 /**
@@ -100,17 +101,22 @@ export async function applyRerank(
   }
 }
 
-/**
- * Gate: off or unwired reranker → identity cut, no degraded from this step.
- */
+/** Gate: off → identity cut; enabled without a reranker is unattempted. */
 export async function maybeRerank(
   hits: readonly FusedHit[],
   args: { query: string; limit: number },
   cfg: RetrieveConfig | undefined,
   reranker: ChunkReranker | undefined
 ): Promise<RerankOutcome> {
-  if (cfg?.rerankEnabled !== true || reranker === undefined) {
+  if (cfg?.rerankEnabled !== true) {
     return { hits: cut(hits, args.limit), degraded: undefined };
+  }
+  if (reranker === undefined) {
+    return {
+      hits: cut(hits, args.limit),
+      degraded: undefined,
+      unattempted: true,
+    };
   }
   return applyRerank(hits, {
     query: args.query,

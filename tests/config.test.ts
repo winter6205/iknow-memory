@@ -963,9 +963,9 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     );
   });
 
-  it("defaults rerank enable to false on a fresh env", () => {
+  it("defaults rerank enable to true on a fresh env", () => {
     withRetrievalEnv({}, () => {
-      expect(loadEnv().retrieval.rerankEnabled).toBe(false);
+      expect(loadEnv().retrieval.rerankEnabled).toBe(true);
     });
   });
 
@@ -1049,11 +1049,11 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     );
   });
 
-  it("treats a blank rerank enable flag as the default off", () => {
+  it("treats a blank rerank enable flag as the default on", () => {
     withRetrievalEnv(
       { GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "   " },
       () => {
-        expect(loadEnv().retrieval.rerankEnabled).toBe(false);
+        expect(loadEnv().retrieval.rerankEnabled).toBe(true);
       }
     );
   });

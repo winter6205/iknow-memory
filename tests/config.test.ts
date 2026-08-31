@@ -28,6 +28,7 @@ import { ConfigError, loadEnv } from "../src/config.ts";
  * boundary validation nor leak into a default assertion.
  */
 const RETRIEVAL_VARS = [
+  "GRAPHRAG_MEMORY_RETRIEVAL_RRF_K",
   "GRAPHRAG_MEMORY_RETRIEVAL_W_VEC",
   "GRAPHRAG_MEMORY_RETRIEVAL_W_BM25",
   "GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH",
@@ -43,6 +44,8 @@ const RETRIEVAL_VARS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_CANDIDATE_CAP",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ARM_FLOOR",
 ] as const;
+
+const PGVECTOR_VARS = ["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] as const;
 
 /**
  * Extract Anthropic trio reused as the temporary rerank adapter.
@@ -84,6 +87,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     // Retrieval pipeline knobs (spec-3 T5) — scrub so a developer's real
     // values don't trip the boundary validation or leak into assertions.
     ...RETRIEVAL_VARS,
+    ...PGVECTOR_VARS,
     ...NEO4J_VARS,
     ...ANTHROPIC_VARS,
   ];
@@ -94,6 +98,11 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       process.env[k] = "";
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+    process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_RRF_K"] = "60";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_VEC"] = "0.7";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_BM25"] = "0.15";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH"] = "0.15";
   });
   afterAll(() => {
     for (const k of SCRUBBED) {
@@ -113,6 +122,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "embedModel",
       "logLevel",
       "neo4j",
+      "pgvectorAnnMaxDimensions",
       "rerank",
       "rerankUrl",
       "retrieval",
@@ -215,6 +225,7 @@ function withIsolatedEnv(
 const DOTENV_MASK_KEYS = [
   ...STAGE1_KEYS,
   ...RETRIEVAL_VARS,
+  ...PGVECTOR_VARS,
   ...NEO4J_VARS,
 ] as const;
 
@@ -228,6 +239,11 @@ function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
     DOTENV_MASK_KEYS,
     {
       GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+      GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
+      GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: "60",
+      GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
+      GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
+      GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
       ...patch,
     },
     fn
@@ -355,7 +371,18 @@ describe("loadEnv — embed config boundary cases", () => {
     patch: Record<string, string | undefined>,
     fn: () => void
   ) {
-    withIsolatedEnv(DOTENV_MASK_KEYS, patch, fn);
+    withIsolatedEnv(
+      DOTENV_MASK_KEYS,
+      {
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
+        GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: "60",
+        GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
+        GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
+        GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
+        ...patch,
+      },
+      fn
+    );
   }
 
   const DIM_BAD_VALUES: Array<readonly [string, string]> = [
@@ -499,6 +526,65 @@ describe("loadEnv — embed config boundary cases", () => {
       expect(env.embedModel).toBeUndefined();
     });
   });
+
+  it("uses the pgvector ANN dimension ceiling default when it is absent", () => {
+    const key = PGVECTOR_VARS[0];
+    const saved = process.env[key];
+    delete process.env[key];
+    try {
+      withIsolatedEnv(
+        DOTENV_MASK_KEYS.filter((masked) => masked !== key),
+        {
+          GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+          GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: "60",
+          GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
+          GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
+          GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
+        },
+        () => {
+          expect(loadEnv().pgvectorAnnMaxDimensions).toBe(2000);
+        }
+      );
+    } finally {
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+    }
+  });
+
+  it("reads the pgvector ANN dimension ceiling from config", () => {
+    withRawEnv(
+      {
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "1024",
+      },
+      () => {
+        expect(loadEnv().pgvectorAnnMaxDimensions).toBe(1024);
+      }
+    );
+  });
+
+  for (const [label, value] of [
+    ["empty", ""],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["non-numeric", "not-a-number"],
+    ["non-finite", "Infinity"],
+  ] as const) {
+    it(`rejects a ${label} pgvector ANN dimension ceiling`, () => {
+      withRawEnv(
+        {
+          GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+          GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: value,
+        },
+        () => {
+          expect(() => loadEnv()).toThrow(ConfigError);
+          expect(() => loadEnv()).toThrow(
+            /GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS/
+          );
+        }
+      );
+    });
+  }
 });
 
 /**
@@ -534,6 +620,11 @@ describe("loadEnv — embedding API key resolution", () => {
       [...DOTENV_MASK_KEYS, ...KEY_VARS],
       {
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536",
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
+        GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: "60",
+        GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
+        GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
+        GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
         ...patch,
       },
       fn
@@ -730,6 +821,7 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
   ) {
     const keys = [
       ...RETRIEVAL_VARS,
+      ...PGVECTOR_VARS,
       ...ANTHROPIC_VARS,
       "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
       "GRAPHRAG_MEMORY_EMBED_BASE_URL",
@@ -742,6 +834,11 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
       delete process.env[k];
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
+    process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_RRF_K"] = "60";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_VEC"] = "0.7";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_BM25"] = "0.15";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH"] = "0.15";
     for (const [k, v] of Object.entries(patch)) {
       if (!saved.has(k)) saved.set(k, process.env[k]);
       if (v === undefined) delete process.env[k];
@@ -768,6 +865,34 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
       expect(retrieval.w_graph).toBe(0.15);
     });
   });
+
+  it("defaults RRF k to 60 on a fresh configuration", () => {
+    withRetrievalEnv({}, () => {
+      expect(loadEnv().retrieval.rrfK).toBe(60);
+    });
+  });
+
+  it("reads RRF k from configuration", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: "1000" }, () => {
+      expect(loadEnv().retrieval.rrfK).toBe(1000);
+    });
+  });
+
+  for (const [label, value] of [
+    ["empty", ""],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["non-numeric", "not-a-number"],
+    ["non-finite NaN", "NaN"],
+    ["non-finite Infinity", "Infinity"],
+  ] as const) {
+    it(`rejects ${label} RRF k with ConfigError`, () => {
+      withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: value }, () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_RETRIEVAL_RRF_K/);
+      });
+    });
+  }
 
   it("defaults the retrieve mode bundle to balanced with its locked levers", () => {
     withRetrievalEnv({}, () => {
@@ -1039,6 +1164,12 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     });
   });
 
+  it("reads an operator override for w_vec", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "1.25" }, () => {
+      expect(loadEnv().retrieval.w_vec).toBe(1.25);
+    });
+  });
+
   const BAD_WEIGHTS: Array<readonly [string, string]> = [
     ["negative", "-0.2"],
     ["zero", "0"],
@@ -1052,6 +1183,15 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
       withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: value }, () => {
         expect(() => loadEnv()).toThrow(ConfigError);
         expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_RETRIEVAL_W_BM25/);
+      });
+    });
+  }
+
+  for (const [label, value] of BAD_WEIGHTS) {
+    it(`rejects w_vec = "${value}" (${label}) with ConfigError`, () => {
+      withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: value }, () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_RETRIEVAL_W_VEC/);
       });
     });
   }

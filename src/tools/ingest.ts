@@ -11,6 +11,7 @@ import {
   type ToolRegistration,
   type ToolResult,
 } from "./registry.js";
+import { ConfigError, readIngestBatchLimit } from "../config.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
@@ -32,10 +33,26 @@ import {
  *   check (valid_from < valid_until) lives in the handler, not the schema,
  *   because it depends on cross-field comparison.
  */
+const IngestBatchItemSchema = z.object({
+  content: z.string().min(1, "content must be a non-empty string"),
+  source_ref: z
+    .string()
+    .min(1, "source_ref must be a non-empty string")
+    .optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  valid_from: z.string().datetime().optional(),
+  valid_until: z.string().datetime().optional(),
+});
+
+const IngestContentSchema = z.union([
+  z.string().min(1, "content must be a non-empty string"),
+  z.array(z.union([z.string().min(1), IngestBatchItemSchema])),
+]);
+
 export const IngestInputSchema = z
   .object({
     action: z.enum(["ingest", "invalidate"]).optional(),
-    content: z.string().min(1, "content must be a non-empty string").optional(),
+    content: IngestContentSchema.optional(),
     source_ref: z.string().min(1, "source_ref must be a non-empty string"),
     metadata: z.record(z.string(), z.unknown()).optional(),
     valid_from: z.string().datetime().optional(),
@@ -45,12 +62,14 @@ export const IngestInputSchema = z
   })
   .superRefine((input, ctx) => {
     const action = input.action ?? "ingest";
-    if (action === "ingest" && input.content === undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["content"],
-        message: "content is required for ingest",
-      });
+    if (action === "ingest") {
+      if (input.content === undefined) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["content"],
+          message: "content is required for ingest",
+        });
+      }
     }
     if (action === "invalidate") {
       if (input.content !== undefined) {
@@ -166,6 +185,148 @@ export interface IngestDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
   identityVersions?: Partial<ContentIdentityVersions>;
+  /** Optional test/wiring override; absent uses the validated env default. */
+  batchLimit?: number;
+}
+
+/** Typed failure for a batch that would exceed the configured limit. */
+export class BatchLimitExceededError extends GraphragError {
+  readonly actualCount: number;
+  readonly limit: number;
+
+  constructor(actualCount: number, limit: number) {
+    super(
+      `ingest: batch actual count ${actualCount} exceeds limit ${limit}`,
+      "INVALID_INPUT"
+    );
+    this.name = "BatchLimitExceededError";
+    // GraphragError's taxonomy predates T7 and errors.ts is outside this
+    // ticket's edit scope. Preserve its runtime typed code without widening
+    // the shared taxonomy for callers that do not know about batch ingest.
+    (this as unknown as { code: string }).code = "BATCH_LIMIT_EXCEEDED";
+    this.actualCount = actualCount;
+    this.limit = limit;
+  }
+}
+
+interface NormalizedIngestItem {
+  content: string;
+  source_ref: string;
+  metadata: Record<string, unknown>;
+  valid_from: string | undefined;
+  valid_until: string | undefined;
+}
+
+function resolveBatchLimit(deps: IngestDeps): number {
+  if (Object.hasOwn(deps, "batchLimit")) {
+    const value = deps.batchLimit;
+    if (
+      value === undefined ||
+      !Number.isFinite(value) ||
+      !Number.isInteger(value) ||
+      value <= 0
+    ) {
+      throw new ConfigError(
+        `ingest batch limit must be a finite positive integer, got "${String(value)}"`
+      );
+    }
+    return value;
+  }
+  return readIngestBatchLimit();
+}
+
+function normalizeIngestItems(input: IngestInput): NormalizedIngestItem[] {
+  const content = input.content;
+  if (content === undefined) {
+    throw new GraphragError(
+      "ingest: content must be provided",
+      "INVALID_INPUT"
+    );
+  }
+  if (typeof content === "string") {
+    if (input.source_ref === undefined) {
+      throw new GraphragError(
+        "ingest: source_ref must be provided",
+        "INVALID_INPUT"
+      );
+    }
+    return [
+      {
+        content,
+        source_ref: input.source_ref,
+        metadata: input.metadata ?? {},
+        valid_from: input.valid_from,
+        valid_until: input.valid_until,
+      },
+    ];
+  }
+  if (!Array.isArray(content)) {
+    throw new GraphragError(
+      "ingest: content must be a string or a batch array",
+      "INVALID_INPUT"
+    );
+  }
+  return content.map((item) => {
+    if (typeof item === "string") {
+      if (input.source_ref === undefined) {
+        throw new GraphragError(
+          "ingest: source_ref must be provided for string batch items",
+          "INVALID_INPUT"
+        );
+      }
+      return {
+        content: item,
+        source_ref: input.source_ref,
+        metadata: input.metadata ?? {},
+        valid_from: input.valid_from,
+        valid_until: input.valid_until,
+      };
+    }
+    return {
+      content: item.content,
+      source_ref: item.source_ref ?? input.source_ref,
+      metadata: item.metadata ?? input.metadata ?? {},
+      valid_from: item.valid_from ?? input.valid_from,
+      valid_until: item.valid_until ?? input.valid_until,
+    };
+  });
+}
+
+function validateIngestItem(item: NormalizedIngestItem): void {
+  if (
+    typeof item.content !== "string" ||
+    item.content.length === 0 ||
+    typeof item.source_ref !== "string" ||
+    item.source_ref.length === 0
+  ) {
+    throw new GraphragError(
+      "ingest: content and source_ref must be non-empty strings",
+      "INVALID_INPUT"
+    );
+  }
+  const byteLength = Buffer.byteLength(item.content, "utf8");
+  if (byteLength > MAX_CONTENT_BYTES) {
+    throw new GraphragError(
+      `ingest: content size ${byteLength} bytes exceeds limit ${MAX_CONTENT_BYTES} (1MB)`,
+      "CONTENT_TOO_LARGE"
+    );
+  }
+  if (item.valid_from && item.valid_until) {
+    const fromMs = Date.parse(item.valid_from);
+    const untilMs = Date.parse(item.valid_until);
+    if (Number.isNaN(fromMs) || Number.isNaN(untilMs)) {
+      throw new GraphragError(
+        "ingest: valid_from / valid_until are not valid ISO 8601 timestamps",
+        "INVALID_INPUT"
+      );
+    }
+    if (fromMs >= untilMs) {
+      throw new GraphragError(
+        "ingest: valid_from must be strictly before valid_until",
+        "INVALID_INPUT"
+      );
+    }
+  }
 }
 
 /**
@@ -184,87 +345,52 @@ export function createIngestHandler(deps: IngestDeps) {
     if (input.action === "invalidate") {
       return handleInvalidation(deps, input);
     }
-    const content = input.content;
-    if (content === undefined || content.length === 0) {
+    const items = normalizeIngestItems(input);
+    if (items.length === 0) {
       throw new GraphragError(
-        "ingest: content must be a non-empty string",
+        "ingest: content batch must contain at least one item",
         "INVALID_INPUT"
       );
     }
+    const batchLimit = resolveBatchLimit(deps);
+    if (items.length > batchLimit) {
+      throw new BatchLimitExceededError(items.length, batchLimit);
+    }
+    for (const item of items) validateIngestItem(item);
 
-    // 1. Size check: reject payloads above MAX_CONTENT_BYTES before doing
-    //    any work. Buffer.byteLength gives UTF-8 byte count, not char count
-    //    — which is what the cap actually limits.
-    const byteLength = Buffer.byteLength(content, "utf8");
-    if (byteLength > MAX_CONTENT_BYTES) {
+    const embeddings = await deps.embedder.embed(
+      items.map((item) => item.content)
+    );
+    if (embeddings.length !== items.length) {
       throw new GraphragError(
-        `ingest: content size ${byteLength} bytes exceeds limit ${MAX_CONTENT_BYTES} (1MB)`,
-        "CONTENT_TOO_LARGE"
+        `ingest: embedding count ${embeddings.length} does not match batch count ${items.length}`,
+        "EMBEDDING_FAILED"
       );
     }
 
-    // 2. Semantic check: valid_from must be strictly before valid_until when
-    //    both are present. A reversed or zero-width window is almost always
-    //    a caller bug — we surface it as INVALID_INPUT so the host can fix
-    //    the call instead of silently storing an empty window.
-    if (input.valid_from && input.valid_until) {
-      const fromMs = Date.parse(input.valid_from);
-      const untilMs = Date.parse(input.valid_until);
-      if (Number.isNaN(fromMs) || Number.isNaN(untilMs)) {
-        // Zod's .datetime() should have caught this, but defend in depth:
-        // a hand-built Input (or a future schema regression) should not
-        // silently pass.
-        throw new GraphragError(
-          "ingest: valid_from / valid_until are not valid ISO 8601 timestamps",
-          "INVALID_INPUT"
-        );
-      }
-      if (fromMs >= untilMs) {
-        throw new GraphragError(
-          "ingest: valid_from must be strictly before valid_until",
-          "INVALID_INPUT"
-        );
-      }
-    }
-
-    // 3. Embed the pushed text as-is. The embedder is contractually
-    //    responsible for throwing GraphragError(EMBEDDING_FAILED |
-    //    EMBEDDING_DIM_MISMATCH) on failure.
-    const embeddings = await deps.embedder.embed([content]);
-
-    // 4. Build one ChunkRecord with ingest-time metadata.
-    //    `valid_from` defaults to now (UTC ISO 8601) when not provided.
-    //    `valid_until` defaults to null (forever valid).
-    //    `created_at` is set to the same instant as the default `valid_from`
-    //    so the two are consistent when the caller omits both.
     const now = new Date().toISOString();
-    const validFrom = input.valid_from ?? now;
-    const validUntil = input.valid_until ?? null;
     const identityVersions = {
       ...DEFAULT_CONTENT_IDENTITY_VERSIONS,
       ...deps.identityVersions,
     };
-    const contentIdentity = computeContentIdentity(content, identityVersions);
-    const records: ChunkRecord[] = [
-      {
-        id: computeChunkId(input.source_ref, contentIdentity),
-        content,
-        embedding: embeddings[0]!,
-        source_ref: input.source_ref,
-        metadata: input.metadata ?? {},
-        valid_from: validFrom,
-        valid_until: validUntil,
+    const records: ChunkRecord[] = items.map((item, index) => {
+      const contentIdentity = computeContentIdentity(
+        item.content,
+        identityVersions
+      );
+      return {
+        id: computeChunkId(item.source_ref, contentIdentity),
+        content: item.content,
+        embedding: embeddings[index]!,
+        source_ref: item.source_ref,
+        metadata: item.metadata,
+        valid_from: item.valid_from ?? now,
+        valid_until: item.valid_until ?? null,
         created_at: now,
-      },
-    ];
+      };
+    });
 
-    // 5. Store. upsert returns the chunk id in input order — we relay
-    //    them as the tool result so callers can correlate or reference
-    //    them later.
     const ids = await deps.storage.upsert(records);
-
-    // 6. Return: textResult(JSON.stringify({ chunk_ids: ids })). The
-    //    shape matches the host's text-content convention.
     return textResult(JSON.stringify({ chunk_ids: ids }));
   };
 }
@@ -277,6 +403,12 @@ async function handleInvalidation(
     throw new GraphragError(
       "ingest: selected storage backend does not support content invalidation",
       "STORAGE_ERROR"
+    );
+  }
+  if (input.source_ref === undefined) {
+    throw new GraphragError(
+      "content invalidation: source_ref must be a non-empty string",
+      "INVALID_INPUT"
     );
   }
   const request = normalizeContentInvalidationRequest(

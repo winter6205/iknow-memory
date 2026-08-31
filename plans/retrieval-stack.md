@@ -59,7 +59,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
 | T4  | Ingest stores pushed text as-is (no re-chunking)                                     | `[implementation]` | T2                 | —        | Done    |
 | T5  | Ingest idempotency on (`source_ref`, content identity)                               | `[implementation]` | T1, T4             | Yes      | Done    |
 | T6  | Content invalidation (close the validity window, never delete)                       | `[implementation]` | T1, T4             | Yes      | Done    |
-| T7  | Batch ingest + connection pool parameters                                            | `[implementation]` | T5                 | —        | Pending |
+| T7  | Batch ingest + connection pool parameters                                            | `[implementation]` | T5                 | —        | Done    |
 | T8  | Degraded envelope with the four set rules                                            | `[implementation]` | T3                 | —        | Done    |
 | T9  | Partial-failure semantics, and invalid input vs legal empty                          | `[implementation]` | T8                 | —        | Done    |
 | T10 | Graph multi-hop is on by default; a missing address degrades                         | `[implementation]` | T8                 | Yes      | Done    |
@@ -127,7 +127,7 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
    - **Inherits:** spec SC-17 (batch limit configurable with a default; at-limit batch succeeds), SC-47 (over-limit is a named overflow typed error, never a silent truncation), SC-18 (pool cap honoured; illegal → `ConfigError`), SC-33 (connection-wait timeout observed as its own failure class, count = 0 during the run). Default values are implementer headroom; the contract only fixes "configurable, > 0, finite, observed".
    - **Surface:** storage (pool) + tools (batch `ingest`) + config
    - **Acceptance:** the configured batch limit is > 0 and finite (0 / missing / non-numeric → typed error); a batch of exactly that many items returns that many chunk ids with an equal row delta; an idempotency-identical batch re-submitted adds 0 rows; a batch over the limit returns a named overflow error distinguishable from "content invalid", exits non-zero, gives both the actual count and the limit, adds 0 rows, and neither truncates nor re-batches the tail; with a pool cap set, the observed concurrent connection count never exceeds it and an illegal cap raises `ConfigError`; a connection-wait-timeout counter exists as an independent failure class.
-   - Status: [ ] pending
+   - Status: [x] done
    - [blocks: T5]
 
 8. **Degraded envelope with the four set rules** — tag: `[implementation]`

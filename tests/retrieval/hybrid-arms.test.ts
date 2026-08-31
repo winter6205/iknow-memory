@@ -330,7 +330,7 @@ describe("assembleRetrievalResult — BM25 fail-open (SC9)", () => {
     ).rejects.toThrow(/provider down/);
   });
 
-  it("keeps a vector-arm failure a hard failure even with BM25 healthy", async () => {
+  it("releases BM25 hits when the vector arm fails and marks vector degraded", async () => {
     const base = await seeded(makeChunk("a", "zubrowka here"));
     const storage = withLexical(
       {
@@ -341,12 +341,13 @@ describe("assembleRetrievalResult — BM25 fail-open (SC9)", () => {
       } as unknown as MemoryBackend,
       async (q, o) => base.searchLexical(q, o)
     );
-    await expect(
-      assembleRetrievalResult(
-        { query: "zubrowka", validAt: NOW, limit: 10 },
-        { embedder, storage, retrieveConfig: CFG }
-      )
-    ).rejects.toThrow(/vector store down/);
+    const out = await assembleRetrievalResult(
+      { query: "zubrowka", validAt: NOW, limit: 10 },
+      { embedder, storage, retrieveConfig: CFG }
+    );
+    expect(out.chunks.map((chunk) => chunk.id)).toEqual(["a"]);
+    expect(out.degraded).toBe(true);
+    expect(out.degraded_reasons).toEqual(["vector:attempted-and-failed"]);
   });
 });
 

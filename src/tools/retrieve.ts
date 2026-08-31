@@ -32,18 +32,44 @@ import {
   isRetrievePreset,
 } from "../core/retrieval/types.js";
 import { assembleRetrievalResult } from "../core/retrieval/index.js";
+import { GraphragError } from "../core/errors.js";
 
 const DEFAULT_LIMIT = 10;
 
-export const RetrieveInputSchema = z.object({
-  query: z.string().min(1, "query must be a non-empty string"),
-  valid_at: z.string().datetime().optional(),
-  filters: z.record(z.string(), z.string()).optional(),
-  limit: z.number().int().min(1).max(100).optional(),
-  preset: z.enum(RETRIEVE_PRESETS).optional(),
-  wait_for_drain: z.boolean().optional(),
-  wait_for_drain_timeout_ms: z.number().int().min(1).max(600_000).optional(),
-});
+export class InputValidationFailureCounter {
+  count = 0;
+
+  increment(): void {
+    this.count += 1;
+  }
+
+  reset(): void {
+    this.count = 0;
+  }
+}
+
+export function createRetrieveInputSchema(
+  counter?: InputValidationFailureCounter
+) {
+  return z.object({
+    query: z
+      .string()
+      .min(1, "query must be a non-empty string")
+      .refine((query) => {
+        const valid = query.trim().length > 0;
+        if (!valid) counter?.increment();
+        return valid;
+      }, "query must contain at least one non-whitespace character"),
+    valid_at: z.string().datetime().optional(),
+    filters: z.record(z.string(), z.string()).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+    preset: z.enum(RETRIEVE_PRESETS).optional(),
+    wait_for_drain: z.boolean().optional(),
+    wait_for_drain_timeout_ms: z.number().int().min(1).max(600_000).optional(),
+  });
+}
+
+export const RetrieveInputSchema = createRetrieveInputSchema();
 
 export type RetrieveInput = z.infer<typeof RetrieveInputSchema>;
 
@@ -79,6 +105,8 @@ export interface RetrieveDeps {
   debug?: boolean;
   /** Internal seam for injected capability observations. */
   capabilityObservations?: readonly CapabilityObservation[];
+  /** Injectable counter for rejected empty or whitespace-only queries. */
+  inputValidationFailureCounter?: InputValidationFailureCounter;
   /** Optional read-only projection outbox wait seam. */
   projectionDrain?: ProjectionDrainWaiter;
 }
@@ -87,6 +115,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
   return async function retrieveHandler(
     input: RetrieveInput
   ): Promise<ToolResult> {
+    validateRetrieveQuery(input, deps.inputValidationFailureCounter);
     const retrieveConfig = applyPreset(
       deps.retrieveConfig,
       input.preset,
@@ -123,6 +152,20 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
 
     return textResult(JSON.stringify(envelope));
   };
+}
+
+function validateRetrieveQuery(
+  input: RetrieveInput,
+  counter: InputValidationFailureCounter | undefined
+): void {
+  if (typeof input?.query === "string" && input.query.trim().length > 0) {
+    return;
+  }
+  counter?.increment();
+  throw new GraphragError(
+    "retrieve query must contain at least one non-whitespace character",
+    "INVALID_INPUT"
+  );
 }
 
 /**
@@ -205,7 +248,10 @@ export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
   name: "retrieve",
   description:
     "Semantic search over the knowledge memory store. Returns ranked chunks filtered by temporal validity.",
-  inputSchema: RetrieveInputSchema,
+  inputSchema:
+    deps.inputValidationFailureCounter === undefined
+      ? RetrieveInputSchema
+      : createRetrieveInputSchema(deps.inputValidationFailureCounter),
   // The registry's erased `ToolRegistrationAny` takes `input: unknown`;
   // the schema validates upstream, so this cast is sound (mirrors echo.ts).
   handler: createRetrieveHandler(

@@ -30,6 +30,7 @@ import type {
   GraphNode,
   GraphWriter,
 } from "../../src/core/graph/types.js";
+import { warnPgUnavailable } from "./pg-test-harness.js";
 
 const DIM = 8;
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
@@ -85,15 +86,15 @@ try {
   await probe.end();
   PG_AVAILABLE = true;
 } catch (err) {
-  console.warn(
-    `\n[graph-backfill-pg] Postgres unreachable at ${BASE_DB_URL}: ${(err as Error).message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/graph-backfill-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/graph-backfill-pg.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${BASE_DB_URL}\n`
-  );
+  warnPgUnavailable({
+    label: "graph-backfill-pg",
+    testPath: "tests/integration/graph-backfill-pg.test.ts",
+    expectedCommand:
+      "npx vitest run tests/integration/graph-backfill-pg.test.ts",
+    connectionString: BASE_DB_URL,
+    error: err,
+    requiresVector: false,
+  });
 }
 const describePg = PG_AVAILABLE ? describe : describe.skip;
 

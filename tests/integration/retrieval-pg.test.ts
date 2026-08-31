@@ -34,7 +34,7 @@
 import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import pg from "pg";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
@@ -45,16 +45,22 @@ import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js
 import { createIngestHandler } from "../../src/tools/ingest.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
+import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 1536;
-const DB_URL =
-  process.env.GRAPHRAG_MEMORY_DB_URL ??
-  "postgresql://postgres@localhost:5432/postgres";
-const SCHEMA = `retrieval_pg_${randomUUID().slice(0, 8).replace(/-/g, "")}`;
-const SCHEMA_URL =
-  DB_URL +
-  (DB_URL.includes("?") ? "&" : "?") +
-  `options=-c%20search_path%3D${SCHEMA},public`;
+const pgHarness = await createPgIntegrationHarness({
+  label: "retrieval-pg",
+  testPath: "tests/integration/retrieval-pg.test.ts",
+  expectedCommand: "npx vitest run tests/integration/retrieval-pg.test.ts",
+  schemaPrefix: "retrieval_pg",
+  defaultConnectionString: "postgresql://postgres@localhost:5432/postgres",
+  requiresVector: true,
+});
+const {
+  schema: SCHEMA,
+  schemaConnectionString: SCHEMA_URL,
+  describePg,
+} = pgHarness;
 const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
 const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
@@ -89,27 +95,6 @@ function vecLiteral(v: number[]): string {
 async function embedVec(text: string): Promise<number[]> {
   return (await embedder.embed([text]))[0]!;
 }
-
-// Loud skip when Postgres is unreachable (describe.skip + Validation block).
-let PG_AVAILABLE = false;
-try {
-  const probe = new pg.Client({ connectionString: DB_URL });
-  await probe.connect();
-  await probe.query("SELECT 1");
-  await probe.end();
-  PG_AVAILABLE = true;
-} catch (err) {
-  console.warn(
-    `\n[retrieval-pg] Postgres unreachable at ${DB_URL}: ${(err as Error).message}\n`
-  );
-  console.warn(
-    "Validation:\n" +
-      "- Not run: tests/integration/retrieval-pg.test.ts\n" +
-      "- Expected command: npx vitest run tests/integration/retrieval-pg.test.ts\n" +
-      `- Blocking issue: cannot connect to Postgres at ${DB_URL}\n`
-  );
-}
-const describePg = PG_AVAILABLE ? describe : describe.skip;
 
 // ---------------------------------------------------------------------------
 // Fixture helpers

@@ -1,7 +1,7 @@
 /**
  * Ingest tool — writes text content into the memory store.
  *
- * Pipeline: validate → size check → chunk → embed → store.
+ * Pipeline: validate → size check → embed → store.
  * Stage 1: no triple extraction, no entity resolution (stage 3).
  */
 import { randomUUID } from "node:crypto";
@@ -11,7 +11,6 @@ import {
   type ToolRegistration,
   type ToolResult,
 } from "./registry.js";
-import { chunkText } from "../core/chunker.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
@@ -48,14 +47,21 @@ export interface IngestDeps {
  *
  * Order of checks (and why this order):
  *  1. Schema — already done by Zod before the handler runs.
- *  2. Size — cheap byte-length check, prevents the expensive chunk/embed
+ *  2. Size — cheap byte-length check, prevents the expensive embed
  *     pipeline from running on a multi-MB payload.
  *  3. Semantic — valid_from < valid_until. Must be explicit (a `>=` window
  *     would be either always-empty or instant-expiry, both bugs).
- *  4. Chunk → embed → upsert.
+ *  4. Embed → upsert.
  */
 export function createIngestHandler(deps: IngestDeps) {
   return async function ingestHandler(input: IngestInput): Promise<ToolResult> {
+    if (input.content.length === 0) {
+      throw new GraphragError(
+        "ingest: content must be a non-empty string",
+        "INVALID_INPUT"
+      );
+    }
+
     // 1. Size check: reject payloads above MAX_CONTENT_BYTES before doing
     //    any work. Buffer.byteLength gives UTF-8 byte count, not char count
     //    — which is what the cap actually limits.
@@ -91,21 +97,12 @@ export function createIngestHandler(deps: IngestDeps) {
       }
     }
 
-    // 3. Chunk. chunkText returns [] for an empty string, but the schema
-    //    already rejects empty content, so this is defense-in-depth.
-    const chunks = chunkText(input.content);
-    if (chunks.length === 0) {
-      throw new GraphragError(
-        "ingest: chunker produced zero chunks (empty content after validation)",
-        "INVALID_INPUT"
-      );
-    }
+    // 3. Embed the pushed text as-is. The embedder is contractually
+    //    responsible for throwing GraphragError(EMBEDDING_FAILED |
+    //    EMBEDDING_DIM_MISMATCH) on failure.
+    const embeddings = await deps.embedder.embed([input.content]);
 
-    // 4. Embed. The embedder is contractually responsible for throwing
-    //    GraphragError(EMBEDDING_FAILED | EMBEDDING_DIM_MISMATCH) on failure.
-    const embeddings = await deps.embedder.embed(chunks.map((c) => c.text));
-
-    // 5. Build ChunkRecord[] with new ids and ingest-time metadata.
+    // 4. Build one ChunkRecord with ingest-time metadata.
     //    `valid_from` defaults to now (UTC ISO 8601) when not provided.
     //    `valid_until` defaults to null (forever valid).
     //    `created_at` is set to the same instant as the default `valid_from`
@@ -113,23 +110,25 @@ export function createIngestHandler(deps: IngestDeps) {
     const now = new Date().toISOString();
     const validFrom = input.valid_from ?? now;
     const validUntil = input.valid_until ?? null;
-    const records: ChunkRecord[] = chunks.map((chunk, i) => ({
-      id: randomUUID(),
-      content: chunk.text,
-      embedding: embeddings[i]!,
-      source_ref: input.source_ref,
-      metadata: input.metadata ?? {},
-      valid_from: validFrom,
-      valid_until: validUntil,
-      created_at: now,
-    }));
+    const records: ChunkRecord[] = [
+      {
+        id: randomUUID(),
+        content: input.content,
+        embedding: embeddings[0]!,
+        source_ref: input.source_ref,
+        metadata: input.metadata ?? {},
+        valid_from: validFrom,
+        valid_until: validUntil,
+        created_at: now,
+      },
+    ];
 
-    // 6. Store. upsert returns the chunk ids in input order — we relay
+    // 5. Store. upsert returns the chunk id in input order — we relay
     //    them as the tool result so callers can correlate or reference
     //    them later.
     const ids = await deps.storage.upsert(records);
 
-    // 7. Return: textResult(JSON.stringify({ chunk_ids: ids })). The
+    // 6. Return: textResult(JSON.stringify({ chunk_ids: ids })). The
     //    shape matches the host's text-content convention.
     return textResult(JSON.stringify({ chunk_ids: ids }));
   };

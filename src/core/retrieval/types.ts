@@ -286,15 +286,14 @@ export interface RetrieveConfig {
   /** Whether the BM25 arm runs at all. Off → vector-only, and NOT degraded. */
   bm25Enabled: boolean;
   /**
-   * Whether the Neo4j graph arm runs at all. Off → vector (+BM25) only,
-   * and NOT degraded: an operator switching an arm off is a choice, the
-   * same contract `bm25Enabled` carries. Absent Neo4j config is a
-   * separate, equally non-degrading reason to skip the arm.
+   * Whether the Neo4j graph arm runs at all. Off → vector (+BM25) only
+   * without a degradation; absent Neo4j config while this stays enabled is
+   * an unattempted default-on capability.
    */
   graphEnabled: boolean;
   /**
-   * Temporary LLM rerank after Host ranking. Default off. On without the
-   * Anthropic trio is a skip at the orchestrator (T3), not `degraded`.
+   * Temporary LLM rerank after Host ranking. Default on. On without the
+   * Anthropic trio is unattempted and the envelope is degraded.
    */
   rerankEnabled: boolean;
   /**

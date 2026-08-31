@@ -4,8 +4,8 @@
  * SC8 — arm set under graph-priority).
  *
  * Everything runs on FakeEmbedder + MemoryBackend, so the suite needs no
- * Postgres, no Neo4j and no network — which is also the configuration
- * SC6 names for byte stability.
+ * Postgres, no Neo4j and no network. The frozen offline evaluator explicitly
+ * disables production-only graph and rerank adapters for byte stability.
  *
  * The load-bearing assertion is SC4: the CLI must score the SAME fused
  * ranking the MCP `retrieve` tool would return, not a private
@@ -44,17 +44,22 @@ import type { Logger } from "../../src/logging.js";
 const DIM = 16;
 const VALID_AT = "2026-06-01T00:00:00.000Z";
 
-/** Production defaults from src/config.ts — the eval must not retune them. */
+/** Frozen offline-evaluator config; production defaults are default-on. */
 const RETRIEVE_CONFIG: RetrieveConfig = {
   w_vec: 0.7,
   w_bm25: 0.15,
   w_graph: 0.15,
   bm25Enabled: true,
-  graphEnabled: true,
+  graphEnabled: false,
   rerankEnabled: false,
   entityLinkTopK: 8,
   candidateCap: 50,
   graphArmFloor: 3,
+};
+
+const GRAPH_RETRIEVE_CONFIG: RetrieveConfig = {
+  ...RETRIEVE_CONFIG,
+  graphEnabled: true,
 };
 
 const scratchDirs: string[] = [];
@@ -204,7 +209,11 @@ describe("eval CLI — no-URI run succeeds (SC5)", () => {
 
     const code = await runCli(
       baseArgv(out),
-      makeDeps({ storage, graphRanker })
+      makeDeps({
+        storage,
+        graphRanker,
+        retrieveConfig: GRAPH_RETRIEVE_CONFIG,
+      })
     );
 
     expect(code).toBe(0);
@@ -258,7 +267,14 @@ describe("eval CLI — graph-priority arm set (SC8)", () => {
     const withoutGraphOut = join(scratchDir(), "without-graph.json");
     const { storage, graphRanker } = graphWiring("c-graph-lead");
 
-    await runCli(baseArgv(withGraphOut), makeDeps({ storage, graphRanker }));
+    await runCli(
+      baseArgv(withGraphOut),
+      makeDeps({
+        storage,
+        graphRanker,
+        retrieveConfig: GRAPH_RETRIEVE_CONFIG,
+      })
+    );
     await runCli(baseArgv(withoutGraphOut), makeDeps());
 
     const withGraph = readBaseline(withGraphOut);
@@ -284,6 +300,7 @@ describe("eval CLI — graph-priority arm set (SC8)", () => {
       baseArgv(out),
       makeDeps({
         storage,
+        retrieveConfig: GRAPH_RETRIEVE_CONFIG,
         graphRanker: {
           async rankEntities(): Promise<RankedEntity[]> {
             throw new Error("neo4j sidecar unreachable");

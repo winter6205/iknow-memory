@@ -32,9 +32,9 @@
  * Debug diagnostics are retained as non-enumerable internal metadata for the
  * offline evaluator, so they cannot leak into the MCP JSON payload.
  *
- * The query is embedded once and the vector feeds every arm that needs it.
- * An embedder that yields no usable vector raises `GraphragError`
- * ("EMBEDDING_FAILED") before any arm starts — never fail-open.
+ * The query is embedded once when credentials are available and the vector
+ * feeds every arm that needs it. Missing credentials are unattempted;
+ * configured providers that fail are fail-open when another arm can answer.
  *
  * Optional arms are fail-open: each is wrapped so a throw becomes an empty
  * `ArmResult` carrying a `failureReason`; the central capability registry
@@ -128,14 +128,14 @@ export interface AssembleDeps {
   graphConfig?: RetrieveConfig;
   /**
    * Neo4j PPR ranker, wired only when a sidecar URI is configured. Absent
-   * is the SC7 case: the arm is not attempted and the envelope carries no
-   * `degraded` — an operator who configured no graph engine has not
-   * suffered a failed graph call.
+   * while graph is default-on is an unattempted capability and is marked
+   * `degraded` by the central envelope decision.
    */
   graphRanker?: GraphRanker;
   /**
    * Temporary LLM reranker, wired only when rerank is enabled AND the
-   * Anthropic trio is complete. Absent + enable-on is a skip, not degraded.
+   * Anthropic trio is complete. Absent + enable-on is unattempted and is
+   * marked `degraded` by the central envelope decision.
    */
   reranker?: ChunkReranker;
   /** Injectable debug gate; wired to `DEBUG=1` by the tool. */
@@ -159,6 +159,15 @@ interface AssemblyResult {
 interface VectorSearchOutcome {
   retrieved: RetrievedChunk[];
   failureReason?: string;
+  failureState?: "unattempted" | "attempted-and-failed";
+  failureCode?: GraphragError["code"];
+}
+
+interface QueryEmbeddingOutcome {
+  embedding?: number[];
+  failureReason?: string;
+  failureState?: "unattempted" | "attempted-and-failed";
+  failureCode?: GraphragError["code"];
 }
 
 const ARM_CAPABILITY: Readonly<Record<ArmName, DegradedCapability>> = {
@@ -173,10 +182,12 @@ export async function assembleRetrievalResult(
   args: AssembleArgs,
   deps: AssembleDeps
 ): Promise<RetrieveOutputEnvelope> {
-  // One embed per retrieve: the same vector feeds the vector search and
-  // the graph arm's seed lookup. Embed failure propagates before any arm
-  // starts.
-  const queryEmbedding = await embedQuery(deps.embedder, args.query);
+  // One embed per retrieve when credentials are available: the same vector
+  // feeds the vector search and the graph arm's seed lookup. Missing
+  // credentials skip this call entirely; a configured provider that throws
+  // is converted to an attempted-and-failed vector outcome.
+  const queryEmbedding = await resolveQueryEmbedding(deps.embedder, args.query);
+  const embedding = queryEmbedding.embedding;
 
   // Fusion weights may fall back to the archived graph config. Optional-arm
   // gates themselves remain owned by their production/archived configs.
@@ -198,18 +209,24 @@ export async function assembleRetrievalResult(
     validAt: args.validAt,
     ...(args.filters !== undefined ? { filters: args.filters } : {}),
   };
-  const vectorSearch = startVectorSearch(
-    deps.storage,
-    queryEmbedding,
-    searchOpts
-  );
+  const vectorSearch =
+    embedding === undefined
+      ? Promise.resolve({
+          retrieved: [],
+          failureReason: queryEmbedding.failureReason,
+          failureState: queryEmbedding.failureState,
+          failureCode: queryEmbedding.failureCode,
+        })
+      : resolveVectorSearch(
+          startVectorSearch(deps.storage, embedding, searchOpts)
+        );
 
   // An active arm always implies its own config — the lexical arm implies
   // `retrieveConfig`, the graph arm implies `graphConfig` — so the
   // `weights === undefined` half is unreachable at runtime. It is what
   // narrows `weights` for the `rrfFuse` call below.
   if (!fusing || weights === undefined) {
-    const vector = await resolveVectorSearch(vectorSearch);
+    const vector = await vectorSearch;
     if (vector.failureReason !== undefined) {
       throw allArmsFailed(vector);
     }
@@ -222,14 +239,18 @@ export async function assembleRetrievalResult(
     const waited = await waitForProjectionDrain(result, deps);
     return buildEnvelope(
       waited.hits,
-      [...waited.observations, ...(deps.capabilityObservations ?? [])],
+      [
+        ...waited.observations,
+        ...arms.observations,
+        ...(deps.capabilityObservations ?? []),
+      ],
       waited.debug
     );
   }
 
   const [vector, optionalResults] = await Promise.all([
-    resolveVectorSearch(vectorSearch),
-    runOptionalArms(queryEmbedding, args, searchOpts, arms),
+    vectorSearch,
+    runOptionalArms(embedding, args, searchOpts, arms),
   ]);
   if (shouldRejectAllArms(vector, optionalResults)) {
     throw allArmsFailed(vector, optionalResults);
@@ -241,11 +262,16 @@ export async function assembleRetrievalResult(
     rerankWindow,
     weights,
     vectorFailureReason: vector.failureReason,
+    vectorFailureState: vector.failureState,
   });
   const waited = await waitForProjectionDrain(result, deps);
   return buildEnvelope(
     waited.hits,
-    [...waited.observations, ...(deps.capabilityObservations ?? [])],
+    [
+      ...waited.observations,
+      ...arms.observations,
+      ...(deps.capabilityObservations ?? []),
+    ],
     waited.debug
   );
 }
@@ -271,6 +297,8 @@ async function resolveVectorSearch(
     return {
       retrieved: [],
       failureReason: failureMessage(err),
+      failureState: "attempted-and-failed",
+      failureCode: err instanceof GraphragError ? err.code : undefined,
     };
   }
 }
@@ -318,7 +346,7 @@ function allArmsFailed(
   }
   return new GraphragError(
     `all retrieval arms failed${failures.length > 0 ? `: ${failures.join("; ")}` : ""}`,
-    "STORAGE_ERROR"
+    vector.failureCode ?? "STORAGE_ERROR"
   );
 }
 
@@ -406,6 +434,7 @@ interface FusedAssemblyContext {
   rerankWindow: number | undefined;
   weights: RetrieveConfig;
   vectorFailureReason?: string;
+  vectorFailureState?: "unattempted" | "attempted-and-failed";
 }
 
 async function assembleVectorOnlyResult(
@@ -429,6 +458,9 @@ async function assembleVectorOnlyResult(
   return {
     hits: neighbors.hits,
     observations: [
+      ...(reranked.unattempted === true
+        ? [observation("rerank", "unattempted")]
+        : []),
       ...(reranked.degraded === true
         ? [observation("rerank", "attempted-and-failed")]
         : []),
@@ -445,8 +477,15 @@ async function assembleFusedResult(
   optionalResults: OptionalArmResults,
   context: FusedAssemblyContext
 ): Promise<AssemblyResult> {
-  const { args, deps, reranker, rerankWindow, weights, vectorFailureReason } =
-    context;
+  const {
+    args,
+    deps,
+    reranker,
+    rerankWindow,
+    weights,
+    vectorFailureReason,
+    vectorFailureState,
+  } = context;
   const { optional, communityPriority, graphPriority, remainder } =
     selectRetrievalResults(retrieved, optionalResults);
   const fused = assembleGraphPriority(
@@ -477,9 +516,13 @@ async function assembleFusedResult(
     hits: neighbors.hits,
     observations: [
       ...(vectorFailureReason !== undefined
-        ? [observation("vector", "attempted-and-failed")]
+        ? [observation("vector", vectorFailureState ?? "attempted-and-failed")]
         : []),
       ...observationsFromOptional(optional),
+      ...optionalResults.observations,
+      ...(reranked.unattempted === true
+        ? [observation("rerank", "unattempted")]
+        : []),
       ...(reranked.degraded === true
         ? [observation("rerank", "attempted-and-failed")]
         : []),
@@ -603,7 +646,7 @@ function normalizeNeighborWindow(
     : [row.valid_from, row.valid_until];
 }
 
-/** Enable-on without a wired adapter is a skip, not degraded. */
+/** Return the adapter only when the caller explicitly enabled reranking. */
 function getReranker(deps: AssembleDeps): ChunkReranker | undefined {
   if (deps.retrieveConfig?.rerankEnabled !== true) return undefined;
   return deps.reranker;
@@ -623,14 +666,32 @@ function toFusedFromRetrieved(retrieved: RetrievedChunk[]): FusedHit[] {
 /**
  * Embed the query into the single vector both arms share.
  *
- * An embedder that resolves without a usable vector (empty batch, or a
- * zero-length vector) is a failure, not a degradation: `undefined` would
- * otherwise flow into `storage.search` and `runGraphArm` and surface as a
- * downstream TypeError or a silently unfiltered search. Raising the typed
- * `EMBEDDING_FAILED` here keeps the pre-lever contract — embed failure
- * propagates before either arm starts — and leaves the graph arm's
- * fail-open degradation contract for graph-arm failures only.
+ * Missing credentials are represented by an unavailable embedder and skip
+ * the call. A configured embedder that throws, or returns no usable vector,
+ * is captured as an attempted-and-failed vector outcome so lexical retrieval
+ * can still release a marked partial response.
  */
+async function resolveQueryEmbedding(
+  embedder: EmbeddingClient,
+  query: string
+): Promise<QueryEmbeddingOutcome> {
+  if (embedder.available === false) {
+    return {
+      failureReason: "embedding credentials are not configured",
+      failureState: "unattempted",
+    };
+  }
+  try {
+    return { embedding: await embedQuery(embedder, query) };
+  } catch (err) {
+    return {
+      failureReason: failureMessage(err),
+      failureState: "attempted-and-failed",
+      failureCode: err instanceof GraphragError ? err.code : undefined,
+    };
+  }
+}
+
 async function embedQuery(
   embedder: EmbeddingClient,
   query: string

@@ -12,7 +12,7 @@
  *     never a rejection (SC8), while a step that legitimately finds nothing
  *     yields an empty NON-degraded one (SC5's "contributes nothing" case).
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 import { runNeo4jGraphArm } from "../../src/core/retrieval/neo4j-graph-arm.js";
 import type {
@@ -329,6 +329,35 @@ describe("runNeo4jGraphArm — nothing to contribute is not a degradation", () =
 });
 
 describe("runNeo4jGraphArm — fail-open (SC8)", () => {
+  it("does not return or emit a BOLT password from a degraded error", async () => {
+    const secret = "neo4j-bolt-secret";
+    const { storage, ranker } = happyPath();
+    ranker.error = new Error(
+      `Neo4j at bolt://neo4j-user:${secret}@db.example.test:7687 is unreachable`
+    );
+    const output: string[] = [];
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: unknown) => {
+        output.push(String(chunk));
+        return true;
+      });
+
+    let result;
+    try {
+      result = await runNeo4jGraphArm(
+        EMBEDDING,
+        { storage, ranker, config: CFG },
+        NOW
+      );
+    } finally {
+      stderr.mockRestore();
+    }
+
+    expect(result.failureReason).not.toContain(secret);
+    expect(output.join("")).not.toContain(secret);
+  });
+
   it("degrades instead of rejecting when the seed query throws", async () => {
     const { storage, ranker } = happyPath();
     storage.seedError = new Error("entities table is gone");

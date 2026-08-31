@@ -20,6 +20,10 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { upSchemaP0 } from "../src/core/storage/schema-p0.js";
+import {
+  redactPgConnectionString,
+  warnPgUnavailable,
+} from "./integration/pg-test-harness.js";
 
 /**
  * The four P0 tables we own. Keep in sync with specs/p0-schema.md.
@@ -61,15 +65,15 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       client = new pg.Client({ connectionString: DB_URL });
       await client.connect();
     } catch (err) {
-      console.warn(
-        `\n[schema-p0] Postgres unreachable at ${DB_URL}: ${(err as Error).message}\n`
-      );
-      console.warn(
-        "Validation:\n" +
-          "- Not run: tests/schema-p0.test.ts (idempotent)\n" +
-          `- Expected command: npx vitest run tests/schema-p0.test.ts -t 'idempotent'\n` +
-          `- Blocking issue: cannot connect to Postgres at ${DB_URL}\n`
-      );
+      warnPgUnavailable({
+        label: "schema-p0",
+        testPath: "tests/schema-p0.test.ts (idempotent)",
+        expectedCommand:
+          "npx vitest run tests/schema-p0.test.ts -t 'idempotent'",
+        connectionString: DB_URL,
+        error: err,
+        requiresVector: false,
+      });
       // Mark the client undefined so every test bails; vitest's it() will
       // still count the run as a skip when the body throws before assertions.
       client = undefined;
@@ -83,7 +87,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
   it("calling upSchemaP0 twice yields the same pg_tables count and does not throw", async () => {
     if (!client) {
       throw new Error(
-        `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+        `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
       );
     }
     const c = client;
@@ -142,7 +146,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     function requireClient(): pg.Client {
       if (!client) {
         throw new Error(
-          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
         );
       }
       return client;
@@ -362,7 +366,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     function requireClient(): pg.Client {
       if (!client) {
         throw new Error(
-          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
         );
       }
       return client;
@@ -609,7 +613,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     function requireClient(): pg.Client {
       if (!client) {
         throw new Error(
-          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
         );
       }
       return client;
@@ -862,7 +866,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     function requireClient(): pg.Client {
       if (!client) {
         throw new Error(
-          `Postgres not reachable at ${DB_URL} — see Validation block in beforeAll`
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
         );
       }
       return client;

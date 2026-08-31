@@ -33,26 +33,9 @@ npm run typecheck  # tsc --noEmit
 
 ## MCP 注册
 
-在 host 的 `.mcp.json` 中注册：
-
-```json
-{
-  "mcpServers": {
-    "iknow-memory": {
-      "command": "node",
-      "args": ["path/to/iknow-memory/dist/index.js"],
-      "env": {
-        "GRAPHRAG_MEMORY_STORAGE": "memory",
-        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048",
-        "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
-        "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3"
-      }
-    }
-  }
-}
-```
-
-pgvector 模式：
+在 host 的 MCP JSON（例如 `.mcp.json` 或 `.cursor/mcp.json`）中注册。
+Host JSON 的 `env` 是 MCP 用户配置的 SSOT；`.env.local` 仅作本地开发 fallback。
+完整说明见 [`docs/mcp-config.md`](docs/mcp-config.md)。
 
 ```json
 {
@@ -62,19 +45,25 @@ pgvector 模式：
       "args": ["path/to/iknow-memory/dist/index.js"],
       "env": {
         "GRAPHRAG_MEMORY_STORAGE": "pgvector",
-        "GRAPHRAG_MEMORY_DB_URL": "postgresql://...",
-        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "2048",
+        "GRAPHRAG_MEMORY_DB_URL": "postgresql://iknow_memory:<db-password>@localhost:5432/iknow_memory",
+        "GRAPHRAG_MEMORY_NEO4J_URI": "bolt://localhost:7687",
+        "GRAPHRAG_MEMORY_EMBED_API_KEY": "<embedding-api-key>",
         "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
-        "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3"
+        "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3",
+        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "1536",
+        "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "true",
+        "ANTHROPIC_AUTH_TOKEN": "<rerank-api-token>",
+        "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
+        "GRAPHRAG_MEMORY_ANTHROPIC_MODEL": "MiniMax-M3"
       }
     }
   }
 }
 ```
 
-> **Embedding key**：`GRAPHRAG_MEMORY_EMBED_API_KEY` 只放在进程环境 / `.env.local` /
-> Cursor Cloud Secret，**不要**写进 git 跟踪的 `.mcp.json`。MCP 子进程一般会继承
-> host 环境；Cloud start 会 setdefault URL / model / dims。
+rerank 默认开启，模型和 endpoint 默认分别为 `MiniMax-M3` 与
+`https://api.minimaxi.com/anthropic`。Embedding key 的兼容 aliases 与 secret
+放置规则见 [`docs/mcp-config.md`](docs/mcp-config.md)。
 
 ## MCP Tools
 

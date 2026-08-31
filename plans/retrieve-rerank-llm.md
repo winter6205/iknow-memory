@@ -45,3 +45,7 @@ minimal-change-verifier: yes — one logical task (temporary LLM rerank); not mi
 ## End of round
 
 **CLOSED on main** (PR #118). Dedicated HTTP rerank is quality **T2** in `plans/retrieve-graph-quality.md` — do not reopen this plan for that work.
+
+## Supersession
+
+Defaults, secret handling, and `degraded` rules were later re-decided by `specs/retrieval-stack.md` / PR #165; keep this historical plan closed and do not reopen its bullets as pending.

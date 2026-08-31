@@ -34,7 +34,7 @@ import {
   loadEnv,
   type Neo4jConfig,
 } from "../config.js";
-import { createLogger, type Logger } from "../logging.js";
+import { createLogger, type Logger, writeStderr } from "../logging.js";
 import { connectNeo4j } from "../core/graph/neo4j-writer.js";
 import {
   SCAN_START,
@@ -129,7 +129,7 @@ export async function runCli(
 ): Promise<number> {
   const parsed = parseArgs(argv);
   if (!parsed.ok) {
-    process.stderr.write(`${USAGE}\ngraph-backfill: ${parsed.error}\n`);
+    writeStderr(`${USAGE}\ngraph-backfill: ${parsed.error}\n`);
     return 2;
   }
   const client = await deps.pool.connect();
@@ -141,7 +141,7 @@ export async function runCli(
     return await backfill(deps, client, parsed.flags);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`graph-backfill fatal: ${msg}\n`);
+    writeStderr(`graph-backfill fatal: ${msg}\n`);
     deps.logger.error("graph-backfill-fatal", { error: msg });
     return 1;
   } finally {
@@ -265,7 +265,7 @@ async function reconcile(
  * projection, and exit 3 (re-run safe) rather than 1.
  */
 function loudSkip(deps: BackfillDeps, err: GraphUnavailableError): number {
-  process.stderr.write(
+  writeStderr(
     `\ngraph-backfill: Neo4j unreachable at ${err.uri}\n` +
       "Validation:\n" +
       "- Not run: Neo4j projection (backfill)\n" +
@@ -291,13 +291,13 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     logger = createLogger(env.logLevel);
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(`graph-backfill config error: ${err.message}\n`);
+      writeStderr(`graph-backfill config error: ${err.message}\n`);
       return 1;
     }
     throw err;
   }
   if (!dbUrl) {
-    process.stderr.write(
+    writeStderr(
       "graph-backfill config error: GRAPHRAG_MEMORY_DB_URL is required\n"
     );
     return 1;
@@ -350,7 +350,7 @@ const isMain = (() => {
 
 if (isMain) {
   main().catch((err) => {
-    process.stderr.write(
+    writeStderr(
       `graph-backfill fatal: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`
     );
     process.exit(1);

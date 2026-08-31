@@ -23,7 +23,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 
 import { ConfigError, loadEnv, type GraphragEnv } from "./config.js";
-import { createLogger } from "./logging.js";
+import { createLogger, redactDiagnostic, writeStderr } from "./logging.js";
 import {
   buildRegistry,
   textResult,
@@ -37,7 +37,6 @@ import {
   UnavailableEmbedder,
   type EmbeddingClient,
 } from "./core/embedder.js";
-import { redactPgDiagnostic } from "./core/storage/pg-diagnostics.js";
 import { MemoryBackend } from "./core/storage/memory-backend.js";
 import {
   createNeo4jPprRanker,
@@ -279,7 +278,7 @@ function registerOne(
         // (server/src/server/mcp.ts createToolError), but we keep the
         // try/catch to also surface stderr via the logger — hosts without
         // structured logging benefit from the observation.
-        const message = redactPgDiagnostic(
+        const message = redactDiagnostic(
           err instanceof Error ? err.message : err
         );
         logger.error("handler threw", { tool: tool.name, error: message });
@@ -301,9 +300,7 @@ export async function main(): Promise<void> {
   } catch (err) {
     if (err instanceof ConfigError) {
       // stderr only; stdout is reserved for the MCP transport.
-      process.stderr.write(
-        `iknow-memory config error: ${redactPgDiagnostic(err.message)}\n`
-      );
+      writeStderr(`iknow-memory config error: ${err.message}\n`);
       process.exit(EXIT_CODES.BAD_CONFIG);
     }
     throw err;
@@ -317,9 +314,7 @@ export async function main(): Promise<void> {
     server = await createServer();
   } catch (err) {
     if (err instanceof ConfigError) {
-      process.stderr.write(
-        `iknow-memory config error: ${redactPgDiagnostic(err.message)}\n`
-      );
+      writeStderr(`iknow-memory config error: ${err.message}\n`);
       process.exit(EXIT_CODES.BAD_CONFIG);
     }
     throw err;
@@ -342,7 +337,7 @@ const isMain = (() => {
 if (isMain) {
   main().catch((err) => {
     // stderr only; never write to stdout (reserved for MCP transport).
-    process.stderr.write(`iknow-memory fatal: ${redactPgDiagnostic(err)}\n`);
+    writeStderr(`iknow-memory fatal: ${redactDiagnostic(err)}\n`);
     process.exit(EXIT_CODES.FATAL_RUNTIME);
   });
 }

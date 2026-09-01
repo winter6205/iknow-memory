@@ -32,6 +32,7 @@ import {
 } from "./tools/registry.js";
 import { echoTool } from "./tools/echo.js";
 import { ingestTool } from "./tools/ingest.js";
+import { pushTool } from "./tools/push.js";
 import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
 import {
   NineRouterEmbedder,
@@ -233,6 +234,7 @@ export async function createServer(): Promise<McpServer> {
   const registry = buildRegistry([
     echoTool,
     ingestTool(deps),
+    pushTool(deps),
     retrieveTool(buildRetrieveDeps(deps, debug)),
   ]);
 

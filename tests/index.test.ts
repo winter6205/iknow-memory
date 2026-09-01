@@ -41,7 +41,13 @@ async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
   const saved = new Map<string, string | undefined>();
   for (const k of ENV_KEYS) {
     saved.set(k, process.env[k]);
-    delete process.env[k];
+    // `readEnv` treats a PRESENT (even blank) process key as explicit and
+    // only falls back to `.env.local` for ABSENT keys. Blanking therefore
+    // masks a developer's `.env.local`; `delete` would re-open the fallback
+    // and let `GRAPHRAG_MEMORY_STORAGE=pgvector` or a stray
+    // `ANTHROPIC_AUTH_TOKEN` bleed into these tests. Mirror the
+    // `maskDotenvLocal` convention in `tests/config.test.ts` (T-007).
+    process.env[k] = "";
   }
   // Dimensions is always required by the memory backend.
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
@@ -49,8 +55,12 @@ async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
   try {
     return await createServer();
   } finally {
+    // Faithfully restore the ORIGINAL value: absent stays absent (delete),
+    // a real value goes back verbatim. Using `""` here would lie about the
+    // pre-test state and could mask a real `.env.local` leak in a later run.
     for (const [k, v] of saved) {
       if (v !== undefined) process.env[k] = v;
+      else delete process.env[k];
     }
   }
 }

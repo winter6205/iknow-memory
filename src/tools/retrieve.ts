@@ -51,7 +51,13 @@ export class InputValidationFailureCounter {
 export function createRetrieveInputSchema(
   counter?: InputValidationFailureCounter
 ) {
-  return z.object({
+  // Plan D0 I-T1: must be z.strictObject, NOT z.object. The legacy
+  // shape silently stripped unannounced keys (top_k, filter, document_id
+  // ...) at the SDK boundary, so fin's adapter appeared to work while
+  // the server quietly ignored the unrecognized fields. strictObject
+  // rejects any unknown key with a parse error, surfacing contract
+  // drift as an explicit failure instead of a quiet mismatch.
+  return z.strictObject({
     query: z
       .string()
       .min(1, "query must be a non-empty string")

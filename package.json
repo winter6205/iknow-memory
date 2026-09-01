@@ -31,6 +31,8 @@
     "extract": "node dist/cli/extract.js",
     "consolidate": "node dist/cli/consolidate.js",
     "eval": "node dist/cli/eval.js",
+    "gate:pr": "node dist/cli/eval.js --gate pr",
+    "gate:release": "node dist/cli/eval.js --gate release",
     "graph:backfill": "node dist/cli/graph-backfill.js",
     "graph:drain": "node dist/cli/graph-drain.js",
     "community:summary": "node dist/cli/community-summary.js",

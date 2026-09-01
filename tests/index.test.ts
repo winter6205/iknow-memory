@@ -128,15 +128,17 @@ function textOf(result: { content: unknown }): string {
 }
 
 describe("createServer — registered tool set (T7)", () => {
-  it("tools/list advertises echo, ingest, push, and retrieve", async () => {
-    // Plan D0 I-T4 added `push` alongside the existing ingest entry;
-    // the wire-level tool set is now echo + ingest + push + retrieve.
+  it("tools/list advertises echo, ingest, invalidation, push, and retrieve", async () => {
+    // Plan D0 I-T4 + I-T5: `push` and `invalidation` joined the tool
+    // set. The wire-level tool set is now echo + ingest + invalidation
+    // + push + retrieve.
     const { client, close } = await connectInProcess();
     try {
       const { tools } = await client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual([
         "echo",
         "ingest",
+        "invalidation",
         "push",
         "retrieve",
       ]);

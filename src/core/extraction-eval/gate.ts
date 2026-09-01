@@ -15,10 +15,11 @@
  *     lower-bound (≥), `hallucinationRate` is upper-bound (≤) — the
  *     natural direction for each metric.
  *   - **extractThresholds** — SC15: pulls the locked thresholds FROM
- *     the baseline entry. The Bootstrap record has no thresholds; the
- *     function returns `null` so the CLI can surface a clear
- *     ConfigError (SC12). The release thresholds live with the
- *     baseline file, never as literals in this module.
+ *     the gold-set directory's `thresholds.json` file (refuse-until-
+ *     lock). The Bootstrap period has no thresholds; the function
+ *     returns `null` so the CLI can surface a clear ConfigError
+ *     (SC12). The release thresholds live in `thresholds.json`, never
+ *     as literals in this module.
  *
  * Per SC7, the five diagnostic error types are deliberately absent
  * from every gate signature: the suite pins the surface so a future
@@ -27,9 +28,11 @@
  * decide whether the gate trips.
  *
  * Pure: no I/O, no clock, no randomness, no LLM. The CLI layer
- * (E-T6) reads the baseline file via `baseline.ts` and hands the
- * parsed data to these functions.
+ * (E-T6) reads the baseline file via `baseline.ts` and the
+ * thresholds file, and hands the parsed data to these functions.
  */
+
+import type { LockedThresholds } from "./baseline.js";
 
 /**
  * The three numeric axes the gate consumes. Same shape on both the
@@ -47,31 +50,27 @@ export interface Axes {
  * ("must be at least"); hallucination rate is upper-bound ("must be
  * at most"). The direction lives on the call site (releaseGate) so a
  * future axis can adopt either semantics without a key rename.
+ *
+ * Re-exported as the gate-facing alias of `LockedThresholds` (the
+ * baseline module owns the canonical name; the gate keeps a friendly
+ * alias for callers that import from this module).
  */
-export interface ReleaseThresholds {
-  f1: number;
-  schemaRate: number;
-  hallucinationRate: number;
-}
+export type ReleaseThresholds = LockedThresholds;
 
 /**
- * The shape E-T4's `baseline.ts` is contracted to produce. Listed
- * here so the gate module can type its inputs without taking a
- * dependency on the I/O layer; the baseline module is free to import
- * `BaselineEntry` back from here or redeclare it identically.
+ * Pull the locked thresholds FROM the gold-set directory. Returns
+ * `null` when no `thresholds.json` exists — the Bootstrap period
+ * records axes only and a release run against that state is a
+ * misconfiguration the CLI (E-T6) surfaces as a ConfigError (SC12).
  *
- * `thresholds` is optional because the Bootstrap period records
- * axes only; release thresholds are locked later in a separate
- * commit (A2, SC12).
+ * Returns a shallow copy so a caller mutating the result cannot
+ * silently rewrite the threshold file.
  */
-export interface BaselineEntry {
-  snapshotId: string;
-  modelId: string;
-  promptHash: string;
-  axes: Axes;
-  thresholds?: ReleaseThresholds;
-  /** ISO timestamp the run was recorded; opaque to the gate. */
-  recordedAt: string;
+export function extractThresholds(
+  locked: LockedThresholds | null
+): ReleaseThresholds | null {
+  if (locked === null) return null;
+  return { ...locked };
 }
 
 /** Knobs for driftGate. */
@@ -140,9 +139,9 @@ export function driftGate(
 /**
  * Release absolute gate. Every axis is checked against its threshold
  * in `extractThresholds`-style input:
- *   - `f1 >= thresholds.f1`
- *   - `schemaRate >= thresholds.schemaRate`
- *   - `hallucinationRate <= thresholds.hallucinationRate`
+ *   - `f1 >= thresholds.f1Minimum`
+ *   - `schemaRate >= thresholds.schemaRateMinimum`
+ *   - `hallucinationRate <= thresholds.hallucinationRateMaximum`
  *
  * Axes that breach are listed under `failures` (the value is `true`;
  * presence is the signal). An empty `failures` object means pass.
@@ -156,27 +155,11 @@ export function releaseGate(
   thresholds: ReleaseThresholds
 ): ReleaseResult {
   const failures: ReleaseFailures = {};
-  if (currentAxes.f1 < thresholds.f1) failures.f1 = true;
-  if (currentAxes.schemaRate < thresholds.schemaRate)
+  if (currentAxes.f1 < thresholds.f1Minimum) failures.f1 = true;
+  if (currentAxes.schemaRate < thresholds.schemaRateMinimum)
     failures.schemaRate = true;
-  if (currentAxes.hallucinationRate > thresholds.hallucinationRate) {
+  if (currentAxes.hallucinationRate > thresholds.hallucinationRateMaximum) {
     failures.hallucinationRate = true;
   }
   return { pass: Object.keys(failures).length === 0, failures };
-}
-
-/**
- * Pull the locked thresholds FROM a baseline entry. Returns `null`
- * when the entry carries none — the Bootstrap period records axes
- * only and a release run against that baseline is a misconfiguration
- * the CLI (E-T6) surfaces as a ConfigError (SC12).
- *
- * Returns a shallow copy so a caller mutating the result cannot
- * silently rewrite the baseline file's threshold record.
- */
-export function extractThresholds(
-  baseline: BaselineEntry
-): ReleaseThresholds | null {
-  if (baseline.thresholds === undefined) return null;
-  return { ...baseline.thresholds };
 }

@@ -275,6 +275,59 @@ describe("createRetrieveHandler", () => {
       expect(body.chunks.map((c) => c.id)).toEqual(["evergreen"]);
     });
   });
+
+  // Plan D0 I-T2: the wire envelope's hit list is `chunks[]`, with each
+  // chunk carrying `source_ref`. The contract forbids carrying an
+  // alternate `hits` list on the envelope — fin's adapter reads
+  // `chunks[]` exclusively (per §B4), so a stray `hits` would silently
+  // drift the two sides. `hits` is allowed as an internal field name on
+  // arm/rerank results, but `buildEnvelope` must never serialize it.
+  describe("wire envelope shape (chunks + source_ref)", () => {
+    it("envelope exposes only `chunks` (never a top-level `hits` field)", async () => {
+      const embedder = new FakeEmbedder(TEST_DIM);
+      const [vec] = await embedder.embed(["source-ref marker"]);
+      await backend.upsert([
+        makeChunk({
+          id: "src-chunk",
+          content: "source-ref marker",
+          source_ref: "docs/source-ref.md",
+          embedding: vec!,
+        }),
+      ]);
+      const result = await handler({ query: "source-ref marker" });
+      const body = parseResultBody(result);
+      // Top-level keys must be exactly chunks (and optionally the
+      // degraded keys handled by a separate suite).
+      expect(Object.keys(body).sort()).toEqual(["chunks"]);
+      expect(Array.isArray(body.chunks)).toBe(true);
+    });
+
+    it("every chunk carries a non-empty source_ref string", async () => {
+      const embedder = new FakeEmbedder(TEST_DIM);
+      const [vec] = await embedder.embed(["alpha"]);
+      await backend.upsert([
+        makeChunk({
+          id: "a",
+          content: "alpha",
+          source_ref: "docs/a.md",
+          embedding: vec!,
+        }),
+        makeChunk({
+          id: "b",
+          content: "alpha variant",
+          source_ref: "docs/b.md",
+          embedding: vec!,
+        }),
+      ]);
+      const result = await handler({ query: "alpha" });
+      const body = parseResultBody(result);
+      expect(body.chunks.length).toBeGreaterThan(0);
+      for (const chunk of body.chunks) {
+        expect(typeof chunk.source_ref).toBe("string");
+        expect(chunk.source_ref.length).toBeGreaterThan(0);
+      }
+    });
+  });
 });
 
 describe("retrieveTool", () => {
@@ -328,6 +381,42 @@ describe("retrieveTool", () => {
       wait_for_drain_timeout_ms: 250,
     });
     expect(result.success).toBe(true);
+  });
+
+  // Plan D0 I-T1: unannounced keys must be rejected at the schema layer so
+  // the wire adapter can never "appear to work" while the server silently
+  // strips the unrecognized fields. The previous shape (z.object without
+  // .strict()) let `top_k` / `filter` / `document_id` vanish without a
+  // peep, which masked the cross-repo contract drift between fin's
+  // push_port and iknow-memory's published input schema.
+  it("input schema rejects unknown top-level keys (no silent strip)", () => {
+    const tool = retrieveTool({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    const result = tool.inputSchema.safeParse({
+      query: "hello",
+      top_k: 5,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("input schema rejects the legacy fin adapter keys top_k/filter/document_id", () => {
+    const tool = retrieveTool({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    for (const legacy of [
+      { top_k: 5 },
+      { filter: { source_ref: "x.md" } },
+      { document_id: "doc-1" },
+    ]) {
+      const result = tool.inputSchema.safeParse({
+        query: "hello",
+        ...legacy,
+      });
+      expect(result.success).toBe(false);
+    }
   });
 });
 

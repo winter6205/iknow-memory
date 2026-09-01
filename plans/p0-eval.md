@@ -23,7 +23,7 @@ ADR-0002 and CONTEXT **extraction F1** are already flushed (not a tracer bullet)
    - **Inherits:** spec A8, A9, SC8, SC11: match key is case-fold+trim heads/tails + extract `normalizeRelation` for `relation_norm`; snapshot 10–40 chunks; every gold triple has provenance; missing provenance is a typed error; no merge into gold from a previous gold model on overwrite (overwrite behaviour is asserted with the CLI in T6 — loader still rejects malformed files).
    - **Surface:** extraction-adjacent eval capability (same family as `src/core/extraction`, not retrieve, not MCP tools).
    - **Acceptance:** a valid fixture snapshot+gold loads; a gold triple without provenance is a typed error; snapshot size outside 10–40 fails validation; `npm test` path for this loader does not call a live LLM.
-   - Status: [ ] pending
+   - Status: [x] done — `src/core/extraction-eval/{types,errors,fixture-io,snapshot,gold,match-key}.ts`; tests `tests/extraction-eval/{snapshot,gold,match-key}.test.ts` (50 cases, no live LLM)
    - [blocks: none]
 
 2. **[parallel] Three-axis scoring** — tag: `[implementation]`

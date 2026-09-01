@@ -620,8 +620,14 @@ describePg("extraction-eval-pg: scoring persisted triples (E-T7)", () => {
    */
   function requireClient(): pg.Client {
     if (!client) {
+      // No URL interpolation here: tests/credential-redaction.test.ts scans
+      // every Error()/console.* call for `${BASE_DB_URL}` and similar, so
+      // surfacing the host string in the diagnostic sink would fail that
+      // guard. The operator already has the URL printed by the Validation
+      // block at the top of the file — that's the single sink for the
+      // raw connection string.
       throw new Error(
-        `Postgres not reachable at ${BASE_DB_URL} — see Validation block in beforeAll`
+        "Postgres not reachable — see Validation block in beforeAll"
       );
     }
     return client;

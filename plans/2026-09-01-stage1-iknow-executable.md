@@ -1,153 +1,175 @@
-# Plan: 阶段 1 iknow-memory 可执行子集（质量栈 T2–T5 + p0-eval）
+# Plan: Stage 1 iknow — quality T2–T5 + p0-eval
 
-**Goal:** 在不联调 fin、不改跨仓基线的前提下，并行推进检索质量栈剩余可切的刀，以及抽取层 **extraction F1** 的 LLM gold 评测（本仓「真实数据」）。
-**Approach:** 一条 worktree、一张计划、两条互不共享可变状态的轨道。Track Q 执行 `plans/retrieve-graph-quality.md` 的 T2–T5：T3/T4/T5 无外部 HTTP，作为质量栈默认第一刀并行；T2 专用 rerank HTTP 与它们并行但不是本轮首选。Track E 执行 `plans/p0-eval.md` 全文 pending 弹：真实数据 = 冻结 10–40 chunk snapshot 上的 gold-build，不是等 fin 入库推送。默认第一刀 Track E 的 T1（gold loader）与 Track Q 的 T3/T4/T5 可同时开。
-**Spec link:** `specs/retrieve-graph-quality.md`；`specs/p0-eval.md`（本 worktree 从 `docs/p0-eval-llm-gold` 带入，允许随本 PR 合入 main）
-**Tracker:** FALLBACK — 本地本文件。操作者本轮禁止 GitHub issue；`plans/retrieve-graph-quality.md` 原本即以本地 markdown 为 SSOT。
-**Per-ticket loop (all bullets):** tdd → `npm test` + `npm run build`（无 live Anthropic / 无 live gold LLM）→ code-review → verification-before-completion → one commit on `docs/stage1-iknow-executable-plan`（或从其再切的 ticket 分支）
+**Goal:** 在本 worktree 上并行落地质量栈可执行子集（dedicated HTTP rerank + projection GC + self-loop reject + `merged_into`）与 p0-eval 全链路（gold loader → scoring/filter → baseline/gate → CLI → PG/CI），本轮不接 fin 推送、不改跨仓对齐基线。
+**Approach:** 双轨同一文件：Track Q 不依赖外部 rerank URL，默认第一刀为 Q-T3 / Q-T4 / Q-T5 三路并行；Q-T2 与之 `[parallel]` 但不是本轮默认产品第一刀，且 `npm test` 禁止 live HTTP。Track E 的「真实数据」路径就是 p0-eval frozen 10–40 chunk snapshot + gold-build；默认第一刀为 E-T1（gold loader），其后按 `plans/p0-eval.md` 依赖图推进 T2–T8。两轨互不阻塞；eval 子弹不掺 extract 管线行为，也不掺 retrieve P@5。
+**Spec link:** `specs/retrieve-graph-quality.md` · `specs/p0-eval.md`（源计划：`plans/retrieve-graph-quality.md` · `plans/p0-eval.md`）
+**Tracker:** **local markdown fallback** — 本文件为执行 SSOT。Operator 禁止 GitHub issues；**不要** `gh issue create`。`plans/retrieve-graph-quality.md` 已写明 GitHub 不是 tracker。认领方式：在本文件翻转对应子弹 **Status**。
+**ACR:** all-yes（分轨各贴 5 行，仍全部 yes）
+**Per-ticket loop (all bullets):** tdd → typecheck+tests → code-review → verification-before-completion → one commit on this worktree branch
 
-## ACR — Track Q（retrieve-graph-quality T2–T5）
+## ACR — Track Q（copy from `plans/retrieve-graph-quality.md` / spec）
 
-bounded-context-guardian: yes — retrieval / extraction / projection 保持能力切片；无 Host 装配模块；无 `controllers/` / `services/`。
-defensive-contract-validator: yes — 各 slice 先测后改；T2 无 live HTTP；T3 沿用既有 Neo4j 测试风格。
-error-handling-enforcer: yes — skip vs fail-open vs `ConfigError` 按 slice 具名；rerank 缺 URL 为 skip 且不标 `degraded`。
-complexity-anti-drift: yes — 每弹一个 helper / CLI 缝，不重写 `assembleRetrievalResult` 成上帝文件。
-minimal-change-verifier: yes — 一弹一 commit；不把剩余质量栈一次落地。
+bounded-context-guardian: yes — retrieval / extraction / projection stay capability slices; no Host context-assembly module; no technical-layer top-level dirs.
+defensive-contract-validator: yes — Testing Strategy names empty / negative / overflow / concurrent / exception for the stack; each slice adds tests before code (writing-plans).
+error-handling-enforcer: yes — skip vs fail-open vs `ConfigError` named per slice; embed hard-fail unchanged; EXIT on skip/fail-open.
+complexity-anti-drift: yes — each slice is a helper on the existing assembler or extract/drain CLI, not a god-file rewrite.
+minimal-change-verifier: yes **for this spec as one contract**; implementation **must** be one logical task per tracer bullet (writing-plans). Do not land remaining slices in one commit.
 
-## ACR — Track E（p0-eval）
+## ACR — Track E（copy from `plans/p0-eval.md` / spec）
 
-bounded-context-guardian: yes — 离线抽取质量评测；不进 Host；隔离 `src/tools` 与 retrieve。
-defensive-contract-validator: yes — spec Testing Strategy 的五类边界；loader/scoring/filter/gate 各弹补测。
-error-handling-enforcer: yes — 模型 id 冲突与未 lock 的 release gate 用 `ConfigError`；exit 0/1/2 按 spec；无空 catch。
-complexity-anti-drift: yes — scoring / filter / baseline / gate / CLI 分开，CLI 只组合。
-minimal-change-verifier: yes — 不混 retrieve P@5、不改 extract 管线行为。
+bounded-context-guardian: yes — eval is an offline extraction-quality capability; no Host assembly; no technical-layer top-level dirs (`controllers`/`services`); isolation from `src/tools` and retrieve.
+defensive-contract-validator: yes — Testing Strategy names empty / negative / overflow / concurrent / exception.
+error-handling-enforcer: yes — ConfigError for model-id clash and pre-lock release gate; typed loader errors; EXIT on fatal is rerun/fix config; gate fail is exit 2 not swallowed; no empty catch in the contract.
+complexity-anti-drift: yes — scoring, filter, baseline, gate, and CLI stay separate; CLI composes them, does not inline a god scorer.
+minimal-change-verifier: yes — one logical task per tracer bullet below; not mixed with retrieve P@5 or extract pipeline behaviour.
 
 ## 已锁定决策
 
-1. 本轮**不改**两仓共享「跨仓对齐基线」章节。
-2. 不与 fin 联调、不接收 fin 推送块；「不二次切分」留阶段 2。
-3. 本仓「真实数据」= p0-eval 的冻结 snapshot + LLM gold-build（`specs/p0-eval.md`），**不是** fin 的 EDGAR 评测数据集，也不是入库推送。
+1. 本轮不改两仓共享「跨仓对齐基线」章节。
+2. 不与 fin 联调、不接收 fin 推送块；不二次切分验收留阶段 2。
+3. 「真实数据」= p0-eval gold snapshot + gold-build，不是 EDGAR/fin 语料。Fin 入库推送是阶段 2。
 4. 质量栈本轮只做 T2–T5；T6 mode bundles 及之后下一轮。
-5. `plans/p0-eval.md` 与 `specs/p0-eval.md` 从 `docs/p0-eval-llm-gold` 带进本 worktree；本 PR 可以把这两份 SSOT 合入 main，实现按 Track E 子弹走。
-6. T2 需要 HTTP 端点时：缺 URL → skip、不 `degraded`；`npm test` 只用 fake HTTP。没有现成端点就不把 T2 当本轮第一刀。
+5. p0-eval spec/plan 从 `docs/p0-eval-llm-gold` 带进本 worktree（`plans/p0-eval.md`、`specs/p0-eval.md`）；本 PR 允许把这两份 SSOT 合入 main，实现按 Track E 子弹推进。
+6. Tracker 本地 markdown。
+
+## Baseline（本轮不重做）
+
+| 轨  | 已在 main                                     | Evidence                                            |
+| --- | --------------------------------------------- | --------------------------------------------------- |
+| Q   | Temporary LLM rerank（quality T1 / slice 0）  | PR #118 · `plans/retrieve-rerank-llm.md` **closed** |
+| Q   | Graph-priority + 质量栈契约                   | PR #94 / #117                                       |
+| Q   | Community summaries（quality T9）             | `plans/retrieve-community.md` **closed**            |
+| E   | ADR-0002 / CONTEXT **extraction F1** 已 flush | 不是 tracer bullet                                  |
+
+## Frontier（默认第一刀）
+
+- **Track Q：** Q-T3 / Q-T4 / Q-T5 并行开工（无需外部 rerank URL）。Q-T2 `[parallel]` 可同回合做，但**不是**本轮默认产品第一刀。
+- **Track E：** E-T1 gold loader — 这就是本仓锁定的「真实数据」路径。其后 E-T2 / E-T3 在 E-T1 之后并行。
 
 ## Tasks (ordered by dependency)
 
-### Track Q — 质量栈
+两轨独立编号别名（Q-T\* / E-T\* 对齐源计划）；下方 1–12 为跨轨顺序号。`[blocks:]` 使用别名，避免与跨轨序号混淆。
 
-1. **[parallel] Projection GC** — tag: `[implementation]`
-   - **Inherits:** `plans/retrieve-graph-quality.md` T3；spec SC4；ADR-0001 Neo4j 非 SoR。ledger delete/retire → drain 按 id 去掉投影；空图仍可 backfill。
-   - **Surface:** 既有 projection outbox / drain CLI。
-   - **Acceptance:** ledger 删除并 drain 后 Neo4j 无该 id 的 node/edge（同 graph-arm 测试风格）；空图 backfill 仍可用。
+### Track Q — retrieve-graph-quality executable subset
+
+1. **[Track Q] Dedicated rerank HTTP (Q-T2)** — tag: `[implementation]`
+   - **Inherits:** `specs/retrieve-graph-quality.md` SC1–SC3, slice 1: 同一 retrieve hook as quality T1; default off; missing URL skip not `degraded`; throw fail-open + `degraded`; not Host chat model.（源计划 `plans/retrieve-graph-quality.md` T2。）
+   - **Surface:** retrieve orchestrator rerank port; config/env for HTTP endpoint. Temporary LLM adapter remains until this bullet replaces it on the hook.
+   - **Acceptance:** off → identical to post-T1 order; on + no URL → skip, no `degraded`; fake HTTP permutation then `limit`; **no live HTTP in `npm test`**（禁止 dedicated live HTTP）。
    - Status: [ ] pending
    - [parallel]
-   - **质量栈默认第一刀之一**
+   - [blocks: none] — quality T1 already on main
 
-2. **[parallel] Self-loop extract reject** — tag: `[implementation]`
-   - **Inherits:** 同文件 T4；spec SC5。行级 reject；`--only-failed` 不强制再抽；不产生孤儿 entity。
-   - **Surface:** extract CLI / triple 写路径。
-   - **Acceptance:** self-loop 记为 reject、无图边；`npm test` exit 0。
+2. **[Track Q] Projection GC (Q-T3)** — tag: `[implementation]`
+   - **Inherits:** spec SC4, slice 2: ledger delete/retire → drain removes projection by id; empty graph still backfill; no graph tombstone as primary scheme. ADR-0001: Neo4j not SoR.
+   - **Surface:** projection outbox / drain CLI (existing graph projection path).
+   - **Acceptance:** after ledger delete and drain, Neo4j has no node/edge for that id (same Neo4j test style as the graph-arm suite); backfill of an empty graph still works.
    - Status: [ ] pending
    - [parallel]
-   - **质量栈默认第一刀之一**
 
-3. **[parallel] Persist `merged_into`** — tag: `[implementation]`
-   - **Inherits:** 同文件 T5；spec SC6。P0c soft-merge；triples FK 不变；`resolveCanonicalId` 仍是生产读路径。
-   - **Surface:** extract merge/write；entities ledger。
-   - **Acceptance:** loser 行 `merged_into` = survivor；二次 extract 对该指针幂等（沿用既有 Postgres extract 测试 helper）。
+3. **[Track Q] Self-loop extract reject (Q-T4)** — tag: `[implementation]`
+   - **Inherits:** spec SC5, slice 3: row-level reject; not `--only-failed` force re-extract; no orphan entity for discarded loops.
+   - **Surface:** extract CLI / triple write path.
+   - **Acceptance:** self-loop is recorded as reject, no graph edge, `--only-failed` does not require re-extract; `npm test` exit 0.
    - Status: [ ] pending
    - [parallel]
-   - **质量栈默认第一刀之一**
 
-4. **[parallel] Dedicated rerank HTTP** — tag: `[implementation]`
-   - **Inherits:** 同文件 T2；spec SC1–SC3。与临时 LLM adapter 同一 retrieve hook；默认关；缺 URL skip 且不 `degraded`；throw fail-open + `degraded`。
-   - **Surface:** retrieve orchestrator rerank port；config/env 中的 HTTP endpoint。
-   - **Acceptance:** 关闭时顺序与 post-T1 相同；开且无 URL → skip；fake HTTP 置换后再 `limit`；`npm test` 无 live HTTP。
+4. **[Track Q] Persist `merged_into` (Q-T5)** — tag: `[implementation]`
+   - **Inherits:** spec SC6, slice 4; P0c soft-merge; triples FK unchanged; `resolveCanonicalId` is the production read path.
+   - **Surface:** extract merge/write path; entities ledger.
+   - **Acceptance:** loser row stores `merged_into` = survivor; second extract is idempotent on that pointer (Postgres test helper already used by extract tests).
    - Status: [ ] pending
    - [parallel]
-   - [blocks: retrieve-graph-quality T1（已 done #118）]
 
-### Track E — p0-eval（真实数据 / extraction F1）
+### Track E — p0-eval（pending 全收，Acceptance 继承 `plans/p0-eval.md`）
 
-5. **Gold types + snapshot/gold loader** — tag: `[implementation]`
-   - **Inherits:** `plans/p0-eval.md` T1；spec A8, A9, SC8, SC11。
-   - **Surface:** 抽取旁路 eval 能力（与 `src/core/extraction` 同族，不是 retrieve，不是 MCP tool）。
-   - **Acceptance:** 合法 fixture snapshot+gold 能加载；缺 provenance 的 gold triple 为具名错误；snapshot 尺寸越出 10–40 校验失败；本 loader 的 `npm test` 路径不打 live LLM。
+ADR-0002 and CONTEXT **extraction F1** are already flushed (not a tracer bullet).
+
+5. **[Track E] Gold types + snapshot/gold loader (E-T1)** — tag: `[implementation]`
+   - **Inherits:** spec A8, A9, SC8, SC11: match key is case-fold+trim heads/tails + extract `normalizeRelation` for `relation_norm`; snapshot 10–40 chunks; every gold triple has provenance; missing provenance is a typed error; no merge into gold from a previous gold model on overwrite (overwrite behaviour is asserted with the CLI in E-T6 — loader still rejects malformed files).
+   - **Surface:** extraction-adjacent eval capability (same family as `src/core/extraction`, not retrieve, not MCP tools).
+   - **Acceptance:** a valid fixture snapshot+gold loads; a gold triple without provenance is a typed error; snapshot size outside 10–40 fails validation; `npm test` path for this loader does not call a live LLM.
    - Status: [ ] pending
-   - **真实数据默认第一刀**
    - [blocks: none]
 
-6. **[parallel] Three-axis scoring** — tag: `[implementation]`
-   - **Inherits:** `plans/p0-eval.md` T2；spec SC4–SC7, A1。
-   - **Surface:** 与 T5 同一 eval 能力。
-   - **Acceptance:** spec SC4 手算 F1 用例通过；UNMAPPED 降低 schema rate；非 substring evidence 计 hallucination；每条误预测恰好一个 error type。
+6. **[Track E] Three-axis scoring (E-T2)** — tag: `[implementation]`
+   - **Inherits:** spec SC4–SC7, A1: micro-F1 exact match on the pinned key; schema rate vs ALLOWED; hallucination = evidence span not a substring; five error types diagnostic only.
+   - **Surface:** same eval capability as E-T1.
+   - **Acceptance:** the SC4 hand-computed F1 case passes; UNMAPPED lowers schema rate; non-substring evidence counts as hallucinated; each mis-prediction gets exactly one error type.
    - Status: [ ] pending
    - [parallel]
-   - [blocks: T5]
+   - [blocks: E-T1]
 
-7. **[parallel] Eval filter** — tag: `[implementation]`
-   - **Inherits:** `plans/p0-eval.md` T3；spec A4, SC10。ALLOWED 从抽取词表 import，禁止模块内硬编码副本。
-   - **Surface:** 同一 eval 能力；词表模块已在 main。
-   - **Acceptance:** accept 路径与每个 reject reason 均有测试；grep 证明 filter 模块无硬编码 ALLOWED 副本。
+7. **[Track E] Eval filter (E-T3)** — tag: `[implementation]`
+   - **Inherits:** spec A4, SC10: code filter; ALLOWED imported from extraction vocabulary; reject reasons no-grounding / relation-not-norm / entity-not-normalized / negated.
+   - **Surface:** same eval capability; vocabulary module already on main.
+   - **Acceptance:** accept path plus each reject reason has a test; grep shows no hard-coded ALLOWED copy inside the filter module.
    - Status: [ ] pending
    - [parallel]
-   - [blocks: T5]
+   - [blocks: E-T1]
 
-8. **Baseline append, steady state, atomic write** — tag: `[implementation]`
-   - **Inherits:** `plans/p0-eval.md` T4；spec A2, A10, SC12, SC13, SC16。
-   - **Surface:** eval 能力 + `gold-set/`（或 env 覆盖路径）。
-   - **Acceptance:** append 记录三轴；0.05 边界正反测；两次并发 append 留下合法 JSON；release-gate 未 lock 即拒必须在 T9 之前存在。
+8. **[Track E] Baseline append, steady state, atomic write (E-T4)** — tag: `[implementation]`
+   - **Inherits:** spec A2, A10, SC12, SC13, SC16: Bootstrap records only; adjacent F1 delta ≤ 0.05 is ready-to-lock; concurrent writers do not leave truncated JSON.
+   - **Surface:** eval capability + `gold-set/` (or env override path).
+   - **Acceptance:** append records three axes; 0.05 boundary is tested both ways; two concurrent appends leave valid JSON; release-gate refuse-until-lock can live here or in E-T5 but must exist before E-T6.
    - Status: [ ] pending
-   - [blocks: T6]
+   - [blocks: E-T2]
 
-9. **PR drift gate + Release absolute gate** — tag: `[implementation]`
-   - **Inherits:** `plans/p0-eval.md` T5；spec A3, SC14, SC15。PR 无 LLM；缺 baseline 通过；error types 永不门禁。
-   - **Surface:** eval 纯函数（CLI 在 T10 接线）。
-   - **Acceptance:** ±0.05 drift 过/不过；无 baseline 首跑通过；每轴绝对过/不过；阈值不硬编码在 gate 模块。
+9. **[Track E] PR drift gate + Release absolute gate (E-T5)** — tag: `[implementation]`
+   - **Inherits:** spec A3, SC14, SC15: PR is LLM-free; missing baseline passes; |ΔF1| > 0.05 → fail; Release reads thresholds from baseline, any axis fail fails; error types never gate.
+   - **Surface:** eval capability (pure functions; CLI wires flags in E-T6).
+   - **Acceptance:** drift pass/fail at ±0.05; first run with no baseline passes; absolute pass/fail per axis; thresholds not hard-coded in the gate module.
    - Status: [ ] pending
-   - [blocks: T8]
+   - [blocks: E-T4]
 
-10. **Eval CLI** — tag: `[implementation]`
-    - **Inherits:** `plans/p0-eval.md` T6；spec A6, A11, A12, A14, A16, SC3, SC9, SC19, SC20。
-    - **Surface:** 既有 CLI 族（`extract`、`eval-retrieve`）上的新 eval 入口，不是 MCP tool。
-    - **Acceptance:** 未知 flag → 2；模型 id 冲突 → 1；`--gate pr` 无 baseline → 0；`--gate release` 未 lock → 1；fake LLM gold-build overwrite 丢掉旧模型残留 triple；eval 入口不 import `src/tools` 或 `src/index`。
+10. **[Track E] Eval CLI (E-T6)** — tag: `[implementation]`
+    - **Inherits:** spec A6, A11, A12, A14, A16, SC3, SC9, SC19, SC20: flags gold-build / audit-rejects / bootstrap / gate pr / gate release; gold and audit model ids ≠ extract; gold-build overwrites same snapshot+model+prompt-hash; audit labels are the three allowed values; isolation from tools/index/retrieve; exits 0/1/2 as spec.
+    - **Surface:** existing CLI family (`extract`, `eval-retrieve`) — new eval entry, not an MCP tool.
+    - **Acceptance:** subprocess tests cover unknown flag → 2, model-id clash → 1, `--gate pr` with no baseline → 0, `--gate release` before lock → 1; fake LLM gold-build overwrite drops leftover triples; eval entry does not import `src/tools` or `src/index`.
     - Status: [ ] pending
-    - [blocks: T7, T9]
+    - [blocks: E-T3, E-T5]
 
-11. **[parallel] Postgres eval integration** — tag: `[implementation]`
-    - **Inherits:** `plans/p0-eval.md` T7；spec A15。只读既有 extraction 表；PG 不可达 loud skip。
-    - **Surface:** 既有 spec-2 PG 测试隔离 / `extraction_records` + triples。
-    - **Acceptance:** PG 可用时能对已持久化 extract batch 打分；PG 宕机时套件 loudly skip，不是静默通过。
+11. **[Track E] Postgres eval integration (E-T7)** — tag: `[implementation]`
+    - **Inherits:** spec A15: read existing extraction tables only; loud skip if Postgres unreachable.
+    - **Surface:** existing spec-2 PG test isolation / `extraction_records` + triples.
+    - **Acceptance:** with Postgres up, a persisted extract batch can be scored; with Postgres down, the suite skips loudly (documented Validation), not a silent pass.
     - Status: [ ] pending
     - [parallel]
-    - [blocks: T10]
+    - [blocks: E-T6]
 
-12. **[parallel] Frozen snapshot v1 + CI scripts + runbook** — tag: `[implementation]`
-    - **Inherits:** `plans/p0-eval.md` T8；spec A5, A13, SC8, SC18。Live LLM gold-build 写在 runbook，不进 `npm test`。
-    - **Surface:** `gold-set/`、`package.json` scripts、operator runbook。
-    - **Acceptance:** snapshot 尺寸在范围内；`npm run gate:pr` / `gate:release` 调 eval CLI；runbook 写明 gold-build → audit → bootstrap → lock → observe，以及 extract 模型不得改写 gold；无 gold 凭证时 `npm test` 仍绿。
+12. **[Track E] Frozen snapshot v1 + CI scripts + runbook (E-T8)** — tag: `[implementation]`
+    - **Inherits:** spec A5, A13, SC8, SC18: 10–40 chunk snapshot in git; `gate:pr` / `gate:release` scripts; Bootstrap-period PR path prints numbers and does not fail on F1 magnitude; runbook: gold-build → audit → bootstrap → lock thresholds → observe gates. Live LLM gold-build is documented, not required for `npm test`.
+    - **Surface:** `gold-set/`, `package.json` scripts, operator runbook docs.
+    - **Acceptance:** snapshot size in range; `npm run gate:pr` and `gate:release` invoke the eval CLI; runbook names the command sequence and the “new ruler” rule (extract model must not rewrite gold); `npm test` still green without gold-model credentials.
     - Status: [ ] pending
     - [parallel]
-    - [blocks: T10]
+    - [blocks: E-T6]
 
 ## 不在本计划范围
 
-- 质量栈 T6 mode bundles、T7 neighbor chunks、T8 node embedding、T10 causal supersession、T11 wait-for-drain（T9 community 已 done）
-- 阶段 2（D）与 fin 推送 / 不二次切分联调
-- fin A1–A7 / A8 EDGAR 数据集
-- retrieve P@5（`specs/retrieve-p5.md`）
-- 用新 extract 模型重写 gold；人工标注
+- Track Q 源计划剩余：**T6** mode bundles、**T7** neighboring chunk evidence、**T8** node embedding in retrieve、**T10** causal relations / fact supersession、**T11** optional projection wait（T9 community 已在 main，本轮不重做）。
+- **阶段 2：** 接收 fin 入库推送、二次切分验收、与 fin 联调。
+- **fin A1–A7**（fin 侧入库 / 推送契约，不在本 worktree 执行）。
+- 改两仓共享「跨仓对齐基线」章节。
+- 把 extract pipeline 行为写进 Track E 子弹；把 retrieve P@5 写进 Track E 子弹。
+- Dedicated rerank 的 live HTTP 进入 `npm test`。
+- GitHub issues / `gh issue create`。
 
 ## 关联工件
 
-| 类型                 | 路径                              |
-| -------------------- | --------------------------------- |
-| 本轮执行 SSOT        | 本文件                            |
-| 质量栈计划           | `plans/retrieve-graph-quality.md` |
-| p0-eval 计划（带入） | `plans/p0-eval.md`                |
-| p0-eval spec（带入） | `specs/p0-eval.md`                |
-| 质量栈 spec          | `specs/retrieve-graph-quality.md` |
+| 角色                | 路径                                                       |
+| ------------------- | ---------------------------------------------------------- |
+| Track Q spec        | `specs/retrieve-graph-quality.md`                          |
+| Track Q 源计划      | `plans/retrieve-graph-quality.md`                          |
+| Track E spec        | `specs/p0-eval.md`                                         |
+| Track E 源计划      | `plans/p0-eval.md`                                         |
+| 本文件（执行 SSOT） | `plans/2026-09-01-stage1-iknow-executable.md`              |
+| Operator index（Q） | `docs/handoff/wayfinder-tickets/retrieve-graph-quality.md` |
+
+## 待写入 (persist)
+
+(none — 不新开术语；CONTEXT / ADR-0002 已随 p0-eval spec flush)
 
 ## End of round
 
-Track Q 的 T2–T5 与 Track E 的 T1–T8 全部落地后，分别对照各自 spec 做 Standards + Spec code-review，再 `verification-before-completion`。禁止把两条轨道揉进同一个 commit。
+两轨全部子弹落地后：对整轮 impl diff 做 code-review（Standards + Spec），对照本计划与两份 spec，再 `verification-before-completion`。单票仍走 header 的 per-ticket loop（含该票的 code-review）。Claim：只改本文件 Status，不改 GitHub。

@@ -66,3 +66,31 @@ export class ExtractionGoldError extends Error {
     this.name = "ExtractionGoldError";
   }
 }
+
+/**
+ * What was wrong with the input passed to the eval filter
+ * (specs/p0-eval.md SC10, A4).
+ *
+ * Distinct from the four typed `RejectReason` values the filter returns
+ * for a *shape-valid* triple it has decided to reject: `FilterError` is
+ * reserved for input the filter cannot answer about — a missing string
+ * field, a number-shaped relation, etc. Throwing rather than returning
+ * a verdict keeps the verdict taxonomy clean (every `accept: false`
+ * still names one of the four documented reasons) while letting callers
+ * distinguish a malformed pipeline from a legitimately filtered triple.
+ */
+export type FilterErrorCode =
+  /** Required field is missing or not a string (head/tail/relationNorm/etc). */
+  | "FILTER_TRIPLE_INVALID"
+  /** `confidence` is present but not a finite number. */
+  | "FILTER_TRIPLE_CONFIDENCE_INVALID";
+
+export class FilterError extends Error {
+  constructor(
+    message: string,
+    readonly code: FilterErrorCode
+  ) {
+    super(message);
+    this.name = "FilterError";
+  }
+}

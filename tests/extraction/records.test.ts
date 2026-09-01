@@ -98,6 +98,10 @@ function makeFakeClient(): {
           const batchId = params[0] as string | undefined;
           const filtered = rows
             .filter((r) => r.status === "failed")
+            // SC5: SELF_LOOP_REJECTED is a permanent reject — listFailed()
+            // hides it so operators only see transient failures that need a
+            // re-extract.
+            .filter((r) => r.error_code !== "SELF_LOOP_REJECTED")
             .filter((r) => (batchId ? r.batch_id === batchId : true))
             .sort((a, b) => (a.created_at < b.created_at ? -1 : 1));
           return { rows: filtered };
@@ -202,6 +206,38 @@ describe("extraction_records", () => {
     const b2 = await listFailed(f.client, { batchId: "b2" });
     expect(b1.map((r) => r.id)).toEqual(["r1"]);
     expect(b2.map((r) => r.id)).toEqual(["r2"]);
+  });
+
+  it("listFailed hides SELF_LOOP_REJECTED rows (SC5)", async () => {
+    const f = makeFakeClient();
+    await insertRecord(f.client, {
+      id: "r1",
+      batchId: "b1",
+      chunkId: "chunk-1",
+      startedAt: "2026-01-01T00:00:00Z",
+    });
+    await markFailed(f.client, "r1", { code: "5xx", msg: "boom" });
+    await insertRecord(f.client, {
+      id: "r2",
+      batchId: "b1",
+      chunkId: "chunk-2",
+      startedAt: "2026-01-01T00:00:00Z",
+    });
+    // SC5: SELF_LOOP_REJECTED is a permanent reject — there is no
+    // re-extract path for it, so listing it as "must re-extract" would be
+    // misleading. listFailed() hides it by error_code.
+    await markFailed(f.client, "r2", {
+      code: "SELF_LOOP_REJECTED",
+      msg: "all outputs were self-loops",
+    });
+    const failed = await listFailed(f.client);
+    expect(failed.map((r) => r.id)).toEqual(["r1"]);
+    // The WHERE clause carries the exclusion so the DB applies the filter,
+    // not the caller.
+    const listCall = f.calls.find((c) =>
+      c.text.includes("SELECT * FROM extraction_records")
+    );
+    expect(listCall?.text).toContain("SELF_LOOP_REJECTED");
   });
 
   it("batch_id aggregation: two records in the same batch are both retrievable", async () => {

@@ -64,6 +64,7 @@ import {
   markSucceeded,
   markFailed,
   newRecordId,
+  SELF_LOOP_REJECTED_CODE,
   type Queryable,
 } from "../core/extraction/records.js";
 import {
@@ -271,12 +272,17 @@ async function scanChunks(
     where.push(`c.created_at >= $${values.length}`);
   }
   if (flags.onlyFailed) {
+    // SC5: SELF_LOOP_REJECTED rows are excluded from --only-failed. A self-loop
+    // is a permanent reject — re-extraction would only reproduce the same
+    // self-loop. `listFailed()` (records.ts) applies the same exclusion; the
+    // chunk scan must mirror it or operators see "must re-extract" rows that
+    // no re-extract path can actually advance.
     where.push(
       `c.id IN (SELECT chunk_id FROM (
-         SELECT chunk_id, status,
+         SELECT chunk_id, status, error_code,
            row_number() OVER (PARTITION BY chunk_id ORDER BY created_at DESC) rn
          FROM extraction_records
-       ) t WHERE rn = 1 AND status = 'failed')`
+       ) t WHERE rn = 1 AND status = 'failed' AND error_code != 'SELF_LOOP_REJECTED')`
     );
   }
   const { rows } = await client.query(
@@ -517,6 +523,24 @@ async function processChunk(
       outcome.outputs,
       startedAt
     );
+    if (counts.allSelfLoop) {
+      // SC5: every output was a self-loop, so the chunk produced zero graph
+      // edges and zero entities. Record the chunk as a permanent reject — the
+      // SELF_LOOP_REJECTED sentinel keeps it visible in extraction_records
+      // while excluding it from --list-failed / --only-failed (no re-extract
+      // path can produce anything but the same self-loop again).
+      await markFailed(client, recordId, {
+        code: SELF_LOOP_REJECTED_CODE,
+        msg: "all outputs were self-loops",
+      });
+      await client.query("COMMIT");
+      deps.logger.info("chunk-rejected", {
+        chunkId: chunk.id,
+        code: SELF_LOOP_REJECTED_CODE,
+        reason: "all-outputs-self-loop",
+      });
+      return { kind: "failed" };
+    }
     // Same transaction as the ledger rows it describes (SC3): a projection
     // intent that outlived a rolled-back chunk would tell the projector to
     // sync a row Postgres never kept, and a chunk that committed without one
@@ -548,6 +572,13 @@ interface PersistCounts {
    * they do not enter the graph (ADR-0001).
    */
   projected: ProjectionSubject[];
+  /**
+   * SC5: every output in this chunk was rejected as a self-loop. The chunk
+   * produced zero graph edges and zero entities; the orchestrator marks it
+   * `failed` with the SELF_LOOP_REJECTED sentinel so --list-failed /
+   * --only-failed can hide it from "must re-extract" lists.
+   */
+  allSelfLoop: boolean;
 }
 
 /** Resolve/create entities and upsert triples for one chunk's outputs. */
@@ -560,6 +591,7 @@ async function persistOutputs(
 ): Promise<PersistCounts> {
   let triples = 0;
   let unmapped = 0;
+  let selfLoopCount = 0;
   const projected: ProjectionSubject[] = [];
   for (const out of outputs) {
     if (
@@ -567,6 +599,7 @@ async function persistOutputs(
       normalizeEntityType(out.headType) === normalizeEntityType(out.tailType)
     ) {
       logSelfLoopRejection(deps, chunkId, out);
+      selfLoopCount += 1;
       continue;
     }
     const { headId, tailId } = await resolveEndpoints(deps, client, out);
@@ -576,6 +609,7 @@ async function persistOutputs(
     projected.push({ kind: "entity", id: headId });
     if (headId === tailId) {
       logSelfLoopRejection(deps, chunkId, out, headId);
+      selfLoopCount += 1;
       continue;
     }
     projected.push({ kind: "entity", id: tailId });
@@ -595,7 +629,11 @@ async function persistOutputs(
     triples += 1;
     if (relationNorm === UNMAPPED) unmapped += 1;
   }
-  return { triples, unmapped, projected };
+  // SC5: `allSelfLoop` is true only when outputs were present and EVERY
+  // one was a self-loop. An empty `outputs` array vacuously yields false so
+  // the caller still treats it as a normal zero-output chunk.
+  const allSelfLoop = outputs.length > 0 && selfLoopCount === outputs.length;
+  return { triples, unmapped, projected, allSelfLoop };
 }
 
 /**
@@ -816,8 +854,16 @@ async function insertEntity(
   );
 }
 
-/** Persist a soft-merge pointer without rewriting any triple foreign keys. */
-async function linkMergedEntity(
+/**
+ * Persist a soft-merge pointer without rewriting any triple foreign keys.
+ *
+ * Exported so the SC6 idempotency contract (slice 4 of
+ * `specs/retrieve-graph-quality.md`) is testable against real Postgres rows
+ * without re-running the full CLI merge path. The `WHERE merged_into IS NULL`
+ * guard is what makes the second call a no-op — the pointer is permanent
+ * for this round once written.
+ */
+export async function linkMergedEntity(
   client: Queryable,
   loserId: string,
   survivorId: string

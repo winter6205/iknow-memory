@@ -415,7 +415,7 @@ describe("--gate pr with no baseline (SC14)", () => {
     expect(code).toBe(0);
   });
 
-  it("exits 2 when |ΔF1| exceeds 0.05", async () => {
+  it("exits 2 when |ΔF1| exceeds 0.05 and thresholds are locked", async () => {
     const dir = scratchDir();
     await appendBaseline(dir, {
       snapshotId: SNAPSHOT_ID,
@@ -431,9 +431,99 @@ describe("--gate pr with no baseline (SC14)", () => {
       axes: { f1: 0.5, schemaRate: 1, hallucinationRate: 0 }, // -0.30 drift → fail
       recordedAt: "2026-09-01T00:05:00.000Z",
     });
+    // Thresholds are committed → the operator has moved past Bootstrap
+    // (A13 / SC18) and the gate hard-fails on drift magnitude.
+    await writeThresholds(dir, {
+      f1Minimum: 0.7,
+      schemaRateMinimum: 0.9,
+      hallucinationRateMaximum: 0.1,
+    });
 
     const code = await runCli(["--gate", "pr"], defaultDeps(dir));
     expect(code).toBe(2);
+  });
+});
+
+/* ------------------------------------------------------------------------ */
+/* --gate pr Bootstrap-period soft-pass (A13 / SC18)                        */
+/* ------------------------------------------------------------------------ */
+
+describe("--gate pr Bootstrap-period soft-pass (A13 / SC18)", () => {
+  it("exits 0 even when |ΔF1| exceeds 0.05 if thresholds are not yet locked", async () => {
+    // A13: during Bootstrap (no thresholds file committed yet) the PR
+    // path is intentionally non-blocking — the operator needs the
+    // numbers visible, not a failing gate. SC14's hard-fail only
+    // applies after thresholds lock.
+    const dir = scratchDir();
+    await appendBaseline(dir, {
+      snapshotId: SNAPSHOT_ID,
+      modelId: GOLD_MODEL,
+      promptHash: SNAPSHOT_PROMPT_HASH,
+      axes: { f1: 0.8, schemaRate: 1, hallucinationRate: 0 },
+      recordedAt: "2026-09-01T00:00:00.000Z",
+    });
+    await appendBaseline(dir, {
+      snapshotId: SNAPSHOT_ID,
+      modelId: GOLD_MODEL,
+      promptHash: SNAPSHOT_PROMPT_HASH,
+      axes: { f1: 0.5, schemaRate: 1, hallucinationRate: 0 }, // -0.30 drift → fail under SC14
+      recordedAt: "2026-09-01T00:05:00.000Z",
+    });
+    // No thresholds file → still in Bootstrap → soft-pass.
+
+    const code = await runCli(["--gate", "pr"], defaultDeps(dir));
+    expect(code).toBe(0);
+  });
+
+  it("prints the latest axes to stderr during the Bootstrap period", async () => {
+    // A13 / SC18: the operator running `npm run gate:pr` during
+    // Bootstrap must see F1 / schema / hallucination numbers on the
+    // terminal, not buried in structured-log JSON.
+    const dir = scratchDir();
+    await appendBaseline(dir, {
+      snapshotId: SNAPSHOT_ID,
+      modelId: GOLD_MODEL,
+      promptHash: SNAPSHOT_PROMPT_HASH,
+      axes: { f1: 0.62, schemaRate: 0.91, hallucinationRate: 0.05 },
+      recordedAt: "2026-09-01T00:00:00.000Z",
+    });
+
+    const stderr = captureStderr();
+    const code = await runCli(["--gate", "pr"], defaultDeps(dir));
+    const captured = stderr.text();
+    stderr.restore();
+
+    expect(code).toBe(0);
+    expect(captured).toMatch(/gate pr: f1=0\.620/);
+    expect(captured).toMatch(/schema=0\.910/);
+    expect(captured).toMatch(/hallucination=0\.050/);
+    expect(captured).toMatch(/runs=1/);
+  });
+
+  it("prints axes even after thresholds lock (drift gate verdict is the exit code, not the print)", async () => {
+    // The axes print is for the operator's reading in all cases; only
+    // the exit code depends on threshold-lock state.
+    const dir = scratchDir();
+    await appendBaseline(dir, {
+      snapshotId: SNAPSHOT_ID,
+      modelId: GOLD_MODEL,
+      promptHash: SNAPSHOT_PROMPT_HASH,
+      axes: { f1: 0.7, schemaRate: 0.95, hallucinationRate: 0.05 },
+      recordedAt: "2026-09-01T00:00:00.000Z",
+    });
+    await writeThresholds(dir, {
+      f1Minimum: 0.6,
+      schemaRateMinimum: 0.9,
+      hallucinationRateMaximum: 0.1,
+    });
+
+    const stderr = captureStderr();
+    const code = await runCli(["--gate", "pr"], defaultDeps(dir));
+    const captured = stderr.text();
+    stderr.restore();
+
+    expect(code).toBe(0);
+    expect(captured).toMatch(/gate pr: f1=0\.700/);
   });
 });
 

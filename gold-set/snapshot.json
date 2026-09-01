@@ -1,0 +1,105 @@
+{
+  "id": "extraction-eval-snapshot-v1",
+  "chunks": [
+    {
+      "id": "snap-v1-c00",
+      "content": "Alice Chen works for Acme Corp in Beijing.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/00"
+    },
+    {
+      "id": "snap-v1-c01",
+      "content": "Bob Martinez is part_of the Atlas Robotics engineering team.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/01"
+    },
+    {
+      "id": "snap-v1-c02",
+      "content": "Cygnus Engine v2 is an instance_of InferenceRuntime.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/02"
+    },
+    {
+      "id": "snap-v1-c03",
+      "content": "Policy 2026-09 supersedes Policy 2026-03 across all EU deployments.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/03"
+    },
+    {
+      "id": "snap-v1-c04",
+      "content": "Diane Whitaker is equivalent_to Diane Whit, the same person in HR records.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/04"
+    },
+    {
+      "id": "snap-v1-c05",
+      "content": "Echo Lake is located_in the Cascade Range of the Pacific Northwest.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/05"
+    },
+    {
+      "id": "snap-v1-c06",
+      "content": "Fjord, Inc. collaborates_with Halberd Co. on the launch of Beacon.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/06"
+    },
+    {
+      "id": "snap-v1-c07",
+      "content": "The Gateway service depends_on the Iris database for write-ahead logging.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/07"
+    },
+    {
+      "id": "snap-v1-c08",
+      "content": "Iris database uses the Kafka log to publish commit markers downstream.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/08"
+    },
+    {
+      "id": "snap-v1-c09",
+      "content": "Juno, a small dog, belongs_to the Kowalski household in Toronto.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/09"
+    },
+    {
+      "id": "snap-v1-c10",
+      "content": "Karen Liu mentions Lukas Brand in her quarterly engineering memo.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/10"
+    },
+    {
+      "id": "snap-v1-c11",
+      "content": "Project Magnet references the Lumina paper in its design rationale.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/11"
+    },
+    {
+      "id": "snap-v1-c12",
+      "content": "Nimbus Air was caused by a delayed dispatch at Northwind Logistics.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/12"
+    },
+    {
+      "id": "snap-v1-c13",
+      "content": "Olive Brun enables the Quasar rollout by stabilizing the gateway pipeline.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/13"
+    },
+    {
+      "id": "snap-v1-c14",
+      "content": "The Sigma release precedes the Taurus release on the 2026 roadmap.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/14"
+    },
+    {
+      "id": "snap-v1-c15",
+      "content": "Uma Bhatt owns the Vega workspace and chairs its Friday review.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/15"
+    },
+    {
+      "id": "snap-v1-c16",
+      "content": "Wren is a subclass_of Songbird in the bird taxonomy we follow.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/16"
+    },
+    {
+      "id": "snap-v1-c17",
+      "content": "Xiu Park works for Yelm Industries in Yokohama on the Zed protocol.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/17"
+    },
+    {
+      "id": "snap-v1-c18",
+      "content": "Argo Group opposes the proposed tariff regime announced in the executive order.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/18"
+    },
+    {
+      "id": "snap-v1-c19",
+      "content": "Cobalt Tools supports the open hardware movement with a permissive license.",
+      "source_ref": "fixture://extraction-eval/snapshot-v1/19"
+    }
+  ]
+}

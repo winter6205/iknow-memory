@@ -533,23 +533,57 @@ async function runBootstrap(
 /* ------------------------------------------------------------------------ */
 
 /**
- * PR drift gate (A14, SC14). LLM-free, reads baseline only.
+ * PR drift gate (A14, SC14, SC18, A13). LLM-free, reads baseline only.
  *
  * Two entries are required for a drift verdict: the most recent
  * BaselineEntry is `current`, the second-most-recent is `baseline`. With
  * fewer entries the gate treats "no prior data" as a pass (exit 0).
+ *
+ * A13 / SC18: while thresholds are NOT yet locked, the gate is in the
+ * Bootstrap period — it prints the latest F1 / schema / hallucination
+ * numbers so the operator can see what the snapshot has produced so
+ * far, and never fails on F1 magnitude. Only after thresholds are
+ * locked does the |ΔF1| vs last baseline act as a hard gate (SC14).
+ * The Bootstrap soft-pass prints to stderr (the eval CLI is offline-
+ * only and does not share stdout with MCP transport); no JSON, no
+ * machine-readable contract — the operator runs `--bootstrap` and
+ * `--gate pr` side by side during steady-state discovery.
  */
 async function runGatePr(flags: EvalFlags, deps: EvalCliDeps): Promise<number> {
   const dir = resolveBaselineDir(flags, deps);
   const entries = await deps.readBaseline(dir);
+  const sorted = [...entries].sort((a, b) =>
+    b.recordedAt.localeCompare(a.recordedAt)
+  );
+  const current = sorted[0];
+  if (current !== undefined) {
+    // Print the latest axes regardless of bootstrap / locked state.
+    // A13: the Bootstrap-period PR path must show the operator the
+    // numbers, not bury them in the logger output that may not be
+    // wired in CI.
+    writeStderr(
+      `gate pr: f1=${current.axes.f1.toFixed(3)} ` +
+        `schema=${current.axes.schemaRate.toFixed(3)} ` +
+        `hallucination=${current.axes.hallucinationRate.toFixed(3)} ` +
+        `(runs=${entries.length})\n`
+    );
+  }
+  // SC18 + A13: during Bootstrap (no locked thresholds) the PR path is
+  // intentionally non-blocking. The drift gate still computes the
+  // delta for the operator's reading, but the exit code is always 0.
+  // A malformed thresholds file is the operator's signal to fix it;
+  // treating it as "not locked" would silently swallow that signal,
+  // so we re-surface as "locked" — the operator sees drift failures
+  // until the file is repaired.
+  const thresholdsLocked = readThresholdsLocked(deps, dir);
+  if (!thresholdsLocked) {
+    deps.logger.info("gate-pr-bootstrap", { entries: entries.length });
+    return 0;
+  }
   if (entries.length < 2) {
     deps.logger.info("gate-pr-no-baseline", { entries: entries.length });
     return 0;
   }
-  const sorted = [...entries].sort((a, b) =>
-    b.recordedAt.localeCompare(a.recordedAt)
-  );
-  const current = sorted[0]!;
   const baseline = sorted[1]!;
   const opts: DriftOpts = { driftTolerance: flags.driftTolerance };
   const result = deps.driftGate(current.axes, baseline.axes, opts);
@@ -563,6 +597,21 @@ async function runGatePr(flags: EvalFlags, deps: EvalCliDeps): Promise<number> {
     deltaF1: result.delta?.f1 ?? 0,
   });
   return 2;
+}
+
+/**
+ * Has the operator committed a locked thresholds file? A13 / SC18
+ * treats "no thresholds file" as the Bootstrap-period signal: until
+ * then, the PR gate stays soft-pass and prints scores. After commit,
+ * the gate hard-fails on drift magnitude.
+ */
+function readThresholdsLocked(deps: EvalCliDeps, dir: string): boolean {
+  try {
+    const locked = deps.readThresholds(dir);
+    return locked !== null;
+  } catch {
+    return true;
+  }
 }
 
 /* ------------------------------------------------------------------------ */

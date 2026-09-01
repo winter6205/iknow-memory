@@ -157,9 +157,12 @@ describe("host-smoke: real stdio MCP client against built server", () => {
       clients.push(client);
 
       const { tools } = await client.listTools();
+      // Plan D0 I-T4 added the `push` entry alongside `ingest`. The
+      // wire-level tool list now spans echo + ingest + push + retrieve.
       expect(tools.map((t) => t.name).sort()).toEqual([
         "echo",
         "ingest",
+        "push",
         "retrieve",
       ]);
 

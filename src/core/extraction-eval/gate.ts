@@ -117,6 +117,12 @@ export interface ReleaseResult {
  * same budget. Schema rate and hallucination rate deltas are
  * reported for the operator's reading but never enter the verdict
  * (per SC14, only F1 gates the PR path).
+ *
+ * The comparison absorbs an IEEE-754 noise band (`Number.EPSILON *
+ * 1000` ≈ 2.2e-13) so two stored F1 values whose subtraction yields
+ * `0.050000000000000044` against the literal `0.05` still register as
+ * "at the boundary" — the SC14 budget is an operator-facing band,
+ * not a sub-ulp arithmetic contract.
  */
 export function driftGate(
   currentAxes: Axes,
@@ -132,7 +138,8 @@ export function driftGate(
     hallucinationRate:
       currentAxes.hallucinationRate - baselineAxes.hallucinationRate,
   };
-  const pass = Math.abs(delta.f1) <= opts.driftTolerance;
+  const pass =
+    Math.abs(delta.f1) <= opts.driftTolerance + Number.EPSILON * 1000;
   return { pass, delta };
 }
 

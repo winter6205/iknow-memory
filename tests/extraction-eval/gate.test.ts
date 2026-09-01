@@ -5,7 +5,8 @@
  * breach → fail; missing baseline → pass ("nothing to drift").
  *
  * SC15 (Release): three axes vs locked thresholds; any axis fail → fail;
- * thresholds are read FROM the baseline file, not from source literals
+ * thresholds are read FROM the operator-locked thresholds file (the
+ * refuse-until-lock companion to the baseline), not from source literals
  * in this module.
  *
  * SC7 cross-check: the five diagnostic error types never feed either
@@ -23,10 +24,10 @@ import {
   extractThresholds,
   releaseGate,
   type Axes,
-  type BaselineEntry,
   type DriftOpts,
   type ReleaseThresholds,
 } from "../../src/core/extraction-eval/gate.js";
+import type { BaselineEntry } from "../../src/core/extraction-eval/baseline.js";
 
 /** Tiny axes builder so tests read as a table of facts. */
 function axes(partial: Partial<Axes> = {}): Axes {
@@ -37,20 +38,15 @@ function axes(partial: Partial<Axes> = {}): Axes {
   };
 }
 
-/** A baseline entry carrying thresholds that are intentionally arbitrary. */
-function baselineOf(
-  partial: Partial<Axes> = {},
-  thresholds?: ReleaseThresholds
-): BaselineEntry {
-  const entry: BaselineEntry = {
+/** A baseline entry with arbitrary axes; thresholds live on file (E-T4). */
+function baselineOf(partial: Partial<Axes> = {}): BaselineEntry {
+  return {
     snapshotId: "snap-v1",
     modelId: "extractor-v1",
     promptHash: "sha256:abc",
     axes: axes(partial),
     recordedAt: "2026-08-30T00:00:00Z",
   };
-  if (thresholds !== undefined) entry.thresholds = thresholds;
-  return entry;
 }
 
 describe("driftGate (SC14)", () => {
@@ -120,13 +116,13 @@ describe("driftGate (SC14)", () => {
   });
 
   it("uses the |ΔF1| absolute value, not the signed delta, for the boundary check", () => {
-    const tolerance = { driftTolerance: 0.05 };
+    const toleranceLocal = { driftTolerance: 0.05 };
     const baseline = baselineOf({ f1: 0.7 });
     const up = axes({ f1: 0.7 + 0.04 });
     const down = axes({ f1: 0.7 - 0.04 });
 
-    expect(driftGate(up, baseline.axes, tolerance).pass).toBe(true);
-    expect(driftGate(down, baseline.axes, tolerance).pass).toBe(true);
+    expect(driftGate(up, baseline.axes, toleranceLocal).pass).toBe(true);
+    expect(driftGate(down, baseline.axes, toleranceLocal).pass).toBe(true);
   });
 
   it("honours a non-default drift tolerance passed via opts", () => {
@@ -143,9 +139,9 @@ describe("driftGate (SC14)", () => {
 
 describe("releaseGate (SC15)", () => {
   const thresholds: ReleaseThresholds = {
-    f1: 0.7,
-    schemaRate: 0.9,
-    hallucinationRate: 0.05,
+    f1Minimum: 0.7,
+    schemaRateMinimum: 0.9,
+    hallucinationRateMaximum: 0.05,
   };
 
   it("passes when every axis meets its threshold", () => {
@@ -237,27 +233,38 @@ describe("releaseGate (SC15)", () => {
 });
 
 describe("extractThresholds (SC15)", () => {
-  it("returns the thresholds carried on the baseline entry", () => {
-    const baseline = baselineOf(
-      { f1: 0.7 },
-      { f1: 0.7, schemaRate: 0.9, hallucinationRate: 0.05 }
-    );
+  it("returns the locked thresholds when present (Release-period)", () => {
+    const locked: ReleaseThresholds = {
+      f1Minimum: 0.7,
+      schemaRateMinimum: 0.9,
+      hallucinationRateMaximum: 0.05,
+    };
 
-    const result = extractThresholds(baseline);
+    const result = extractThresholds(locked);
 
     expect(result).toEqual({
-      f1: 0.7,
-      schemaRate: 0.9,
-      hallucinationRate: 0.05,
+      f1Minimum: 0.7,
+      schemaRateMinimum: 0.9,
+      hallucinationRateMaximum: 0.05,
     });
   });
 
-  it("returns null when the baseline entry has not yet locked thresholds (Bootstrap-period)", () => {
-    const baseline = baselineOf({ f1: 0.7 }); // no thresholds yet
-
-    const result = extractThresholds(baseline);
-
+  it("returns null when no thresholds are locked (Bootstrap-period)", () => {
+    const result = extractThresholds(null);
     expect(result).toBeNull();
+  });
+
+  it("returns a defensive copy — mutating the result does not rewrite the input", () => {
+    const locked: ReleaseThresholds = {
+      f1Minimum: 0.7,
+      schemaRateMinimum: 0.9,
+      hallucinationRateMaximum: 0.05,
+    };
+
+    const result = extractThresholds(locked)!;
+    result.f1Minimum = 0;
+
+    expect(locked.f1Minimum).toBe(0.7);
   });
 
   it("is not hard-coded — the gate's verdict changes when thresholds change", () => {
@@ -267,28 +274,18 @@ describe("extractThresholds (SC15)", () => {
       hallucinationRate: 0.04,
     });
     const tight: ReleaseThresholds = {
-      f1: 0.75,
-      schemaRate: 0.9,
-      hallucinationRate: 0.03,
+      f1Minimum: 0.75,
+      schemaRateMinimum: 0.9,
+      hallucinationRateMaximum: 0.03,
     };
     const loose: ReleaseThresholds = {
-      f1: 0.7,
-      schemaRate: 0.8,
-      hallucinationRate: 0.05,
+      f1Minimum: 0.7,
+      schemaRateMinimum: 0.8,
+      hallucinationRateMaximum: 0.05,
     };
 
-    const fromTight = releaseGate(
-      current,
-      extractThresholds({
-        ...baselineOf({}, tight),
-      })!
-    );
-    const fromLoose = releaseGate(
-      current,
-      extractThresholds({
-        ...baselineOf({}, loose),
-      })!
-    );
+    const fromTight = releaseGate(current, extractThresholds(tight)!);
+    const fromLoose = releaseGate(current, extractThresholds(loose)!);
 
     expect(fromTight.pass).toBe(false);
     expect(fromLoose.pass).toBe(true);
@@ -302,9 +299,9 @@ describe("error types never gate (SC7)", () => {
     // would re-introduce a path where mis-predictions can fail a gate
     // they are explicitly forbidden from failing.
     const thresholds: ReleaseThresholds = {
-      f1: 0.7,
-      schemaRate: 0.9,
-      hallucinationRate: 0.05,
+      f1Minimum: 0.7,
+      schemaRateMinimum: 0.9,
+      hallucinationRateMaximum: 0.05,
     };
     const current = axes({
       f1: 0.8,

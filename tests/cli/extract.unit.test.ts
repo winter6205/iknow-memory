@@ -791,8 +791,8 @@ describe("merged_into is persisted for fuzzy merges (T5)", () => {
   });
 });
 
-describe("self-loop outputs are extract rejects (T4)", () => {
-  it("rejects before entity creation, graph writes, or chunk failure", async () => {
+describe("self-loop outputs are extract rejects (T4 / SC5)", () => {
+  it("all self-loop outputs mark the chunk failed with SELF_LOOP_REJECTED (SC5)", async () => {
     const client = new FakeClient();
     scanOneChunk(client);
     const warnings: LoggedLine[] = [];
@@ -830,9 +830,105 @@ describe("self-loop outputs are extract rejects (T4)", () => {
         reason: "head-equals-tail",
       }),
     });
-    expect(boundValuesFor(client, /SET status = 'succeeded'/)).toEqual([
-      expect.arrayContaining([0, 0]),
-    ]);
+    // SC5: row-level reject — the chunk record is marked FAILED with the
+    // SELF_LOOP_REJECTED sentinel, not succeeded. The 'failed' status + the
+    // sentinel code is what --list-failed / --only-failed filter against.
+    expect(boundValuesFor(client, /SET status = 'succeeded'/)).toEqual([]);
+    const fails = boundValuesFor(client, /SET status = 'failed'/);
+    expect(fails).toHaveLength(1);
+    expect(fails[0]?.[1]).toBe("SELF_LOOP_REJECTED");
+    expect(fails[0]?.[2]).toBe("all outputs were self-loops");
+  });
+
+  it("mixed outputs (one self-loop + one valid) succeed with one projection intent only", async () => {
+    const client = new FakeClient();
+    serveOwnEntityWrites(client);
+    const warnings: LoggedLine[] = [];
+    const llm = new FakeLLMClient({
+      scripted: async () => ({
+        kind: "ok" as const,
+        outputs: [
+          // Self-loop: dropped.
+          { ...SELF_LOOP_OUTPUT, tail: SELF_LOOP_OUTPUT.head },
+          // Valid triple: head and tail differ.
+          { ...SELF_LOOP_OUTPUT, tail: "Acme Corp", tailType: "system" },
+        ],
+      }),
+    });
+    const deps: CliDeps = {
+      ...makeDeps(client, llm),
+      embedder: new ConstantEmbedder(8),
+      logger: {
+        ...silentLogger(),
+        warn: (msg, fields) => warnings.push({ msg, fields }),
+      },
+    };
+
+    const code = await runCli(["--batch-size", "1"], deps);
+    expect(code).toBe(0);
+
+    // Self-loop's warning logged; chunk as a whole still succeeds.
+    expect(warnings.map((w) => w.msg)).toContain("triple-self-loop-rejected");
+
+    // One triple upserted (the valid output); the self-loop never reaches the
+    // dedup layer.
+    expect(upsertedEndpoints(client)).toHaveLength(1);
+
+    // One triple INSERT, three projection intents (head, tail, triple) for the
+    // valid output. The self-loop contributes zero projection intents because
+    // no graph edge exists for a discarded self-loop.
+    const outbox = boundValuesFor(client, /INSERT INTO projection_outbox/);
+    expect(outbox).toHaveLength(3);
+
+    // The chunk is succeeded, not failed — the mixed chunk is NOT a reject.
+    expect(boundValuesFor(client, /SET status = 'failed'/)).toEqual([]);
+    const successes = boundValuesFor(client, /SET status = 'succeeded'/);
+    expect(successes).toHaveLength(1);
+    expect(successes[0]?.[1]).toBe(1);
+    expect(successes[0]?.[2]).toBe(0);
+  });
+
+  it("does not re-extract a self-loop after a failed run with --only-failed (SC5)", async () => {
+    const client = new FakeClient();
+    let extractCalls = 0;
+    let chunkScanCount = 0;
+    client.rowsOverride = (text) => {
+      if (/FROM chunks c/.test(text)) {
+        chunkScanCount += 1;
+        // Only the first chunk scan returns the chunk; every subsequent scan
+        // (including --only-failed) returns empty so the LLM is never called
+        // a second time. The WHERE clause is asserted below.
+        return chunkScanCount === 1
+          ? [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }]
+          : [];
+      }
+      if (/FROM entities/.test(text)) return [];
+      return [];
+    };
+    const llm = new FakeLLMClient({
+      scripted: async () => {
+        extractCalls += 1;
+        return {
+          kind: "ok" as const,
+          outputs: [{ ...SELF_LOOP_OUTPUT, tail: SELF_LOOP_OUTPUT.head }],
+        };
+      },
+    });
+    const deps = makeDeps(client, llm);
+
+    expect(await runCli(["--batch-size", "1"], deps)).toBe(0);
+    expect(await runCli(["--only-failed", "--batch-size", "1"], deps)).toBe(0);
+
+    // The LLM ran exactly once. Even though the chunk has a failed extraction
+    // record (SELF_LOOP_REJECTED), --only-failed skips it: there is no
+    // re-extract path for a permanent reject.
+    expect(extractCalls).toBe(1);
+    const onlyFailedScan = client.queries.filter((query) =>
+      /FROM chunks c/.test(query)
+    )[1];
+    expect(onlyFailedScan).toContain("status = 'failed'");
+    // The WHERE clause also excludes the SELF_LOOP_REJECTED sentinel.
+    expect(onlyFailedScan).toContain("SELF_LOOP_REJECTED");
   });
 
   it("persists same-normalized-name endpoints when their types differ", async () => {
@@ -855,14 +951,19 @@ describe("self-loop outputs are extract rejects (T4)", () => {
   it("does not re-extract a self-loop after a successful run with --only-failed", async () => {
     const client = new FakeClient();
     let extractCalls = 0;
+    let chunkScanCount = 0;
     client.rowsOverride = (text) => {
       if (/FROM chunks c/.test(text)) {
-        const succeeded = client.queries.some((query) =>
-          /SET status = 'succeeded'/.test(query)
-        );
-        return succeeded
-          ? []
-          : [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }];
+        chunkScanCount += 1;
+        // Only the first chunk scan returns the chunk; every subsequent
+        // scan (including --only-failed) returns empty. Under the new
+        // SC5 contract an all-self-loop chunk is marked `failed` with
+        // the SELF_LOOP_REJECTED sentinel, so the run never reaches
+        // `succeeded` and the test no longer keys off `SET status =
+        // 'succeeded'`.
+        return chunkScanCount === 1
+          ? [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }]
+          : [];
       }
       if (/FROM entities/.test(text)) return [];
       return [];
@@ -1258,6 +1359,35 @@ describe("runCli --list-failed", () => {
     expect(sqlFor(client, /FROM extraction_records/)).toContain(
       "batch_id = $1"
     );
+  });
+
+  it("excludes SELF_LOOP_REJECTED rows from the listFailed SELECT (SC5)", async () => {
+    const client = new FakeClient();
+    serveFailedRows(client, [
+      failedRow({
+        chunkId: "chunk-transient",
+        batchId: BATCH_A,
+        errorCode: "5xx",
+        createdAt: "2026-08-04T00:00:00.000Z",
+      }),
+      failedRow({
+        chunkId: "chunk-self-loop",
+        batchId: BATCH_A,
+        errorCode: "SELF_LOOP_REJECTED",
+        createdAt: "2026-08-05T00:00:00.000Z",
+      }),
+    ]);
+    const deps = makeDeps(client, throwingLlm());
+
+    const code = await runCli(["--list-failed"], deps);
+
+    expect(code).toBe(0);
+    // The WHERE clause must hide SELF_LOOP_REJECTED rows: there is no
+    // re-extract path for a permanent reject, so it would be misleading to
+    // list it as "must re-extract" alongside transient failures (SC5).
+    const sql = sqlFor(client, /FROM extraction_records/);
+    expect(sql).toContain("SELF_LOOP_REJECTED");
+    expect(sql).not.toContain("batch_id = $1");
   });
 
   it("--batch-id requires a UUID value; otherwise exit 2", async () => {

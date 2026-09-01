@@ -68,3 +68,15 @@ export {
   type FilterResult,
   type RejectReason,
 } from "./filter.js";
+export {
+  driftGate,
+  extractThresholds,
+  releaseGate,
+  type Axes,
+  type BaselineEntry,
+  type DriftOpts,
+  type DriftResult,
+  type ReleaseFailures,
+  type ReleaseResult,
+  type ReleaseThresholds,
+} from "./gate.js";

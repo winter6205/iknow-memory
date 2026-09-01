@@ -849,7 +849,13 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     const saved = new Map<string, string | undefined>();
     for (const k of keys) {
       saved.set(k, process.env[k]);
-      delete process.env[k];
+      // `readEnv` (src/config.ts) treats a PRESENT (even blank) process key
+      // as explicit and only falls back to `.env.local` for ABSENT keys, so
+      // `delete` here would RE-OPEN the `.env.local` fallback and let a
+      // developer's `ANTHROPIC_AUTH_TOKEN` / `GRAPHRAG_MEMORY_DB_URL` leak
+      // into the rerank + pgvector contract tests below. Blanking beats the
+      // file. Mirror the `maskDotenvLocal` convention above (T-007, #169).
+      process.env[k] = "";
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
     process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";

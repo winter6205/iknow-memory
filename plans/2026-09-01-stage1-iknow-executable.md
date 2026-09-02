@@ -53,10 +53,10 @@ minimal-change-verifier: yes — one logical task per tracer bullet below; not m
 ### Track Q — retrieve-graph-quality executable subset
 
 1. **[Track Q] Dedicated rerank HTTP (Q-T2)** — tag: `[implementation]`
-   - **Inherits:** `specs/retrieve-graph-quality.md` SC1–SC3, slice 1: 同一 retrieve hook as quality T1; default off; missing URL skip not `degraded`; throw fail-open + `degraded`; not Host chat model.（源计划 `plans/retrieve-graph-quality.md` T2。）
+   - **Inherits:** `specs/retrieve-graph-quality.md` SC1–SC3, slice 1: 同一 retrieve hook as quality T1; **default on** (C-3); missing URL → unattempted default-on capability → `degraded` + `rerank:unattempted` in `degraded_reasons`; throw fail-open + `degraded`; not Host chat model.（源计划 `plans/retrieve-graph-quality.md` T2。）
    - **Surface:** retrieve orchestrator rerank port; config/env for HTTP endpoint. Temporary LLM adapter remains until this bullet replaces it on the hook.
-   - **Acceptance:** off → identical to post-T1 order; on + no URL → skip, no `degraded`; fake HTTP permutation then `limit`; **no live HTTP in `npm test`**（禁止 dedicated live HTTP）。
-   - Status: [ ] pending
+   - **Acceptance:** off (`rerankEnabled=false`) → identical to post-T1 order; on + no URL → pre-rerank order, `degraded: true` with `rerank:unattempted` in `degraded_reasons`; fake HTTP permutation then `limit`; **no live HTTP in `npm test`**（禁止 dedicated live HTTP）。
+   - Status: [x] completed
    - [parallel]
    - [blocks: none] — quality T1 already on main
 
@@ -64,21 +64,21 @@ minimal-change-verifier: yes — one logical task per tracer bullet below; not m
    - **Inherits:** spec SC4, slice 2: ledger delete/retire → drain removes projection by id; empty graph still backfill; no graph tombstone as primary scheme. ADR-0001: Neo4j not SoR.
    - **Surface:** projection outbox / drain CLI (existing graph projection path).
    - **Acceptance:** after ledger delete and drain, Neo4j has no node/edge for that id (same Neo4j test style as the graph-arm suite); backfill of an empty graph still works.
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel]
 
 3. **[Track Q] Self-loop extract reject (Q-T4)** — tag: `[implementation]`
    - **Inherits:** spec SC5, slice 3: row-level reject; not `--only-failed` force re-extract; no orphan entity for discarded loops.
    - **Surface:** extract CLI / triple write path.
    - **Acceptance:** self-loop is recorded as reject, no graph edge, `--only-failed` does not require re-extract; `npm test` exit 0.
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel]
 
 4. **[Track Q] Persist `merged_into` (Q-T5)** — tag: `[implementation]`
    - **Inherits:** spec SC6, slice 4; P0c soft-merge; triples FK unchanged; `resolveCanonicalId` is the production read path.
    - **Surface:** extract merge/write path; entities ledger.
    - **Acceptance:** loser row stores `merged_into` = survivor; second extract is idempotent on that pointer (Postgres test helper already used by extract tests).
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel]
 
 ### Track E — p0-eval（pending 全收，Acceptance 继承 `plans/p0-eval.md`）
@@ -89,14 +89,14 @@ ADR-0002 and CONTEXT **extraction F1** are already flushed (not a tracer bullet)
    - **Inherits:** spec A8, A9, SC8, SC11: match key is case-fold+trim heads/tails + extract `normalizeRelation` for `relation_norm`; snapshot 10–40 chunks; every gold triple has provenance; missing provenance is a typed error; no merge into gold from a previous gold model on overwrite (overwrite behaviour is asserted with the CLI in E-T6 — loader still rejects malformed files).
    - **Surface:** extraction-adjacent eval capability (same family as `src/core/extraction`, not retrieve, not MCP tools).
    - **Acceptance:** a valid fixture snapshot+gold loads; a gold triple without provenance is a typed error; snapshot size outside 10–40 fails validation; `npm test` path for this loader does not call a live LLM.
-   - Status: [ ] pending
+   - Status: [x] completed
    - [blocks: none]
 
 6. **[Track E] Three-axis scoring (E-T2)** — tag: `[implementation]`
    - **Inherits:** spec SC4–SC7, A1: micro-F1 exact match on the pinned key; schema rate vs ALLOWED; hallucination = evidence span not a substring; five error types diagnostic only.
    - **Surface:** same eval capability as E-T1.
    - **Acceptance:** the SC4 hand-computed F1 case passes; UNMAPPED lowers schema rate; non-substring evidence counts as hallucinated; each mis-prediction gets exactly one error type.
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel]
    - [blocks: E-T1]
 
@@ -104,7 +104,7 @@ ADR-0002 and CONTEXT **extraction F1** are already flushed (not a tracer bullet)
    - **Inherits:** spec A4, SC10: code filter; ALLOWED imported from extraction vocabulary; reject reasons no-grounding / relation-not-norm / entity-not-normalized / negated.
    - **Surface:** same eval capability; vocabulary module already on main.
    - **Acceptance:** accept path plus each reject reason has a test; grep shows no hard-coded ALLOWED copy inside the filter module.
-   - Status: [ ] pending
+   - Status: [x] completed
    - [parallel]
    - [blocks: E-T1]
 
@@ -112,28 +112,28 @@ ADR-0002 and CONTEXT **extraction F1** are already flushed (not a tracer bullet)
    - **Inherits:** spec A2, A10, SC12, SC13, SC16: Bootstrap records only; adjacent F1 delta ≤ 0.05 is ready-to-lock; concurrent writers do not leave truncated JSON.
    - **Surface:** eval capability + `gold-set/` (or env override path).
    - **Acceptance:** append records three axes; 0.05 boundary is tested both ways; two concurrent appends leave valid JSON; release-gate refuse-until-lock can live here or in E-T5 but must exist before E-T6.
-   - Status: [ ] pending
+   - Status: [x] completed
    - [blocks: E-T2]
 
 9. **[Track E] PR drift gate + Release absolute gate (E-T5)** — tag: `[implementation]`
    - **Inherits:** spec A3, SC14, SC15: PR is LLM-free; missing baseline passes; |ΔF1| > 0.05 → fail; Release reads thresholds from baseline, any axis fail fails; error types never gate.
    - **Surface:** eval capability (pure functions; CLI wires flags in E-T6).
    - **Acceptance:** drift pass/fail at ±0.05; first run with no baseline passes; absolute pass/fail per axis; thresholds not hard-coded in the gate module.
-   - Status: [ ] pending
+   - Status: [x] completed
    - [blocks: E-T4]
 
 10. **[Track E] Eval CLI (E-T6)** — tag: `[implementation]`
     - **Inherits:** spec A6, A11, A12, A14, A16, SC3, SC9, SC19, SC20: flags gold-build / audit-rejects / bootstrap / gate pr / gate release; gold and audit model ids ≠ extract; gold-build overwrites same snapshot+model+prompt-hash; audit labels are the three allowed values; isolation from tools/index/retrieve; exits 0/1/2 as spec.
     - **Surface:** existing CLI family (`extract`, `eval-retrieve`) — new eval entry, not an MCP tool.
     - **Acceptance:** subprocess tests cover unknown flag → 2, model-id clash → 1, `--gate pr` with no baseline → 0, `--gate release` before lock → 1; fake LLM gold-build overwrite drops leftover triples; eval entry does not import `src/tools` or `src/index`.
-    - Status: [ ] pending
+    - Status: [x] completed
     - [blocks: E-T3, E-T5]
 
 11. **[Track E] Postgres eval integration (E-T7)** — tag: `[implementation]`
     - **Inherits:** spec A15: read existing extraction tables only; loud skip if Postgres unreachable.
     - **Surface:** existing spec-2 PG test isolation / `extraction_records` + triples.
     - **Acceptance:** with Postgres up, a persisted extract batch can be scored; with Postgres down, the suite skips loudly (documented Validation), not a silent pass.
-    - Status: [ ] pending
+    - Status: [x] completed
     - [parallel]
     - [blocks: E-T6]
 
@@ -141,7 +141,7 @@ ADR-0002 and CONTEXT **extraction F1** are already flushed (not a tracer bullet)
     - **Inherits:** spec A5, A13, SC8, SC18: 10–40 chunk snapshot in git; `gate:pr` / `gate:release` scripts; Bootstrap-period PR path prints numbers and does not fail on F1 magnitude; runbook: gold-build → audit → bootstrap → lock thresholds → observe gates. Live LLM gold-build is documented, not required for `npm test`.
     - **Surface:** `gold-set/`, `package.json` scripts, operator runbook docs.
     - **Acceptance:** snapshot size in range; `npm run gate:pr` and `gate:release` invoke the eval CLI; runbook names the command sequence and the “new ruler” rule (extract model must not rewrite gold); `npm test` still green without gold-model credentials.
-    - Status: [ ] pending
+    - Status: [x] completed
     - [parallel]
     - [blocks: E-T6]
 

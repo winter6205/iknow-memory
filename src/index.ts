@@ -24,6 +24,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 
 import { ConfigError, loadEnv, type GraphragEnv } from "./config.js";
 import { createLogger, redactDiagnostic, writeStderr } from "./logging.js";
+import { parseStdioEntry } from "./cli/stdio-entry.js";
 import {
   buildRegistry,
   textResult,
@@ -31,6 +32,8 @@ import {
 } from "./tools/registry.js";
 import { echoTool } from "./tools/echo.js";
 import { ingestTool } from "./tools/ingest.js";
+import { invalidationTool } from "./tools/invalidation.js";
+import { pushTool } from "./tools/push.js";
 import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
 import {
   NineRouterEmbedder,
@@ -232,6 +235,8 @@ export async function createServer(): Promise<McpServer> {
   const registry = buildRegistry([
     echoTool,
     ingestTool(deps),
+    invalidationTool(deps),
+    pushTool(deps),
     retrieveTool(buildRetrieveDeps(deps, debug)),
   ]);
 
@@ -288,7 +293,17 @@ function registerOne(
   );
 }
 
-export async function main(): Promise<void> {
+export async function main(argv?: readonly string[]): Promise<void> {
+  // Plan D0 I-T3: argv is validated up front so an operator typo can't
+  // silently spin up a stdio MCP session that just hangs. The argv
+  // parameter is injectable for tests; production callers leave it
+  // undefined and we read process.argv.slice(2).
+  const parsed = parseStdioEntry(argv ?? process.argv.slice(2));
+  if (!parsed.ok) {
+    writeStderr(`iknow-memory: ${parsed.error}\n`);
+    process.exit(EXIT_CODES.BAD_CONFIG);
+  }
+
   // Config first, and on its own: a ConfigError is an operator mistake, not
   // a crash, so it exits with BAD_CONFIG and a one-line message rather than
   // the stack trace the FATAL_RUNTIME path prints. createServer() re-reads

@@ -60,6 +60,20 @@ import { driftGate as defaultDriftGate } from "../core/extraction-eval/gate.js";
 import { releaseGate as defaultReleaseGate } from "../core/extraction-eval/gate.js";
 import type { LLMClient } from "../core/extraction/llm-client.js";
 
+/** Eval-side ConfigError. Distinct from `core/config.ts`'s ConfigError
+ * so the offline operator tool's exit-1 surface does not depend on the
+ * MCP server's startup config.
+ *
+ * Declared before any top-level `main()` side effect: `class` bindings
+ * are in TDZ until the declaration runs, and `node dist/cli/eval.js`
+ * evaluates `isMain` during module init. */
+export class EvalConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EvalConfigError";
+  }
+}
+
 /** Subcommand routing — one of five. */
 export type Subcommand =
   "gold-build" | "audit-rejects" | "bootstrap" | "gate-pr" | "gate-release";
@@ -745,12 +759,65 @@ function toGoldTriple(
  * required env is incomplete — this is the production counterpart of
  * the test-injected `EvalCliDeps`.
  */
-export function buildEvalCliDepsFromEnv(): EvalCliDeps {
+function subcommandNeedsLiveLlm(subcommand: Subcommand): boolean {
+  return (
+    subcommand === "gold-build" ||
+    subcommand === "audit-rejects" ||
+    subcommand === "bootstrap"
+  );
+}
+
+function unwiredExtractClient(): LLMClient {
+  return {
+    async extract(): Promise<never> {
+      // EXIT: --gate pr/release never extract; live gold/bootstrap must wire env
+      throw new EvalConfigError(
+        "config error: extract LLM is not wired for this subcommand; see docs/runbooks/extraction-eval.md"
+      );
+    },
+  };
+}
+
+function unwiredAuditClient(): AuditLLMClient {
+  return {
+    async audit(): Promise<never> {
+      // EXIT: --gate pr/release never audit; --audit-rejects must wire env
+      throw new EvalConfigError(
+        "config error: audit LLM is not wired for this subcommand; see docs/runbooks/extraction-eval.md"
+      );
+    },
+  };
+}
+
+export function buildEvalCliDepsFromEnv(subcommand: Subcommand): EvalCliDeps {
+  const dir = baselineDirFromEnv();
+  if (!subcommandNeedsLiveLlm(subcommand)) {
+    return {
+      llmClient: unwiredExtractClient(),
+      llmAuditClient: unwiredAuditClient(),
+      extractModelId: "",
+      baselineDir: dir,
+      loadSnapshot: loadChunkSnapshot,
+      loadGold: loadGoldSet,
+      saveGold: defaultSaveGold,
+      saveAudit: defaultSaveAudit,
+      appendBaseline: defaultAppendBaseline,
+      readBaseline: defaultReadBaseline,
+      readThresholds: defaultReadThresholds,
+      driftGate: defaultDriftGate,
+      releaseGate: defaultReleaseGate,
+      hashPrompt: defaultHashPrompt,
+      logger: createLogger(
+        (process.env["LOG_LEVEL"] as
+          "debug" | "info" | "warn" | "error" | undefined) ?? "info"
+      ),
+      now: () => new Date().toISOString(),
+    };
+  }
   const extractModelId = requireEnv(
     "EVAL_EXTRACT_MODEL",
     "extraction model id (SC9 cross-family guard)"
   );
-  const dir = baselineDirFromEnv();
   return {
     llmClient: buildLlmFromEnv("EVAL_EXTRACT_MODEL"),
     llmAuditClient: buildAuditLlmFromEnv(),
@@ -776,7 +843,17 @@ export function buildEvalCliDepsFromEnv(): EvalCliDeps {
 
 export async function runCliFromEnv(argv: string[]): Promise<number> {
   try {
-    const deps = buildEvalCliDepsFromEnv();
+    const parsed = parseArgs(argv);
+    if (!parsed.ok) {
+      writeStderr(`${USAGE}\neval: ${parsed.error}\n`);
+      return 2;
+    }
+    const subcommand = parsed.flags.subcommand;
+    if (subcommand === null) {
+      writeStderr(`${USAGE}\neval: internal: missing subcommand after parse\n`);
+      return 2;
+    }
+    const deps = buildEvalCliDepsFromEnv(subcommand);
     return await runCli(argv, deps);
   } catch (err) {
     if (err instanceof EvalConfigError) {
@@ -873,14 +950,4 @@ if (isMain) {
     );
     process.exit(1);
   });
-}
-
-/** Eval-side ConfigError. Distinct from `core/config.ts`'s ConfigError
- * so the offline operator tool's exit-1 surface does not depend on the
- * MCP server's startup config. */
-export class EvalConfigError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "EvalConfigError";
-  }
 }

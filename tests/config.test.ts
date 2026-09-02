@@ -1372,7 +1372,8 @@ describe("loadEnv — Neo4j sidecar config", () => {
     const saved = new Map<string, string | undefined>();
     for (const k of keys) {
       saved.set(k, process.env[k]);
-      delete process.env[k];
+      // Present blank: loadEnv must not fall through to `.env.local`.
+      process.env[k] = "";
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
     process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";

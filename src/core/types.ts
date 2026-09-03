@@ -64,4 +64,35 @@ export interface SearchOptions {
   limit: number;
   validAt: string; // ISO 8601 — filter: valid_from <= validAt AND (valid_until IS NULL OR valid_until > validAt)
   filters?: Record<string, string>; // exact match on source_ref / metadata keys
+  /**
+   * Optional lexical precision-layer controls. Vector backends ignore this
+   * block; the Elasticsearch adapter consumes it when it builds the lexical
+   * query. Keeping it on the shared search shape lets the orchestrator pass
+   * one immutable set of retrieval knobs to either backend.
+   */
+  precision?: PrecisionSearchOptions;
+}
+
+export interface PrecisionSearchOptions {
+  /**
+   * Okapi BM25 term-frequency saturation. Same retrieval knob on both
+   * backends, different mechanism: the MemoryBackend double applies it
+   * per query (in-memory BM25); the Elasticsearch backend applies it as
+   * INDEX-TIME similarity settings only (ES has no per-request BM25
+   * override), so a query-time k1 there is deliberately ignored.
+   */
+  k1?: number;
+  /**
+   * Okapi BM25 document-length normalization. Index-time on the ES
+   * backend (see the `k1` note above); query-time on MemoryBackend.
+   */
+  b?: number;
+  /** Use match_phrase clauses in addition to term matching. */
+  phrase?: boolean;
+  /** Use configured per-field boosts instead of uniform fields. */
+  fieldBoost?: boolean;
+  /** Use the IK CJK query analyzer; false preserves the unsegmented path. */
+  cjkSegmentation?: boolean;
+  /** Optional field → boost overrides for the lexical query. */
+  fieldBoosts?: Record<string, number>;
 }

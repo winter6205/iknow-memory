@@ -1,18 +1,21 @@
 /**
  * MemoryBackend's BM25 lexical arm (#66).
  *
- * Same contract as `PgvectorBackend.searchLexical` — a query string in,
- * ranked `RetrievedChunk[]` out, honouring valid_window / filters / limit
- * — so hybrid retrieval can be exercised in unit tests without Postgres
- * (SC10). Scores are NOT expected to match Postgres: this side computes
- * real Okapi BM25 (k1=1.2, b=0.75) while `ts_rank_cd` approximates, and
- * RRF only ever consumes rank order.
+ * Same contract as `ElasticsearchPrecisionLayer.searchLexical` — a query
+ * string in, ranked `RetrievedChunk[]` out, honouring valid_window /
+ * filters / limit — so hybrid retrieval can be exercised in unit tests
+ * without a running precision-layer cluster (SC10). Scores are NOT
+ * expected to match the ES precision layer: this side computes real
+ * Okapi BM25 (k1=1.2, b=0.75) and RRF only ever consumes rank order.
  *
  * Ranking assertions here are about relative order, not absolute values,
  * so they stay meaningful if the smoothing constants are ever retuned.
  */
 import { describe, it, expect, beforeEach } from "vitest";
-import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
+import {
+  MemoryBackend,
+  tokenize,
+} from "../../src/core/storage/memory-backend.js";
 import { supportsLexicalSearch } from "../../src/core/storage/backend.js";
 import type { ChunkRecord } from "../../src/core/types.js";
 
@@ -82,6 +85,31 @@ describe("MemoryBackend — lexical (BM25) arm", () => {
       validAt: NOW,
     });
     expect(hits.map((h) => h.id)).toEqual(["a"]);
+  });
+
+  it("segments continuous Chinese text into multiple lexical terms", () => {
+    expect(tokenize("连续中文文本的分词结果").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("keeps mixed Chinese and English searchable", async () => {
+    await backend.upsert([
+      makeChunk({ id: "mixed", content: "部署 Elasticsearch 集群" }),
+    ]);
+    const hits = await backend.searchLexical("Elasticsearch 集群", {
+      limit: 10,
+      validAt: NOW,
+    });
+    expect(hits.map((hit) => hit.id)).toEqual(["mixed"]);
+  });
+
+  it("handles a single Chinese character and punctuation-only input", async () => {
+    await backend.upsert([makeChunk({ id: "single", content: "甲" })]);
+    expect(
+      await backend.searchLexical("甲", { limit: 10, validAt: NOW })
+    ).toHaveLength(1);
+    expect(
+      await backend.searchLexical("！？。", { limit: 10, validAt: NOW })
+    ).toEqual([]);
   });
 
   it("ranks a rare term above a term that appears in every chunk", async () => {

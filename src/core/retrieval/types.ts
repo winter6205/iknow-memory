@@ -254,6 +254,12 @@ export interface ArmResult {
   belowFloor: boolean;
   /** Human-readable failure reason when the arm is unavailable. */
   failureReason?: string;
+  /**
+   * Additional capability observations produced while an arm remains
+   * fail-open. Entity seed fusion uses this to report a failed lexical
+   * lookup while still returning graph results from vector seeds.
+   */
+  observations?: CapabilityObservation[];
 }
 
 /** A fused hit after RRF. */
@@ -283,8 +289,24 @@ export interface RetrieveConfig {
   w_bm25: number;
   /** Weight for the graph arm in RRF. */
   w_graph: number;
+  /** Okapi BM25 term-frequency saturation. */
+  k1?: number;
+  /** Okapi BM25 document-length normalization. */
+  b?: number;
   /** Whether the BM25 arm runs at all. Off → vector-only, and NOT degraded. */
   bm25Enabled: boolean;
+  /** Whether the shared vector capability is included in the retrieval run. */
+  vectorEnabled?: boolean;
+  /** Whether the same query is fused with reciprocal rank fusion. */
+  rrfEnabled?: boolean;
+  /** Whether the precision layer segments CJK query text. */
+  cjkSegmentationEnabled?: boolean;
+  /** Whether exact phrase clauses participate in lexical ranking. */
+  phraseEnabled?: boolean;
+  /** Whether configured lexical field boosts participate in ranking. */
+  fieldBoostEnabled?: boolean;
+  /** Optional field boost map consumed by the precision layer. */
+  fieldBoosts?: Record<string, number>;
   /**
    * Whether the Neo4j graph arm runs at all. Off → vector (+BM25) only
    * without a degradation; absent Neo4j config while this stays enabled is
@@ -331,6 +353,13 @@ export interface RankedEntity {
    * must not become the ranking algorithm).
    */
   score: number;
+}
+
+/** Candidate returned by one entity-finding route before seed RRF. */
+export interface EntitySeedCandidate {
+  id: string;
+  canonical_name: string;
+  score?: number;
 }
 
 /**
@@ -426,6 +455,22 @@ export interface EntityEmbeddingStorage {
   ): Promise<EntityChunkRow[]>;
 }
 
+/** Entity lookup supplied by the precision layer during seed finding. */
+export interface EntityLexicalStorage {
+  searchEntities(
+    query: string,
+    limit: number,
+    precision?: {
+      k1?: number;
+      b?: number;
+      cjkSegmentation?: boolean;
+      phrase?: boolean;
+      fieldBoost?: boolean;
+      fieldBoosts?: Record<string, number>;
+    }
+  ): Promise<Array<{ id: string; canonical_name: string; score?: number }>>;
+}
+
 /** A ledger-stored community summary exposed as a retrieve candidate. */
 export interface CommunitySummaryRow {
   id: string;
@@ -458,7 +503,7 @@ export interface GraphArmStorage {
   seedEntitiesByEmbedding(
     embedding: number[],
     topK: number
-  ): Promise<Array<{ id: string; canonical_name: string }>>;
+  ): Promise<Array<{ id: string; canonical_name: string; score?: number }>>;
   chunksByOneHopFromEntities(
     seedIds: string[],
     validAt: string,

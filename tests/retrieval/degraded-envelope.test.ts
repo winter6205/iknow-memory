@@ -220,4 +220,67 @@ describe("retrieve degraded envelope", () => {
       "keyword_bm25:attempted-and-failed",
     ]);
   });
+
+  /**
+   * T5 (specs/es-precision-layer.md): the entity-finding stage's lexical
+   * leg fails open. The graph arm keeps the vector seeds, but the failure
+   * must surface as a `keyword_bm25:attempted-and-failed` observation on
+   * the envelope — NOT as a `graph_ppr:attempted-and-failed` (the graph
+   * arm did not fail), and NOT as a `belowFloor` graph floor violation.
+   *
+   * The central registry is the only decision point for the wire flag,
+   * so the assertion here pins that the ARM_CAPABILITY map
+   * (`src/core/retrieval/index.ts`) routes the lexical leg's observation
+   * to the `keyword_bm25` capability, not `graph_ppr`.
+   */
+  it("entity lexical fail-open names keyword_bm25 only — never graph_ppr", async () => {
+    const backend = new FakeRetrievalBackend();
+    const result = await assembleRetrievalResult(
+      { query: "专名查询", validAt: NOW, limit: 10 },
+      {
+        embedder: new FixedEmbedder(),
+        storage: backend,
+        retrieveConfig: CFG,
+        capabilityObservations: [
+          observe("keyword_bm25", "attempted-and-failed"),
+        ],
+      }
+    );
+
+    expect(result.degraded).toBe(true);
+    expect(result.degraded_reasons).toEqual([
+      "keyword_bm25:attempted-and-failed",
+    ]);
+    // The graph arm is NOT below-floor in this scenario: a seed lexical
+    // failure is a lexical observation, not a graph one. Belt-and-braces
+    // assertion against future refactors that confuse the two.
+    expect(result.degraded_reasons).not.toContain(
+      "graph_ppr:attempted-and-failed"
+    );
+    expect(result.degraded_reasons).not.toContain("graph_ppr:unattempted");
+  });
+
+  it("graph below-floor and entity lexical fail-open coexist as distinct reasons", async () => {
+    const backend = new FakeRetrievalBackend();
+    const result = await assembleRetrievalResult(
+      { query: "专名查询", validAt: NOW, limit: 10 },
+      {
+        embedder: new FixedEmbedder(),
+        storage: backend,
+        retrieveConfig: CFG,
+        capabilityObservations: [
+          observe("graph_ppr", "attempted-and-failed"),
+          observe("keyword_bm25", "attempted-and-failed"),
+        ],
+      }
+    );
+
+    // Order follows CAPABILITY_REGISTRY declaration order, not observation
+    // order — the registry is the single point where the wire reasons are
+    // emitted.
+    expect(result.degraded_reasons).toEqual([
+      "keyword_bm25:attempted-and-failed",
+      "graph_ppr:attempted-and-failed",
+    ]);
+  });
 });

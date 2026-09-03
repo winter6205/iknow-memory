@@ -14,6 +14,7 @@ import {
 import { ConfigError, readIngestBatchLimit } from "../config.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
+import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
 import {
   normalizeContentInvalidationRequest,
@@ -184,6 +185,8 @@ export function computeChunkId(
 export interface IngestDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
+  /** Optional ES derived-index writer; Postgres remains authoritative. */
+  precision?: PrecisionIndexer;
   identityVersions?: Partial<ContentIdentityVersions>;
   /** Optional test/wiring override; absent uses the validated env default. */
   batchLimit?: number;
@@ -391,7 +394,29 @@ export function createIngestHandler(deps: IngestDeps) {
     });
 
     const ids = await deps.storage.upsert(records);
-    return textResult(JSON.stringify({ chunk_ids: ids }));
+    let precisionFailed = false;
+    if (deps.precision !== undefined) {
+      try {
+        await deps.precision.indexChunks(records);
+      } catch (error) {
+        // EXIT: a derived-index failure is visible but never rolls back the
+        // authoritative chunk write; reindex repairs it later.
+        precisionFailed = true;
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`ingest precision index failed: ${message}\n`);
+      }
+    }
+    return textResult(
+      JSON.stringify({
+        chunk_ids: ids,
+        ...(precisionFailed
+          ? {
+              degraded: true,
+              degraded_reasons: ["keyword_bm25:attempted-and-failed"],
+            }
+          : {}),
+      })
+    );
   };
 }
 

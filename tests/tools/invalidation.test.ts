@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   createInvalidationHandler,
   invalidationTool,
@@ -8,6 +8,7 @@ import { FakeEmbedder } from "../../src/core/embedder.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
 import { GraphragError } from "../../src/core/errors.js";
 import type { ToolResult } from "../../src/tools/registry.js";
+import type { PrecisionIndexer } from "../../src/core/storage/elasticsearch-precision.js";
 
 const TEST_DIM = 1536;
 
@@ -19,12 +20,44 @@ function parseBody(result: ToolResult): {
     invalidated_at: string;
     triggered_by: string;
   }>;
+  degraded?: boolean;
+  degraded_reasons?: string[];
 } {
   const text = result.content[0]?.text;
   if (typeof text !== "string") {
     throw new Error("expected text content in ToolResult");
   }
   return JSON.parse(text);
+}
+
+/**
+ * Build a PrecisionIndexer stub with only the methods the invalidation
+ * handler calls. Keeps each test focused on the precision dual-write
+ * contract without hauling in the full ES mock.
+ */
+function fakePrecision(
+  behavior: { kind: "ok" } | { kind: "fail"; error: unknown }
+): PrecisionIndexer & {
+  invalidateSourceRef: ReturnType<typeof vi.fn>;
+} {
+  const invalidateSourceRef = vi.fn(async () => {
+    if (behavior.kind === "fail") throw behavior.error;
+  });
+  return {
+    searchLexical: vi.fn(async () => []),
+    indexChunks: vi.fn(async () => undefined),
+    indexEntities: vi.fn(async () => undefined),
+    rebuildChunks: vi.fn(async () => undefined),
+    rebuildEntities: vi.fn(async () => undefined),
+    invalidateSourceRef,
+    deleteChunkIndex: vi.fn(async () => undefined),
+    deleteEntityIndex: vi.fn(async () => undefined),
+    analyze: vi.fn(async () => []),
+    close: vi.fn(async () => undefined),
+    searchEntities: vi.fn(async () => []),
+  } as unknown as PrecisionIndexer & {
+    invalidateSourceRef: ReturnType<typeof vi.fn>;
+  };
 }
 
 /**
@@ -148,6 +181,134 @@ describe("createInvalidationHandler — close-window semantics", () => {
         triggered_by: "fin",
       })
     ).rejects.toBeInstanceOf(GraphragError);
+  });
+});
+
+/**
+ * ES precision dual-write semantics. Postgres stays authoritative: an ES
+ * failure surfaces as degraded:true + keyword_bm25:attempted-and-failed,
+ * never as a rolled-back authoritative write. Unconfigured (no precision)
+ * preserves the existing wire shape exactly.
+ */
+describe("createInvalidationHandler — precision dual-write", () => {
+  const NOW = new Date().toISOString();
+
+  async function seededDeps(): Promise<{
+    deps: InvalidationDeps;
+    seedChunk: (sourceRef: string) => Promise<string>;
+    storage: MemoryBackend;
+  }> {
+    const storage = new MemoryBackend(TEST_DIM);
+    const embedder = new FakeEmbedder(TEST_DIM);
+    const deps: InvalidationDeps = { embedder, storage };
+    const seedChunk = async (sourceRef: string): Promise<string> => {
+      const [embedding] = await embedder.embed([`payload for ${sourceRef}`]);
+      const ids = await storage.upsert([
+        {
+          id: `chunk-for-${sourceRef}`,
+          content: `payload for ${sourceRef}`,
+          embedding: embedding!,
+          source_ref: sourceRef,
+          metadata: {},
+          valid_from: "2024-01-01T00:00:00Z",
+          valid_until: null,
+          created_at: NOW,
+        },
+      ]);
+      return ids[0]!;
+    };
+    return { deps, seedChunk, storage };
+  }
+
+  it("unconfigured (precision undefined) keeps the legacy wire shape", async () => {
+    const { deps, seedChunk } = await seededDeps();
+    const sourceRef = "docs/no-precision.md";
+    await seedChunk(sourceRef);
+
+    const body = parseBody(
+      await createInvalidationHandler(deps)({
+        source_ref: sourceRef,
+        invalidated_at: "2024-06-01T00:00:00Z",
+        triggered_by: "fin",
+      })
+    );
+
+    expect(body.degraded).toBeUndefined();
+    expect(body.degraded_reasons).toBeUndefined();
+    expect(body.invalidated_chunk_ids).toHaveLength(1);
+  });
+
+  it("precision success: response shape stays non-degraded", async () => {
+    const { deps, seedChunk } = await seededDeps();
+    const precision = fakePrecision({ kind: "ok" });
+    deps.precision = precision;
+    const sourceRef = "docs/es-ok.md";
+    await seedChunk(sourceRef);
+
+    const body = parseBody(
+      await createInvalidationHandler(deps)({
+        source_ref: sourceRef,
+        invalidated_at: "2024-06-01T00:00:00Z",
+        triggered_by: "fin",
+      })
+    );
+
+    expect(body.degraded).toBeUndefined();
+    expect(body.degraded_reasons).toBeUndefined();
+    expect(precision.invalidateSourceRef).toHaveBeenCalledTimes(1);
+    expect(precision.invalidateSourceRef).toHaveBeenCalledWith(
+      sourceRef,
+      "2024-06-01T00:00:00.000Z"
+    );
+  });
+
+  it("precision failure: authority write still completes, response marks degraded", async () => {
+    // Spec SC-5: ES write failure must not roll back the authoritative
+    // close. The ledger has the invalidation record; the response carries
+    // the same `keyword_bm25:attempted-and-failed` reason the ingest/push
+    // paths use, so observability stays consistent across dual-writes.
+    const { deps, seedChunk, storage } = await seededDeps();
+    const precision = fakePrecision({
+      kind: "fail",
+      error: new Error("es unreachable"),
+    });
+    deps.precision = precision;
+    const sourceRef = "docs/es-fail.md";
+    await seedChunk(sourceRef);
+
+    // Silence the stderr observation; assert on the response shape.
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+
+    const body = parseBody(
+      await createInvalidationHandler(deps)({
+        source_ref: sourceRef,
+        invalidated_at: "2024-06-01T00:00:00Z",
+        triggered_by: "fin",
+      })
+    );
+
+    expect(body.degraded).toBe(true);
+    expect(body.degraded_reasons).toEqual([
+      "keyword_bm25:attempted-and-failed",
+    ]);
+    expect(body.invalidated_chunk_ids).toHaveLength(1);
+
+    // Authority close still happened: the chunk's validity window is
+    // closed and the ledger holds the invalidation record.
+    const records = await storage.listInvalidations(sourceRef);
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      chunk_id: `chunk-for-${sourceRef}`,
+      invalidated_at: "2024-06-01T00:00:00.000Z",
+      triggered_by: "fin",
+    });
+
+    expect(stderr).toHaveBeenCalledWith(
+      expect.stringContaining("invalidation precision index failed")
+    );
+    stderr.mockRestore();
   });
 });
 

@@ -121,6 +121,71 @@ function happyPath(): { storage: FakeArmStorage; ranker: FakeRanker } {
 }
 
 describe("runNeo4jGraphArm — seed → PPR → chunks", () => {
+  it("fuses vector and lexical entity candidates before PPR", async () => {
+    const { storage, ranker } = happyPath();
+    storage.seeds = [
+      { id: "vector-only", canonical_name: "Vector entity" },
+      { id: "shared", canonical_name: "Shared entity" },
+    ];
+    storage.rows = [
+      chunkRow("shared", "c-shared"),
+      chunkRow("lexical-only", "c-lexical"),
+      chunkRow("vector-only", "c-vector"),
+    ];
+    ranker.ranked = [
+      { id: "shared", score: 0.9 },
+      { id: "vector-only", score: 0.5 },
+      { id: "lexical-only", score: 0.2 },
+    ];
+    const lexical = {
+      searchEntities: async () => [
+        { id: "lexical-only", canonical_name: "Lexical entity" },
+        { id: "shared", canonical_name: "Shared entity" },
+      ],
+    };
+
+    const result = await runNeo4jGraphArm(
+      EMBEDDING,
+      { storage, ranker, config: CFG, entityLexical: lexical },
+      NOW,
+      "专名查询"
+    );
+
+    expect(result.hits.map((hit) => hit.id)).toEqual([
+      "c-shared",
+      "c-vector",
+      "c-lexical",
+    ]);
+    expect(ranker.calls[0]?.seedIds).toEqual([
+      "shared",
+      "vector-only",
+      "lexical-only",
+    ]);
+  });
+
+  it("keeps vector entity seeds when the lexical seed lookup fails", async () => {
+    const { storage, ranker } = happyPath();
+    storage.rows = [chunkRow("e-seed", "c-vector")];
+    ranker.ranked = [{ id: "e-seed", score: 0.9 }];
+    const lexical = {
+      searchEntities: async () => {
+        throw new Error("entity index unavailable");
+      },
+    };
+
+    const result = await runNeo4jGraphArm(
+      EMBEDDING,
+      { storage, ranker, config: CFG, entityLexical: lexical },
+      NOW,
+      "专名查询"
+    );
+
+    expect(result.hits.map((hit) => hit.id)).toEqual(["c-vector"]);
+    expect(result.observations).toEqual([
+      { capability: "keyword_bm25", state: "attempted-and-failed" },
+    ]);
+  });
+
   it("returns graph-arm hits ordered by the PPR rank of the entity that reached them", async () => {
     const { storage, ranker } = happyPath();
 

@@ -15,6 +15,25 @@
 - **进行中**：检索/图谱质量栈 T2–T11 — `plans/retrieve-graph-quality.md`（tracker 只认仓库文件，不认 GitHub issues）
 - **后置**：抽取 F1（#15）、多粒度切分、专用社区/因果等见该 plan 未勾选项
 
+## Elasticsearch 精度层（可选增强）
+
+当 `GRAPHRAG_MEMORY_ES_URL` 未设置时，`retrieve` 行为与现状完全一致（向量单臂，词法臂 loud-skip，`degraded` 不变）。
+
+设置后启用四项词法能力（中文分词 + Okapi BM25 + 短语 + 字段加权），同一引擎同一词元流承载：
+
+- **chunk / entity 双写**：`ingest`、`push` 写入 Postgres 成功后再写两份派生索引
+  `iknow-memory-chunks` 与 `iknow-memory-entities`（索引与 mapping 由
+  `src/core/storage/elasticsearch-precision.ts` 的 `chunkMappings()` / `entityMappings()` 定义，首次写入时自动建索引）。
+- **两路词法召回**：Host 排序的 fallback + remainder fill 接 ES 词法臂，
+  Neo4j 图臂种子由向量路 + ES 词法路 RRF 融合产生（同一 RRF 常数 k=60，两次独立调用）。
+- **降级语义**：`unconfigured` → 词法臂缺席、不设 degraded（loud-skip）；
+  `configured-but-failing at call time` → 词法臂填命名条目（`keyword_bm25` 等），
+  向量结果照常返回。
+
+部署、版本对齐（ES 8.x / analysis-ik 同 patch / `@elastic/elasticsearch` 8.x）、
+安装、映射、重灌与重写恢复详见 [`docs/runbooks/es-precision-layer.md`](docs/runbooks/es-precision-layer.md)。
+环境变量见 `.env.example` 末尾“Elasticsearch precision layer”块。
+
 ## 运行
 
 ```bash
@@ -54,7 +73,11 @@ Host JSON 的 `env` 是 MCP 用户配置的 SSOT；`.env.local` 仅作本地开�
         "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "true",
         "ANTHROPIC_AUTH_TOKEN": "<rerank-api-token>",
         "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
-        "GRAPHRAG_MEMORY_ANTHROPIC_MODEL": "MiniMax-M3"
+        "GRAPHRAG_MEMORY_ANTHROPIC_MODEL": "MiniMax-M3",
+        "GRAPHRAG_MEMORY_ES_URL": "",
+        "GRAPHRAG_MEMORY_ES_CHUNK_INDEX": "",
+        "GRAPHRAG_MEMORY_ES_ENTITY_INDEX": "",
+        "GRAPHRAG_MEMORY_ES_REQUEST_TIMEOUT_MS": ""
       }
     }
   }

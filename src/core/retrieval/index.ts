@@ -66,6 +66,7 @@ import type {
   RetrieveConfig,
   RetrieveOutputEnvelope,
 } from "./types.js";
+import type { EntityLexicalStorage } from "./types.js";
 import type {
   RetrievedChunk,
   SearchOptions,
@@ -122,6 +123,10 @@ export interface AssembleDeps {
   embedder: EmbeddingClient;
   /** May implement the lexical and/or graph seams; neither is required. */
   storage: StorageBackend;
+  /** Optional Elasticsearch precision-layer chunk search. */
+  lexical?: import("../storage/backend.js").LexicalStorageBackend;
+  /** Optional Elasticsearch precision-layer entity search. */
+  entityLexical?: EntityLexicalStorage;
   /** Hybrid retrieval config. Absent → vector-only. */
   retrieveConfig?: RetrieveConfig;
   /** Opt-in archived graph arm; absent on the production path. */
@@ -204,10 +209,13 @@ export async function assembleRetrievalResult(
       ? weights.candidateCap
       : ARM_CANDIDATE_POOL;
 
-  const searchOpts = {
+  const searchOpts: SearchOptions = {
     limit: Math.max(args.limit, candidatePool, rerankWindow ?? 0),
     validAt: args.validAt,
     ...(args.filters !== undefined ? { filters: args.filters } : {}),
+    ...(deps.retrieveConfig !== undefined
+      ? { precision: precisionSearchOptions(deps.retrieveConfig) }
+      : {}),
   };
   const vectorSearch =
     embedding === undefined
@@ -227,7 +235,17 @@ export async function assembleRetrievalResult(
   // narrows `weights` for the `rrfFuse` call below.
   if (!fusing || weights === undefined) {
     const vector = await vectorSearch;
-    if (vector.failureReason !== undefined) {
+    // T12: an unattempted vector arm (embedding credentials absent) is a
+    // skipped capability, not a failure — a degraded empty envelope is the
+    // contract, matching the fused path. Only an attempted-and-failed arm
+    // with no surviving partner arm escalates to all-arms-failed. The ES
+    // precision layer made this combination reachable on the production
+    // path: pgvector no longer carries a lexical arm, so unconfigured ES +
+    // unconfigured embeddings leaves vector as the sole arm.
+    if (
+      vector.failureReason !== undefined &&
+      vector.failureState !== "unattempted"
+    ) {
       throw allArmsFailed(vector);
     }
     const result = await assembleVectorOnlyResult(
@@ -240,6 +258,16 @@ export async function assembleRetrievalResult(
     return buildEnvelope(
       waited.hits,
       [
+        // Mirror assembleFusedResult: surface the skipped vector arm so the
+        // degraded envelope names it (vector:unattempted).
+        ...(vector.failureReason !== undefined
+          ? [
+              observation(
+                "vector",
+                vector.failureState ?? "attempted-and-failed"
+              ),
+            ]
+          : []),
         ...waited.observations,
         ...arms.observations,
         ...(deps.capabilityObservations ?? []),
@@ -547,11 +575,12 @@ async function assembleFusedResult(
 function observationsFromOptional(
   optional: readonly ArmResult[]
 ): CapabilityObservation[] {
-  return optional.flatMap((arm) =>
-    arm.belowFloor
+  return optional.flatMap((arm) => [
+    ...(arm.observations ?? []),
+    ...(arm.belowFloor
       ? [observation(ARM_CAPABILITY[arm.arm], "attempted-and-failed")]
-      : []
-  );
+      : []),
+  ]);
 }
 
 function observation(
@@ -650,6 +679,27 @@ function normalizeNeighborWindow(
 function getReranker(deps: AssembleDeps): ChunkReranker | undefined {
   if (deps.retrieveConfig?.rerankEnabled !== true) return undefined;
   return deps.reranker;
+}
+
+function precisionSearchOptions(
+  config: RetrieveConfig
+): NonNullable<SearchOptions["precision"]> {
+  return {
+    ...(config.k1 !== undefined ? { k1: config.k1 } : {}),
+    ...(config.b !== undefined ? { b: config.b } : {}),
+    ...(config.cjkSegmentationEnabled !== undefined
+      ? { cjkSegmentation: config.cjkSegmentationEnabled }
+      : {}),
+    ...(config.phraseEnabled !== undefined
+      ? { phrase: config.phraseEnabled }
+      : {}),
+    ...(config.fieldBoostEnabled !== undefined
+      ? { fieldBoost: config.fieldBoostEnabled }
+      : {}),
+    ...(config.fieldBoosts !== undefined
+      ? { fieldBoosts: config.fieldBoosts }
+      : {}),
+  };
 }
 
 function toFusedFromRetrieved(retrieved: RetrievedChunk[]): FusedHit[] {

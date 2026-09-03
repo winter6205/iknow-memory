@@ -1676,3 +1676,375 @@ describe("runCli --backfill-embeddings", () => {
     );
   });
 });
+
+// ─── T5: precision-layer entity projection (specs/es-precision-layer.md) ──
+
+/** A recorded fake of the PrecisionIndexer write surface the CLI uses. */
+class RecordingPrecision {
+  indexed: unknown[][] = [];
+  deleted: string[][] = [];
+  indexError: unknown;
+  deleteError: unknown;
+
+  async indexEntities(entities: unknown[]): Promise<void> {
+    if (this.indexError !== undefined) throw this.indexError;
+    this.indexed.push(entities);
+  }
+
+  async deleteEntities(ids: string[]): Promise<void> {
+    if (this.deleteError !== undefined) throw this.deleteError;
+    this.deleted.push(ids);
+  }
+}
+
+describe("extract → precision.indexEntities (T5 entity projection)", () => {
+  it("unconfigured precision layer: no index call, run still succeeds", async () => {
+    const client = new FakeClient();
+    scanOneChunk(client);
+    const llm = new FakeLLMClient({
+      scripted: async () => ({ kind: "ok" as const, outputs: [ALICE_OUTPUT] }),
+    });
+    const deps = makeDeps(client, llm);
+
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+  });
+
+  it("configured precision layer: indexes the canonical name + full alias set after commit", async () => {
+    const client = new FakeClient();
+    scanOneChunk(client);
+    // The post-commit projection read goes through the shared T5 helper
+    // (`fetchEntityProjection`); the fake answers it with the two rows the
+    // INSERTs above would have produced, each with its full alias set.
+    const projectionRows = [
+      {
+        id: "id-head",
+        canonical_name: ALICE_OUTPUT.head,
+        type: "person",
+        retired: false,
+        aliases: [ALICE_OUTPUT.head],
+      },
+      {
+        id: "id-tail",
+        canonical_name: ALICE_OUTPUT.tail,
+        type: "system",
+        retired: false,
+        aliases: [ALICE_OUTPUT.tail],
+      },
+    ];
+    const baseRowsOverride = client.rowsOverride;
+    client.rowsOverride = (text: string) =>
+      /entity_aliases a ON a\.entity_id = e\.id/.test(text)
+        ? projectionRows
+        : baseRowsOverride
+          ? baseRowsOverride(text)
+          : [];
+    const llm = new FakeLLMClient({
+      scripted: async () => ({ kind: "ok" as const, outputs: [ALICE_OUTPUT] }),
+    });
+    const precision = new RecordingPrecision();
+    const deps: CliDeps = { ...makeDeps(client, llm), precision };
+
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+    expect(precision.indexed).toHaveLength(1);
+    const records = precision.indexed[0] as Array<{
+      canonical_name: string;
+      aliases: string[];
+    }>;
+    // head + tail, each carrying its canonical name as an alias
+    expect(records.map((r) => r.canonical_name)).toEqual([
+      ALICE_OUTPUT.head,
+      ALICE_OUTPUT.tail,
+    ]);
+    for (const record of records) {
+      expect(record.aliases).toContain(record.canonical_name);
+    }
+    // The projection query is the shared T5 helper, not an ad-hoc SELECT.
+    expect(
+      client.queries.some((q) =>
+        /entity_aliases a ON a\.entity_id = e\.id/.test(q)
+      )
+    ).toBe(true);
+    // Indexing happens after COMMIT: no open transaction when it runs.
+    expect(client.queries[client.queries.length - 1]).not.toBe("BEGIN");
+  });
+
+  it("ES index failure is fail-open: exit 0, authority rows unaffected", async () => {
+    const client = new FakeClient();
+    scanOneChunk(client);
+    const llm = new FakeLLMClient({
+      scripted: async () => ({ kind: "ok" as const, outputs: [ALICE_OUTPUT] }),
+    });
+    const precision = new RecordingPrecision();
+    precision.indexError = new Error("entity index unavailable");
+    const deps: CliDeps = { ...makeDeps(client, llm), precision };
+
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+    expect(precision.indexed).toEqual([]);
+    // The authority writes still happened (INSERT INTO entities fired).
+    expect(boundValuesFor(client, /INSERT INTO entities/)).toHaveLength(2);
+  });
+
+  it("no delete fires on a plain create run", async () => {
+    const client = new FakeClient();
+    scanOneChunk(client);
+    const llm = new FakeLLMClient({
+      scripted: async () => ({ kind: "ok" as const, outputs: [ALICE_OUTPUT] }),
+    });
+    const precision = new RecordingPrecision();
+    const deps: CliDeps = { ...makeDeps(client, llm), precision };
+
+    await runCli(["--batch-size", "1"], deps);
+
+    expect(precision.deleted).toEqual([]);
+  });
+
+  it("an L3 merge deletes the loser id from the entity index after commit", async () => {
+    const client = new FakeClient();
+    // Same shape as the "merged_into is persisted for fuzzy merges (T5)"
+    // fixture: a live survivor plus an incoming head that only the L3
+    // cosine can fold into it. ConstantEmbedder makes L3 see cosine 1.0.
+    serveMergePersistenceRows(
+      client,
+      personRow(SURVIVOR_HEAD, SELF_LOOP_OUTPUT.head)
+    );
+    const llm = new FakeLLMClient({
+      scripted: async () => ({
+        kind: "ok" as const,
+        outputs: [
+          {
+            ...SELF_LOOP_OUTPUT,
+            head: "Alicia Smith",
+            tail: "Acme",
+            tailType: "system",
+          },
+        ],
+      }),
+    });
+    const precision = new RecordingPrecision();
+    const deps: CliDeps = {
+      ...makeDeps(client, llm),
+      embedder: new ConstantEmbedder(8),
+      precision,
+    };
+
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+    const loser = boundValuesFor(client, /INSERT INTO entities/).find(
+      (values) => values[1] === "Alicia Smith"
+    );
+    expect(loser).toBeDefined();
+    expect(precision.deleted).toEqual([[loser![0]]]);
+  });
+
+  it("ES delete failure is fail-open: exit 0, merge already committed", async () => {
+    const client = new FakeClient();
+    serveMergePersistenceRows(
+      client,
+      personRow(SURVIVOR_HEAD, SELF_LOOP_OUTPUT.head)
+    );
+    const llm = new FakeLLMClient({
+      scripted: async () => ({
+        kind: "ok" as const,
+        outputs: [
+          {
+            ...SELF_LOOP_OUTPUT,
+            head: "Alicia Smith",
+            tail: "Acme",
+            tailType: "system",
+          },
+        ],
+      }),
+    });
+    const precision = new RecordingPrecision();
+    precision.deleteError = new Error("delete_by_query rejected");
+    const deps: CliDeps = {
+      ...makeDeps(client, llm),
+      embedder: new ConstantEmbedder(8),
+      precision,
+    };
+
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+    // The merge itself committed: the loser INSERT and the merged_into
+    // UPDATE are both durable despite the ES-side delete failure. Two
+    // entity INSERTs fire (the folded head loser + the fresh Acme tail).
+    expect(boundValuesFor(client, /INSERT INTO entities/)).toHaveLength(2);
+    expect(
+      boundValuesFor(client, /UPDATE entities SET merged_into/)
+    ).toHaveLength(1);
+  });
+});
+
+// ─── T9 High-2 fix: runCliFromEnv production precision wiring ────────────────
+// The extract CLI is a production entry point; when the env configures an ES
+// block, `runCliFromEnv` must build an `ElasticsearchPrecisionLayer` (mirroring
+// the server wiring in src/index.ts buildDeps) and inject it into CliDeps.
+// Unconfigured ES stays `undefined` — a silent no-op for every precision call,
+// matching the MCP push/ingest path. The fake Pool + mocked layer mean the
+// assertions never touch a live Postgres or Elasticsearch.
+describe("runCliFromEnv precision wiring (production entry point)", () => {
+  function makeFakeEnv(
+    elasticsearch: import("../../src/config.js").ElasticsearchConfig | undefined
+  ): import("../../src/config.js").GraphragEnv {
+    return {
+      logLevel: "info",
+      storage: "pgvector",
+      dbUrl: "postgres://localhost/test",
+      embedBaseUrl: undefined,
+      embedModel: undefined,
+      embedDimensions: 8,
+      pgvectorAnnMaxDimensions: 2048,
+      ingestBatchLimit: 100,
+      pgvectorPoolMax: 4,
+      pgvectorConnectionWaitTimeoutMs: 5000,
+      embedApiKey: undefined,
+      retrieval: {
+        preset: "balanced",
+        rrfK: 60,
+        w_vec: 1,
+        w_bm25: 1,
+        w_graph: 0.15,
+        k1: 1.4,
+        b: 0.6,
+        bm25Enabled: true,
+        cjkSegmentationEnabled: true,
+        phraseEnabled: true,
+        fieldBoostEnabled: true,
+        fieldBoosts: { content: 1 },
+        rrfEnabled: true,
+        vectorEnabled: true,
+        graphEnabled: true,
+        nodeEmbeddingEnabled: false,
+        rerankEnabled: false,
+        waitForDrainEnabled: false,
+        waitForDrainTimeoutMs: 5000,
+        entityLinkTopK: 10,
+        candidateCap: 100,
+        neighborWidth: 1,
+        graphArmFloor: 3,
+      },
+      neo4j: undefined,
+      elasticsearch,
+      rerank: undefined,
+      rerankUrl: undefined,
+    };
+  }
+
+  const ES_CONFIG: import("../../src/config.js").ElasticsearchConfig = {
+    node: "http://localhost:9200",
+    chunkIndex: "iknow-memory-chunks",
+    entityIndex: "iknow-memory-entities",
+    username: undefined,
+    password: undefined,
+    apiKey: undefined,
+    requestTimeoutMs: 5000,
+  };
+
+  function captureStderr(): { text: () => string; restore: () => void } {
+    const chunks: string[] = [];
+    const spy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk) => {
+        chunks.push(String(chunk));
+        return true;
+      });
+    return {
+      text: () => chunks.join(""),
+      restore: () => spy.mockRestore(),
+    };
+  }
+
+  async function withMockedEnv(
+    env: import("../../src/config.js").GraphragEnv
+  ): Promise<{
+    layerInstances: Array<{
+      config: unknown;
+      options: unknown;
+      closed: number;
+    }>;
+  }> {
+    const layerInstances: Array<{
+      config: unknown;
+      options: unknown;
+      closed: number;
+    }> = [];
+    const stderr = captureStderr();
+    vi.doMock("../../src/config.js", async () => {
+      const actual = await vi.importActual<
+        typeof import("../../src/config.js")
+      >("../../src/config.js");
+      return { ...actual, loadEnv: () => env };
+    });
+    // The Pool must never dial a real Postgres: replace `pg` with a fake
+    // whose connect() answers the scan with zero rows so `--list-unmapped`
+    // finishes immediately with exit 0.
+    vi.doMock("pg", () => ({
+      Pool: class {
+        async connect() {
+          return {
+            query: async () => ({ rows: [] }),
+            release: () => {},
+          };
+        }
+        async end() {}
+      },
+    }));
+    vi.doMock("../../src/core/storage/elasticsearch-precision.js", () => ({
+      ElasticsearchPrecisionLayer: class {
+        config: unknown;
+        options: unknown;
+        closed = 0;
+        constructor(config: unknown, options: unknown) {
+          this.config = config;
+          this.options = options;
+          layerInstances.push(this);
+        }
+        async close() {
+          this.closed += 1;
+        }
+      },
+    }));
+    try {
+      // Drop the statically-cached extract module so the dynamic import
+      // re-evaluates it against the mocks above (vi.doMock only affects
+      // imports after a module-registry reset).
+      vi.resetModules();
+      const mod = await import("../../src/cli/extract.js");
+      await mod.runCliFromEnv(["--list-unmapped"]);
+    } finally {
+      stderr.restore();
+      vi.doUnmock("../../src/config.js");
+      vi.doUnmock("pg");
+      vi.doUnmock("../../src/core/storage/elasticsearch-precision.js");
+      vi.resetModules();
+    }
+    return { layerInstances };
+  }
+
+  it("builds an ElasticsearchPrecisionLayer from env.elasticsearch with k1/b from env.retrieval", async () => {
+    const { layerInstances } = await withMockedEnv(makeFakeEnv(ES_CONFIG));
+
+    expect(layerInstances).toHaveLength(1);
+    expect(layerInstances[0]!.config).toEqual(ES_CONFIG);
+    expect(layerInstances[0]!.options).toEqual({ k1: 1.4, b: 0.6 });
+    // Resource cleanup: the layer is closed with the pool in `finally`.
+    expect(layerInstances[0]!.closed).toBe(1);
+  });
+
+  it("leaves precision unconfigured (undefined) when env has no ES block", async () => {
+    const { layerInstances } = await withMockedEnv(makeFakeEnv(undefined));
+
+    // No precision layer was ever constructed, and the run still exits 0 —
+    // the pipeline's precision calls are silent no-ops on the unconfigured
+    // path (same posture as the MCP push/ingest wiring).
+    expect(layerInstances).toHaveLength(0);
+  });
+});

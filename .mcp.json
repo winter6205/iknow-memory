@@ -9,7 +9,11 @@
         "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
         "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
         "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3",
-        "GRAPHRAG_MEMORY_LOG_LEVEL": "info"
+        "GRAPHRAG_MEMORY_LOG_LEVEL": "info",
+        "GRAPHRAG_MEMORY_ES_URL": "",
+        "GRAPHRAG_MEMORY_ES_CHUNK_INDEX": "",
+        "GRAPHRAG_MEMORY_ES_ENTITY_INDEX": "",
+        "GRAPHRAG_MEMORY_ES_REQUEST_TIMEOUT_MS": ""
       }
     }
   }

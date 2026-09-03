@@ -94,6 +94,20 @@ export const PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS_VAR =
   "GRAPHRAG_MEMORY_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS";
 export const DEFAULT_PGVECTOR_CONNECTION_WAIT_TIMEOUT_MS = 5_000;
 
+/** Elasticsearch precision-layer connection settings. */
+export const ELASTICSEARCH_URL_VAR = "GRAPHRAG_MEMORY_ES_URL";
+export const ELASTICSEARCH_NODE_VAR = "GRAPHRAG_MEMORY_ES_NODE";
+export const ELASTICSEARCH_USERNAME_VAR = "GRAPHRAG_MEMORY_ES_USERNAME";
+export const ELASTICSEARCH_PASSWORD_VAR = "GRAPHRAG_MEMORY_ES_PASSWORD";
+export const ELASTICSEARCH_API_KEY_VAR = "GRAPHRAG_MEMORY_ES_API_KEY";
+export const ELASTICSEARCH_CHUNK_INDEX_VAR = "GRAPHRAG_MEMORY_ES_CHUNK_INDEX";
+export const ELASTICSEARCH_ENTITY_INDEX_VAR = "GRAPHRAG_MEMORY_ES_ENTITY_INDEX";
+export const ELASTICSEARCH_REQUEST_TIMEOUT_MS_VAR =
+  "GRAPHRAG_MEMORY_ES_REQUEST_TIMEOUT_MS";
+export const DEFAULT_ELASTICSEARCH_CHUNK_INDEX = "iknow-memory-chunks";
+export const DEFAULT_ELASTICSEARCH_ENTITY_INDEX = "iknow-memory-entities";
+export const DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT_MS = 5_000;
+
 /**
  * Startup configuration failure. Distinct from GraphragError (core/errors.ts),
  * which covers per-request tool failures: a ConfigError is unrecoverable and
@@ -167,6 +181,12 @@ export interface GraphragEnv {
    */
   neo4j: Neo4jConfig | undefined;
   /**
+   * Elasticsearch precision layer, or undefined when no ES node is
+   * configured. The absence is an intentional loud-skip signal for the
+   * lexical capability; it is not a startup error.
+   */
+  elasticsearch: ElasticsearchConfig | undefined;
+  /**
    * LLM credentials for temporary retrieve rerank, or undefined when
    * `ANTHROPIC_AUTH_TOKEN` is absent. Model / base URL default to China
    * MiniMax-M3 when those env vars are unset.
@@ -185,6 +205,24 @@ export interface RerankConfig {
   apiKey: string;
   model: string;
   baseUrl: string;
+}
+
+/** Credentials and index names for the optional ES precision layer. */
+export interface ElasticsearchConfig {
+  /** One Elasticsearch 8.x node URL. */
+  node: string;
+  /** Basic-auth user, paired with `password`, or undefined. */
+  username: string | undefined;
+  /** Basic-auth password, never logged. */
+  password: string | undefined;
+  /** API key, mutually exclusive with basic auth. */
+  apiKey: string | undefined;
+  /** Derived chunk index containing authoritative chunk projections. */
+  chunkIndex: string;
+  /** Derived entity + alias index used during graph seed finding. */
+  entityIndex: string;
+  /** Per-request client timeout. */
+  requestTimeoutMs: number;
 }
 
 function parseEnvFile(path: string): Record<string, string> {
@@ -364,6 +402,20 @@ const RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS_VAR =
   "GRAPHRAG_MEMORY_RETRIEVAL_WAIT_FOR_DRAIN_TIMEOUT_MS";
 const RETRIEVAL_RERANK_URL_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL";
 const RETRIEVAL_PRESET_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_PRESET";
+export const RETRIEVAL_K1_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_K1";
+export const RETRIEVAL_B_VAR = "GRAPHRAG_MEMORY_RETRIEVAL_B";
+export const RETRIEVAL_CJK_SEGMENTATION_ENABLED_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_CJK_SEGMENTATION_ENABLED";
+export const RETRIEVAL_PHRASE_ENABLED_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_PHRASE_ENABLED";
+export const RETRIEVAL_FIELD_BOOST_ENABLED_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_FIELD_BOOST_ENABLED";
+export const RETRIEVAL_FIELD_BOOSTS_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_FIELD_BOOSTS";
+export const RETRIEVAL_RRF_ENABLED_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_RRF_ENABLED";
+export const RETRIEVAL_VECTOR_ENABLED_VAR =
+  "GRAPHRAG_MEMORY_RETRIEVAL_VECTOR_ENABLED";
 const LLM_AUTH_TOKEN_VAR = "ANTHROPIC_AUTH_TOKEN";
 const ANTHROPIC_MODEL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_MODEL";
 const ANTHROPIC_BASE_URL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL";
@@ -421,6 +473,47 @@ function parseFinitePositive(
     );
   }
   return n;
+}
+
+const DEFAULT_RETRIEVAL_FIELD_BOOSTS: Readonly<Record<string, number>> = {
+  content: 1,
+  source_ref: 1,
+  "metadata.*": 1,
+};
+
+function parseFieldBoosts(raw: string | undefined): Record<string, number> {
+  if (raw === undefined || raw.trim() === "") {
+    return { ...DEFAULT_RETRIEVAL_FIELD_BOOSTS };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new ConfigError(
+      `${RETRIEVAL_FIELD_BOOSTS_VAR} must be a JSON object of non-negative finite weights`
+    );
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).length === 0
+  ) {
+    throw new ConfigError(
+      `${RETRIEVAL_FIELD_BOOSTS_VAR} must be a non-empty JSON object of non-negative finite weights`
+    );
+  }
+  const result: Record<string, number> = {};
+  for (const [field, value] of Object.entries(parsed)) {
+    const n = typeof value === "number" ? value : Number(value);
+    if (field.trim() === "" || !Number.isFinite(n) || n < 0) {
+      throw new ConfigError(
+        `${RETRIEVAL_FIELD_BOOSTS_VAR} field "${field}" must have a finite non-negative weight`
+      );
+    }
+    result[field] = n;
+  }
+  return result;
 }
 
 /**
@@ -505,9 +598,41 @@ function parseRetrievalConfig(): RetrieveConfig {
       readRawEnv(RETRIEVAL_W_GRAPH_VAR),
       0.15
     ),
+    k1: parseFinitePositive(
+      RETRIEVAL_K1_VAR,
+      readRawEnv(RETRIEVAL_K1_VAR),
+      1.2
+    ),
+    b: parseFinitePositive(RETRIEVAL_B_VAR, readRawEnv(RETRIEVAL_B_VAR), 0.75),
     bm25Enabled: parseBoolean(
       RETRIEVAL_BM25_ENABLED_VAR,
       readEnv(RETRIEVAL_BM25_ENABLED_VAR),
+      true
+    ),
+    cjkSegmentationEnabled: parseBoolean(
+      RETRIEVAL_CJK_SEGMENTATION_ENABLED_VAR,
+      readEnv(RETRIEVAL_CJK_SEGMENTATION_ENABLED_VAR),
+      true
+    ),
+    phraseEnabled: parseBoolean(
+      RETRIEVAL_PHRASE_ENABLED_VAR,
+      readEnv(RETRIEVAL_PHRASE_ENABLED_VAR),
+      true
+    ),
+    fieldBoostEnabled: parseBoolean(
+      RETRIEVAL_FIELD_BOOST_ENABLED_VAR,
+      readEnv(RETRIEVAL_FIELD_BOOST_ENABLED_VAR),
+      true
+    ),
+    fieldBoosts: parseFieldBoosts(readRawEnv(RETRIEVAL_FIELD_BOOSTS_VAR)),
+    rrfEnabled: parseBoolean(
+      RETRIEVAL_RRF_ENABLED_VAR,
+      readEnv(RETRIEVAL_RRF_ENABLED_VAR),
+      true
+    ),
+    vectorEnabled: parseBoolean(
+      RETRIEVAL_VECTOR_ENABLED_VAR,
+      readEnv(RETRIEVAL_VECTOR_ENABLED_VAR),
       true
     ),
     graphEnabled: parseBoolean(
@@ -623,6 +748,106 @@ function parseRerankConfig(): RerankConfig | undefined {
   return { apiKey, model, baseUrl };
 }
 
+function isElasticsearchIndexName(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 255 &&
+    /^[a-z0-9][a-z0-9_-]*$/.test(value)
+  );
+}
+
+/**
+ * Load the optional Elasticsearch precision-layer connection block.
+ *
+ * A missing node is deliberate: the production caller leaves the lexical
+ * capability unconfigured and the retrieval orchestrator loud-skips it.
+ * Values that look like an attempted configuration are rejected early so a
+ * typo cannot silently select a different deployment.
+ */
+function parseElasticsearchConfig(): ElasticsearchConfig | undefined {
+  const node =
+    readTrimmed(ELASTICSEARCH_URL_VAR) ?? readTrimmed(ELASTICSEARCH_NODE_VAR);
+  const username = readTrimmed(ELASTICSEARCH_USERNAME_VAR);
+  const password = readTrimmed(ELASTICSEARCH_PASSWORD_VAR);
+  const apiKey = readTrimmed(ELASTICSEARCH_API_KEY_VAR);
+
+  if (node === undefined) {
+    if (
+      username !== undefined ||
+      password !== undefined ||
+      apiKey !== undefined
+    ) {
+      throw new ConfigError(
+        `${ELASTICSEARCH_URL_VAR} is required when Elasticsearch credentials are set`
+      );
+    }
+    return undefined;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(node);
+  } catch {
+    throw new ConfigError(
+      `${ELASTICSEARCH_URL_VAR} must be an http:// or https:// URL`
+    );
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new ConfigError(
+      `${ELASTICSEARCH_URL_VAR} must be an http:// or https:// URL`
+    );
+  }
+  if (username !== undefined && password === undefined) {
+    throw new ConfigError(
+      `${ELASTICSEARCH_PASSWORD_VAR} is required when ${ELASTICSEARCH_USERNAME_VAR} is set`
+    );
+  }
+  if (password !== undefined && username === undefined) {
+    throw new ConfigError(
+      `${ELASTICSEARCH_USERNAME_VAR} is required when ${ELASTICSEARCH_PASSWORD_VAR} is set`
+    );
+  }
+  if (
+    apiKey !== undefined &&
+    (username !== undefined || password !== undefined)
+  ) {
+    throw new ConfigError(
+      `${ELASTICSEARCH_API_KEY_VAR} cannot be combined with Elasticsearch username/password`
+    );
+  }
+
+  const chunkIndex =
+    readTrimmed(ELASTICSEARCH_CHUNK_INDEX_VAR) ??
+    DEFAULT_ELASTICSEARCH_CHUNK_INDEX;
+  const entityIndex =
+    readTrimmed(ELASTICSEARCH_ENTITY_INDEX_VAR) ??
+    DEFAULT_ELASTICSEARCH_ENTITY_INDEX;
+  for (const [name, index] of [
+    [ELASTICSEARCH_CHUNK_INDEX_VAR, chunkIndex],
+    [ELASTICSEARCH_ENTITY_INDEX_VAR, entityIndex],
+  ] as const) {
+    if (!isElasticsearchIndexName(index)) {
+      throw new ConfigError(
+        `${name} must be a lowercase Elasticsearch index name`
+      );
+    }
+  }
+
+  return {
+    node: node.replace(/\/$/, ""),
+    username,
+    password,
+    apiKey,
+    chunkIndex,
+    entityIndex,
+    requestTimeoutMs: parseConfiguredPositiveInt(
+      ELASTICSEARCH_REQUEST_TIMEOUT_MS_VAR,
+      readRawEnv(ELASTICSEARCH_REQUEST_TIMEOUT_MS_VAR),
+      DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT_MS
+    ),
+  };
+}
+
 /** Scheme of `uri` including the colon, or undefined if it is not a URI. */
 function uriScheme(uri: string): string | undefined {
   try {
@@ -696,6 +921,7 @@ export function loadEnv(): GraphragEnv {
 
   const retrieval = parseRetrievalConfig();
   const neo4j = parseNeo4jConfig();
+  const elasticsearch = parseElasticsearchConfig();
   const rerank = parseRerankConfig();
   const rerankUrl = readTrimmed(RETRIEVAL_RERANK_URL_VAR);
 
@@ -715,6 +941,7 @@ export function loadEnv(): GraphragEnv {
     embedApiKey,
     retrieval,
     neo4j,
+    elasticsearch,
     rerank,
     rerankUrl,
   };

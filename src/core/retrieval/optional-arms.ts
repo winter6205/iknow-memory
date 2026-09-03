@@ -18,6 +18,7 @@ import type {
   ArmResult,
   CapabilityObservation,
   CommunitySummaryStorage,
+  EntityLexicalStorage,
   GraphArmStorage,
   GraphRanker,
   RetrieveConfig,
@@ -37,6 +38,10 @@ import {
 
 export interface OptionalArmDeps {
   storage: StorageBackend;
+  /** Optional precision-layer lexical chunk adapter. */
+  lexical?: LexicalStorageBackend;
+  /** Optional precision-layer entity adapter for graph seed finding. */
+  entityLexical?: EntityLexicalStorage;
   retrieveConfig?: RetrieveConfig;
   graphConfig?: RetrieveConfig;
   graphRanker?: GraphRanker;
@@ -134,7 +139,12 @@ export async function runOptionalArms(
   const neo4j =
     arms.neo4jGraph === undefined || queryEmbedding === undefined
       ? undefined
-      : runNeo4jGraphArm(queryEmbedding, arms.neo4jGraph, query.validAt);
+      : runNeo4jGraphArm(
+          queryEmbedding,
+          arms.neo4jGraph,
+          query.validAt,
+          query.query
+        );
   const nodeEmbedding =
     queryEmbedding === undefined
       ? undefined
@@ -293,6 +303,9 @@ function getNeo4jGraphArm(
     storage: deps.storage.neo4jArmSeed,
     ranker: deps.graphRanker,
     config,
+    ...(deps.entityLexical !== undefined
+      ? { entityLexical: deps.entityLexical }
+      : {}),
   };
 }
 
@@ -301,6 +314,7 @@ function getLexicalArm(
 ): LexicalStorageBackend | undefined {
   const config = deps.retrieveConfig;
   if (config === undefined || !config.bm25Enabled) return undefined;
+  if (deps.lexical !== undefined) return deps.lexical;
   if (!supportsLexicalSearch(deps.storage)) return undefined;
   return deps.storage;
 }

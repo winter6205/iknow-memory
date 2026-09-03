@@ -29,6 +29,7 @@ import {
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
+import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
 import {
   computeChunkId,
   computeContentIdentity,
@@ -68,6 +69,8 @@ export type PushItem = z.infer<typeof PushItemSchema>;
 export interface PushDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
+  /** Optional ES derived-index writer; authority writes always win. */
+  precision?: PrecisionIndexer;
   identityVersions?: Partial<ContentIdentityVersions>;
 }
 
@@ -127,7 +130,30 @@ export function createPushHandler(deps: PushDeps) {
     // (source_ref, content) returns the existing chunk_id and adds
     // zero new rows (the cross-repo idempotency baseline).
     const ids = await deps.storage.upsert(records);
-    return textResult(JSON.stringify({ chunk_ids: ids }));
+    let precisionFailed = false;
+    if (deps.precision !== undefined) {
+      try {
+        await deps.precision.indexChunks(records);
+      } catch (error) {
+        // EXIT: Postgres is authoritative; an ES outage is retryable through
+        // the reindex command and must not turn a successful push into a
+        // partial authority write.
+        precisionFailed = true;
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`push precision index failed: ${message}\n`);
+      }
+    }
+    return textResult(
+      JSON.stringify({
+        chunk_ids: ids,
+        ...(precisionFailed
+          ? {
+              degraded: true,
+              degraded_reasons: ["keyword_bm25:attempted-and-failed"],
+            }
+          : {}),
+      })
+    );
   };
 }
 

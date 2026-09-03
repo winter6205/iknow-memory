@@ -100,3 +100,16 @@ export class BaselineWriteError extends Error {
     this.name = "BaselineWriteError";
   }
 }
+
+/**
+ * The ablation matrix builder or aggregation step produced an
+ * unrecoverable value: an empty sample set, a non-finite metric, or a
+ * missing baseline row. These are programming / fixture errors, not
+ * retrieval failures, so they surface separately from `EvalRunError`.
+ */
+export class AblationMatrixError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AblationMatrixError";
+  }
+}

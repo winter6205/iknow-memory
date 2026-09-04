@@ -1,5 +1,7 @@
 # Spec: Retrieve graph-priority ranking
 
+> **Superseded in part (boot):** missing Neo4j URI with `graphEnabled` on is fail-start (`specs/graph-rerank-boot-and-evidence.md`, ADR-0006), not skip/`degraded`. Ranking order in this spec still holds.
+
 > **Status:** draft → ACR gate in this file (§Architecture Change Reviewer).
 > **Source:** wayfinder grilling #89 (CLOSED) — production ranking is graph-priority, not three-arm RRF 0.7/0.15/0.15.
 > **Predecessor:** `specs/neo4j-graph-arm.md` (seed → PPR → chunks; this spec changes **how** those hits enter Host `chunks[]`).

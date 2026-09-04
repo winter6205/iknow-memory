@@ -75,6 +75,11 @@ function runCliSubprocess(
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         // The report lines ride the structured logger, same as --list-unmapped.
         GRAPHRAG_MEMORY_LOG_LEVEL: "info",
+        // ADR-0006 fail-start: the child's env has no Neo4j URI or rerank
+        // URL, which a default-on graph/rerank boot refuses. The extract
+        // CLI exercises neither arm, so switch them off explicitly.
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
         ...envOverrides,
         PATH: process.env.PATH ?? "",
       },

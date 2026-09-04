@@ -43,6 +43,12 @@ function withEnv(
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_VEC"] = "0.7";
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_BM25"] = "0.15";
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH"] = "0.15";
+  // ADR-0006 fail-start: the scrubbed baseline leaves no Neo4j URI or
+  // rerank URL, which a default-on graph/rerank boot now refuses. These
+  // tests exercise batch/pool knobs, not the arms, so switch them off —
+  // the explicit-off path stays legal without the deps.
+  process.env["GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"] = "false";
+  process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;

@@ -386,6 +386,9 @@ function withRetrievalEnv(
     ...RETRIEVAL_VARS,
     "GRAPHRAG_MEMORY_EMBED_DIMENSIONS" as string,
     "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
+    // ADR-0006 fail-start rerank dep: the URL family must be scrubbed too,
+    // or a parent's real URL would leak into the assertions below.
+    "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
   ];
   const saved = new Map<string, string | undefined>();
   for (const k of kevs) {
@@ -394,6 +397,14 @@ function withRetrievalEnv(
   }
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
+  // ADR-0006 fail-start: the deleted baseline leaves no Neo4j URI and no
+  // rerank URL, so default-on graph/rerank would refuse to boot. The
+  // tests below assert parse-level validation and pin the default-on
+  // field set, so the baseline supplies both deps (never dialed — these
+  // tests only read the parsed config) instead of switching arms off.
+  process.env["GRAPHRAG_MEMORY_NEO4J_URI"] = "bolt://localhost:7687";
+  process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL"] =
+    "https://rerank.example.test/v1/";
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;

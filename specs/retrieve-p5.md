@@ -1,5 +1,7 @@
 # Spec: Retrieve P@5 Baseline Harness
 
+> **Superseded in part (eval boot):** the published ruler is default-on graph+rerank via `loadEnv()` (`specs/graph-rerank-boot-and-evidence.md`). Do not hardcode graph/rerank off to publish a two-arm run.
+
 > **Status:** ACR-passed (architecture-change-reviewer 5-verdict gate — see §Architecture Change Reviewer).
 > **Source tickets:** winter6205/iknow-memory#82 (impl), #80 (grilling CLOSED 2026-08-27), Completion gate on map #1.
 > **Wayfinder parent:** winter6205/iknow-memory#1.

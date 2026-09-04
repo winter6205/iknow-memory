@@ -15,7 +15,7 @@ The retrieve envelope uses the exact field names `degraded` and `degraded_reason
 
 The four and only four set rules are:
 
-1. A capability enabled by default cannot be attempted because its credentials or address are missing → set `degraded`.
+1. A capability enabled by default cannot be attempted because its credentials or address are missing → set `degraded`. **Exception (ADR-0006):** default-on **graph** and **rerank** in this case refuse process start (`ConfigError`) instead of starting and setting `degraded`. Vector, BM25, and Elasticsearch still follow this rule.
 2. An attempted capability call fails → set `degraded`.
 3. A capability was attempted but found no hits → do **not** set `degraded`.
 4. A capability explicitly switched off by the caller → do **not** set `degraded`.

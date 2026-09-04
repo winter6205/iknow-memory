@@ -300,9 +300,9 @@ export async function createServer(): Promise<McpServer> {
   const debug = process.env.DEBUG === "1";
   const registry = buildRegistry([
     echoTool,
-    ingestTool(deps),
+    ingestTool({ ...deps, logger }),
     invalidationTool(deps),
-    pushTool(deps),
+    pushTool({ ...deps, logger }),
     retrieveTool(buildRetrieveDeps(deps, debug)),
   ]);
 

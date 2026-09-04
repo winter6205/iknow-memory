@@ -18,6 +18,12 @@ export interface EmbeddingClient {
    * it to false when embedding credentials are absent.
    */
   readonly available?: boolean;
+  /**
+   * Model id surfaced for process logs (SC10). Optional so test doubles stay
+   * source-compatible; production wiring sets it from the configured model.
+   * Never the API key.
+   */
+  readonly modelId?: string;
   embed(texts: string[]): Promise<number[][]>;
 }
 
@@ -39,6 +45,8 @@ export interface NineRouterEmbedderOpts {
  */
 export class NineRouterEmbedder implements EmbeddingClient {
   readonly available = true;
+  /** Exposed for the SC10 process-log field whitelist (never the API key). */
+  readonly modelId: string;
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly apiKey: string;
@@ -47,6 +55,7 @@ export class NineRouterEmbedder implements EmbeddingClient {
   constructor(opts: NineRouterEmbedderOpts) {
     this.baseUrl = opts.baseUrl;
     this.model = opts.model;
+    this.modelId = opts.model;
     this.apiKey = opts.apiKey;
     this.dimensions = opts.dimensions;
   }
@@ -126,6 +135,8 @@ export class NineRouterEmbedder implements EmbeddingClient {
  */
 export class UnavailableEmbedder implements EmbeddingClient {
   readonly available = false;
+  /** Sentinel id, so the failed embed log still names a model slot. */
+  readonly modelId = "unavailable";
 
   async embed(_texts: string[]): Promise<number[][]> {
     throw new GraphragError(

@@ -501,6 +501,32 @@ type ChunkOutcome =
   | { kind: "failed"; ungrounded: 0 }
   | { kind: "write-failure"; ungrounded: 0 };
 
+/**
+ * Process-log field whitelist (SC10): { time, chunkId, modelId, latencyMs,
+ * outcome, counts }. See src/logging.ts for the full contract — never chunk
+ * body text, span text, descriptions, prompts or API keys as log fields.
+ */
+interface ChunkLogFields {
+  time: string;
+  chunkId: string;
+  modelId: string | null;
+  latencyMs: number;
+}
+
+/** Whitelisted per-chunk log fields; `code` only on the failure legs. */
+function chunkLogFields(
+  deps: CliDeps,
+  chunkId: string,
+  latencyStart: number
+): ChunkLogFields {
+  return {
+    time: deps.now ? deps.now() : new Date().toISOString(),
+    chunkId,
+    modelId: deps.llm.modelId ?? null,
+    latencyMs: Date.now() - latencyStart,
+  };
+}
+
 /** One chunk in one transaction; mark-and-continue on every failure leg. */
 async function processChunk(
   deps: CliDeps,
@@ -510,6 +536,9 @@ async function processChunk(
   startedAt: string
 ): Promise<ChunkOutcome> {
   const recordId = newRecordId();
+  // Latency covers the whole chunk (LLM call + persist) so the per-chunk
+  // process log reflects what an operator would wait for (SC10).
+  const latencyStart = Date.now();
   await client.query("BEGIN");
   try {
     await insertRecord(client, {
@@ -526,8 +555,9 @@ async function processChunk(
       });
       await client.query("COMMIT");
       deps.logger.info("chunk-failed", {
-        chunkId: chunk.id,
+        ...chunkLogFields(deps, chunk.id, latencyStart),
         code: outcome.errorCode,
+        outcome: "failed",
       });
       return { kind: "failed", ungrounded: 0 };
     }
@@ -551,9 +581,10 @@ async function processChunk(
       });
       await client.query("COMMIT");
       deps.logger.info("chunk-rejected", {
-        chunkId: chunk.id,
+        ...chunkLogFields(deps, chunk.id, latencyStart),
         code: SELF_LOOP_REJECTED_CODE,
         reason: "all-outputs-self-loop",
+        outcome: "failed",
       });
       return { kind: "failed", ungrounded: 0 };
     }
@@ -575,11 +606,21 @@ async function processChunk(
     // as `ok` either way; the precision layer surfaces its own degradation
     // through `keyword_bm25:attempted-and-failed` on stderr.
     await projectEntitiesToPrecisionLayer(deps, client, counts);
+    // SC10 success leg: the counts are only final after persistOutputs, so
+    // this event fires post-commit with the whitelisted field set.
+    deps.logger.info("chunk-extracted", {
+      ...chunkLogFields(deps, chunk.id, latencyStart),
+      outcome: "ok",
+      triples: counts.triples,
+      unmapped: counts.unmapped,
+      ungrounded: counts.ungrounded,
+    });
     return { kind: "ok", ungrounded: counts.ungrounded };
   } catch (err) {
     await client.query("ROLLBACK");
     deps.logger.error("chunk-write-failed", {
-      chunkId: chunk.id,
+      ...chunkLogFields(deps, chunk.id, latencyStart),
+      outcome: "write-failed",
       error: err instanceof Error ? err.message : String(err),
     });
     return { kind: "write-failure", ungrounded: 0 };
@@ -966,14 +1007,34 @@ async function embedEntity(
     incoming.canonicalName,
     incoming.description
   );
-  const [vector] = await deps.embedder.embed([text]);
-  if (!vector) {
-    throw new GraphragError(
-      `embedder returned no vector for entity "${incoming.canonicalName}"`,
-      "EMBEDDING_FAILED"
-    );
+  // SC10 embed log: one entry per embed call, whitelist fields only — the
+  // embedded SSOT text itself never travels with the log line.
+  const latencyStart = Date.now();
+  try {
+    const [vector] = await deps.embedder.embed([text]);
+    if (!vector) {
+      throw new GraphragError(
+        `embedder returned no vector for entity "${incoming.canonicalName}"`,
+        "EMBEDDING_FAILED"
+      );
+    }
+    deps.logger.info("entity-embed", {
+      time: deps.now ? deps.now() : new Date().toISOString(),
+      modelId: deps.embedder.modelId ?? null,
+      latencyMs: Date.now() - latencyStart,
+      outcome: "ok",
+    });
+    return vector;
+  } catch (err) {
+    deps.logger.error("entity-embed", {
+      time: deps.now ? deps.now() : new Date().toISOString(),
+      modelId: deps.embedder.modelId ?? null,
+      latencyMs: Date.now() - latencyStart,
+      outcome: "failed",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
   }
-  return vector;
 }
 
 async function insertEntity(

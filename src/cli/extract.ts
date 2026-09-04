@@ -39,6 +39,7 @@ import {
   type GraphragEnv,
 } from "../config.js";
 import { createLogger, type Logger, writeStderr } from "../logging.js";
+import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { upSchemaP0 } from "../core/storage/schema-p0.js";
 import {
   emitProjectionIntents,
@@ -82,6 +83,7 @@ import {
   type EmbeddingClient,
 } from "../core/embedder.js";
 import { normalizeEntityType } from "./entity-type.js";
+import { fetchEntityProjection } from "../core/storage/entity-projection.js";
 
 export interface CliFlags {
   batchSize: number;
@@ -132,6 +134,13 @@ export interface CliDeps {
   logger: Logger;
   /** Injectable clock for deterministic started_at in tests. */
   now?: () => string;
+  /**
+   * Optional ES derived-index writer. Mirrors the `push` tool pattern
+   * (src/tools/push.ts): authority writes always win, ES write failures
+   * log `keyword_bm25:attempted-and-failed` and never abort the chunk
+   * transaction. Absent when no precision layer is configured.
+   */
+  precision?: import("../core/storage/elasticsearch-precision.js").PrecisionIndexer;
 }
 
 type ParsedArgs = { ok: true; flags: CliFlags } | { ok: false; error: string };
@@ -552,6 +561,13 @@ async function processChunk(
       unmappedCount: counts.unmapped,
     });
     await client.query("COMMIT");
+    // Authority writes are durable; the precision layer can now safely
+    // mirror the canonical names + alias set we just persisted. Failures
+    // here NEVER roll the chunk back — the same fail-open posture
+    // `src/tools/push.ts` takes for chunk indexing. The chunk is reported
+    // as `ok` either way; the precision layer surfaces its own degradation
+    // through `keyword_bm25:attempted-and-failed` on stderr.
+    await projectEntitiesToPrecisionLayer(deps, client, counts);
     return { kind: "ok" };
   } catch (err) {
     await client.query("ROLLBACK");
@@ -560,6 +576,52 @@ async function processChunk(
       error: err instanceof Error ? err.message : String(err),
     });
     return { kind: "write-failure" };
+  }
+}
+
+/**
+ * Best-effort mirror of the ledger entities this chunk just touched into
+ * the ES precision-layer entity index. Authority writes always win — the
+ * precision layer call happens AFTER `COMMIT`, is wrapped in try/catch,
+ * and never aborts the chunk. Unconfigured precision layers are silent
+ * no-ops (matches `push.ts`).
+ */
+async function projectEntitiesToPrecisionLayer(
+  deps: CliDeps,
+  client: CliClient,
+  counts: PersistCounts
+): Promise<void> {
+  if (deps.precision === undefined) return;
+  // Merge losers MUST be removed from the entity index BEFORE we re-index
+  // the survivors: a stale loser in the index would otherwise continue
+  // resolving lexically to a row whose only purpose is `merged_into`
+  // audit. Fail-open here too — a delete failure cannot reverse a
+  // committed merge.
+  if (counts.mergedLoserIds.length > 0) {
+    try {
+      await deps.precision.deleteEntities(counts.mergedLoserIds);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      writeStderr(`extract precision entity delete failed: ${message}\n`);
+      deps.logger.warn("precision-entity-delete-failed", {
+        ids: counts.mergedLoserIds,
+        error: message,
+      });
+    }
+  }
+  if (counts.entities.length === 0) return;
+  try {
+    const records = await fetchEntityProjection(client, counts.entities);
+    if (records.length > 0) {
+      await deps.precision.indexEntities(records);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    writeStderr(`extract precision entity index failed: ${message}\n`);
+    deps.logger.warn("precision-entity-index-failed", {
+      ids: counts.entities,
+      error: message,
+    });
   }
 }
 
@@ -572,6 +634,23 @@ interface PersistCounts {
    * they do not enter the graph (ADR-0001).
    */
   projected: ProjectionSubject[];
+  /**
+   * Unique canonical entity ids touched this chunk. De-duplicated because
+   * the same entity may appear as the head of one output and the tail of
+   * another; the precision-layer projection needs one row per entity id,
+   * and a survivor of a soft-merge counts only once (the loser is NOT in
+   * this set — it stays in `projected` for the Neo4j projection but the
+   * ES entity index never sees a retired/merged-away row).
+   */
+  entities: string[];
+  /**
+   * Loser ids materialised by an L3 merge. Each loser is a fresh
+   * `entities` row whose `merged_into` now points at a survivor; the
+   * precision layer must drop them from its entity index so a lexical
+   * seed lookup cannot resolve to a row that exists only as audit
+   * history in the ledger.
+   */
+  mergedLoserIds: string[];
   /**
    * SC5: every output in this chunk was rejected as a self-loop. The chunk
    * produced zero graph edges and zero entities; the orchestrator marks it
@@ -593,6 +672,8 @@ async function persistOutputs(
   let unmapped = 0;
   let selfLoopCount = 0;
   const projected: ProjectionSubject[] = [];
+  const entityIds = new Set<string>();
+  const mergedLoserIds = new Set<string>();
   for (const out of outputs) {
     if (
       normalizeAlias(out.head) === normalizeAlias(out.tail) &&
@@ -602,17 +683,24 @@ async function persistOutputs(
       selfLoopCount += 1;
       continue;
     }
-    const { headId, tailId } = await resolveEndpoints(deps, client, out);
+    const {
+      headId,
+      tailId,
+      mergedLoserIds: losers,
+    } = await resolveEndpoints(deps, client, out);
     // Both endpoints are projectable nodes even when the triple below is
     // rejected — an entity with no edge is still a node the graph arm can
     // seed on.
     projected.push({ kind: "entity", id: headId });
+    entityIds.add(headId);
+    for (const loser of losers) mergedLoserIds.add(loser);
     if (headId === tailId) {
       logSelfLoopRejection(deps, chunkId, out, headId);
       selfLoopCount += 1;
       continue;
     }
     projected.push({ kind: "entity", id: tailId });
+    entityIds.add(tailId);
     const relationNorm = await vetRelationNorm(deps, out);
     // A merge returns the surviving row's id: its confidence just moved, so
     // the edge still needs re-projecting.
@@ -633,7 +721,14 @@ async function persistOutputs(
   // one was a self-loop. An empty `outputs` array vacuously yields false so
   // the caller still treats it as a normal zero-output chunk.
   const allSelfLoop = outputs.length > 0 && selfLoopCount === outputs.length;
-  return { triples, unmapped, projected, allSelfLoop };
+  return {
+    triples,
+    unmapped,
+    projected,
+    entities: [...entityIds],
+    mergedLoserIds: [...mergedLoserIds],
+    allSelfLoop,
+  };
 }
 
 /**
@@ -652,15 +747,19 @@ async function resolveEndpoints(
   deps: CliDeps,
   client: CliClient,
   out: ExtractionOutput
-): Promise<{ headId: string; tailId: string }> {
+): Promise<{
+  headId: string;
+  tailId: string;
+  mergedLoserIds: string[];
+}> {
   // Normalize LLM types to the closed P0 set up front (CR High #2) so the
   // merge gates and the persisted row agree on the same type value.
-  const headId = await resolveEntity(deps, client, {
+  const head = await resolveEntity(deps, client, {
     canonicalName: out.head,
     type: normalizeEntityType(out.headType),
     description: out.description,
   });
-  const tailId = await resolveEntity(
+  const tail = await resolveEntity(
     deps,
     client,
     {
@@ -668,9 +767,13 @@ async function resolveEndpoints(
       type: normalizeEntityType(out.tailType),
       description: out.description,
     },
-    { excludeIds: [headId] }
+    { excludeIds: [head.id] }
   );
-  return { headId, tailId };
+  return {
+    headId: head.id,
+    tailId: tail.id,
+    mergedLoserIds: [...head.mergedLoserIds, ...tail.mergedLoserIds],
+  };
 }
 
 /**
@@ -732,13 +835,18 @@ async function vetRelationNorm(
  * `excludeIds` drops candidates the caller has already ruled out — the SC6
  * head/tail exclusion. The filter is applied to the loaded `CandidateEntity[]`
  * before the gates see it, so the merge module keeps its locked signature.
+ *
+ * Returns the resolved id and any loser ids this call wrote. Loser ids are
+ * the rows materialized as `merged_into` survivors — the precision layer
+ * must remove them from its entity index so a lexical seed lookup can
+ * never resolve to a row the ledger no longer answers for.
  */
 async function resolveEntity(
   deps: CliDeps,
   client: CliClient,
   incoming: IncomingEntity,
   opts: { excludeIds?: string[] } = {}
-): Promise<string> {
+): Promise<{ id: string; mergedLoserIds: string[] }> {
   const excluded = new Set(opts.excludeIds ?? []);
   const live = (await loadEntities(client)).filter((c) => !excluded.has(c.id));
   const { canonicalId, decision } = await mergeEntitiesWithGating(
@@ -751,6 +859,7 @@ async function resolveEntity(
   if (decision !== "created-new" && decision.kind === "merge") {
     const survivorId = await resolveCanonicalId(client, canonicalId);
     const survivor = live.find((c) => c.id === survivorId);
+    const mergedLoserIds: string[] = [];
     if (decision.via === "L3") {
       // L3 is the only fuzzy merge: materialize the incoming entity as the
       // loser so the ledger retains a rollbackable merged_into edge. L0
@@ -763,16 +872,17 @@ async function resolveEntity(
         await embedEntity(deps, incoming)
       );
       await linkMergedEntity(client, loserId, survivorId);
+      mergedLoserIds.push(loserId);
     }
     if (survivor && survivor.canonicalName !== incoming.canonicalName) {
       await insertAlias(client, survivorId, incoming.canonicalName, "variant");
     }
-    return survivorId;
+    return { id: survivorId, mergedLoserIds };
   }
   const id = randomUUID();
   await insertEntity(client, id, incoming, await embedEntity(deps, incoming));
   await insertAlias(client, id, incoming.canonicalName, "name");
-  return id;
+  return { id, mergedLoserIds: [] };
 }
 
 /**
@@ -1033,6 +1143,19 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     return 2;
   }
   const pool = new Pool({ connectionString: env.dbUrl });
+  // Mirror the server wiring (src/index.ts buildDeps): the ES precision
+  // layer is built when the env block is configured (k1/b from env.retrieval)
+  // and stays undefined otherwise — a silent no-op for every precision call
+  // in the pipeline, matching the MCP push/ingest path. Without this, the
+  // extract CLI's entity projection was unreachable in production and the
+  // entity index could only be repaired by a manual `npm run es:reindex`.
+  const precision =
+    env.elasticsearch === undefined
+      ? undefined
+      : new ElasticsearchPrecisionLayer(env.elasticsearch, {
+          k1: env.retrieval.k1,
+          b: env.retrieval.b,
+        });
   try {
     const deps: CliDeps = {
       pool,
@@ -1040,6 +1163,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
       embedder: buildEmbedder({ env, flags: parsed.flags }),
       dims: env.embedDimensions,
       logger: createLogger(env.logLevel),
+      ...(precision !== undefined ? { precision } : {}),
     };
     return await runCli(argv, deps);
   } catch (err) {
@@ -1050,6 +1174,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     throw err;
   } finally {
     await pool.end();
+    if (precision !== undefined) await precision.close();
   }
 }
 

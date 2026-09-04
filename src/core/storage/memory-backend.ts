@@ -8,6 +8,7 @@
  */
 import type {
   ChunkRecord,
+  PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
   StorageBackend,
@@ -29,25 +30,34 @@ const BM25_K1 = 1.2;
 /** Okapi BM25 length-normalization strength. */
 const BM25_B = 0.75;
 
-/**
- * Split text into lexical terms.
- *
- * Lowercase, then split on anything that is not a letter or digit. This
- * deliberately mirrors what Postgres' `simple` text-search config does on
- * the production side (case-folding and nothing else — no stemmer, no
- * stop-word list), so a query behaves the same shape in both backends
- * even though the scores differ.
- *
- * Unicode-aware via the `u` flag, so accented and CJK characters survive
- * tokenization. CJK still lands as one run per contiguous span because
- * there is no segmenter here — segmentation is explicitly out of scope
- * for this spec, and adding a naive one would silently change recall.
- */
-function tokenize(text: string): string[] {
+/** The fallback tokenization used when the caller explicitly disables CJK. */
+function tokenizeWithoutCjk(text: string): string[] {
   return text
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter((t) => t.length > 0);
+}
+
+/**
+ * Split text into lexical terms using the same shape as the precision layer.
+ *
+ * `Intl.Segmenter` ships with Node's ICU data and provides dictionary-backed
+ * word boundaries for Chinese. The small Han-character fallback is only for
+ * runtimes built with reduced ICU data; it preserves the important contract
+ * that a continuous CJK string cannot collapse into one searchable token.
+ * `cjkSegmentation=false` intentionally restores the old contiguous-run
+ * behavior for ablation tests.
+ */
+export function tokenize(text: string, cjkSegmentation = true): string[] {
+  if (!cjkSegmentation) return tokenizeWithoutCjk(text);
+  const segmenter = new Intl.Segmenter("zh", { granularity: "word" });
+  const terms = [...segmenter.segment(text)]
+    .filter((part) => part.isWordLike)
+    .flatMap((part) => tokenizeWithoutCjk(part.segment));
+  if (terms.length >= 2 || !/\p{Script=Han}/u.test(text)) return terms;
+  return [...text.toLowerCase()].filter((char) =>
+    /\p{Script=Han}|\p{L}|\p{N}/u.test(char)
+  );
 }
 
 /** Per-chunk lexical statistics: term counts plus the chunk's length. */
@@ -248,14 +258,18 @@ export class MemoryBackend
   }
 
   /**
-   * Okapi BM25 over the inverted index — the same contract
-   * `PgvectorBackend.searchLexical` implements, so hybrid retrieval can be
-   * exercised without Postgres.
+   * Okapi BM25 over the inverted index — the in-process test seam
+   * mirroring `ElasticsearchPrecisionLayer.searchLexical`, so hybrid
+   * retrieval can be exercised without a running precision-layer cluster.
    *
-   * Unlike the Postgres side (which approximates with `ts_rank_cd`), this
-   * is the real k1/b formula: the corpus is small and fully in memory, so
-   * there is no reason to approximate. Scores are NOT comparable between
-   * the two backends, which is fine — RRF fuses on rank.
+   * The corpus is small and fully in memory, so the real k1/b formula
+   * runs here with no approximation. Scores are NOT comparable across
+   * backends, which is fine — RRF fuses on rank.
+   *
+   * k1/b are the same retrieval knob as on the ES precision layer, but a
+   * different mechanism: in-memory BM25 is computed per query, so they are
+   * read from `SearchOptions.precision` here; on the ES backend they are
+   * index-time similarity settings (see that class's searchLexical note).
    *
    * Query terms are OR-ed: candidates are the union of the postings for
    * the query's terms. Requiring every term would return nothing for
@@ -268,12 +282,17 @@ export class MemoryBackend
     const admits = this.buildAdmissionFilter("searchLexical", opts);
     if (opts.limit <= 0) return [];
 
-    const terms = [...new Set(tokenize(query))];
+    const precision = opts.precision;
+    const terms = [
+      ...new Set(tokenize(query, precision?.cjkSegmentation ?? true)),
+    ];
     if (terms.length === 0) return [];
 
     const docCount = this.docs.size;
     if (docCount === 0) return [];
     const avgLength = this.totalLength / docCount;
+    const k1 = precision?.k1 ?? BM25_K1;
+    const b = precision?.b ?? BM25_B;
 
     const scores = new Map<string, number>();
     for (const term of terms) {
@@ -291,17 +310,20 @@ export class MemoryBackend
         if (chunk === undefined || !admits(chunk)) continue;
         const doc = this.docs.get(id)!;
         const freq = doc.termFreq.get(term) ?? 0;
-        const norm =
-          freq +
-          BM25_K1 * (1 - BM25_B + (BM25_B * doc.length) / (avgLength || 1));
+        const norm = freq + k1 * (1 - b + (b * doc.length) / (avgLength || 1));
         scores.set(
           id,
-          (scores.get(id) ?? 0) + (idf * (freq * (BM25_K1 + 1))) / norm
+          (scores.get(id) ?? 0) + (idf * (freq * (k1 + 1))) / norm
         );
       }
     }
 
-    return [...scores.entries()]
+    const ranked = [...scores.entries()]
+      .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0] < b[0] ? -1 : 1))
+      .map(([id, score]) => [id, score] as [string, number]);
+    applyFieldBoost(ranked, terms, precision, admits, this.store.values());
+    applyPhraseBoost(ranked, query, precision, this.store);
+    return ranked
       .sort((a, b) => (b[1] !== a[1] ? b[1] - a[1] : a[0] < b[0] ? -1 : 1))
       .slice(0, opts.limit)
       .map(([id, score]) => toRetrievedChunk(this.store.get(id)!, score));
@@ -419,6 +441,65 @@ export class MemoryBackend
     this.docs.clear();
     this.postings.clear();
     this.totalLength = 0;
+  }
+}
+
+function applyFieldBoost(
+  ranked: Array<[string, number]>,
+  queryTerms: readonly string[],
+  precision: PrecisionSearchOptions | undefined,
+  admits: (chunk: ChunkRecord) => boolean,
+  records: Iterable<ChunkRecord>
+): void {
+  if (precision?.fieldBoost === false) return;
+  const boosts = precision?.fieldBoosts ?? {};
+  if (Object.keys(boosts).length === 0) return;
+  // Metadata and source_ref are not part of the content postings. Scan those
+  // small fields only when field boosting is requested so they can contribute
+  // as independently weighted lexical evidence.
+  for (const record of records) {
+    if (!admits(record)) continue;
+    const id = record.id;
+    const fields: Array<[string, string]> = [
+      ["source_ref", record.source_ref],
+      ...Object.entries(record.metadata).map(
+        ([key, value]) => [`metadata.${key}`, String(value)] as [string, string]
+      ),
+    ];
+    for (const [field, value] of fields) {
+      const boost = boosts[field] ?? boosts["metadata.*"] ?? 0;
+      if (boost <= 0) continue;
+      const fieldTerms = new Set(tokenizeWithoutCjk(value));
+      const matches = queryTerms.filter((term) => fieldTerms.has(term)).length;
+      if (matches === 0) continue;
+      const current = ranked.find(([rankedId]) => rankedId === id);
+      const next = (current?.[1] ?? 0) + boost * matches;
+      if (current) current[1] = next;
+      else ranked.push([id, next]);
+    }
+  }
+}
+
+function applyPhraseBoost(
+  ranked: Array<[string, number]>,
+  query: string,
+  precision: PrecisionSearchOptions | undefined,
+  records: ReadonlyMap<string, ChunkRecord>
+): void {
+  if (precision?.phrase === false) return;
+  const queryTerms = tokenize(query, precision?.cjkSegmentation ?? true);
+  if (queryTerms.length < 2) return;
+  for (const entry of ranked) {
+    const record = records.get(entry[0]);
+    if (record === undefined) continue;
+    const contentTerms = tokenize(
+      record.content,
+      precision?.cjkSegmentation ?? true
+    );
+    const matches = contentTerms.some((_, index) =>
+      queryTerms.every((term, offset) => contentTerms[index + offset] === term)
+    );
+    if (matches) entry[1] += Math.max(entry[1] * 0.5, 0.001);
   }
 }
 

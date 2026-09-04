@@ -31,13 +31,17 @@
 import type {
   ArmHit,
   ArmResult,
+  CapabilityObservation,
   EntityChunkRow,
+  EntityLexicalStorage,
+  EntitySeedCandidate,
   GraphRanker,
   Neo4jArmStorage,
   RankedEntity,
   RetrieveConfig,
 } from "./types.js";
 import { redactDiagnostic, writeStderr } from "../../logging.js";
+import { rrfFuseEntitySeeds } from "./rrf.js";
 
 /** Runtime deps injected by the retrieve orchestrator. */
 export interface Neo4jGraphArmDeps {
@@ -46,6 +50,8 @@ export interface Neo4jGraphArmDeps {
   /** Graph side: PPR over the read-only projection. */
   ranker: GraphRanker;
   config: RetrieveConfig;
+  /** Optional ES entity index used during entity finding. */
+  entityLexical?: EntityLexicalStorage;
 }
 
 /** An empty contribution that is explicitly NOT a degradation. */
@@ -62,10 +68,11 @@ const NOTHING_TO_ADD: ArmResult = {
 export async function runNeo4jGraphArm(
   queryEmbedding: number[],
   deps: Neo4jGraphArmDeps,
-  validAt: string
+  validAt: string,
+  query?: string
 ): Promise<ArmResult> {
   try {
-    return await recall(queryEmbedding, deps, validAt);
+    return await recall(queryEmbedding, deps, validAt, query);
   } catch (err) {
     // EXIT: degraded ArmResult 上行 orchestrator → envelope degraded:true
     return degraded(err);
@@ -76,22 +83,21 @@ export async function runNeo4jGraphArm(
 async function recall(
   queryEmbedding: number[],
   deps: Neo4jGraphArmDeps,
-  validAt: string
+  validAt: string,
+  query: string | undefined
 ): Promise<ArmResult> {
-  const seeds = await deps.storage.seedEntitiesByEmbedding(
-    queryEmbedding,
-    deps.config.entityLinkTopK
-  );
+  const seedResult = await getSeedEntities(deps, queryEmbedding, query);
+  const seeds = seedResult.seeds;
   // No seed entity means the ledger holds nothing the query can anchor on.
   // Skipping the graph round trip here is also what keeps an unanchored
   // (global, non-personalized) PageRank from ever being asked for.
-  if (seeds.length === 0) return NOTHING_TO_ADD;
+  if (seeds.length === 0) return withSeedStatus(NOTHING_TO_ADD, seedResult);
 
   const ranked = await deps.ranker.rankEntities(
     seeds.map((seed) => seed.id),
     deps.config.candidateCap
   );
-  if (ranked.length === 0) return NOTHING_TO_ADD;
+  if (ranked.length === 0) return withSeedStatus(NOTHING_TO_ADD, seedResult);
 
   const rows = await deps.storage.chunksByEntityIds(
     ranked.map((entity) => entity.id),
@@ -99,7 +105,108 @@ async function recall(
     deps.config.candidateCap
   );
   const hits = rankChunks(rows, ranked).slice(0, deps.config.candidateCap);
-  return { arm: "graph", hits, belowFloor: false };
+  return withSeedStatus({ arm: "graph", hits, belowFloor: false }, seedResult);
+}
+
+interface SeedResult {
+  seeds: EntitySeedCandidate[];
+  observations: CapabilityObservation[];
+  failureReason?: string;
+}
+
+/**
+ * The entity-finding stage is the only place where the lexical entity index
+ * participates. A failed lexical lookup releases the vector seed list and
+ * records a named observation; it never prevents the graph from answering.
+ */
+async function getSeedEntities(
+  deps: Neo4jGraphArmDeps,
+  embedding: number[],
+  query: string | undefined
+): Promise<SeedResult> {
+  const vectorPromise = deps.storage.seedEntitiesByEmbedding(
+    embedding,
+    deps.config.entityLinkTopK
+  );
+  if (query === undefined || deps.entityLexical === undefined) {
+    return { seeds: await vectorPromise, observations: [] };
+  }
+
+  const lexicalPromise = deps.entityLexical.searchEntities(
+    query,
+    deps.config.entityLinkTopK,
+    precisionOptions(deps.config)
+  );
+  const [vector, lexical] = await Promise.allSettled([
+    vectorPromise,
+    lexicalPromise,
+  ]);
+  if (vector.status === "rejected" && lexical.status === "rejected") {
+    throw vector.reason;
+  }
+  if (vector.status === "rejected") {
+    return {
+      seeds: lexical.status === "fulfilled" ? lexical.value : [],
+      observations: [],
+    };
+  }
+  if (lexical.status === "rejected") {
+    return {
+      seeds: vector.value,
+      observations: [
+        { capability: "keyword_bm25", state: "attempted-and-failed" },
+      ],
+      failureReason: redactDiagnostic(lexical.reason),
+    };
+  }
+  return {
+    seeds: rrfFuseEntitySeeds(
+      vector.value,
+      lexical.value,
+      deps.config,
+      deps.config.entityLinkTopK
+    ),
+    observations: [],
+  };
+}
+
+function precisionOptions(config: RetrieveConfig): {
+  k1?: number;
+  b?: number;
+  cjkSegmentation?: boolean;
+  phrase?: boolean;
+  fieldBoost?: boolean;
+  fieldBoosts?: Record<string, number>;
+} {
+  return {
+    ...(config.k1 !== undefined ? { k1: config.k1 } : {}),
+    ...(config.b !== undefined ? { b: config.b } : {}),
+    ...(config.cjkSegmentationEnabled !== undefined
+      ? { cjkSegmentation: config.cjkSegmentationEnabled }
+      : {}),
+    ...(config.phraseEnabled !== undefined
+      ? { phrase: config.phraseEnabled }
+      : {}),
+    ...(config.fieldBoostEnabled !== undefined
+      ? { fieldBoost: config.fieldBoostEnabled }
+      : {}),
+    ...(config.fieldBoosts !== undefined
+      ? { fieldBoosts: config.fieldBoosts }
+      : {}),
+  };
+}
+
+function withSeedStatus(result: ArmResult, seed: SeedResult): ArmResult {
+  if (seed.observations.length === 0 && seed.failureReason === undefined) {
+    return result;
+  }
+  return {
+    ...result,
+    observations: seed.observations,
+    ...(seed.failureReason !== undefined
+      ? { failureReason: seed.failureReason }
+      : {}),
+  };
 }
 
 /**

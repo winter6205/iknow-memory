@@ -426,6 +426,22 @@ describe("retrieve config boundary validation (T5)", () => {
         rerankEnabled: true,
         preset: "balanced",
         rrfK: 60,
+        // ES precision layer (T3/T6): every new knob defaults on so the
+        // field-set pin keeps catching additions. All three default-on
+        // arms stay enabled; only the optional node-embedding arm stays
+        // opt-in (false).
+        k1: 1.2,
+        b: 0.75,
+        cjkSegmentationEnabled: true,
+        phraseEnabled: true,
+        fieldBoostEnabled: true,
+        fieldBoosts: {
+          content: 1,
+          source_ref: 1,
+          "metadata.*": 1,
+        },
+        rrfEnabled: true,
+        vectorEnabled: true,
         // Seed / traversal knobs keep their P0 values.
         entityLinkTopK: 8,
         candidateCap: 50,

@@ -252,6 +252,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
       relationRaw: "works at",
       relationNorm: "works_at",
       sourceChunkId: null,
+      evidenceSpan: "Alice works at Acme Corp since January",
     };
 
     // W1 = [2026-01-01, 2026-02-01).
@@ -341,6 +342,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
       relationNorm: "attends",
       confidence: 1.0,
       sourceChunkId: null,
+      evidenceSpan: "Bob attends the Acme summit in January",
       validWindow: {
         start: "2026-01-01T00:00:00Z",
         end: "2026-02-01T00:00:00Z",

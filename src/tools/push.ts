@@ -109,7 +109,8 @@ export function createPushHandler(deps: PushDeps) {
     const embeddings = await embedWithLog(
       deps.logger,
       deps.embedder,
-      input.items.map((item) => item.content)
+      input.items.map((item) => item.content),
+      { itemCount: input.items.length }
     );
     if (embeddings.length !== input.items.length) {
       throw new GraphragError(

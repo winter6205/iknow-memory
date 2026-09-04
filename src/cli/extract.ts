@@ -83,6 +83,7 @@ import {
   NineRouterEmbedder,
   type EmbeddingClient,
 } from "../core/embedder.js";
+import { embedWithLog } from "../core/embed-log.js";
 import { normalizeEntityType } from "./entity-type.js";
 import { fetchEntityProjection } from "../core/storage/entity-projection.js";
 
@@ -472,7 +473,7 @@ async function processBatch(
   chunks: ChunkInput[]
 ): Promise<BatchOutcome> {
   const batchId = newRecordId();
-  const startedAt = deps.now ? deps.now() : new Date().toISOString();
+  const startedAt = depsNow(deps);
   let writeFailures = 0;
   let succeeded = 0;
   let failed = 0;
@@ -482,7 +483,8 @@ async function processBatch(
     if (out.kind === "write-failure") writeFailures += 1;
     else if (out.kind === "ok") succeeded += 1;
     else failed += 1;
-    if (out.kind !== "failed") ungrounded += out.ungrounded;
+    // Every leg defines `ungrounded` (failed legs are 0), so no guard needed.
+    ungrounded += out.ungrounded;
   }
   deps.logger.info("extract-batch-complete", {
     batchId,
@@ -500,6 +502,11 @@ type ChunkOutcome =
   | { kind: "ok"; ungrounded: number }
   | { kind: "failed"; ungrounded: 0 }
   | { kind: "write-failure"; ungrounded: 0 };
+
+/** Injectable clock fallback: every log/timestamp site reads the time here. */
+function depsNow(deps: CliDeps): string {
+  return deps.now ? deps.now() : new Date().toISOString();
+}
 
 /**
  * Process-log field whitelist (SC10): { time, chunkId, modelId, latencyMs,
@@ -520,7 +527,7 @@ function chunkLogFields(
   latencyStart: number
 ): ChunkLogFields {
   return {
-    time: deps.now ? deps.now() : new Date().toISOString(),
+    time: depsNow(deps),
     chunkId,
     modelId: deps.llm.modelId ?? null,
     latencyMs: Date.now() - latencyStart,
@@ -761,38 +768,23 @@ async function persistOutputs(
     // Persist gate for the evidence span (SC7, assumption 10): the span must
     // be a non-empty substring of the chunk text, or the triple is a
     // hallucination and never lands. Per-triple mark-and-continue — the
-    // grounded siblings still insert and the chunk still succeeds. The gate
-    // sits AFTER endpoint resolution so entity behaviour is untouched (an
-    // entity with no edge is still a node the graph arm can seed on). The
-    // span text itself is never logged — only its length (no ingest-body
-    // leak into logs).
+    // grounded siblings still insert and the chunk still succeeds.
     if (!isGrounded(out, chunkContent)) {
-      deps.logger.warn("triple-ungrounded-rejected", {
-        chunkId,
-        entityId: null,
-        head: out.head,
-        tail: out.tail,
-        relationRaw: out.relationRaw,
-        evidenceSpanLength: out.evidenceSpan.length,
-        reason: "span-not-in-chunk",
-      });
+      logUngroundedRejection(deps, chunkId, out);
       ungroundedCount += 1;
       continue;
     }
     const relationNorm = await vetRelationNorm(deps, out);
-    // A merge returns the surviving row's id: its confidence just moved, so
-    // the edge still needs re-projecting.
-    const { tripleId } = await upsertTriple(client, {
+    const upserted = await resolveAndUpsertTriple(
+      client,
+      chunkId,
+      out,
       headId,
       tailId,
-      relationRaw: out.relationRaw,
       relationNorm,
-      confidence: out.confidence,
-      sourceChunkId: chunkId,
-      evidenceSpan: out.evidenceSpan,
-      validWindow: { start: startedAt, end: null },
-    });
-    projected.push({ kind: "triple", id: tripleId });
+      startedAt
+    );
+    projected.push({ kind: "triple", id: upserted.tripleId });
     triples += 1;
     if (relationNorm === UNMAPPED) unmapped += 1;
   }
@@ -875,6 +867,52 @@ function logSelfLoopRejection(
     tail: out.tail,
     relationRaw: out.relationRaw,
     reason: "head-equals-tail",
+  });
+}
+
+/**
+ * The ungrounded leg of the SC7 persist gate: the span text itself is never
+ * logged — only its length (no ingest-body leak into logs).
+ */
+function logUngroundedRejection(
+  deps: CliDeps,
+  chunkId: string,
+  out: ExtractionOutput
+): void {
+  deps.logger.warn("triple-ungrounded-rejected", {
+    chunkId,
+    entityId: null,
+    head: out.head,
+    tail: out.tail,
+    relationRaw: out.relationRaw,
+    evidenceSpanLength: out.evidenceSpan.length,
+    reason: "span-not-in-chunk",
+  });
+}
+
+/**
+ * Upsert one grounded triple. A merge returns the surviving row's id: its
+ * confidence just moved, so the edge still needs re-projecting (the caller
+ * pushes it onto `projected` either way).
+ */
+async function resolveAndUpsertTriple(
+  client: CliClient,
+  chunkId: string,
+  out: ExtractionOutput,
+  headId: string,
+  tailId: string,
+  relationNorm: string,
+  startedAt: string
+): Promise<{ tripleId: string }> {
+  return upsertTriple(client, {
+    headId,
+    tailId,
+    relationRaw: out.relationRaw,
+    relationNorm,
+    confidence: out.confidence,
+    sourceChunkId: chunkId,
+    evidenceSpan: out.evidenceSpan,
+    validWindow: { start: startedAt, end: null },
   });
 }
 
@@ -1008,33 +1046,20 @@ async function embedEntity(
     incoming.description
   );
   // SC10 embed log: one entry per embed call, whitelist fields only — the
-  // embedded SSOT text itself never travels with the log line.
-  const latencyStart = Date.now();
-  try {
-    const [vector] = await deps.embedder.embed([text]);
-    if (!vector) {
-      throw new GraphragError(
-        `embedder returned no vector for entity "${incoming.canonicalName}"`,
-        "EMBEDDING_FAILED"
-      );
-    }
-    deps.logger.info("entity-embed", {
-      time: deps.now ? deps.now() : new Date().toISOString(),
-      modelId: deps.embedder.modelId ?? null,
-      latencyMs: Date.now() - latencyStart,
-      outcome: "ok",
-    });
-    return vector;
-  } catch (err) {
-    deps.logger.error("entity-embed", {
-      time: deps.now ? deps.now() : new Date().toISOString(),
-      modelId: deps.embedder.modelId ?? null,
-      latencyMs: Date.now() - latencyStart,
-      outcome: "failed",
-      error: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
+  // embedded SSOT text itself never travels with the log line. Same shared
+  // contract as the tools' "embed" event; no itemCount (single text) and
+  // the CLI's injectable clock drives `time`.
+  const [vector] = await embedWithLog(deps.logger, deps.embedder, [text], {
+    eventName: "entity-embed",
+    now: () => depsNow(deps),
+  });
+  if (!vector) {
+    throw new GraphragError(
+      `embedder returned no vector for entity "${incoming.canonicalName}"`,
+      "EMBEDDING_FAILED"
+    );
   }
+  return vector;
 }
 
 async function insertEntity(

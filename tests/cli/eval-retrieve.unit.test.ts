@@ -615,36 +615,38 @@ describe("eval CLI — loadEnv switches (SC4, ADR-0006)", () => {
   });
 
   it("keeps both retrieval flags true on a default-on env with deps present", async () => {
-    // The assembler is stubbed so the run exercises flag propagation into
-    // EvalDeps without needing a real graph arm: the default-on config is
-    // passed verbatim and the degraded-arm contract would fail the run if
-    // the flags had been silently flipped off.
+    // Behavioral: the config flows from the REAL loadEnv() through
+    // runCliFromEnv into the assembler's deps. The injected assemble spy
+    // captures the flags then aborts the run on the first query, so no
+    // graph arm or rerank endpoint is ever contacted; the EnvError sentinel
+    // surfaces via the CLI's typed assembler-failure path (exit 1).
+    let captured: RetrieveConfig | undefined;
     await withEnv(
       {
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "16",
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
+        // Both switches left unset: default-on env (the SC4 subject).
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: undefined,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: undefined,
       },
       async () => {
         const out = join(scratchDir(), "baseline.json");
         const stderr = captureStderr();
         try {
-          const code = await runCli(baseArgv(out), {
-            embedder: new FakeEmbedder(DIM),
-            storage: new MemoryBackend(DIM),
-            // Verbatim-from-env shape: graph + rerank default-on.
-            retrieveConfig: {
-              ...RETRIEVE_CONFIG,
-              graphEnabled: true,
-              rerankEnabled: true,
-            },
-            logger: silentLogger(),
+          const code = await runCliFromEnv(baseArgv(out), {
             assemble: async (_args, deps) => {
-              expect(deps.retrieveConfig.graphEnabled).toBe(true);
-              expect(deps.retrieveConfig.rerankEnabled).toBe(true);
+              captured = deps.retrieveConfig;
               throw new Error("flags propagation asserted");
             },
           });
+          expect(
+            captured,
+            "assembler must be reached with env config"
+          ).toBeDefined();
+          expect(captured?.graphEnabled).toBe(true);
+          expect(captured?.rerankEnabled).toBe(true);
           // The stub throw maps to the CLI's typed assembler-failure path.
           expect(code).toBe(1);
           expect(stderr.text()).toContain("flags propagation asserted");

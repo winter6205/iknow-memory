@@ -94,6 +94,11 @@ function runCliSubprocess(
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_LOG_LEVEL: "error",
+        // ADR-0006 fail-start: the child's env has no Neo4j URI or rerank
+        // URL, which a default-on graph/rerank boot refuses. The extract
+        // CLI exercises neither arm, so switch them off explicitly.
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
         ...envOverrides,
         PATH: process.env.PATH ?? "",
       },
@@ -315,10 +320,13 @@ describe("extract CLI subprocess e2e (T9)", () => {
     await resetSchema(c);
 
     // Seed 5 chunks; the FakeLLMClient queue pops one response per chunk.
+    // Each chunk content carries its canned output's evidenceSpan
+    // (`cN-h relates to cN-t`) so the persist gate (T3, SC7) does not drop
+    // the triple this mark-and-continue test needs in the ledger.
     for (let i = 0; i < 5; i += 1) {
       await c.query(`INSERT INTO chunks (id, content) VALUES ($1, $2)`, [
         randomUUID(),
-        `chunk-${i} content`,
+        `c${i}-h relates to c${i}-t`,
       ]);
     }
 
@@ -367,6 +375,20 @@ describe("extract CLI subprocess e2e (T9)", () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]?.status).toBe("failed");
     expect(failed[0]?.error_code).toBe("5xx");
+
+    // T3 (SC8): grounded inserts persist `triples.evidence_span` — the real
+    // column written by the real pipeline, not a fake client. The 5xx chunk
+    // contributes none. The four ok chunks' triples share one dedup key
+    // (their entities L3-merge into one head and one tail survivor), so a
+    // single surviving row is expected — it must carry the first chunk's
+    // grounded span.
+    const spans = await c.query<{ evidence_span: string | null }>(
+      `SELECT evidence_span FROM triples`
+    );
+    expect(spans.rows.length).toBeGreaterThanOrEqual(1);
+    for (const row of spans.rows) {
+      expect(row.evidence_span).toMatch(/^c\d-h relates to c\d-t$/);
+    }
   });
 
   // -----------------------------------------------------------------

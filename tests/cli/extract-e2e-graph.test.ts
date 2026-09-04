@@ -77,6 +77,11 @@ function runCliSubprocess(
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_LOG_LEVEL: "error",
+        // ADR-0006 fail-start: the child's env has no Neo4j URI or rerank
+        // URL, which a default-on graph/rerank boot refuses. The extract
+        // CLI exercises neither arm, so switch them off explicitly.
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
         ...envOverrides,
         PATH: process.env.PATH ?? "",
       },
@@ -110,6 +115,15 @@ async function connectServer(envOverrides: Record<string, string>): Promise<{
       GRAPHRAG_MEMORY_VECTOR_API_KEY: "",
       GRAPHRAG_MEMORY_ANTHROPIC_API_KEY: "",
       GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+      // ADR-0006 fail-start: a default-on graph child without a URI refuses
+      // to boot. Cases 3/4 assert `graph_ppr:unattempted`, so pin a
+      // controlled dummy URI (never dialed — the children run without
+      // embedding credentials, so the arm never starts) instead of turning
+      // the switch off. Rerank goes explicitly off: under fail-start a
+      // booted server with rerank on always carries a reranker, so
+      // `rerank:unattempted` is no longer reachable at this layer.
+      GRAPHRAG_MEMORY_NEO4J_URI: "bolt://127.0.0.1:1",
+      GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
       ...envOverrides,
       PATH: process.env.PATH ?? "",
     },
@@ -332,19 +346,16 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
       expect(result.isError).not.toBe(true);
       const payload = JSON.parse(textOf(result)) as Record<string, unknown>;
       // T12/T10/T11: default-on capabilities that cannot be attempted are
-      // named in the single degraded envelope decision.
+      // named in the single degraded envelope decision. (ADR-0006: the
+      // child boots with rerank explicitly off, so rerank emits no
+      // unattempted reason — see connectServer above.)
       expect(payload).toHaveProperty("chunks");
       expect(Array.isArray(payload.chunks)).toBe(true);
       expect(payload.chunks).toEqual([]);
       expect(payload).toHaveProperty("degraded", true);
       expect(payload.degraded_reasons).toEqual(
-        expect.arrayContaining([
-          "vector:unattempted",
-          "graph_ppr:unattempted",
-          "rerank:unattempted",
-        ])
+        expect.arrayContaining(["vector:unattempted", "graph_ppr:unattempted"])
       );
-      expect(payload).not.toHaveProperty("debug");
     } finally {
       await close();
     }
@@ -379,6 +390,14 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
       const { client: mcp, close } = await connectServer({
         GRAPHRAG_MEMORY_STORAGE: "pgvector",
         DEBUG: "1",
+        // ADR-0006 fail-start: Case 4 pins the dummy URI, but pgvector HAS
+        // the neo4jArmSeed seam, so a default-on graph child here would
+        // wire a real ranker, take the fused assembly path, and hit the
+        // all-arms-failed gate (vector failed + empty optional arms) —
+        // an isError envelope, not the archived-arm shape under test.
+        // Case 3 (memory storage, no seam) keeps the default-on
+        // `graph_ppr:unattempted` coverage.
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
       });
       try {
         const result = await mcp.callTool({
@@ -396,15 +415,15 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         // chunk survives — none of the seeded graph chunks can have reached
         // the envelope.
         expect(payload.chunks).toEqual([]);
-        // Missing embedding credentials and absent default-on adapters are
-        // unattempted capabilities, so the host-visible envelope is marked.
+        // Missing embedding credentials are an unattempted capability, so
+        // the host-visible envelope is marked. The graph switch is
+        // explicitly off here (see connectServer overrides above), so no
+        // `graph_ppr:unattempted` reason is emitted in this case; the
+        // rerank switch is off too, so no `rerank:unattempted` either.
+        // (ADR-0006 — see connectServer above.)
         expect(payload).toHaveProperty("degraded", true);
         expect(payload.degraded_reasons).toEqual(
-          expect.arrayContaining([
-            "vector:unattempted",
-            "graph_ppr:unattempted",
-            "rerank:unattempted",
-          ])
+          expect.arrayContaining(["vector:unattempted"])
         );
         expect(payload).not.toHaveProperty("debug");
       } finally {
@@ -546,7 +565,17 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         `INSERT INTO chunks (id, content, embedding, created_at) VALUES
            ($1, $2, $3, '2024-01-01T00:00:00Z'),
            ($4, $5, $3, '2024-01-02T00:00:00Z')`,
-        [chunkIdA, "chunk-A content", zeroVec, chunkIdB, "chunk-B content"]
+        [
+          // Each chunk content carries its CLI output's evidenceSpan
+          // (`A-h relates to A-t` / `B-h relates to B-t`) so the persist
+          // gate does not drop the triple this test's concurrency probe
+          // needs in the ledger.
+          chunkIdA,
+          "A-h relates to A-t",
+          zeroVec,
+          chunkIdB,
+          "B-h relates to B-t",
+        ]
       );
       [code1, code2] = await Promise.all([
         runOne("A", "2024-01-01T00:00:00.000Z", aErr),

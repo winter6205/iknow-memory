@@ -17,10 +17,14 @@
  *
  * Three contracts worth naming:
  *
- *   - **The offline evaluator disables unavailable production adapters.**
- *     The seeded MemoryBackend has no Neo4j sidecar or rerank token, so this
- *     CLI explicitly switches those capabilities off. The baseline records
- *     `armSet` as `vector+bm25` and the process exits 0 (SC5).
+ *   - **The retrieval switches come from the same `loadEnv()` as the
+ *     server (ADR-0006).** Graph and rerank are default-on; the published
+ *     ruler is that default-on path unless the env explicitly offs a
+ *     switch. The eval corpus is a seeded chunk-only MemoryBackend with no
+ *     Neo4j ranker or rerank adapter wired, so a default-on env whose arms
+ *     cannot deliver here fails the run through the degraded-arm contract
+ *     (`assertArmsDelivered`) instead of publishing a mislabeled baseline.
+ *     An explicit env-off keeps the two-arm run working.
  *   - **A failed query fails the run.** If the assembler throws, the run
  *     stops with a typed error naming the query. Recording an empty
  *     top-5 instead would publish a lower P@5 that looks exactly like a
@@ -40,9 +44,11 @@
  *
  * Exit-code map:
  *   0 success — every gold query scored and the baseline was replaced,
- *     including the two-arm no-Neo4j-URI run.
+ *     including the two-arm run when the env explicitly offs the arms.
  *   1 config / fatal — unusable gold or corpus fixture, an assembler
- *     throw, a failed baseline write, or a ConfigError from the env.
+ *     throw, a failed baseline write, or a ConfigError from the env
+ *     (including the ADR-0006 fail-start on default-on graph/rerank
+ *     without deps).
  *   2 usage error (unknown / malformed flag).
  *
  * Env: the same block every entry point in this package reads, via
@@ -356,10 +362,15 @@ function reconcileArmSet(
 /**
  * Wire real deps from env and run; used by main().
  *
- * No Neo4j ranker is constructed. The eval searches the corpus this CLI
- * just seeded into a chunk-only backend, and explicitly disables the
- * production graph and rerank adapters so missing offline integrations do
- * not become part of the frozen SC-29 baseline.
+ * No Neo4j ranker or rerank adapter is constructed: the eval searches the
+ * corpus this CLI just seeded into a chunk-only MemoryBackend, and a real
+ * Neo4j ranker would map entity hits to Postgres chunk ids outside the
+ * corpus. The retrieval switches therefore travel verbatim from
+ * `loadEnv()` (ADR-0006) — a default-on env without the deps fails at this
+ * call exactly as the server does, and an env-off switch keeps the offline
+ * two-arm run working. Arms that stay on but cannot deliver against the
+ * seeded backend fail the run via `assertArmsDelivered` instead of
+ * publishing a mislabeled baseline.
  */
 export async function runCliFromEnv(argv: string[]): Promise<number> {
   let embedder: EmbeddingClient;
@@ -369,15 +380,8 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
   try {
     const env = loadEnv();
     logger = createLogger(env.logLevel);
-    // SC-29 freezes this CLI as a local, chunk-only evaluator. Its seeded
-    // MemoryBackend has no Neo4j or rerank adapter, so switch those
-    // default-on production capabilities off explicitly rather than
-    // publishing a degraded baseline.
-    retrieveConfig = {
-      ...env.retrieval,
-      graphEnabled: false,
-      rerankEnabled: false,
-    };
+    // Same source of truth as the server: no hardcoded off overrides.
+    retrieveConfig = env.retrieval;
     storage = new MemoryBackend(env.embedDimensions);
     embedder = buildEmbedder(env);
   } catch (err) {

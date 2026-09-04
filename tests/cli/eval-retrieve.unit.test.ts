@@ -14,13 +14,16 @@
  * a direct `assembleRetrievalResult` call on an identically seeded store.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { readFileSync } from "node:fs";
 
 import {
   parseArgs,
   runCli,
+  runCliFromEnv,
   type EvalDeps,
 } from "../../src/cli/eval-retrieve.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
@@ -513,5 +516,159 @@ describe("eval CLI — empty / malformed fixtures (SC9)", () => {
 
     expect(code).toBe(2);
     expect(stderr.text()).toContain("usage:");
+  });
+});
+
+/**
+ * ADR-0006: eval and the server share the same `loadEnv()` switches.
+ *
+ * specs/graph-rerank-boot-and-evidence.md SC4: the CLI source must not
+ * assign `graphEnabled: false` / `rerankEnabled: false`; a default-on env
+ * keeps both flags true; a default-on env without the deps fails exactly
+ * as the server does (ConfigError → exit 1); an explicit env-off keeps
+ * the offline two-arm run working.
+ */
+describe("eval CLI — loadEnv switches (SC4, ADR-0006)", () => {
+  // Spec-4 SC4: a grep-level guard. The historical bug was the literal
+  // hardcoded spread-override in runCliFromEnv; asserting its absence in
+  // the source prevents a regression the behavioral tests below could
+  // only catch indirectly.
+  it("source contains no hardcoded graphEnabled/rerankEnabled false override", () => {
+    const source = readFileSync(
+      join(process.cwd(), "src/cli/eval-retrieve.ts"),
+      "utf8"
+    );
+    expect(source).not.toMatch(/graphEnabled\s*:\s*false/);
+    expect(source).not.toMatch(/rerankEnabled\s*:\s*false/);
+  });
+
+  /**
+   * Save / restore the env vars runCliFromEnv's loadEnv reads. Blanking
+   * (not deleting) masks a developer's `.env.local` the same way
+   * tests/config.test.ts does. Only the deps-present case needs the
+   * module's real assembler run; the deps-missing case fails before any
+   * embedding or seeding happens.
+   */
+  const ENV_KEYS = [
+    "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
+    "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
+    "GRAPHRAG_MEMORY_EMBED_BASE_URL",
+    "GRAPHRAG_MEMORY_EMBED_MODEL",
+    "GRAPHRAG_MEMORY_EMBED_API_KEY",
+    "GRAPHRAG_MEMORY_EMBED_API_KEY_ENV",
+    "GRAPHRAG_MEMORY_VECTOR_API_KEY",
+    "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
+    "NINE_ROUTER_KEY",
+    "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+    "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
+    "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
+    "GRAPHRAG_MEMORY_NEO4J_URI",
+    "GRAPHRAG_MEMORY_NEO4J_USER",
+    "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
+  ] as const;
+
+  function withEnv(
+    patch: Record<string, string | undefined>,
+    fn: () => Promise<void>
+  ): Promise<void> {
+    const saved = new Map<string, string | undefined>();
+    for (const key of ENV_KEYS) {
+      saved.set(key, process.env[key]);
+      process.env[key] = "";
+    }
+    for (const [key, value] of Object.entries(patch)) {
+      if (!saved.has(key)) saved.set(key, process.env[key]);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return fn().finally(() => {
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    });
+  }
+
+  it("fails with exit 1 + config-error message on a default-on env without deps", async () => {
+    await withEnv(
+      {
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "16",
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
+      },
+      async () => {
+        const stderr = captureStderr();
+        try {
+          const code = await runCliFromEnv([]);
+          expect(code).toBe(1);
+          // The message names the graph switch + URI: fail-start, not a
+          // silent two-arm run.
+          expect(stderr.text()).toContain("eval-retrieve config error:");
+          expect(stderr.text()).toContain(
+            "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"
+          );
+          expect(stderr.text()).toContain("GRAPHRAG_MEMORY_NEO4J_URI");
+        } finally {
+          stderr.restore();
+        }
+      }
+    );
+  });
+
+  it("keeps both retrieval flags true on a default-on env with deps present", async () => {
+    // The assembler is stubbed so the run exercises flag propagation into
+    // EvalDeps without needing a real graph arm: the default-on config is
+    // passed verbatim and the degraded-arm contract would fail the run if
+    // the flags had been silently flipped off.
+    await withEnv(
+      {
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "16",
+        GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
+      },
+      async () => {
+        const out = join(scratchDir(), "baseline.json");
+        const stderr = captureStderr();
+        try {
+          const code = await runCli(baseArgv(out), {
+            embedder: new FakeEmbedder(DIM),
+            storage: new MemoryBackend(DIM),
+            // Verbatim-from-env shape: graph + rerank default-on.
+            retrieveConfig: {
+              ...RETRIEVE_CONFIG,
+              graphEnabled: true,
+              rerankEnabled: true,
+            },
+            logger: silentLogger(),
+            assemble: async (_args, deps) => {
+              expect(deps.retrieveConfig.graphEnabled).toBe(true);
+              expect(deps.retrieveConfig.rerankEnabled).toBe(true);
+              throw new Error("flags propagation asserted");
+            },
+          });
+          // The stub throw maps to the CLI's typed assembler-failure path.
+          expect(code).toBe(1);
+          expect(stderr.text()).toContain("flags propagation asserted");
+        } finally {
+          stderr.restore();
+        }
+      }
+    );
+  });
+
+  it("runs the offline two-arm baseline when the env explicitly offs both switches", async () => {
+    await withEnv(
+      {
+        GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "16",
+        GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+      },
+      async () => {
+        const out = join(scratchDir(), "baseline.json");
+        const code = await runCliFromEnv(baseArgv(out));
+        expect(code).toBe(0);
+        expect(readBaseline(out).armSet).toBe("vector+bm25");
+      }
+    );
   });
 });

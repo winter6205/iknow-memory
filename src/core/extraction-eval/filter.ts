@@ -153,8 +153,17 @@ function assertTripleShape(triple: ExtractionOutput): void {
  * Empty chunk text ⇒ every triple is ungrounded (the no-grounding
  * branch covers it explicitly so a chunk text of "" does not need a
  * separate code path on the caller side).
+ *
+ * Exported — not a private eval helper — because production persist
+ * (`src/cli/extract.ts`) applies the same predicate as its insert gate
+ * (specs/graph-rerank-boot-and-evidence.md assumption 10): there must be
+ * exactly one substring algorithm, or eval and persist would disagree
+ * about what counts as a grounded triple.
  */
-function isGrounded(triple: ExtractionOutput, chunkText: string): boolean {
+export function isGrounded(
+  triple: ExtractionOutput,
+  chunkText: string
+): boolean {
   if (triple.evidenceSpan.length === 0) return false;
   if (chunkText.length === 0) return false;
   return chunkText.includes(triple.evidenceSpan);

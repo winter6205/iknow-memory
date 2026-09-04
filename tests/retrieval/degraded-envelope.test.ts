@@ -193,6 +193,32 @@ describe("retrieve degraded envelope", () => {
     });
   });
 
+  it("chunk objects carry exactly the known keys — no evidence_span leaks to Hosts", async () => {
+    // The `triples.evidence_span` column is persist-side only (specs/
+    // graph-rerank-boot-and-evidence.md SC9); the retrieval envelope must
+    // never grow a field carrying it, even as an optional key.
+    const result = await assembleRetrievalResult(
+      { query: "q", validAt: NOW, limit: 10 },
+      {
+        embedder: new FixedEmbedder(),
+        storage: new FakeRetrievalBackend(),
+        retrieveConfig: CFG,
+      }
+    );
+
+    expect(result.chunks).toHaveLength(1);
+    for (const chunk of result.chunks) {
+      expect(Object.keys(chunk).sort()).toEqual([
+        "content",
+        "id",
+        "score",
+        "source_ref",
+        "valid_window",
+      ]);
+      expect(Object.keys(chunk)).not.toContain("evidence_span");
+    }
+  });
+
   it("serializes degraded reasons without leaking internal debug keys", async () => {
     const backend = new FakeRetrievalBackend();
     backend.lexicalError = new GraphragError(

@@ -307,37 +307,13 @@ function normalizeIngestItems(input: IngestInput): NormalizedIngestItem[] {
  * (not per item), whitelist fields only — { time, modelId, itemCount,
  * latencyMs, outcome }. Content text and embeddings never travel with the
  * line; `redactDiagnostic` stays URL/credential redaction, not a body scanner.
- * Exported so `push.ts` reuses the same log contract instead of a copy.
+ *
+ * The implementation now lives in core/embed-log.ts (single contract shared
+ * with the extract CLI's "entity-embed" event); this re-export keeps the
+ * historical import path for push.ts and existing tests.
  */
-export async function embedWithLog(
-  logger: Logger | undefined,
-  embedder: EmbeddingClient,
-  texts: string[]
-): Promise<number[][]> {
-  const latencyStart = Date.now();
-  const fields = {
-    time: new Date().toISOString(),
-    modelId: embedder.modelId ?? null,
-    itemCount: texts.length,
-  };
-  try {
-    const embeddings = await embedder.embed(texts);
-    logger?.info("embed", {
-      ...fields,
-      latencyMs: Date.now() - latencyStart,
-      outcome: "ok",
-    });
-    return embeddings;
-  } catch (err) {
-    logger?.error("embed", {
-      ...fields,
-      latencyMs: Date.now() - latencyStart,
-      outcome: "failed",
-      error: err instanceof Error ? err.message : String(err),
-    });
-    throw err;
-  }
-}
+export { embedWithLog } from "../core/embed-log.js";
+import { embedWithLog } from "../core/embed-log.js";
 
 function validateIngestItem(item: NormalizedIngestItem): void {
   if (
@@ -408,7 +384,8 @@ export function createIngestHandler(deps: IngestDeps) {
     const embeddings = await embedWithLog(
       deps.logger,
       deps.embedder,
-      items.map((item) => item.content)
+      items.map((item) => item.content),
+      { itemCount: items.length }
     );
     if (embeddings.length !== items.length) {
       throw new GraphragError(

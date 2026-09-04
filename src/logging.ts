@@ -12,9 +12,13 @@
  * Process-log field whitelist (SC10, specs/graph-rerank-boot-and-evidence.md):
  * the extract/embed operational events carry only
  *   { time, chunkId, modelId, latencyMs, outcome, counts }
- * plus the already-shipped extraction reject fields (chunkId, ids, codes).
- * Chunk body text, evidence-span text, entity descriptions, prompts,
- * embeddings and API keys must never be passed as log fields.
+ * plus the already-shipped extraction reject fields — per-triple rejects
+ * (`triple-self-loop-rejected` / `triple-ungrounded-rejected`) name the
+ * head / tail / relationRaw entity-relation strings, the self-loop leg an
+ * entityId, and the ungrounded leg an evidenceSpanLength; the entity/link
+ * events carry entity ids. Chunk body text, evidence-span text, entity
+ * descriptions, prompts, embeddings and API keys must never be passed as
+ * log fields.
  * `redactDiagnostic` below is URL/credential redaction for error diagnostics
  * — it is NOT an ingest-body secret scanner, so it cannot rescue a body
  * string that a caller passes as a field value.

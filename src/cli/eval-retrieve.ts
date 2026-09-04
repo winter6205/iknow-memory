@@ -372,7 +372,10 @@ function reconcileArmSet(
  * seeded backend fail the run via `assertArmsDelivered` instead of
  * publishing a mislabeled baseline.
  */
-export async function runCliFromEnv(argv: string[]): Promise<number> {
+export async function runCliFromEnv(
+  argv: string[],
+  overrides: Partial<EvalDeps> = {}
+): Promise<number> {
   let embedder: EmbeddingClient;
   let storage: StorageBackend;
   let retrieveConfig: RetrieveConfig;
@@ -392,7 +395,16 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     throw err;
   }
   try {
-    return await runCli(argv, { embedder, storage, retrieveConfig, logger });
+    // Overrides merge AFTER the env-derived deps so tests can observe the
+    // real loadEnv-produced config (e.g. an `assemble` spy) without the
+    // CLI re-deriving anything; production callers pass no overrides.
+    return await runCli(argv, {
+      embedder,
+      storage,
+      retrieveConfig,
+      logger,
+      ...overrides,
+    });
   } finally {
     await storage.close();
   }

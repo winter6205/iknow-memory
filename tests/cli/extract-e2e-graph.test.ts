@@ -356,6 +356,9 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
       expect(payload.degraded_reasons).toEqual(
         expect.arrayContaining(["vector:unattempted", "graph_ppr:unattempted"])
       );
+      // No DEBUG=1 in this child (see connectServer above), so the debug
+      // payload must not leak into the host-visible envelope.
+      expect(payload).not.toHaveProperty("debug");
     } finally {
       await close();
     }

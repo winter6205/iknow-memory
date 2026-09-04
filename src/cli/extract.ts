@@ -53,6 +53,7 @@ import {
   type LLMClient,
 } from "../core/extraction/llm-client.js";
 import { upsertTriple } from "../core/extraction/dedup.js";
+import { isGrounded } from "../core/extraction-eval/filter.js";
 import {
   normalizeRelation,
   DEFAULT_THRESHOLD,
@@ -475,11 +476,13 @@ async function processBatch(
   let writeFailures = 0;
   let succeeded = 0;
   let failed = 0;
+  let ungrounded = 0;
   for (const chunk of chunks) {
     const out = await processChunk(deps, client, chunk, batchId, startedAt);
     if (out.kind === "write-failure") writeFailures += 1;
     else if (out.kind === "ok") succeeded += 1;
     else failed += 1;
+    if (out.kind !== "failed") ungrounded += out.ungrounded;
   }
   deps.logger.info("extract-batch-complete", {
     batchId,
@@ -488,12 +491,15 @@ async function processBatch(
     succeeded,
     failed,
     writeFailures,
+    ungrounded,
   });
   return { writeFailures, succeeded, failed };
 }
 
 type ChunkOutcome =
-  { kind: "ok" } | { kind: "failed" } | { kind: "write-failure" };
+  | { kind: "ok"; ungrounded: number }
+  | { kind: "failed"; ungrounded: 0 }
+  | { kind: "write-failure"; ungrounded: 0 };
 
 /** One chunk in one transaction; mark-and-continue on every failure leg. */
 async function processChunk(
@@ -523,12 +529,13 @@ async function processChunk(
         chunkId: chunk.id,
         code: outcome.errorCode,
       });
-      return { kind: "failed" };
+      return { kind: "failed", ungrounded: 0 };
     }
     const counts = await persistOutputs(
       deps,
       client,
       chunk.id,
+      chunk.content,
       outcome.outputs,
       startedAt
     );
@@ -548,7 +555,7 @@ async function processChunk(
         code: SELF_LOOP_REJECTED_CODE,
         reason: "all-outputs-self-loop",
       });
-      return { kind: "failed" };
+      return { kind: "failed", ungrounded: 0 };
     }
     // Same transaction as the ledger rows it describes (SC3): a projection
     // intent that outlived a rolled-back chunk would tell the projector to
@@ -568,14 +575,14 @@ async function processChunk(
     // as `ok` either way; the precision layer surfaces its own degradation
     // through `keyword_bm25:attempted-and-failed` on stderr.
     await projectEntitiesToPrecisionLayer(deps, client, counts);
-    return { kind: "ok" };
+    return { kind: "ok", ungrounded: counts.ungrounded };
   } catch (err) {
     await client.query("ROLLBACK");
     deps.logger.error("chunk-write-failed", {
       chunkId: chunk.id,
       error: err instanceof Error ? err.message : String(err),
     });
-    return { kind: "write-failure" };
+    return { kind: "write-failure", ungrounded: 0 };
   }
 }
 
@@ -629,6 +636,13 @@ interface PersistCounts {
   triples: number;
   unmapped: number;
   /**
+   * Outputs whose evidence span did not ground in the chunk text. Per-triple
+   * rejects (mark-and-continue): the chunk is NOT failed for them — only
+   * allSelfLoop escalates — but the count surfaces in the batch log so a
+   * hallucination spike is observable without reading rows back.
+   */
+  ungrounded: number;
+  /**
    * Ledger subjects this chunk touched, in write order — the projection
    * intents the caller emits before committing. Chunks are never listed:
    * they do not enter the graph (ADR-0001).
@@ -665,12 +679,14 @@ async function persistOutputs(
   deps: CliDeps,
   client: CliClient,
   chunkId: string,
+  chunkContent: string,
   outputs: ExtractionOutput[],
   startedAt: string
 ): Promise<PersistCounts> {
   let triples = 0;
   let unmapped = 0;
   let selfLoopCount = 0;
+  let ungroundedCount = 0;
   const projected: ProjectionSubject[] = [];
   const entityIds = new Set<string>();
   const mergedLoserIds = new Set<string>();
@@ -701,6 +717,27 @@ async function persistOutputs(
     }
     projected.push({ kind: "entity", id: tailId });
     entityIds.add(tailId);
+    // Persist gate for the evidence span (SC7, assumption 10): the span must
+    // be a non-empty substring of the chunk text, or the triple is a
+    // hallucination and never lands. Per-triple mark-and-continue — the
+    // grounded siblings still insert and the chunk still succeeds. The gate
+    // sits AFTER endpoint resolution so entity behaviour is untouched (an
+    // entity with no edge is still a node the graph arm can seed on). The
+    // span text itself is never logged — only its length (no ingest-body
+    // leak into logs).
+    if (!isGrounded(out, chunkContent)) {
+      deps.logger.warn("triple-ungrounded-rejected", {
+        chunkId,
+        entityId: null,
+        head: out.head,
+        tail: out.tail,
+        relationRaw: out.relationRaw,
+        evidenceSpanLength: out.evidenceSpan.length,
+        reason: "span-not-in-chunk",
+      });
+      ungroundedCount += 1;
+      continue;
+    }
     const relationNorm = await vetRelationNorm(deps, out);
     // A merge returns the surviving row's id: its confidence just moved, so
     // the edge still needs re-projecting.
@@ -711,6 +748,7 @@ async function persistOutputs(
       relationNorm,
       confidence: out.confidence,
       sourceChunkId: chunkId,
+      evidenceSpan: out.evidenceSpan,
       validWindow: { start: startedAt, end: null },
     });
     projected.push({ kind: "triple", id: tripleId });
@@ -724,6 +762,7 @@ async function persistOutputs(
   return {
     triples,
     unmapped,
+    ungrounded: ungroundedCount,
     projected,
     entities: [...entityIds],
     mergedLoserIds: [...mergedLoserIds],

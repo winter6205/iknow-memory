@@ -8,7 +8,8 @@ import {
  * In-memory fake of the `triples` table for unit-testing the write-layer dedup.
  *
  * Mirrors the spec-1 DDL columns the dedup touches: id, head_id, tail_id,
- * relation_raw, relation_norm, confidence, source_chunk_id, valid_window.
+ * relation_raw, relation_norm, confidence, source_chunk_id, evidence_span,
+ * valid_window.
  * `valid_window` is stored as `{ start, end }` (end null = unbounded) and
  * overlap uses left-closed/right-open semantics (tstzrange).
  */
@@ -20,6 +21,7 @@ interface StoredTriple {
   relation_norm: string;
   confidence: number;
   source_chunk_id: string | null;
+  evidence_span: string | null;
   valid_window: { start: string; end: string | null };
 }
 
@@ -90,6 +92,7 @@ function makeFakeClient(initial: StoredTriple[] = []): FakeClient {
             relation_norm,
             confidence,
             source_chunk_id,
+            evidence_span,
             start,
             end,
           ] = values as [
@@ -99,6 +102,7 @@ function makeFakeClient(initial: StoredTriple[] = []): FakeClient {
             string,
             string,
             number,
+            string | null,
             string | null,
             string,
             string | null,
@@ -111,6 +115,7 @@ function makeFakeClient(initial: StoredTriple[] = []): FakeClient {
             relation_norm,
             confidence,
             source_chunk_id,
+            evidence_span,
             valid_window: { start, end: end ?? null },
           });
           return { rows: [{ id }] };
@@ -128,6 +133,7 @@ const baseTriple = {
   relationNorm: "works_for",
   confidence: 0.9,
   sourceChunkId: "chunk-1",
+  evidenceSpan: "Alice Smith works at Acme Corp",
   validWindow: { start: "2026-01-01T00:00:00Z", end: "2026-12-31T00:00:00Z" },
 };
 
@@ -150,6 +156,7 @@ describe("upsertTriple", () => {
         relation_norm: "works_for",
         confidence: 0.9,
         source_chunk_id: "chunk-1",
+        evidence_span: "old surviving span",
         valid_window: {
           start: "2026-01-01T00:00:00Z",
           end: "2026-12-31T00:00:00Z",
@@ -174,6 +181,7 @@ describe("upsertTriple", () => {
         relation_norm: "works_for",
         confidence: 0.9,
         source_chunk_id: "chunk-1",
+        evidence_span: null,
         valid_window: {
           start: "2026-01-01T00:00:00Z",
           end: "2026-12-31T00:00:00Z",
@@ -195,6 +203,7 @@ describe("upsertTriple", () => {
         relation_norm: "works_for",
         confidence: 0.4,
         source_chunk_id: "chunk-1",
+        evidence_span: null,
         valid_window: {
           start: "2026-01-01T00:00:00Z",
           end: "2026-12-31T00:00:00Z",
@@ -216,6 +225,7 @@ describe("upsertTriple", () => {
         relation_norm: "works_for",
         confidence: 0.9,
         source_chunk_id: "chunk-1",
+        evidence_span: null,
         valid_window: {
           start: "2026-01-01T00:00:00Z",
           end: "2026-12-31T00:00:00Z",
@@ -240,6 +250,7 @@ describe("upsertTriple", () => {
         relation_norm: "works_for",
         confidence: 0.9,
         source_chunk_id: "chunk-1",
+        evidence_span: null,
         valid_window: {
           start: "2020-01-01T00:00:00Z",
           end: "2020-12-31T00:00:00Z",
@@ -249,5 +260,39 @@ describe("upsertTriple", () => {
     const result = await upsertTriple(f.client, baseTriple);
     expect(result.merged).toBe(false);
     expect(f.rows).toHaveLength(2);
+  });
+
+  it("insert stores evidence_span on the fresh row", async () => {
+    const f = makeFakeClient();
+    await upsertTriple(f.client, baseTriple);
+    expect(f.rows).toHaveLength(1);
+    expect(f.rows[0]?.evidence_span).toBe(baseTriple.evidenceSpan);
+  });
+
+  it("merge does not overwrite the survivor's evidence_span while confidence takes max (provenance rule)", async () => {
+    const f = makeFakeClient([
+      {
+        id: "existing-1",
+        head_id: "h1",
+        tail_id: "t1",
+        relation_raw: "works at",
+        relation_norm: "works_for",
+        confidence: 0.4,
+        source_chunk_id: "chunk-1",
+        evidence_span: "first chunk's surviving span",
+        valid_window: {
+          start: "2026-01-01T00:00:00Z",
+          end: "2026-12-31T00:00:00Z",
+        },
+      },
+    ]);
+    await upsertTriple(f.client, {
+      ...baseTriple,
+      confidence: 0.9,
+      evidenceSpan: "second chunk's span",
+    });
+    expect(f.rows).toHaveLength(1);
+    expect(f.rows[0]?.confidence).toBe(0.9);
+    expect(f.rows[0]?.evidence_span).toBe("first chunk's surviving span");
   });
 });

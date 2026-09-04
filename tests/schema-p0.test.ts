@@ -419,6 +419,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
         "source_chunk_id",
         "valid_window",
         "superseded_by",
+        "evidence_span",
         "created_at",
       ];
       for (const col of expected) {

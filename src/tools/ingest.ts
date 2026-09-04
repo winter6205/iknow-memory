@@ -16,6 +16,7 @@ import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
+import type { Logger } from "../logging.js";
 import {
   normalizeContentInvalidationRequest,
   supportsContentInvalidation,
@@ -190,6 +191,12 @@ export interface IngestDeps {
   identityVersions?: Partial<ContentIdentityVersions>;
   /** Optional test/wiring override; absent uses the validated env default. */
   batchLimit?: number;
+  /**
+   * Optional structured logger for the SC10 embed process log. Optional so
+   * existing dep constructions stay source-compatible; production wiring
+   * threads the server logger in.
+   */
+  logger?: Logger;
 }
 
 /** Typed failure for a batch that would exceed the configured limit. */
@@ -295,6 +302,43 @@ function normalizeIngestItems(input: IngestInput): NormalizedIngestItem[] {
   });
 }
 
+/**
+ * SC10 embed process log: ONE structured entry per `embedder.embed(...)` call
+ * (not per item), whitelist fields only — { time, modelId, itemCount,
+ * latencyMs, outcome }. Content text and embeddings never travel with the
+ * line; `redactDiagnostic` stays URL/credential redaction, not a body scanner.
+ * Exported so `push.ts` reuses the same log contract instead of a copy.
+ */
+export async function embedWithLog(
+  logger: Logger | undefined,
+  embedder: EmbeddingClient,
+  texts: string[]
+): Promise<number[][]> {
+  const latencyStart = Date.now();
+  const fields = {
+    time: new Date().toISOString(),
+    modelId: embedder.modelId ?? null,
+    itemCount: texts.length,
+  };
+  try {
+    const embeddings = await embedder.embed(texts);
+    logger?.info("embed", {
+      ...fields,
+      latencyMs: Date.now() - latencyStart,
+      outcome: "ok",
+    });
+    return embeddings;
+  } catch (err) {
+    logger?.error("embed", {
+      ...fields,
+      latencyMs: Date.now() - latencyStart,
+      outcome: "failed",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err;
+  }
+}
+
 function validateIngestItem(item: NormalizedIngestItem): void {
   if (
     typeof item.content !== "string" ||
@@ -361,7 +405,9 @@ export function createIngestHandler(deps: IngestDeps) {
     }
     for (const item of items) validateIngestItem(item);
 
-    const embeddings = await deps.embedder.embed(
+    const embeddings = await embedWithLog(
+      deps.logger,
+      deps.embedder,
       items.map((item) => item.content)
     );
     if (embeddings.length !== items.length) {

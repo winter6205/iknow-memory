@@ -15,6 +15,11 @@ import { type ExtractionOutput, type ExtractionResponse } from "./types.js";
 /** Public contract — every adapter implements this one method. */
 export interface LLMClient {
   extract(chunkText: string): Promise<ExtractionResponse>;
+  /**
+   * Model id surfaced for process logs (SC10). Optional so test doubles and
+   * unwired stubs stay source-compatible; production adapters set it.
+   */
+  readonly modelId?: string;
 }
 
 // ─── Retry classification (#4 D4) ────────────────────────────────────────
@@ -97,8 +102,12 @@ export class AnthropicLLMClient implements LLMClient {
   private readonly anthropic: AnthropicLike;
   private readonly sleep: (ms: number) => Promise<void>;
 
+  /** Exposed for the SC10 process-log field whitelist (never the API key). */
+  readonly modelId: string;
+
   constructor(opts: AnthropicLLMClientOpts) {
     this.model = opts.model;
+    this.modelId = opts.model;
     this.anthropic =
       opts.anthropic ??
       (new Anthropic({
@@ -251,6 +260,8 @@ function defaultSleep(ms: number): Promise<void> {
 export interface FakeLLMClientOpts {
   queue?: ExtractionResponse[];
   scripted?: (chunkText: string) => Promise<ExtractionResponse>;
+  /** Surfaced as `modelId` for the SC10 process-log assertions. */
+  modelId?: string;
 }
 
 export class FakeLLMClient implements LLMClient {
@@ -259,12 +270,16 @@ export class FakeLLMClient implements LLMClient {
     ((chunkText: string) => Promise<ExtractionResponse>) | undefined;
   private head = 0;
 
+  /** Surfaced for the SC10 process-log field whitelist. */
+  readonly modelId: string | undefined;
+
   constructor(opts: FakeLLMClientOpts) {
     if (!opts.queue && !opts.scripted) {
       throw new Error("FakeLLMClient requires queue or scripted");
     }
     this.queue = opts.queue ?? [];
     this.scripted = opts.scripted;
+    this.modelId = opts.modelId;
   }
 
   async extract(chunkText: string): Promise<ExtractionResponse> {

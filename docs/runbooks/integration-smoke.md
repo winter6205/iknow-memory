@@ -36,24 +36,24 @@ spec-2 real-LLM extraction path in detail.
 `.env.local`, which is gitignored; never paste real values into this file or any
 commit):
 
-| Env var                                    | Meaning                                           |
-| ------------------------------------------ | ------------------------------------------------- |
-| `GRAPHRAG_MEMORY_DB_URL`                   | Postgres DSN (`postgresql://...`)                 |
-| `GRAPHRAG_MEMORY_STORAGE`                  | `pgvector` (ledger + vector + BM25 `content_tsv`) |
-| `GRAPHRAG_MEMORY_EMBED_DIMENSIONS`         | `2048` for Zhipu embedding-3                      |
-| `GRAPHRAG_MEMORY_EMBED_BASE_URL`           | `https://open.bigmodel.cn/api/paas/v4`            |
-| `GRAPHRAG_MEMORY_EMBED_MODEL`              | `embedding-3`                                     |
-| `GRAPHRAG_MEMORY_EMBED_API_KEY`            | Zhipu embedding key (dedicated; not MiniMax)      |
-| `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV`        | optional: NAME of another env var holding key     |
-| `GRAPHRAG_MEMORY_LOG_LEVEL`                | optional: `info` (default) or `debug`             |
-| `DEBUG`                                    | optional: `1` exposes the retrieve debug keys     |
-| `GRAPHRAG_MEMORY_RETRIEVAL_W_VEC`          | optional: vector weight (default `0.7`)           |
-| `GRAPHRAG_MEMORY_RETRIEVAL_W_BM25`         | optional: BM25 weight (default `0.15`)            |
-| `GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH`        | optional: Neo4j PPR weight (default `0.15`)       |
-| `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED`   | optional: `false` to switch BM25 off              |
-| `GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED`  | optional: `false` to switch the Neo4j arm off     |
-| `GRAPHRAG_MEMORY_NEO4J_URI`                | optional: Bolt URI; omit to skip the graph arm    |
-| `GRAPHRAG_MEMORY_NEO4J_USER` / `_PASSWORD` | required as a pair when URI is set                |
+| Env var                                    | Meaning                                                                       |
+| ------------------------------------------ | ----------------------------------------------------------------------------- |
+| `GRAPHRAG_MEMORY_DB_URL`                   | Postgres DSN (`postgresql://...`)                                             |
+| `GRAPHRAG_MEMORY_STORAGE`                  | `pgvector` (ledger + vector; lexical ranking lives in the ES precision layer) |
+| `GRAPHRAG_MEMORY_EMBED_DIMENSIONS`         | `2048` for Zhipu embedding-3                                                  |
+| `GRAPHRAG_MEMORY_EMBED_BASE_URL`           | `https://open.bigmodel.cn/api/paas/v4`                                        |
+| `GRAPHRAG_MEMORY_EMBED_MODEL`              | `embedding-3`                                                                 |
+| `GRAPHRAG_MEMORY_EMBED_API_KEY`            | Zhipu embedding key (dedicated; not MiniMax)                                  |
+| `GRAPHRAG_MEMORY_EMBED_API_KEY_ENV`        | optional: NAME of another env var holding key                                 |
+| `GRAPHRAG_MEMORY_LOG_LEVEL`                | optional: `info` (default) or `debug`                                         |
+| `DEBUG`                                    | optional: `1` exposes the retrieve debug keys                                 |
+| `GRAPHRAG_MEMORY_RETRIEVAL_W_VEC`          | optional: vector weight (default `0.7`)                                       |
+| `GRAPHRAG_MEMORY_RETRIEVAL_W_BM25`         | optional: BM25 weight (default `0.15`)                                        |
+| `GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH`        | optional: Neo4j PPR weight (default `0.15`)                                   |
+| `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED`   | optional: `false` to switch BM25 off                                          |
+| `GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED`  | optional: `false` to switch the Neo4j arm off                                 |
+| `GRAPHRAG_MEMORY_NEO4J_URI`                | optional: Bolt URI; omit to skip the graph arm                                |
+| `GRAPHRAG_MEMORY_NEO4J_USER` / `_PASSWORD` | required as a pair when URI is set                                            |
 
 Production retrieve is vector + BM25 + Neo4j PPR at `0.7 / 0.15 / 0.15`
 (`src/config.ts`). No URI → the Neo4j arm is not attempted and the envelope

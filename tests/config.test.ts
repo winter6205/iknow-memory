@@ -116,6 +116,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     const env = loadEnv();
     expect(Object.keys(env).sort()).toEqual([
       "dbUrl",
+      "elasticsearch",
       "embedApiKey",
       "embedBaseUrl",
       "embedDimensions",

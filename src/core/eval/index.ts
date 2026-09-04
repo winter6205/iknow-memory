@@ -13,6 +13,7 @@ export {
   EvalScoringError,
   GoldFixtureError,
   BaselineWriteError,
+  AblationMatrixError,
   type CorpusFixtureErrorCode,
   type GoldFixtureErrorCode,
 } from "./errors.js";
@@ -51,3 +52,22 @@ export {
   DEFAULT_GOLD_PATH,
   REPO_ROOT,
 } from "./paths.js";
+export {
+  ABLATION_CAPABILITY_KEYS,
+  aggregateConfig,
+  buildAblationConfigs,
+  buildAblationReport,
+  findBaselineConfig,
+  median,
+  percentageChange,
+  renderAblationJson,
+  renderAblationMarkdown,
+  round2,
+  type AblationCapabilities,
+  type AblationCapability,
+  type AblationConfig,
+  type AblationConfigResult,
+  type AblationMetricSample,
+  type AblationReport,
+  type RawSampleInput,
+} from "./ablation-matrix.js";

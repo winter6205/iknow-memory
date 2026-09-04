@@ -16,9 +16,11 @@ import {
 } from "./registry.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { SearchOptions, StorageBackend } from "../core/types.js";
+import type { LexicalStorageBackend } from "../core/storage/backend.js";
 import type {
   CapabilityObservation,
   ChunkReranker,
+  EntityLexicalStorage,
   RetrievePreset,
   GraphRanker,
   ProjectionDrainWaiter,
@@ -83,6 +85,10 @@ export type RetrieveInput = z.infer<typeof RetrieveInputSchema>;
 export interface RetrieveDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
+  /** Optional Elasticsearch precision-layer chunk search. */
+  lexical?: LexicalStorageBackend;
+  /** Optional Elasticsearch precision-layer entity search. */
+  entityLexical?: EntityLexicalStorage;
   /**
    * Hybrid retrieval config — BM25 weight and enable switch. Wired from
    * `loadEnv().retrieval` at the server assembly layer. When undefined the
@@ -146,6 +152,10 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
       {
         embedder: deps.embedder,
         storage: deps.storage,
+        ...(deps.lexical !== undefined ? { lexical: deps.lexical } : {}),
+        ...(deps.entityLexical !== undefined
+          ? { entityLexical: deps.entityLexical }
+          : {}),
         retrieveConfig,
         graphConfig: deps.graphConfig,
         graphRanker: deps.graphRanker,

@@ -42,11 +42,17 @@ import {
 } from "./core/embedder.js";
 import { MemoryBackend } from "./core/storage/memory-backend.js";
 import {
+  ElasticsearchPrecisionLayer,
+  type PrecisionIndexer,
+} from "./core/storage/elasticsearch-precision.js";
+import {
   createNeo4jPprRanker,
   type PprRanker,
 } from "./core/graph/neo4j-ppr.js";
 import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
 import type { StorageBackend } from "./core/types.js";
+import type { SearchOptions } from "./core/types.js";
+import type { LexicalStorageBackend } from "./core/storage/backend.js";
 
 const SERVER_NAME = "iknow-memory";
 const SERVER_VERSION = "0.0.0";
@@ -75,6 +81,8 @@ const EXIT_CODES = {
 interface ServerDeps {
   embedder: EmbeddingClient;
   storage: StorageBackend;
+  /** Optional Elasticsearch precision layer for derived indexes. */
+  precision?: PrecisionIndexer;
   /**
    * Retrieval pipeline config. Always present — loadEnv() always returns
    * it. Structural type from GraphragEnv so this file never imports
@@ -130,19 +138,68 @@ interface ServerDeps {
 export function buildRetrieveDeps(
   deps: Pick<
     ServerDeps,
-    "embedder" | "storage" | "retrieval" | "graphRanker" | "reranker"
+    | "embedder"
+    | "storage"
+    | "precision"
+    | "retrieval"
+    | "graphRanker"
+    | "reranker"
   >,
   debug: boolean
 ): RetrieveDeps {
   return {
     embedder: deps.embedder,
     storage: deps.storage,
+    ...(deps.precision !== undefined
+      ? {
+          lexical: lexicalAdapterFromPrecision(deps.precision),
+          entityLexical: deps.precision,
+        }
+      : {}),
     retrieveConfig: deps.retrieval,
     ...(deps.graphRanker !== undefined
       ? { graphRanker: deps.graphRanker }
       : {}),
     ...(deps.reranker !== undefined ? { reranker: deps.reranker } : {}),
     debug,
+  };
+}
+
+/**
+ * Adapt a `PrecisionIndexer` to the `LexicalStorageBackend` shape consumed by
+ * the BM25 arm.
+ *
+ * `PrecisionIndexer` is the broader derived-index port (chunks + entities
+ * + invalidation); the lexical arm only ever reads `searchLexical`. Wrapping
+ * keeps `LexicalStorageBackend` — which the BM25 arm and several tests
+ * consume — unchanged while letting the same `PrecisionIndexer` instance
+ * double as the seed-finding entity port (entityLexical).
+ *
+ * `upsert` / `search` / `close` are intentionally unimplemented: the lexical
+ * arm never calls them, and the orchestrator picks `deps.storage` for vector
+ * searches via the standard path. A call here would mean a wiring bug.
+ */
+function lexicalAdapterFromPrecision(
+  precision: PrecisionIndexer
+): LexicalStorageBackend {
+  return {
+    upsert: () =>
+      Promise.reject(
+        new ConfigError(
+          "precision-derived lexical backend does not implement upsert; " +
+            "use storage.upsert for authoritative writes"
+        )
+      ),
+    search: () =>
+      Promise.reject(
+        new ConfigError(
+          "precision-derived lexical backend does not implement vector search; " +
+            "use storage.search for vector recall"
+        )
+      ),
+    searchLexical: (query: string, opts: SearchOptions) =>
+      precision.searchLexical(query, opts),
+    close: () => precision.close(),
   };
 }
 
@@ -187,6 +244,14 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     storage = new MemoryBackend(env.embedDimensions);
   }
 
+  const precision =
+    env.elasticsearch === undefined
+      ? undefined
+      : new ElasticsearchPrecisionLayer(env.elasticsearch, {
+          k1: env.retrieval.k1,
+          b: env.retrieval.b,
+        });
+
   // Both branches always pass `dimensions` through; the dim value is always
   // required by config so this is just plumbing.
   let embedder: EmbeddingClient;
@@ -215,6 +280,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
   return {
     embedder,
     storage,
+    ...(precision !== undefined ? { precision } : {}),
     retrieval: env.retrieval,
     ...(env.neo4j !== undefined
       ? { graphRanker: createNeo4jPprRanker(env.neo4j) }

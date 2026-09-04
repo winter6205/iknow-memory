@@ -19,6 +19,7 @@ import type {
   ArmHit,
   ArmName,
   ArmResult,
+  EntitySeedCandidate,
   FusedHit,
   RetrieveConfig,
 } from "./types.js";
@@ -116,4 +117,48 @@ export function rrfFuse(
     for (const hit of arm.hits) addHit(acc, hit, weight, k);
   }
   return [...acc.values()].sort(compareFusedHits).slice(0, limit);
+}
+
+/**
+ * Fuse entity candidates with the same rank-only algorithm used for chunks.
+ *
+ * Entity candidates are projected into the existing `ArmHit` shape only for
+ * the duration of the call; no entity becomes a chunk result. Keeping this
+ * adapter here makes the entity-finding RRF use the same k and tie-breaking
+ * rules as Host fallback RRF while preserving the two granularities.
+ */
+export function rrfFuseEntitySeeds(
+  vector: readonly EntitySeedCandidate[],
+  lexical: readonly EntitySeedCandidate[],
+  cfg: RetrieveConfig,
+  limit: number
+): EntitySeedCandidate[] {
+  if (limit <= 0) return [];
+  const arms: ArmResult[] = [
+    toEntityArmResult("vector", vector),
+    toEntityArmResult("bm25", lexical),
+  ];
+  return rrfFuse(arms, cfg, limit).map((hit) => ({
+    id: hit.id,
+    canonical_name: hit.content,
+  }));
+}
+
+function toEntityArmResult(
+  arm: "vector" | "bm25",
+  candidates: readonly EntitySeedCandidate[]
+): ArmResult {
+  return {
+    arm,
+    hits: candidates.map((candidate, index) => ({
+      id: candidate.id,
+      arm,
+      rank: index + 1,
+      score: candidate.score ?? 0,
+      content: candidate.canonical_name,
+      source_ref: "__entity__",
+      valid_window: ["1970-01-01T00:00:00.000Z", null],
+    })),
+    belowFloor: false,
+  };
 }

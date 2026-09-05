@@ -24,7 +24,9 @@ and are deliberately not restated in any Acceptance below.
 
 ## Closed / Merged
 
-PR #165 (391dd10) is merged. T1–T13 and T16 are Done; T14+ remain Pending.
+PR #165 (391dd10) is merged. T1–T13 and T16 are Done.
+PR #175 is merged. T14 (CJK precision layer) and T15 (Okapi k1/b, phrase, field boosting) are Done — see `plans/es-precision-layer.md`.
+T17+ remain Pending.
 
 ## architecture-change-reviewer verdict
 
@@ -183,14 +185,14 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
     - **Inherits:** spec SC-1; §Precision layer = CJK segmentation + Okapi BM25 + phrase queries + field boosting delivered as one unit, present at both the entity-finding stage and the fallback stage, complementing **vector search** with no primary/standby switchover; C-1 / C-8 — the earlier Postgres `content_tsv` production shape is superseded, and the new runtime client is a consequence of 定档 B, not an open item; external dependencies unconfigured loud-skip, configured-but-failing sets `degraded` and names the item.
     - **Surface:** retrieval (lexical arm) + storage (derived lexical index) + config; one adapter seam for the whole layer — the structural split is judged by `complexity-anti-drift`, not by numbers copied here
     - **Acceptance:** a CJK query that is not semantically close to the target chunk — per SC-1's three assertions: an anchored sample list of ≥ 3 pairs where cosine(query, target) < cosine(control, target), an absolute ceiling on that cosine, and a non-empty shared-token intersection — returns the target chunk in top-5 with all capabilities on, and the same fixture does not return it with CJK segmentation switched off; the layer's analysis returns ≥ 2 tokens for a continuous CJK string (1 = fail); the layer is queried at both the entity-finding stage and the fallback stage; unconfigured it loud-skips, configured-but-failing at call time it sets `degraded` and names the item; no second lexical ranking implementation is left behind on the authoritative store.
-    - Status: [ ] pending
+    - Status: [x] done — PR #175 · `plans/es-precision-layer.md`
     - [parallel] with T10, T11, T12, T13, T16
 
 15. **Okapi BM25 parameters, phrase queries, and field boosting** — tag: `[implementation]`
     - **Inherits:** spec SC-3 (k1 / b configurable and effective; defaults read from config, > 0 and finite; illegal values → typed error; default values are implementer headroom, not spec content), SC-4 (an exact-phrase match outranks a loose-token-only match inside top-5), SC-5 (changing field weights changes the top-5 id order; a zero-weighted field contributes no hits; negative weights are a config error).
     - **Surface:** retrieval (precision-layer query construction) + config
     - **Acceptance:** changing k1 / b through config changes the top-5 id sequence for the same query on the same corpus; both default to config-sourced values that are > 0 and finite; values ≤ 0, non-numeric, or non-finite raise a typed error; phrase-matched chunks outrank token-only-matched chunks within top-5; changing field weights changes the top-5 id sequence and a zero-weighted field contributes nothing; negative weights are rejected at config load.
-    - Status: [ ] pending
+    - Status: [x] done — PR #175 (es-precision-layer T3–T4)
     - [blocks: T14]
 
 16. **Fusion parameters configurable (RRF k, vector / keyword weights)** — tag: `[implementation]`

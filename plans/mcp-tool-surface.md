@@ -1,5 +1,7 @@
 # Plan: MCP tool surface
 
+**Status（2026-09-05）：** PR [#185](https://github.com/winter6205/iknow-memory/pull/185) 已合入 `main`。T1–T3 闭合。
+
 **Goal:** Hosts see exactly `ingest`, `push`, `invalidate`, `extract`, `retrieve`; extract reuses one core pipeline; echo and the `invalidation` name are gone.
 **Approach:** Lift CLI-private extract persist into `src/core/extraction` first so the MCP tool cannot import `src/cli`. Catalog tidy (echo, ingest invalidate, rename) can run in parallel. Then register MCP `extract` on the lifted module.
 **Spec link:** `specs/mcp-tool-surface.md`
@@ -23,20 +25,20 @@ OVERALL: PASS — hand to writing-plans.
    - **Inherits:** spec assumption 14, Does #2, SC10, SC13; same pending scan, per-chunk transaction, mark-and-continue, outbox emit, no FakeLLM persist; CLI flags (`--dry-run`, `--list-failed`, `--list-unmapped`, `--backfill-embeddings`) stay CLI-only.
    - **Surface:** existing `src/core/extraction` capability and `src/cli/extract.ts` as the flag/exit-code entry.
    - **Acceptance:** CLI extract behaviour tests still pass; persist/batch is callable from core without going through CLI argv; `src/cli/extract.ts` no longer owns a second persist implementation.
-   - Status: [ ] pending
+   - Status: [x] closed — PR #185
 
 2. **[parallel] Catalog tidy: echo off, ingest write-only, `invalidate` name** — tag: `[implementation]`
    - **Inherits:** spec SC1 (minus `extract` until T3), SC2–SC5; `echo` and `invalidation` absent; ingest rejects invalidate action; `invalidate` keeps close-window / no delete / idempotent; `push` and `retrieve` contracts unchanged; Host-facing descriptions, no stage-0 / fin-port jargon.
    - **Surface:** existing MCP registry (`src/index.ts`, `src/tools`).
    - **Acceptance:** `tools/list` has no `echo` or `invalidation`; `ingest` + invalidate action is a validation error; `invalidate` matches today’s invalidation behaviour; existing push/retrieve/invalidation tests green under the new name; `npm test` exits 0.
-   - Status: [ ] pending
+   - Status: [x] closed — PR #185
    - [parallel]
 
 3. **MCP `extract` on the lifted pipeline** — tag: `[implementation]`
    - **Inherits:** spec extract contract + SC6–SC9, SC13; `chunk_ids` xor `source_ref`; batch cap = ingest batch limit; zeros on empty pending `source_ref`; typed error if persist creds missing; first-slice **evidence span** gate if that persist path is already on the branch.
    - **Surface:** MCP tools + lifted `src/core/extraction` (T1). Must not import `src/cli`.
    - **Acceptance:** registry names are exactly `{ingest, push, invalidate, extract, retrieve}`; xor/empty/over-limit selectors error; one fail + one success in a batch does not abort; `src/tools` has zero `src/cli` imports; `npm test` and `npm run build` exit 0.
-   - Status: [ ] pending
+   - Status: [x] closed — PR #185
    - [blocks: T1]
 
 ## 待写入 (persist)

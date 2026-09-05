@@ -1,5 +1,7 @@
 # Plan: Retrieve and graph quality stack
 
+**Status（2026-09-05）：** T2–T11 已在 main。T2–T5 见 PR [#171](https://github.com/winter6205/iknow-memory/pull/171)；T6–T8 / T10–T11 见 PR [#120](https://github.com/winter6205/iknow-memory/pull/120)；T9 见 `plans/retrieve-community.md` + PR [#123](https://github.com/winter6205/iknow-memory/pull/123)。不要把 Frontier 当待办。
+
 **Goal:** Ship the remaining in-protocol retrieve and graph-quality path as ordered slices — without new MCP tools or Host assembly.
 **Approach:** Slice 0 (temporary LLM rerank) **shipped on main** via `plans/retrieve-rerank-llm.md` / PR #118. Later slices attach to the same retrieve hook, extract CLI, and drain path. `balanced` copies today’s RetrieveConfig levers; `conservative` / `tokenmax` only change window size and neighbor width relative to that copy — exact integers stay implementer headroom. #15, multi-granularity chunking, Neo4j node embeddings, and SQL graph-arm revival stay out.
 **Spec link:** `specs/retrieve-graph-quality.md`
@@ -19,7 +21,7 @@
 | Temporary LLM rerank (slice 0 / T1)       | PR #118 · `plans/retrieve-rerank-llm.md` **closed**    |
 | Quality stack contract + this plan        | PR #117 · `specs/retrieve-graph-quality.md`            |
 
-**Current starting point:** graph-priority + temporary LLM rerank (default on) are on `main`. Next work is **T2–T11** below.
+**Current starting point:** quality stack T1–T11 are on `main`. Remaining retrieval work is `plans/retrieval-stack.md` T17–T24 and flake #170 — not this file.
 
 ## ACR
 
@@ -42,49 +44,49 @@ minimal-change-verifier: yes **for this spec as one contract**; implementation *
    - **Inherits:** spec SC1–SC3, slice 1: same retrieve hook as T1; default off; missing URL skip not `degraded`; throw fail-open + `degraded`; not Host chat model.
    - **Surface:** retrieve orchestrator rerank port; config/env for HTTP endpoint. Temporary LLM adapter remains until this bullet replaces it on the hook.
    - **Acceptance:** off → identical to post-T1 order; on + no URL → skip, no `degraded`; fake HTTP permutation then `limit`; no live HTTP in `npm test`.
-   - Status: [ ] pending
+   - Status: [x] done — PR #171 Track Q
    - [blocks: T1]
 
 3. **[parallel] Projection GC** — tag: `[implementation]`
    - **Inherits:** spec SC4, slice 2: ledger delete/retire → drain removes projection by id; empty graph still backfill; no graph tombstone as primary scheme. ADR-0001: Neo4j not SoR.
    - **Surface:** projection outbox / drain CLI (existing graph projection path).
    - **Acceptance:** after ledger delete and drain, Neo4j has no node/edge for that id (same Neo4j test style as the graph-arm suite); backfill of an empty graph still works.
-   - Status: [ ] pending
+   - Status: [x] done — PR #171 Track Q
    - [parallel]
 
 4. **[parallel] Self-loop extract reject** — tag: `[implementation]`
    - **Inherits:** spec SC5, slice 3: row-level reject; not `--only-failed` force re-extract; no orphan entity for discarded loops.
    - **Surface:** extract CLI / triple write path.
    - **Acceptance:** self-loop is recorded as reject, no graph edge, `--only-failed` does not require re-extract; `npm test` exit 0.
-   - Status: [ ] pending
+   - Status: [x] done — PR #171 Track Q
    - [parallel]
 
 5. **[parallel] Persist `merged_into`** — tag: `[implementation]`
    - **Inherits:** spec SC6, slice 4; P0c soft-merge; triples FK unchanged; `resolveCanonicalId` is the production read path.
    - **Surface:** extract merge/write path; entities ledger.
    - **Acceptance:** loser row stores `merged_into` = survivor; second extract is idempotent on that pointer (Postgres test helper already used by extract tests).
-   - Status: [ ] pending
+   - Status: [x] done — PR #171 Track Q
    - [parallel]
 
 6. **Mode bundles on retrieve** — tag: `[implementation]`
    - **Inherits:** spec SC7, slice 5: names `conservative` | `balanced` | `tokenmax`; env default + optional retrieve input; unknown name → `ConfigError` or typed tool error. **balanced** copies current RetrieveConfig (entityLinkTopK 8, candidateCap 50, w_vec 0.7, w_bm25 0.15, Host limit default 10). **conservative** narrower candidate window and neighbor N=0 vs balanced. **tokenmax** wider candidate window and neighbor N≥1 vs balanced. Exact conservative/tokenmax integers are implementer headroom inside that shape. Not a new MCP tool.
    - **Surface:** `RetrieveConfig` / retrieve tool input.
    - **Acceptance:** unknown preset rejected; default bundle is `balanced` and matches current levers; envelope unchanged.
-   - Status: [ ] pending
+   - Status: [x] done — PR #120
    - [blocks: T1]
 
 7. **Neighboring chunk evidence** — tag: `[implementation]`
    - **Inherits:** spec SC8, slice 6: ±N same `source_ref` from Postgres after ranking/rerank; default N from bundle (balanced 1); N=0 identity; chunks never enter Neo4j; still honor `limit` or a documented cap.
    - **Surface:** retrieve orchestrator; chunk ledger (Postgres).
    - **Acceptance:** three-chunk source, hit middle, N=1 can include neighbors; no Neo4j writes; N=0 unchanged order aside from existing ranking.
-   - Status: [ ] pending
+   - Status: [x] done — PR #120
    - [blocks: T6]
 
 8. **Node embedding in retrieve** — tag: `[implementation]`
    - **Inherits:** spec SC9, slice 7: optional seed/score from Postgres `entities.embedding`; throw → today’s graph-priority (or RRF fallback) + `degraded`; no Neo4j vector index / node embedding properties.
    - **Surface:** retrieve orchestrator; entities ledger embeddings (already used for merge).
    - **Acceptance:** fake store throw → pre-embedding ranking + `degraded`; path off → identical to post-T1 graph-priority retrieve.
-   - Status: [ ] pending
+   - Status: [x] done — PR #120
    - [blocks: T1]
 
 9. **Community summaries for topic retrieve** — tag: `[implementation]`
@@ -98,22 +100,19 @@ minimal-change-verifier: yes **for this spec as one contract**; implementation *
     - **Inherits:** spec SC11, slice 9: causal `relation_norm` in vocabulary; extract may emit them; consolidate CLI dry-run default; apply writes `superseded_by` and closes `valid_window`; retrieve already filters `valid_at`.
     - **Surface:** extraction vocabulary; extract write; new or existing operator CLI beside extract; retrieve unchanged except temporal filter already there.
     - **Acceptance:** a superseded fact with `valid_until` before `valid_at` does not appear in graph-mapped chunks; dry-run apply does not write; apply does.
-    - Status: [ ] pending
+    - Status: [x] done — PR #120
     - [blocks: T5]
 
 11. **Optional projection wait** — tag: `[implementation]`
     - **Inherits:** spec SC12, slice 10: default off; on waits for drain up to timeout; timeout or drain error → fail-open + `degraded`; no transaction-internal Neo4j write.
     - **Surface:** retrieve config/input; drain/outbox.
     - **Acceptance:** wait off → no drain wait; wait on + timeout → pre-wait ranking + `degraded`; `npm test` without live Neo4j exit 0 when wait is off.
-    - Status: [ ] pending
+    - Status: [x] done — PR #120 (`wait_for_drain`)
     - [blocks: T3]
 
-## Frontier (start here)
+## Frontier
 
-1. **T2** dedicated HTTP rerank — preferred next product knife (replaces temporary adapter on the same hook).
-2. **T3 / T4 / T5** may run in parallel with each other (and with T2) — projection GC, self-loop reject, `merged_into` persist.
-
-Claim a bullet by flipping **Status** on the feature branch. Do not open or edit GitHub issues for tracking.
+本文件子弹已全部 `[x]`。不要从 T2 再开工。
 
 ## 待写入 (persist)
 

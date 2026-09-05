@@ -1,5 +1,7 @@
 # Plan: Graph / rerank fail-start, process logs, evidence span persist
 
+**Status（2026-09-05）：** PR [#184](https://github.com/winter6205/iknow-memory/pull/184) 已合入 `main`。T1–T4 闭合。
+
 **Goal:** Default-on graph and rerank refuse to start without deps; eval shares that config; extract persists only grounded evidence spans; extract/embed emit secret-free process logs.
 **Approach:** Config boot first so server and eval tell the same truth; schema+gate as a parallel write path; logs as a parallel observability path. MCP catalog is out (`specs/mcp-tool-surface.md`).
 **Spec link:** `specs/graph-rerank-boot-and-evidence.md`
@@ -23,27 +25,27 @@ OVERALL: PASS — hand to writing-plans.
    - **Inherits:** spec SC1–SC3, SC6, assumption 13; ADR-0006; ADR-0005 rules 2–4 unchanged; explicit off still starts; retrieve-time throw still fail-open + `degraded`. Vector / BM25 / ES boot contracts unchanged.
    - **Surface:** existing `loadEnv()` / `GraphragEnv` (`src/config.ts`) and server construct (`src/index.ts` already maps `ConfigError` to process exit).
    - **Acceptance:** default-on with no Neo4j URI → `loadEnv()` throws `ConfigError`; default-on with production rerank deps missing → same; `graphEnabled=false` without Neo4j → load succeeds; `npm test` exits 0 without live Neo4j.
-   - Status: [ ] pending
+   - Status: [x] closed — PR #184
 
 2. **Eval retrieve uses the same `loadEnv()` switches** — tag: `[implementation]`
    - **Inherits:** spec SC4–SC5; P@5 / R@5 ruler is the default-on path; gold size unchanged; no MRR/nDCG gate; no hardcoded `graphEnabled: false` / `rerankEnabled: false`.
    - **Surface:** existing `eval:retrieve` CLI (same `loadEnv()` family as the server).
    - **Acceptance:** that CLI source does not assign those two flags false; a default-on env keeps both true; missing graph/rerank deps fail the CLI the same way as the server; existing gold harness shape still writes `eval/baseline/retrieve-p5.json` when deps are present.
-   - Status: [ ] pending
+   - Status: [x] closed — PR #184
    - [blocks: T1]
 
 3. **[parallel] Persist grounded evidence spans on triples** — tag: `[implementation]`
    - **Inherits:** spec SC7–SC9, assumptions 10–12; substring gate only (`chunkText.includes(evidenceSpan)` and non-empty); other `filterTriple` reasons stay eval-only; merge does not overwrite survivor `evidence_span`; retrieve envelope has no span on Host `chunks[]`.
    - **Surface:** existing triples schema + extract persist/upsert (`src/core/storage` P0 schema and `src/core/extraction` write path).
    - **Acceptance:** ungrounded / empty span does not insert; grounded insert stores `triples.evidence_span`; one ungrounded sibling in a batch does not block a grounded one; `retrieve` success JSON has no evidence field on chunks; existing DBs gain the column via additive DDL.
-   - Status: [ ] pending
+   - Status: [x] closed — PR #184
    - [parallel]
 
 4. **[parallel] Structured extract and embed process logs** — tag: `[implementation]`
    - **Inherits:** spec SC10, assumption 9; fields: time, chunk id, model id, latency, success/fail, counts; whitelist; no secrets; no raw chunk text; `redactDiagnostic` stays URL/credential redaction, not an ingest-body scanner; do not mask stored chunk text.
    - **Surface:** existing `createLogger` / extract CLI and embed call sites (ingest and extract).
    - **Acceptance:** one extract chunk and one embed call emit those fields; payload has no API key and no chunk body; `npm test` and `npm run build` exit 0.
-   - Status: [ ] pending
+   - Status: [x] closed — PR #184
    - [parallel]
 
 ## 待写入 (persist)

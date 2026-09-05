@@ -53,6 +53,7 @@ import {
   type LLMClient,
 } from "../core/extraction/llm-client.js";
 import { upsertTriple } from "../core/extraction/dedup.js";
+import { isGrounded } from "../core/extraction-eval/filter.js";
 import {
   normalizeRelation,
   DEFAULT_THRESHOLD,
@@ -82,6 +83,7 @@ import {
   NineRouterEmbedder,
   type EmbeddingClient,
 } from "../core/embedder.js";
+import { embedWithLog } from "../core/embed-log.js";
 import { normalizeEntityType } from "./entity-type.js";
 import { fetchEntityProjection } from "../core/storage/entity-projection.js";
 
@@ -471,15 +473,18 @@ async function processBatch(
   chunks: ChunkInput[]
 ): Promise<BatchOutcome> {
   const batchId = newRecordId();
-  const startedAt = deps.now ? deps.now() : new Date().toISOString();
+  const startedAt = depsNow(deps);
   let writeFailures = 0;
   let succeeded = 0;
   let failed = 0;
+  let ungrounded = 0;
   for (const chunk of chunks) {
     const out = await processChunk(deps, client, chunk, batchId, startedAt);
     if (out.kind === "write-failure") writeFailures += 1;
     else if (out.kind === "ok") succeeded += 1;
     else failed += 1;
+    // Every leg defines `ungrounded` (failed legs are 0), so no guard needed.
+    ungrounded += out.ungrounded;
   }
   deps.logger.info("extract-batch-complete", {
     batchId,
@@ -488,12 +493,46 @@ async function processBatch(
     succeeded,
     failed,
     writeFailures,
+    ungrounded,
   });
   return { writeFailures, succeeded, failed };
 }
 
 type ChunkOutcome =
-  { kind: "ok" } | { kind: "failed" } | { kind: "write-failure" };
+  | { kind: "ok"; ungrounded: number }
+  | { kind: "failed"; ungrounded: 0 }
+  | { kind: "write-failure"; ungrounded: 0 };
+
+/** Injectable clock fallback: every log/timestamp site reads the time here. */
+function depsNow(deps: CliDeps): string {
+  return deps.now ? deps.now() : new Date().toISOString();
+}
+
+/**
+ * Process-log field whitelist (SC10): { time, chunkId, modelId, latencyMs,
+ * outcome, counts }. See src/logging.ts for the full contract — never chunk
+ * body text, span text, descriptions, prompts or API keys as log fields.
+ */
+interface ChunkLogFields {
+  time: string;
+  chunkId: string;
+  modelId: string | null;
+  latencyMs: number;
+}
+
+/** Whitelisted per-chunk log fields; `code` only on the failure legs. */
+function chunkLogFields(
+  deps: CliDeps,
+  chunkId: string,
+  latencyStart: number
+): ChunkLogFields {
+  return {
+    time: depsNow(deps),
+    chunkId,
+    modelId: deps.llm.modelId ?? null,
+    latencyMs: Date.now() - latencyStart,
+  };
+}
 
 /** One chunk in one transaction; mark-and-continue on every failure leg. */
 async function processChunk(
@@ -504,6 +543,9 @@ async function processChunk(
   startedAt: string
 ): Promise<ChunkOutcome> {
   const recordId = newRecordId();
+  // Latency covers the whole chunk (LLM call + persist) so the per-chunk
+  // process log reflects what an operator would wait for (SC10).
+  const latencyStart = Date.now();
   await client.query("BEGIN");
   try {
     await insertRecord(client, {
@@ -520,15 +562,17 @@ async function processChunk(
       });
       await client.query("COMMIT");
       deps.logger.info("chunk-failed", {
-        chunkId: chunk.id,
+        ...chunkLogFields(deps, chunk.id, latencyStart),
         code: outcome.errorCode,
+        outcome: "failed",
       });
-      return { kind: "failed" };
+      return { kind: "failed", ungrounded: 0 };
     }
     const counts = await persistOutputs(
       deps,
       client,
       chunk.id,
+      chunk.content,
       outcome.outputs,
       startedAt
     );
@@ -544,11 +588,12 @@ async function processChunk(
       });
       await client.query("COMMIT");
       deps.logger.info("chunk-rejected", {
-        chunkId: chunk.id,
+        ...chunkLogFields(deps, chunk.id, latencyStart),
         code: SELF_LOOP_REJECTED_CODE,
         reason: "all-outputs-self-loop",
+        outcome: "failed",
       });
-      return { kind: "failed" };
+      return { kind: "failed", ungrounded: 0 };
     }
     // Same transaction as the ledger rows it describes (SC3): a projection
     // intent that outlived a rolled-back chunk would tell the projector to
@@ -568,14 +613,24 @@ async function processChunk(
     // as `ok` either way; the precision layer surfaces its own degradation
     // through `keyword_bm25:attempted-and-failed` on stderr.
     await projectEntitiesToPrecisionLayer(deps, client, counts);
-    return { kind: "ok" };
+    // SC10 success leg: the counts are only final after persistOutputs, so
+    // this event fires post-commit with the whitelisted field set.
+    deps.logger.info("chunk-extracted", {
+      ...chunkLogFields(deps, chunk.id, latencyStart),
+      outcome: "ok",
+      triples: counts.triples,
+      unmapped: counts.unmapped,
+      ungrounded: counts.ungrounded,
+    });
+    return { kind: "ok", ungrounded: counts.ungrounded };
   } catch (err) {
     await client.query("ROLLBACK");
     deps.logger.error("chunk-write-failed", {
-      chunkId: chunk.id,
+      ...chunkLogFields(deps, chunk.id, latencyStart),
+      outcome: "write-failed",
       error: err instanceof Error ? err.message : String(err),
     });
-    return { kind: "write-failure" };
+    return { kind: "write-failure", ungrounded: 0 };
   }
 }
 
@@ -629,6 +684,13 @@ interface PersistCounts {
   triples: number;
   unmapped: number;
   /**
+   * Outputs whose evidence span did not ground in the chunk text. Per-triple
+   * rejects (mark-and-continue): the chunk is NOT failed for them — only
+   * allSelfLoop escalates — but the count surfaces in the batch log so a
+   * hallucination spike is observable without reading rows back.
+   */
+  ungrounded: number;
+  /**
    * Ledger subjects this chunk touched, in write order — the projection
    * intents the caller emits before committing. Chunks are never listed:
    * they do not enter the graph (ADR-0001).
@@ -665,12 +727,14 @@ async function persistOutputs(
   deps: CliDeps,
   client: CliClient,
   chunkId: string,
+  chunkContent: string,
   outputs: ExtractionOutput[],
   startedAt: string
 ): Promise<PersistCounts> {
   let triples = 0;
   let unmapped = 0;
   let selfLoopCount = 0;
+  let ungroundedCount = 0;
   const projected: ProjectionSubject[] = [];
   const entityIds = new Set<string>();
   const mergedLoserIds = new Set<string>();
@@ -701,19 +765,26 @@ async function persistOutputs(
     }
     projected.push({ kind: "entity", id: tailId });
     entityIds.add(tailId);
+    // Persist gate for the evidence span (SC7, assumption 10): the span must
+    // be a non-empty substring of the chunk text, or the triple is a
+    // hallucination and never lands. Per-triple mark-and-continue — the
+    // grounded siblings still insert and the chunk still succeeds.
+    if (!isGrounded(out, chunkContent)) {
+      logUngroundedRejection(deps, chunkId, out);
+      ungroundedCount += 1;
+      continue;
+    }
     const relationNorm = await vetRelationNorm(deps, out);
-    // A merge returns the surviving row's id: its confidence just moved, so
-    // the edge still needs re-projecting.
-    const { tripleId } = await upsertTriple(client, {
+    const upserted = await resolveAndUpsertTriple(
+      client,
+      chunkId,
+      out,
       headId,
       tailId,
-      relationRaw: out.relationRaw,
       relationNorm,
-      confidence: out.confidence,
-      sourceChunkId: chunkId,
-      validWindow: { start: startedAt, end: null },
-    });
-    projected.push({ kind: "triple", id: tripleId });
+      startedAt
+    );
+    projected.push({ kind: "triple", id: upserted.tripleId });
     triples += 1;
     if (relationNorm === UNMAPPED) unmapped += 1;
   }
@@ -724,6 +795,7 @@ async function persistOutputs(
   return {
     triples,
     unmapped,
+    ungrounded: ungroundedCount,
     projected,
     entities: [...entityIds],
     mergedLoserIds: [...mergedLoserIds],
@@ -795,6 +867,52 @@ function logSelfLoopRejection(
     tail: out.tail,
     relationRaw: out.relationRaw,
     reason: "head-equals-tail",
+  });
+}
+
+/**
+ * The ungrounded leg of the SC7 persist gate: the span text itself is never
+ * logged — only its length (no ingest-body leak into logs).
+ */
+function logUngroundedRejection(
+  deps: CliDeps,
+  chunkId: string,
+  out: ExtractionOutput
+): void {
+  deps.logger.warn("triple-ungrounded-rejected", {
+    chunkId,
+    entityId: null,
+    head: out.head,
+    tail: out.tail,
+    relationRaw: out.relationRaw,
+    evidenceSpanLength: out.evidenceSpan.length,
+    reason: "span-not-in-chunk",
+  });
+}
+
+/**
+ * Upsert one grounded triple. A merge returns the surviving row's id: its
+ * confidence just moved, so the edge still needs re-projecting (the caller
+ * pushes it onto `projected` either way).
+ */
+async function resolveAndUpsertTriple(
+  client: CliClient,
+  chunkId: string,
+  out: ExtractionOutput,
+  headId: string,
+  tailId: string,
+  relationNorm: string,
+  startedAt: string
+): Promise<{ tripleId: string }> {
+  return upsertTriple(client, {
+    headId,
+    tailId,
+    relationRaw: out.relationRaw,
+    relationNorm,
+    confidence: out.confidence,
+    sourceChunkId: chunkId,
+    evidenceSpan: out.evidenceSpan,
+    validWindow: { start: startedAt, end: null },
   });
 }
 
@@ -927,7 +1045,14 @@ async function embedEntity(
     incoming.canonicalName,
     incoming.description
   );
-  const [vector] = await deps.embedder.embed([text]);
+  // SC10 embed log: one entry per embed call, whitelist fields only — the
+  // embedded SSOT text itself never travels with the log line. Same shared
+  // contract as the tools' "embed" event; no itemCount (single text) and
+  // the CLI's injectable clock drives `time`.
+  const [vector] = await embedWithLog(deps.logger, deps.embedder, [text], {
+    eventName: "entity-embed",
+    now: () => depsNow(deps),
+  });
   if (!vector) {
     throw new GraphragError(
       `embedder returned no vector for entity "${incoming.canonicalName}"`,

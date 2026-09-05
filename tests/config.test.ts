@@ -103,6 +103,13 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_VEC"] = "0.7";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_BM25"] = "0.15";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH"] = "0.15";
+    // ADR-0006 fail-start: with the graph/rerank switches default-on, a
+    // scrubbed baseline (no URI, no rerank URL) would refuse to boot. The
+    // block asserts non-graph contracts, so supply the two deps instead of
+    // flipping the switches off.
+    process.env["GRAPHRAG_MEMORY_NEO4J_URI"] = "bolt://localhost:7687";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL"] =
+      "https://rerank.example.test/v1/";
   });
   afterAll(() => {
     for (const k of SCRUBBED) {
@@ -249,6 +256,12 @@ function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
       GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
       GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
       GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
+      // ADR-0006 fail-start deps: the scrubbed baseline is default-on for
+      // graph + rerank with neither dep configured, which now refuses to
+      // boot. Supply both so the storage/embedding assertions below keep
+      // exercising their intended paths.
+      GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
+      GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
       ...patch,
     },
     fn
@@ -390,6 +403,9 @@ describe("loadEnv — embed config boundary cases", () => {
         GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
         GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
         GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
+        // ADR-0006 fail-start deps for the default-on scrubbed baseline.
+        GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
         ...patch,
       },
       fn
@@ -644,6 +660,9 @@ describe("loadEnv — embedding API key resolution", () => {
         GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
         GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
         GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
+        // ADR-0006 fail-start deps for the default-on scrubbed baseline.
+        GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
         ...patch,
       },
       fn
@@ -842,6 +861,7 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
       ...RETRIEVAL_VARS,
       ...PGVECTOR_VARS,
       ...ANTHROPIC_VARS,
+      ...NEO4J_VARS,
       "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
       "GRAPHRAG_MEMORY_EMBED_BASE_URL",
       "GRAPHRAG_MEMORY_EMBED_MODEL",
@@ -864,6 +884,12 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_VEC"] = "0.7";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_BM25"] = "0.15";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH"] = "0.15";
+    // ADR-0006 fail-start: the scrubbed baseline keeps graph + rerank
+    // default-on (several tests below assert that default), so the
+    // baseline must carry both deps or loadEnv would refuse to boot.
+    process.env["GRAPHRAG_MEMORY_NEO4J_URI"] = "bolt://localhost:7687";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL"] =
+      "https://rerank.example.test/v1/";
     for (const [k, v] of Object.entries(patch)) {
       if (!saved.has(k)) saved.set(k, process.env[k]);
       if (v === undefined) delete process.env[k];
@@ -1029,9 +1055,18 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
   });
 
   it("leaves the dedicated rerank URL undefined by default", () => {
-    withRetrievalEnv({}, () => {
-      expect(loadEnv().rerankUrl).toBeUndefined();
-    });
+    // ADR-0006: the URL only exists undefined while rerank is explicitly
+    // off; default-on + absent URL now refuses to boot (covered in the
+    // fail-start describe below). The baseline plants a URL, so blank it.
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+      },
+      () => {
+        expect(loadEnv().rerankUrl).toBeUndefined();
+      }
+    );
   });
 
   it("reads and trims the dedicated rerank URL without requiring Anthropic credentials", () => {
@@ -1048,9 +1083,16 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
   });
 
   it("treats a blank dedicated rerank URL as absent", () => {
-    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "   " }, () => {
-      expect(loadEnv().rerankUrl).toBeUndefined();
-    });
+    // ADR-0006: absent is only legal with rerank explicitly off.
+    withRetrievalEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "   ",
+      },
+      () => {
+        expect(loadEnv().rerankUrl).toBeUndefined();
+      }
+    );
   });
 
   it("turns rerank on when the enable flag is true", () => {
@@ -1353,12 +1395,14 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
 /**
  * Neo4j sidecar connection block (#70 T1).
  *
- * The block is `undefined` when no URI is configured, which is the config
- * half of SC7: the graph arm cannot even be attempted, so retrieve skips
- * it and the envelope stays non-degraded. Everything an operator DID
+ * These tests pin the parse-level contract: everything an operator DID
  * declare must either be usable or refuse to start — a URI with an
  * unusable scheme, or half a credential pair, is a typo the server must
  * not paper over by connecting anonymously or by ignoring the value.
+ *
+ * ADR-0006 baseline: the graph switch is explicitly off here so the
+ * parse-level cases can run without a sidecar; the fail-start behavior
+ * for default-on graph without a URI lives in its own describe below.
  */
 describe("loadEnv — Neo4j sidecar config", () => {
   function withNeo4jEnv(
@@ -1369,6 +1413,9 @@ describe("loadEnv — Neo4j sidecar config", () => {
       ...NEO4J_VARS,
       ...PGVECTOR_VARS,
       "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
+      "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+      "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
+      "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
     ];
     const saved = new Map<string, string | undefined>();
     for (const k of keys) {
@@ -1378,6 +1425,10 @@ describe("loadEnv — Neo4j sidecar config", () => {
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
     process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
+    // ADR-0006: explicit off is the only way to boot without the sidecar
+    // deps, and rerank off keeps the missing rerank URL legal.
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"] = "false";
+    process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
     for (const [k, v] of Object.entries(patch)) {
       if (!saved.has(k)) saved.set(k, process.env[k]);
       if (v === undefined) delete process.env[k];
@@ -1534,6 +1585,208 @@ describe("loadEnv — Neo4j sidecar config", () => {
         })();
         expect(err).toBeInstanceOf(ConfigError);
         expect(err?.message).not.toContain("super-secret-value");
+      }
+    );
+  });
+});
+
+/**
+ * ADR-0006 fail-start (specs/graph-rerank-boot-and-evidence.md SC1–SC3).
+ *
+ * A process whose graph or rerank switch is on (the default) must refuse
+ * to start when the dependency the production retrieve path would need is
+ * missing: graph needs a Neo4j URI, rerank needs the dedicated HTTP
+ * rerank URL. An explicit off switch is the only way to boot without the
+ * deps, and that choice must not be treated as a degradation. The five
+ * boundary classes map: empty/missing → ConfigError; negative (explicit
+ * off) → boots; overflow (unusable URI) → still rejected by the existing
+ * parse; concurrent → not applicable at boot (single loadEnv call);
+ * exception → typed ConfigError naming both vars.
+ */
+describe("loadEnv — graph/rerank fail-start (ADR-0006)", () => {
+  const URI = "bolt://localhost:7687";
+  const RERANK_URL = "https://rerank.example.test/v1/";
+
+  // The withEnv baseline plants both deps (ADR-0006). A blank value reads
+  // as absent to loadEnv (present-blank collapses to undefined), so each
+  // test blanks exactly the dep whose absence is under test.
+  it("throws ConfigError when graph is default-on and no Neo4j URI exists (empty/missing)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED[\s\S]*GRAPHRAG_MEMORY_NEO4J_URI/
+        );
+      }
+    );
+  });
+
+  it("names ADR-0006 fail-start in the graph ConfigError message", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(/ADR-0006/);
+      }
+    );
+  });
+
+  it("throws ConfigError when rerank is default-on and no rerank URL exists (empty/missing)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: URI,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED[\s\S]*GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL/
+        );
+      }
+    );
+  });
+
+  it("treats a blank URI as missing under default-on graph (empty class)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "   ",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_NEO4J_URI/);
+      }
+    );
+  });
+
+  it("treats a blank rerank URL as missing under default-on rerank (empty class)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: URI,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "   ",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL/);
+      }
+    );
+  });
+
+  it("boots when graph is explicitly off and no Neo4j URI exists (negative)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.retrieval.graphEnabled).toBe(false);
+        expect(env.neo4j).toBeUndefined();
+      }
+    );
+  });
+
+  it("boots when rerank is explicitly off and no rerank URL exists (negative)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: URI,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.retrieval.rerankEnabled).toBe(false);
+        expect(env.rerankUrl).toBeUndefined();
+      }
+    );
+  });
+
+  it("boots with both switches explicitly off and neither dep present (negative)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.neo4j).toBeUndefined();
+        expect(env.rerankUrl).toBeUndefined();
+      }
+    );
+  });
+
+  it("still rejects an unusable URI scheme even under fail-start (overflow)", () => {
+    // The fail-start check runs after parseNeo4jConfig, so a declared-but
+    // -unusable URI keeps its original parse error naming the var.
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "http://localhost:7687",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_NEO4J_URI/);
+      }
+    );
+  });
+
+  it("rejects an unparseable graph switch before fail-start can run (exception ordering)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "yes",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED must be one of/
+        );
+      }
+    );
+  });
+
+  it("error is an instance of ConfigError naming both graph vars (exception)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        let caught: unknown;
+        try {
+          loadEnv();
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(ConfigError);
+        const message = (caught as Error).message;
+        expect(message).toContain("GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED");
+        expect(message).toContain("GRAPHRAG_MEMORY_NEO4J_URI");
+      }
+    );
+  });
+
+  it("boots with graph on + URI present and rerank on + rerank URL present", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: URI,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: RERANK_URL,
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.retrieval.graphEnabled).toBe(true);
+        expect(env.retrieval.rerankEnabled).toBe(true);
+        expect(env.neo4j?.uri).toBe(URI);
+        expect(env.rerankUrl).toBe(RERANK_URL);
       }
     );
   });

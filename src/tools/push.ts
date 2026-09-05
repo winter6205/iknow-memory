@@ -30,10 +30,12 @@ import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
+import type { Logger } from "../logging.js";
 import {
   computeChunkId,
   computeContentIdentity,
   DEFAULT_CONTENT_IDENTITY_VERSIONS,
+  embedWithLog,
   type ContentIdentityVersions,
 } from "./ingest.js";
 
@@ -72,6 +74,12 @@ export interface PushDeps {
   /** Optional ES derived-index writer; authority writes always win. */
   precision?: PrecisionIndexer;
   identityVersions?: Partial<ContentIdentityVersions>;
+  /**
+   * Optional structured logger for the SC10 embed process log. Optional so
+   * existing dep constructions stay source-compatible; production wiring
+   * threads the server logger in.
+   */
+  logger?: Logger;
 }
 
 function validateItemSize(item: PushItem): void {
@@ -98,8 +106,11 @@ export function createPushHandler(deps: PushDeps) {
     };
     for (const item of input.items) validateItemSize(item);
 
-    const embeddings = await deps.embedder.embed(
-      input.items.map((item) => item.content)
+    const embeddings = await embedWithLog(
+      deps.logger,
+      deps.embedder,
+      input.items.map((item) => item.content),
+      { itemCount: input.items.length }
     );
     if (embeddings.length !== input.items.length) {
       throw new GraphragError(

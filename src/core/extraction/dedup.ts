@@ -15,6 +15,11 @@
  * semantically (the survivor's source_chunk_id + the merge event). We do NOT
  * invent a `source_chunk_ids` array column: that would violate the "no column
  * changes" boundary (Ask-first).
+ *
+ * `evidence_span` follows the same provenance rule (specs/
+ * graph-rerank-boot-and-evidence.md assumption 12): the span is evidence for
+ * the fact as first extracted from the survivor's source chunk, so a merge
+ * updates only confidence — never the survivor's span.
  */
 import { randomUUID } from "node:crypto";
 import type { Queryable } from "./records.js";
@@ -35,6 +40,8 @@ export interface TripleInput {
   relationNorm: string;
   confidence: number;
   sourceChunkId: string | null;
+  /** The model-proposed chunk substring grounding this triple (persist gate). */
+  evidenceSpan: string;
   validWindow: ValidWindow;
 }
 
@@ -56,8 +63,8 @@ async function insertNewTriple(
   await client.query(
     `INSERT INTO triples
        (id, head_id, tail_id, relation_raw, relation_norm, confidence,
-        source_chunk_id, valid_window)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, tstzrange($8, $9, $10))`,
+        source_chunk_id, evidence_span, valid_window)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, tstzrange($9, $10, $11))`,
     [
       tripleId,
       triple.headId,
@@ -66,6 +73,7 @@ async function insertNewTriple(
       triple.relationNorm,
       triple.confidence,
       triple.sourceChunkId,
+      triple.evidenceSpan,
       triple.validWindow.start,
       triple.validWindow.end,
       RANGE_BOUNDS,
@@ -103,8 +111,9 @@ async function findOverlap(
 
 /**
  * Merge the new triple into an existing overlapping row: confidence =
- * max(existing, new). Provenance (source_chunk_id) is left untouched — the
- * first-extracted chunk retains it (A9 reconciliation, see file header).
+ * max(existing, new). Provenance (source_chunk_id, evidence_span) is left
+ * untouched — the first-extracted chunk retains both (A9 reconciliation +
+ * assumption 12, see file header).
  */
 async function mergeIntoExisting(
   client: Queryable,

@@ -84,6 +84,7 @@ async function createTriples(client: PoolClient): Promise<void> {
       source_chunk_id uuid REFERENCES chunks(id) ON DELETE SET NULL,
       valid_window    tstzrange NOT NULL,
       superseded_by   uuid REFERENCES triples(id) ON DELETE SET NULL,
+      evidence_span   text,
       created_at      timestamptz NOT NULL DEFAULT now()
     )`);
   // Keep existing P0 installations forward-compatible with the supersession
@@ -92,6 +93,12 @@ async function createTriples(client: PoolClient): Promise<void> {
     ALTER TABLE triples
       ADD COLUMN IF NOT EXISTS superseded_by uuid
       REFERENCES triples(id) ON DELETE SET NULL`);
+  // Same forward-compat for the grounding column: nullable because
+  // pre-existing rows have no span; new inserts are gated non-empty by the
+  // production persist path (specs/graph-rerank-boot-and-evidence.md SC8).
+  await client.query(`
+    ALTER TABLE triples
+      ADD COLUMN IF NOT EXISTS evidence_span text`);
   await client.query(`
     CREATE INDEX IF NOT EXISTS triples_valid_window_idx
       ON triples USING gist (valid_window)`);

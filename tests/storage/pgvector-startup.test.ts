@@ -105,6 +105,11 @@ function serverEnv(
     GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(dimensions),
     GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
     GRAPHRAG_MEMORY_LOG_LEVEL: options.logLevel ?? "error",
+    // ADR-0006 fail-start: these suites exercise pgvector startup, not the
+    // graph/rerank arms, so both switches go explicitly off — the boot must
+    // succeed (or fail on pgvector grounds) without sidecar credentials.
+    GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+    GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
     PATH: process.env.PATH ?? "",
     ...(options.nodeOptions === undefined
       ? {}

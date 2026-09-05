@@ -265,10 +265,16 @@ describe("entity-type normalization through the pipeline (CR High #2)", () => {
         ],
       }),
     });
-    // The scan must return one chunk so persistOutputs runs.
+    // The scan must return one chunk so persistOutputs runs. The content
+    // carries the output's evidenceSpan so the persist gate passes.
     client.rowsOverride = (text) =>
       /FROM chunks c/.test(text)
-        ? [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }]
+        ? [
+            {
+              id: "00000000-0000-4000-8000-000000000000",
+              content: "Alice works at Acme",
+            },
+          ]
         : [];
 
     const deps = makeDeps(client, llm);
@@ -328,11 +334,24 @@ const ALICE_OUTPUT = {
   confidence: 0.9,
 };
 
+/**
+ * Default fake chunk content: a superset carrying the evidence spans the
+ * module-level canned outputs use, so the persist gate (isGrounded) passes
+ * for them. Tests whose outputs carry different spans pass their own
+ * content below.
+ */
+const FAKE_CHUNK_CONTENT =
+  "Alice Smith mentors Alicia Smith. Alice Smith works at Acme Corp.";
+
 /** One chunk to scan, so persistOutputs runs on the scripted output. */
-function scanOneChunk(client: FakeClient, rows: unknown[] = []): void {
+function scanOneChunk(
+  client: FakeClient,
+  rows: unknown[] = [],
+  content: string = FAKE_CHUNK_CONTENT
+): void {
   client.rowsOverride = (text) =>
     /FROM chunks c/.test(text)
-      ? [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }]
+      ? [{ id: "00000000-0000-4000-8000-000000000000", content }]
       : /FROM entities/.test(text)
         ? rows
         : [];
@@ -570,7 +589,12 @@ class ConstantEmbedder implements EmbeddingClient {
 function serveOwnEntityWrites(client: FakeClient, seed: unknown[] = []): void {
   client.rowsOverride = (text) => {
     if (/FROM chunks c/.test(text)) {
-      return [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }];
+      return [
+        {
+          id: "00000000-0000-4000-8000-000000000000",
+          content: FAKE_CHUNK_CONTENT,
+        },
+      ];
     }
     if (/^\s*SELECT[\s\S]*FROM entities/.test(text)) {
       return [...seed, ...insertedEntityRows(client)];
@@ -620,7 +644,12 @@ function serveMergePersistenceRows(
         }));
     }
     if (/FROM chunks c/.test(text)) {
-      return [{ id: "00000000-0000-4000-8000-000000000000", content: "x" }];
+      return [
+        {
+          id: "00000000-0000-4000-8000-000000000000",
+          content: FAKE_CHUNK_CONTENT,
+        },
+      ];
     }
     if (/^\s*SELECT[\s\S]*FROM entities/.test(text)) {
       return [survivor, ...insertedEntityRowsWithMergePointers(client)];
@@ -1062,11 +1091,14 @@ async function runOneRelation(over: {
   relationNorm: string;
 }): Promise<FakeClient> {
   const client = new FakeClient();
-  scanOneChunk(client);
+  const out = relationOutput(over);
+  // The chunk content must contain the output's evidenceSpan or the persist
+  // gate (not this ticket's relation cascade) would reject the triple.
+  scanOneChunk(client, [], out.evidenceSpan);
   const llm = new FakeLLMClient({
     scripted: async () => ({
       kind: "ok" as const,
-      outputs: [relationOutput(over)],
+      outputs: [out],
     }),
   });
   const deps: CliDeps = {
@@ -1141,7 +1173,13 @@ describe("relation_norm is cascade-vetted before upsert (A10 / SC8)", () => {
 
   it("the record's unmapped_count counts vetted sentinels, not claimed ones", async () => {
     const client = new FakeClient();
-    scanOneChunk(client);
+    // Both outputs' spans must ground in the chunk or the persist gate (not
+    // this test's concern) would drop them.
+    scanOneChunk(
+      client,
+      [],
+      "Dana Lee based in Berlin Dana Lee mysteriously linked to Initech"
+    );
     const llm = new FakeLLMClient({
       scripted: async () => ({
         kind: "ok" as const,
@@ -1180,6 +1218,168 @@ describe("relation_norm is cascade-vetted before upsert (A10 / SC8)", () => {
     // (id, triples_count, unmapped_count)
     expect(marks[0]![1]).toBe(2);
     expect(marks[0]![2]).toBe(1);
+  });
+});
+
+// ─── T3: evidence-span persist gate (SC7, specs/graph-rerank-boot-…md) ────
+
+/** The chunk content the grounding tests scan; the grounded span is inside. */
+const GROUNDED_CHUNK =
+  "Alice Smith works at Acme Corp on the billing platform.";
+
+interface GateLogged {
+  msg: string;
+  fields: Record<string, unknown> | undefined;
+}
+
+/** Run one chunk with the given outputs against GROUNDED_CHUNK. */
+async function runGateChunk(
+  outputs: unknown[]
+): Promise<{ client: FakeClient; warnings: GateLogged[]; code: number }> {
+  const client = new FakeClient();
+  scanOneChunk(client, [], GROUNDED_CHUNK);
+  const warnings: GateLogged[] = [];
+  const llm = new FakeLLMClient({
+    scripted: async () => ({ kind: "ok" as const, outputs: outputs as never }),
+  });
+  const deps: CliDeps = {
+    ...makeDeps(client, llm),
+    logger: {
+      ...silentLogger(),
+      warn: (msg, fields) => warnings.push({ msg, fields }),
+    },
+  };
+  const code = await runCli(["--batch-size", "1"], deps);
+  return { client, warnings, code };
+}
+
+/** Bound values of every INSERT INTO triples call. */
+function tripleInserts(client: FakeClient): unknown[][] {
+  return boundValuesFor(client, /INSERT INTO triples/);
+}
+
+describe("evidence-span persist gate (SC7)", () => {
+  it("an empty evidenceSpan output is rejected; no triple INSERT fires", async () => {
+    const { client, code } = await runGateChunk([
+      { ...ALICE_OUTPUT, evidenceSpan: "" },
+    ]);
+
+    expect(code).toBe(0); // per-triple reject, chunk still succeeds
+    expect(tripleInserts(client)).toEqual([]);
+    // Entity endpoints still resolve: an entity without an edge is a node.
+    expect(boundValuesFor(client, /INSERT INTO entities/)).toHaveLength(2);
+  });
+
+  it("a span that is not a substring of the chunk is rejected with a structured warn", async () => {
+    const { client, warnings, code } = await runGateChunk([
+      { ...ALICE_OUTPUT, evidenceSpan: "completely unrelated text" },
+    ]);
+
+    expect(code).toBe(0);
+    expect(tripleInserts(client)).toEqual([]);
+    expect(warnings).toContainEqual({
+      msg: "triple-ungrounded-rejected",
+      fields: expect.objectContaining({
+        chunkId: "00000000-0000-4000-8000-000000000000",
+        head: ALICE_OUTPUT.head,
+        tail: ALICE_OUTPUT.tail,
+        relationRaw: ALICE_OUTPUT.relationRaw,
+        // Length only — never the span text (no ingest-body leak into logs).
+        evidenceSpanLength: "completely unrelated text".length,
+        reason: "span-not-in-chunk",
+      }),
+    });
+    const warnFields = warnings[0]?.fields ?? {};
+    expect(JSON.stringify(warnFields)).not.toContain(
+      "completely unrelated text"
+    );
+  });
+
+  it("a span longer than the chunk and not contained is rejected (overflow class)", async () => {
+    const { client, code } = await runGateChunk([
+      { ...ALICE_OUTPUT, evidenceSpan: `${GROUNDED_CHUNK}${"x".repeat(50)}` },
+    ]);
+
+    expect(code).toBe(0);
+    expect(tripleInserts(client)).toEqual([]);
+  });
+
+  it("an over-long span that is still a substring persists (overflow class)", async () => {
+    // A long span repeated inside the chunk: build a chunk that contains a
+    // 10_000-char span verbatim.
+    const longSpan = "billing platform".repeat(625); // 10_000 chars
+    const chunk = `${"x".repeat(10_000)} ${GROUNDED_CHUNK} ${longSpan}`;
+    const client = new FakeClient();
+    scanOneChunk(client, [], chunk);
+    const llm = new FakeLLMClient({
+      scripted: async () => ({
+        kind: "ok" as const,
+        outputs: [{ ...ALICE_OUTPUT, evidenceSpan: longSpan }],
+      }),
+    });
+    const deps = makeDeps(client, llm);
+
+    const code = await runCli(["--batch-size", "1"], deps);
+
+    expect(code).toBe(0);
+    expect(tripleInserts(client)).toHaveLength(1);
+    // The persisted row carries the accepted span.
+    expect(tripleInserts(client)[0]![7]).toBe(longSpan);
+  });
+
+  it("a grounded output persists and the triple INSERT carries evidence_span", async () => {
+    const { client, code } = await runGateChunk([ALICE_OUTPUT]);
+
+    expect(code).toBe(0);
+    const inserts = tripleInserts(client);
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]![7]).toBe(ALICE_OUTPUT.evidenceSpan);
+  });
+
+  it("one ungrounded output does not block its grounded sibling (concurrent class)", async () => {
+    const { client, warnings, code } = await runGateChunk([
+      { ...ALICE_OUTPUT, evidenceSpan: "hallucinated span" },
+      ALICE_OUTPUT,
+    ]);
+
+    expect(code).toBe(0);
+    expect(warnings.map((w) => w.msg)).toContain("triple-ungrounded-rejected");
+    // Exactly one triple inserted — the grounded sibling.
+    expect(tripleInserts(client)).toHaveLength(1);
+    expect(tripleInserts(client)[0]![7]).toBe(ALICE_OUTPUT.evidenceSpan);
+    // Chunk succeeded with triples_count = 1 (the ungrounded one is not
+    // counted as a triple, and the chunk is NOT the self-loop reject).
+    const marks = boundValuesFor(client, /SET status = 'succeeded'/);
+    expect(marks).toHaveLength(1);
+    expect(marks[0]![1]).toBe(1);
+  });
+
+  it("an all-ungrounded chunk succeeds with zero triples — not the SELF_LOOP reject", async () => {
+    const { client, warnings, code } = await runGateChunk([
+      { ...ALICE_OUTPUT, evidenceSpan: "hallucinated span one" },
+      { ...ALICE_OUTPUT, evidenceSpan: "hallucinated span two" },
+    ]);
+
+    expect(code).toBe(0);
+    expect(tripleInserts(client)).toEqual([]);
+    expect(warnings.map((w) => w.msg)).toEqual([
+      "triple-ungrounded-rejected",
+      "triple-ungrounded-rejected",
+    ]);
+    expect(boundValuesFor(client, /SET status = 'failed'/)).toEqual([]);
+    const marks = boundValuesFor(client, /SET status = 'succeeded'/);
+    expect(marks).toHaveLength(1);
+    expect(marks[0]![1]).toBe(0);
+  });
+
+  it("the gate is boolean logic, not a throw: a rejected output never fails the batch", async () => {
+    const { client, code } = await runGateChunk([
+      { ...ALICE_OUTPUT, evidenceSpan: "nope" },
+      { ...ALICE_OUTPUT, evidenceSpan: "" },
+    ]);
+
+    expect(code).toBe(0); // writeFailures === 0; mark-and-continue held
+    expect(client.queries.filter((q) => /^ROLLBACK$/.test(q))).toEqual([]);
   });
 });
 

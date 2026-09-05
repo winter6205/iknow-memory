@@ -79,6 +79,11 @@ function runCliSubprocess(args: string[]): Promise<ProcResult> {
         GRAPHRAG_MEMORY_EMBED_API_KEY: "",
         GRAPHRAG_MEMORY_EMBED_API_KEY_ENV: "",
         NINE_ROUTER_KEY: "",
+        // ADR-0006 fail-start: the child's env has no Neo4j URI or rerank
+        // URL, which a default-on graph/rerank boot refuses. The extract
+        // CLI exercises neither arm, so switch them off explicitly.
+        GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

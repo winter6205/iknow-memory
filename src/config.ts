@@ -123,8 +123,9 @@ export class ConfigError extends Error {
 /**
  * Neo4j sidecar connection settings (#70).
  *
- * Present only when a URI is configured. Absence leaves the default-on graph
- * capability unattempted; the retrieval envelope reports that state.
+ * Present only when a URI is configured. Since ADR-0006, absence with the
+ * graph switch on (the default) refuses process start; only an explicit
+ * `GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED=false` boots without the sidecar.
  * Credentials are optional because a local Neo4j may run with auth disabled,
  * but a half-declared pair is rejected at startup.
  */
@@ -177,7 +178,9 @@ export interface GraphragEnv {
   retrieval: RetrieveConfig;
   /**
    * Neo4j sidecar connection block, or undefined when no URI is configured.
-   * Undefined is surfaced as an unattempted default-on graph capability.
+   * With the graph switch on (the default) undefined never reaches here —
+   * loadEnv refuses to start (ADR-0006); it only occurs when the switch is
+   * explicitly off.
    */
   neo4j: Neo4jConfig | undefined;
   /**
@@ -694,8 +697,10 @@ const NEO4J_URI_SCHEMES: readonly string[] = [
 /**
  * Load + validate the GRAPHRAG_MEMORY_NEO4J_* family.
  *
- * No URI → undefined, leaving the default-on graph capability unattempted.
- * Anything the operator DID declare must be usable:
+ * No URI → undefined. Since ADR-0006 the parse function itself stays silent
+ * about that case, but loadEnv refuses to start when the graph switch is on
+ * (the default); an undefined block therefore only ever coexists with an
+ * explicit off switch. Anything the operator DID declare must be usable:
  * a URI the driver cannot dial, credentials with nothing to connect to,
  * or half a credential pair all abort at startup. Silently ignoring them
  * would hand an operator a server they believe is graph-backed while it
@@ -728,6 +733,33 @@ function parseNeo4jConfig(): Neo4jConfig | undefined {
     );
   }
   return { uri, user, password };
+}
+
+/**
+ * ADR-0006 fail-start: a process whose graph or rerank switch is on (the
+ * default) must not boot without the dependency the production retrieve
+ * path would need. Graph requires a usable Neo4j config; rerank requires
+ * the dedicated HTTP endpoint the server wiring actually consults
+ * (`env.rerankUrl`). An explicit off switch keeps missing deps legal — that
+ * is a choice, not a degradation, so no degraded implication is recorded
+ * here. Vector / BM25 / Elasticsearch keep ADR-0005 rule 1 (start + skip /
+ * degraded) and are deliberately not consulted.
+ */
+function assertFailStart(
+  retrieval: RetrieveConfig,
+  neo4j: Neo4jConfig | undefined,
+  rerankUrl: string | undefined
+): void {
+  if (retrieval.graphEnabled && neo4j === undefined) {
+    throw new ConfigError(
+      `${RETRIEVAL_GRAPH_ENABLED_VAR} is on (default) but ${NEO4J_URI_VAR} is not configured: a default-on graph capability cannot start without its Neo4j sidecar (ADR-0006 fail-start). Set ${NEO4J_URI_VAR}, or explicitly set ${RETRIEVAL_GRAPH_ENABLED_VAR}=false to run without the graph arm.`
+    );
+  }
+  if (retrieval.rerankEnabled && rerankUrl === undefined) {
+    throw new ConfigError(
+      `${RETRIEVAL_RERANK_ENABLED_VAR} is on (default) but ${RETRIEVAL_RERANK_URL_VAR} is not configured: a default-on rerank capability cannot start without its rerank endpoint (ADR-0006 fail-start). Set ${RETRIEVAL_RERANK_URL_VAR}, or explicitly set ${RETRIEVAL_RERANK_ENABLED_VAR}=false to run without reranking.`
+    );
+  }
 }
 
 /**
@@ -924,6 +956,10 @@ export function loadEnv(): GraphragEnv {
   const elasticsearch = parseElasticsearchConfig();
   const rerank = parseRerankConfig();
   const rerankUrl = readTrimmed(RETRIEVAL_RERANK_URL_VAR);
+  // ADR-0006: after every block parses, refuse a default-on graph/rerank
+  // boot whose dependency is missing. Runs after (not inside) the parsers
+  // so the per-family parse errors keep naming their own vars first.
+  assertFailStart(retrieval, neo4j, rerankUrl);
 
   return {
     logLevel,

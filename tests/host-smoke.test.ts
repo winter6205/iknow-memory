@@ -62,12 +62,14 @@ const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
   "NINE_ROUTER_KEY",
-  // A parent Neo4j URI would make the child attempt the production graph
-  // arm; this suite pins a no-sidecar child. T10 separately verifies that
-  // the default-on capability is marked unattempted when absent.
+  // A parent Neo4j URI / rerank URL must not leak into the child; both are
+  // replaced below with the values this suite pins (ADR-0006).
   "GRAPHRAG_MEMORY_NEO4J_URI",
   "GRAPHRAG_MEMORY_NEO4J_USER",
   "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
+  "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
+  "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
 ] as const;
 
 /**
@@ -89,6 +91,15 @@ function hostSmokeEnv(): Record<string, string> {
   env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   for (const key of HOST_SMOKE_SCRUBBED_ENV_KEYS) env[key] = "";
   env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
+  // ADR-0006 fail-start: a default-on graph child without any URI refuses
+  // to boot. The suite's assertions expect the graph capability present
+  // but unattempted (graph_ppr:unattempted), so pin a controlled dummy URI
+  // instead of switching the arm off. It is never dialed: the child's
+  // MemoryBackend has no neo4jArmSeed seam, so the arm cannot start.
+  env["GRAPHRAG_MEMORY_NEO4J_URI"] = "bolt://127.0.0.1:1";
+  // Rerank has no corpus to permute over stdio smoke traffic; explicit off
+  // is the ADR-0006-legal way to boot without a rerank URL.
+  env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
   return env;
 }
 

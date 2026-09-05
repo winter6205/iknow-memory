@@ -200,9 +200,12 @@ describePg("persisted relation_norm follows the A10 trust policy (SC8)", () => {
   it("maps a rejected claim, keeps a valid one, and never silently coerces", async () => {
     const c = client!;
     await resetSchema(c);
+    // The chunk content must carry all three outputs' evidenceSpan
+    // (`${head} ${raw} ${tail}`) or the persist gate — not the A10 cascade
+    // this test exercises — would drop them.
     await c.query(`INSERT INTO chunks (id, content) VALUES ($1, $2)`, [
       randomUUID(),
-      "Dana Lee works at Initech.",
+      "Dana Lee works at Initech Ravi Patel mysteriously linked to Globex Mona Diaz works at Umbrella",
     ]);
 
     await extractOutputs([

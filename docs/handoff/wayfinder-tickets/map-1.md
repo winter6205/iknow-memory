@@ -9,18 +9,19 @@
 
 ## Live 进度（2026-08-29）
 
-| 项                          | 状态          | 证据（文件 / 已合 PR）                                                                             |
-| --------------------------- | ------------- | -------------------------------------------------------------------------------------------------- |
-| 地基 Stage 0+1 + P0 wiring  | on main       | `plans/p0-wiring-closure.md` · PR #54                                                              |
-| BM25 + SQL 图臂归档         | CLOSED        | PR #68                                                                                             |
-| Neo4j outbox + PPR 图臂     | CLOSED        | PR #77 · `plans/neo4j-graph-arm.md`                                                                |
-| Host T-007 + P@5 harness    | CLOSED        | PR #81 / #87                                                                                       |
-| 图优先排序                  | CLOSED        | PR #94 · `plans/retrieve-graph-priority.md`                                                        |
-| 临时 LLM 精排（quality T1） | CLOSED        | PR #118 · `plans/retrieve-rerank-llm.md`                                                           |
-| 余下检索/图谱质量           | **OPEN 子图** | [map-retrieve-graph-quality.md](map-retrieve-graph-quality.md) · `plans/retrieve-graph-quality.md` |
-| #15 抽取 F1                 | **后置**      | 不进质量子图；勿开工                                                                               |
+| 项                            | 状态          | 证据（文件 / 已合 PR）                                                                             |
+| ----------------------------- | ------------- | -------------------------------------------------------------------------------------------------- |
+| 地基 Stage 0+1 + P0 wiring    | on main       | `plans/p0-wiring-closure.md` · PR #54                                                              |
+| BM25 + SQL 图臂归档           | CLOSED        | PR #68                                                                                             |
+| Neo4j outbox + PPR 图臂       | CLOSED        | PR #77 · `plans/neo4j-graph-arm.md`                                                                |
+| Host T-007 + P@5 harness      | CLOSED        | PR #81 / #87                                                                                       |
+| 图优先排序                    | CLOSED        | PR #94 · `plans/retrieve-graph-priority.md`                                                        |
+| 临时 LLM 精排（quality T1）   | CLOSED        | PR #118 · `plans/retrieve-rerank-llm.md`                                                           |
+| 图/精排 fail-start + 证据留档 | **OPEN**      | `specs/graph-rerank-boot-and-evidence.md` · `plans/graph-rerank-boot-and-evidence.md`              |
+| 余下检索/图谱质量             | **OPEN 子图** | [map-retrieve-graph-quality.md](map-retrieve-graph-quality.md) · `plans/retrieve-graph-quality.md` |
+| #15 抽取 F1                   | **后置**      | 不进质量子图；勿开工                                                                               |
 
-**下回合：** 质量栈 **T2**（专用 HTTP rerank），或并行 **T3 / T4 / T5**。只读 `plans/retrieve-graph-quality.md`。
+**下回合：** 先做 `plans/graph-rerank-boot-and-evidence.md`。质量栈 T2–T11 仍见 `plans/retrieve-graph-quality.md`，不与第一刀混开。
 
 ## 明确未做（勿当成已关）
 

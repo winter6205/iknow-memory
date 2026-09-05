@@ -52,6 +52,12 @@ async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
   // Dimensions is always required by the memory backend.
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
+  // ADR-0006 fail-start: the scrubbed baseline has no Neo4j URI or rerank
+  // URL, which a default-on graph/rerank boot now refuses. These tests
+  // exercise offline tool wiring, not the arms, so switch them off — the
+  // explicit-off path stays legal without the deps.
+  process.env["GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"] = "false";
+  process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
   try {
     return await createServer();
   } finally {

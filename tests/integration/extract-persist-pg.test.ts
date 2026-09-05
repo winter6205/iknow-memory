@@ -309,7 +309,13 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
   it("SC6: the L2 gate rejects on descriptions loaded from the database", async () => {
     const c = client!;
     await resetSchema(c);
-    await seedChunks(c, ["Alice at Acme.", "Bob at Globex."]);
+    // Chunk content must carry the outputs' evidenceSpan (default "Alice
+    // Smith works at Acme Corp") or the persist gate would reject them —
+    // that gate is not what this test exercises.
+    await seedChunks(c, [
+      "Alice Smith works at Acme Corp",
+      "Bob Jones coordinates warehouse logistics for Globex Ltd",
+    ]);
 
     const code = await runExtraction(
       [
@@ -367,7 +373,10 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
   it("SC6: a same-type tail sharing the head's description never yields head_id = tail_id", async () => {
     const c = client!;
     await resetSchema(c);
-    await seedChunks(c, ["Alice Smith mentors Alicia Smith."]);
+    // The default output's evidenceSpan is "Alice Smith works at Acme Corp";
+    // the chunk must contain it or the persist gate (not the SC6 exclusion
+    // this test exercises) would drop the triple.
+    await seedChunks(c, ["Alice Smith works at Acme Corp"]);
 
     // ConstantEmbedder merges any two same-type candidates through L3, so
     // only the candidate-set exclusion can keep the two ends apart.
@@ -426,7 +435,14 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
   it("SC9/T5: L3 merge persists loser → survivor and a repeat extract is idempotent", async () => {
     const c = client!;
     await resetSchema(c);
-    await seedChunks(c, ["Alice at Acme.", "Alicia at Acme.", "Alicia again."]);
+    // Every output's evidenceSpan is the default "Alice Smith works at Acme
+    // Corp" — each chunk content must contain it or the persist gate (not
+    // the L3 merge this test exercises) would drop the triple.
+    await seedChunks(c, [
+      "Alice Smith works at Acme Corp",
+      "Alicia Smith at Alice Smith works at Acme Corp again.",
+      "Alicia again at Alice Smith works at Acme Corp.",
+    ]);
 
     // Chunk 1 creates "Alice Smith"; chunk 2 presents a differing surface
     // form that is merged through L3 and materialized as a loser. Chunk 3

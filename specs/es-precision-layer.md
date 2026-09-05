@@ -1,6 +1,6 @@
 # Spec: Elasticsearch 精度层落地（T14）
 
-> 继承 `specs/retrieval-stack.md`（定档 B）与 C-1 改判。票源：`plans/retrieval-stack.md` T14；tracker：iknow-memory #135。
+> 继承 `specs/retrieval-stack.md`（定档 B）与 C-1 改判。票源：`plans/retrieval-stack.md` T14；tracker：iknow-memory #135（CLOSED 2026-09-04，PR #175）。
 
 ## Objective
 

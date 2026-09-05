@@ -162,27 +162,55 @@ describe("host-smoke: real stdio MCP client against built server", () => {
   );
 
   test(
-    "tools/list returns ingest, invalidate, push, and retrieve with object inputSchemas",
+    "tools/list returns ingest, invalidate, push, extract, and retrieve with object inputSchemas",
     { timeout: 30_000 },
     async () => {
       const client = await connectClient();
       clients.push(client);
 
       const { tools } = await client.listTools();
-      // specs/mcp-tool-surface.md Catalog: exactly these four write/read
-      // tools over the wire (`extract` joins in the follow-up ticket).
-      // `echo` is archived; the invalidation tool answers to `invalidate`.
-      expect(tools.map((t) => t.name).sort()).toEqual([
+      // specs/mcp-tool-surface.md Catalog: exactly these write/read tools
+      // over the wire. `echo` is archived; the invalidation tool answers
+      // to `invalidate`; `extract` runs the lifted core pipeline.
+      const names = tools.map((t) => t.name).sort();
+      expect(names).toEqual([
+        "extract",
         "ingest",
         "invalidate",
         "push",
         "retrieve",
       ]);
+      expect(names).not.toContain("echo");
+      expect(names).not.toContain("invalidation");
 
       for (const tool of tools) {
         expect((tool.inputSchema as { type?: string }).type).toBe("object");
         expect(tool.description.length).toBeGreaterThan(0);
       }
+    }
+  );
+
+  test(
+    "tools/call extract answers the typed no-database error over stdio",
+    { timeout: 30_000 },
+    async () => {
+      // The smoke child runs memory storage with no GRAPHRAG_MEMORY_DB_URL:
+      // extract must fail as a typed tool result (not crash the server),
+      // and the error must be Host-readable without CLI-flag wording.
+      const client = await connectClient();
+      clients.push(client);
+
+      const result = await client.callTool({
+        name: "extract",
+        arguments: { source_ref: "host-smoke-extract-no-db" },
+      });
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ type: string; text?: string }>)
+        .filter((c) => c.type === "text")
+        .map((c) => c.text ?? "")
+        .join("");
+      expect(text).toMatch(/GRAPHRAG_MEMORY_DB_URL/);
+      expect(text).not.toMatch(/--dry-run/);
     }
   );
 

@@ -196,6 +196,29 @@ export interface ProcessBatchOptions {
    * explicit id-list caller).
    */
   batchSize?: number;
+  /**
+   * Per-chunk outcome observer. The CLI ignores it; the MCP extract tool
+   * uses it to report failed chunk ids + error codes WITHOUT re-querying
+   * extraction_records — a write-failure leg rolls the whole chunk
+   * transaction back, so no failed row exists to select for those chunks.
+   */
+  onChunkOutcome?: (outcome: ChunkOutcomeReport) => void;
+}
+
+/**
+ * One chunk's sealed outcome, as reported to `onChunkOutcome`. Mirrors the
+ * `extraction_records` shape (`chunk_id` / `error_code` / `error_msg`) so a
+ * caller can forward it to its client verbatim; write-failure legs carry no
+ * `error_code` of the extraction kind (the record row rolled back with the
+ * transaction), only the thrown write error message.
+ */
+export interface ChunkOutcomeReport {
+  chunkId: string;
+  kind: "ok" | "failed" | "write-failure";
+  /** Failure code on `failed` legs (LLM error code or SELF_LOOP_REJECTED). */
+  errorCode?: string;
+  /** Human-readable failure message on `failed` / `write-failure` legs. */
+  errorMsg?: string;
 }
 
 /** Run the batch, one transaction per chunk (record + entities + triples). */
@@ -218,6 +241,15 @@ export async function processBatch(
     else failed += 1;
     // Every leg defines `ungrounded` (failed legs are 0), so no guard needed.
     ungrounded += out.ungrounded;
+    opts.onChunkOutcome?.({
+      chunkId: chunk.id,
+      kind: out.kind,
+      ...(out.kind === "failed"
+        ? { errorCode: out.errorCode, errorMsg: out.errorMsg }
+        : out.kind === "write-failure"
+          ? { errorMsg: out.errorMsg }
+          : {}),
+    });
   }
   deps.logger.info("extract-batch-complete", {
     batchId,
@@ -240,8 +272,13 @@ export async function processBatch(
 
 type ChunkOutcome =
   | { kind: "ok"; ungrounded: number }
-  | { kind: "failed"; ungrounded: 0 }
-  | { kind: "write-failure"; ungrounded: 0 };
+  | {
+      kind: "failed";
+      ungrounded: 0;
+      errorCode: string;
+      errorMsg: string;
+    }
+  | { kind: "write-failure"; ungrounded: 0; errorMsg: string };
 
 /**
  * Process-log field whitelist (SC10): { time, chunkId, modelId, latencyMs,
@@ -301,7 +338,12 @@ async function processChunk(
         code: outcome.errorCode,
         outcome: "failed",
       });
-      return { kind: "failed", ungrounded: 0 };
+      return {
+        kind: "failed",
+        ungrounded: 0,
+        errorCode: outcome.errorCode,
+        errorMsg: outcome.errorMsg,
+      };
     }
     const counts = await persistOutputs(
       deps,
@@ -328,7 +370,12 @@ async function processChunk(
         reason: "all-outputs-self-loop",
         outcome: "failed",
       });
-      return { kind: "failed", ungrounded: 0 };
+      return {
+        kind: "failed",
+        ungrounded: 0,
+        errorCode: SELF_LOOP_REJECTED_CODE,
+        errorMsg: "all outputs were self-loops",
+      };
     }
     // Same transaction as the ledger rows it describes (SC3): a projection
     // intent that outlived a rolled-back chunk would tell the projector to
@@ -365,7 +412,11 @@ async function processChunk(
       outcome: "write-failed",
       error: err instanceof Error ? err.message : String(err),
     });
-    return { kind: "write-failure", ungrounded: 0 };
+    return {
+      kind: "write-failure",
+      ungrounded: 0,
+      errorMsg: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 

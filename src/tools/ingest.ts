@@ -2,7 +2,8 @@
  * Ingest tool — writes text content into the memory store.
  *
  * Pipeline: validate → size check → embed → store.
- * Stage 1: no triple extraction, no entity resolution (stage 3).
+ * The tool is write-only (specs/mcp-tool-surface.md): content invalidation
+ * is a separate `invalidate` tool, never an ingest action.
  */
 import { createHash } from "node:crypto";
 import { z } from "zod";
@@ -17,23 +18,19 @@ import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
 import type { Logger } from "../logging.js";
-import {
-  normalizeContentInvalidationRequest,
-  supportsContentInvalidation,
-  type ContentInvalidationRecord,
-} from "../core/storage/backend.js";
 
 /**
  * Zod schema for the ingest input. Mirrors `IngestInput` in core/types.ts
  * but with validation rules attached.
  *
- * - Normal ingest: `content` and `source_ref` are non-empty strings.
- * - Invalidation action: `action: "invalidate"` plus `source_ref` and
- *   `triggered_by`; it closes all chunks for that source without a new tool.
+ * - `content` and `source_ref` are required (loose ingest).
  * - `metadata`: optional string-keyed map of unknown values.
  * - `valid_from` / `valid_until`: optional ISO 8601 datetimes. The semantic
  *   check (valid_from < valid_until) lives in the handler, not the schema,
  *   because it depends on cross-field comparison.
+ * - Strict object (specs/mcp-tool-surface.md SC2): unknown keys — including
+ *   the removed `action` / `invalidated_at` / `triggered_by` invalidate
+ *   fields — are validation errors, never silently stripped.
  */
 const IngestBatchItemSchema = z.object({
   content: z.string().min(1, "content must be a non-empty string"),
@@ -52,66 +49,19 @@ const IngestContentSchema = z.union([
 ]);
 
 export const IngestInputSchema = z
-  .object({
-    action: z.enum(["ingest", "invalidate"]).optional(),
+  .strictObject({
     content: IngestContentSchema.optional(),
     source_ref: z.string().min(1, "source_ref must be a non-empty string"),
     metadata: z.record(z.string(), z.unknown()).optional(),
     valid_from: z.string().datetime().optional(),
     valid_until: z.string().datetime().optional(),
-    invalidated_at: z.string().datetime().optional(),
-    triggered_by: z.string().min(1).optional(),
   })
   .superRefine((input, ctx) => {
-    const action = input.action ?? "ingest";
-    if (action === "ingest") {
-      if (input.content === undefined) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["content"],
-          message: "content is required for ingest",
-        });
-      }
-    }
-    if (action === "invalidate") {
-      if (input.content !== undefined) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["content"],
-          message: "content is not allowed for invalidation",
-        });
-      }
-      if (input.triggered_by === undefined) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["triggered_by"],
-          message: "triggered_by is required for invalidation",
-        });
-      }
-      if (
-        input.metadata !== undefined ||
-        input.valid_from !== undefined ||
-        input.valid_until !== undefined
-      ) {
-        ctx.addIssue({
-          code: "custom",
-          path: ["action"],
-          message: "invalidation cannot carry ingest fields",
-        });
-      }
-    }
-    if (action === "ingest" && input.invalidated_at !== undefined) {
+    if (input.content === undefined) {
       ctx.addIssue({
         code: "custom",
-        path: ["invalidated_at"],
-        message: "invalidated_at requires action invalidate",
-      });
-    }
-    if (action === "ingest" && input.triggered_by !== undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["triggered_by"],
-        message: "triggered_by requires action invalidate",
+        path: ["content"],
+        message: "content is required for ingest",
       });
     }
   });
@@ -365,9 +315,6 @@ function validateIngestItem(item: NormalizedIngestItem): void {
  */
 export function createIngestHandler(deps: IngestDeps) {
   return async function ingestHandler(input: IngestInput): Promise<ToolResult> {
-    if (input.action === "invalidate") {
-      return handleInvalidation(deps, input);
-    }
     const items = normalizeIngestItems(input);
     if (items.length === 0) {
       throw new GraphragError(
@@ -443,41 +390,6 @@ export function createIngestHandler(deps: IngestDeps) {
   };
 }
 
-async function handleInvalidation(
-  deps: IngestDeps,
-  input: IngestInput
-): Promise<ToolResult> {
-  if (!supportsContentInvalidation(deps.storage)) {
-    throw new GraphragError(
-      "ingest: selected storage backend does not support content invalidation",
-      "STORAGE_ERROR"
-    );
-  }
-  if (input.source_ref === undefined) {
-    throw new GraphragError(
-      "content invalidation: source_ref must be a non-empty string",
-      "INVALID_INPUT"
-    );
-  }
-  const request = normalizeContentInvalidationRequest(
-    input.source_ref,
-    input.invalidated_at ?? new Date().toISOString(),
-    input.triggered_by ?? ""
-  );
-  const records: ContentInvalidationRecord[] =
-    await deps.storage.invalidateSourceRef(
-      request.sourceRef,
-      request.invalidatedAt,
-      request.triggeredBy
-    );
-  return textResult(
-    JSON.stringify({
-      invalidated_chunk_ids: records.map((record) => record.chunk_id),
-      invalidations: records,
-    })
-  );
-}
-
 /**
  * Wire the ingest tool into the registry. The handler is closed over `deps`
  * so the tool stays a static registration from the registry's perspective.
@@ -485,12 +397,14 @@ async function handleInvalidation(
 export const ingestTool = (deps: IngestDeps): ToolRegistration => ({
   name: "ingest",
   description:
-    "Ingest text content into the knowledge memory store. " +
-    "Chunks, embeds, and stores with optional temporal validity.",
+    "Loose text ingest: write content into the knowledge memory store. " +
+    "Requires content and source_ref; metadata and a temporal validity " +
+    "window (valid_from / valid_until) are optional. The text is chunked, " +
+    "embedded, and stored.",
   inputSchema: IngestInputSchema,
   // The registry's handler signature is `(input: unknown) => ...` (the
   // generic is erased at the boundary so the registry stays a single
   // `ToolRegistrationAny` map). Each tool's real handler is typed against
-  // its own Zod schema; the cast mirrors echo.ts.
+  // its own Zod schema; the cast mirrors the other tool files.
   handler: createIngestHandler(deps) as unknown as ToolRegistration["handler"],
 });

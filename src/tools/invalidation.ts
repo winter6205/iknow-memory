@@ -1,11 +1,10 @@
 /**
- * Invalidation tool — dedicated entry for fin's invalidation_port.
+ * Invalidate tool — MCP name `invalidate` (renamed from `invalidation`,
+ * specs/mcp-tool-surface.md Catalog).
  *
- * Plan D0 I-T5: §B4 content invalidation semantics. This tool is the
- * cross-repo counterpart to fin's `invalidation_port`. It is
- * intentionally distinct from `ingest`'s `action: "invalidate"` path
- * for the same reason `push` is distinct from `ingest`: one tool per
- * caller-facing contract, even when the storage backend is shared.
+ * §B4 content invalidation semantics: one tool per caller-facing
+ * contract, distinct from `ingest` and `push` even though the storage
+ * backend is shared.
  *
  * Behavior:
  *  - Closes the validity window at `invalidated_at`. A subsequent
@@ -119,13 +118,12 @@ export function createInvalidationHandler(deps: InvalidationDeps) {
 }
 
 export const invalidationTool = (deps: InvalidationDeps): ToolRegistration => ({
-  name: "invalidation",
+  name: "invalidate",
   description:
-    "Close the validity window for every chunk of a source_ref. The " +
-    "action appends a record to the per-chunk invalidation ledger " +
-    "(queryable via listInvalidations) and is idempotent on identical " +
-    "requests. No physical delete: chunks remain in the store with a " +
-    "closed valid_until window.",
+    "Close the validity window of every chunk belonging to a source_ref. " +
+    "Idempotent on identical requests, and there is no physical delete: " +
+    "chunks remain in the store with a closed valid_until window, plus a " +
+    "queryable invalidation record per chunk.",
   inputSchema: InvalidationInputSchema,
   handler: createInvalidationHandler(
     deps

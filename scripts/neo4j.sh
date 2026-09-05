@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Neo4j + GDS sidecar for the Cursor Cloud Agent VM.
+# Local Neo4j + GDS sidecar (also used by Cloud Agent install/start).
 #
 # The graph arm (specs/neo4j-graph-arm.md T4) needs a Neo4j that can run
-# `gds.pageRank.stream`, and the Cloud VM has no Docker — so the tarball
-# distribution plus the GDS plugin jar is the only way to get one. Both are
-# unpacked under $HOME, outside the repo, so nothing here can reach git.
+# `gds.pageRank.stream`, and environments without Docker use the tarball
+# plus the GDS plugin jar. Both are unpacked under $HOME, outside the repo,
+# so nothing here can reach git.
 #
 # Auth is disabled rather than given a password: the listener is bound to
 # 127.0.0.1 and a committed password would be a secret in a tracked file.
@@ -15,11 +15,11 @@
 # https://neo4j.com/docs/graph-data-science/current/installation/supported-neo4j-versions/
 #
 # Usage:
-#   bash scripts/cursor-neo4j.sh install   # download + configure (idempotent)
-#   bash scripts/cursor-neo4j.sh start     # start + wait for bolt
-#   bash scripts/cursor-neo4j.sh stop
-#   bash scripts/cursor-neo4j.sh status
-#   eval "$(bash scripts/cursor-neo4j.sh env)"   # export the URI
+#   bash scripts/neo4j.sh install   # download + configure (idempotent)
+#   bash scripts/neo4j.sh start     # start + wait for bolt
+#   bash scripts/neo4j.sh stop
+#   bash scripts/neo4j.sh status
+#   eval "$(bash scripts/neo4j.sh env)"   # export the URI
 set -euo pipefail
 
 NEO4J_VERSION="${NEO4J_VERSION:-5.26.0}"
@@ -29,7 +29,7 @@ NEO4J_HOME="$NEO4J_ROOT/neo4j-community-$NEO4J_VERSION"
 BOLT_PORT="${NEO4J_BOLT_PORT:-7687}"
 BOLT_URI="bolt://127.0.0.1:$BOLT_PORT"
 
-log() { printf '\n=== cursor-neo4j: %s ===\n' "$*"; }
+log() { printf '\n=== neo4j: %s ===\n' "$*"; }
 
 install_neo4j() {
   if [ -x "$NEO4J_HOME/bin/neo4j" ] &&
@@ -39,7 +39,7 @@ install_neo4j() {
   fi
 
   command -v java >/dev/null || {
-    echo "cursor-neo4j: java is required (Neo4j $NEO4J_VERSION needs JDK 17 or 21)" >&2
+    echo "neo4j.sh: java is required (Neo4j $NEO4J_VERSION needs JDK 17 or 21)" >&2
     return 1
   }
 
@@ -68,6 +68,8 @@ install_neo4j() {
 # Neo4j refuses to boot on a duplicated key.
 configure_neo4j() {
   local conf="$NEO4J_HOME/conf/neo4j.conf"
+  # Keep this string: existing installs already have it in neo4j.conf.
+  # Changing it would append a second listen/auth block and refuse boot.
   local marker="# cursor-neo4j: local GDS sidecar"
 
   set_conf "$conf" server.http.enabled false
@@ -107,7 +109,7 @@ start_neo4j() {
     return 0
   fi
   [ -x "$NEO4J_HOME/bin/neo4j" ] || {
-    echo "cursor-neo4j: not installed — run 'cursor-neo4j.sh install' first" >&2
+    echo "neo4j.sh: not installed — run 'neo4j.sh install' first" >&2
     return 1
   }
   log "start"
@@ -120,7 +122,7 @@ start_neo4j() {
     fi
     sleep 2
   done
-  echo "cursor-neo4j: bolt did not come up within 120s" >&2
+  echo "neo4j.sh: bolt did not come up within 120s" >&2
   tail -40 "$NEO4J_HOME/logs/neo4j.log" >&2 || true
   return 1
 }
@@ -137,7 +139,7 @@ status)
   ;;
 env) printf 'export GRAPHRAG_MEMORY_NEO4J_URI=%s\n' "$BOLT_URI" ;;
 *)
-  echo "usage: cursor-neo4j.sh install|start|stop|status|env" >&2
+  echo "usage: neo4j.sh install|start|stop|status|env" >&2
   exit 2
   ;;
 esac

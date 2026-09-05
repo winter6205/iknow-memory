@@ -12,7 +12,7 @@
 ## 当前状态
 
 - **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并 wiring；vector + BM25；Neo4j PPR 图臂；graph-priority 排序；rerank 默认开（缺依赖拒启动见 `specs/graph-rerank-boot-and-evidence.md`，尚未落地）
-- **进行中**：第一刀 `plans/graph-rerank-boot-and-evidence.md`；质量栈 T2–T11 仍见 `plans/retrieve-graph-quality.md`（tracker 只认仓库文件）
+- **进行中**：第一刀 `plans/graph-rerank-boot-and-evidence.md`；第二刀 `plans/mcp-tool-surface.md`；质量栈 T2–T11 仍见 `plans/retrieve-graph-quality.md`
 - **后置**：抽取 F1（#15）、多粒度切分、专用社区/因果等见该 plan 未勾选项
 
 ## Elasticsearch 精度层（可选增强）

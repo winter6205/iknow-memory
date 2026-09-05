@@ -5,6 +5,10 @@ import { GraphragError } from "../src/core/errors.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import type { StorageBackend } from "../src/core/types.js";
 import { createIngestHandler, IngestInputSchema } from "../src/tools/ingest.js";
+import {
+  createInvalidationHandler,
+  InvalidationInputSchema,
+} from "../src/tools/invalidation.js";
 
 const TEST_DIM = 32;
 const SOURCE_REF = "t6/invalidation";
@@ -60,6 +64,7 @@ describe("T6 content invalidation", () => {
   it("closes the window at the invalidation instant and leaves a queryable record", async () => {
     const deps = makeDeps();
     const ingest = createIngestHandler(deps);
+    const invalidate = createInvalidationHandler(deps);
     const ingested = await ingest({
       content: CONTENT,
       source_ref: SOURCE_REF,
@@ -68,8 +73,7 @@ describe("T6 content invalidation", () => {
     const chunkId = JSON.parse(textOf(ingested)).chunk_ids[0] as string;
 
     const before = await queryContent(deps, BEFORE_INVALIDATION);
-    const invalidated = await ingest({
-      action: "invalidate",
+    const invalidated = await invalidate({
       source_ref: SOURCE_REF,
       invalidated_at: INVALIDATED_AT,
       triggered_by: "fin",
@@ -97,17 +101,19 @@ describe("T6 content invalidation", () => {
 
   it("repeating the same invalidation request is idempotent", async () => {
     const deps = makeDeps();
-    const ingest = createIngestHandler(deps);
-    await ingest({ content: CONTENT, source_ref: SOURCE_REF });
+    const invalidate = createInvalidationHandler(deps);
+    await createIngestHandler(deps)({
+      content: CONTENT,
+      source_ref: SOURCE_REF,
+    });
     const request = {
-      action: "invalidate" as const,
       source_ref: SOURCE_REF,
       invalidated_at: INVALIDATED_AT,
       triggered_by: "fin",
     };
 
-    const first = invalidationPayload(await ingest(request));
-    const second = invalidationPayload(await ingest(request));
+    const first = invalidationPayload(await invalidate(request));
+    const second = invalidationPayload(await invalidate(request));
 
     expect(second).toEqual(first);
     await expect(
@@ -118,13 +124,13 @@ describe("T6 content invalidation", () => {
   it("does not reopen a closed row when the same content is re-pushed", async () => {
     const deps = makeDeps();
     const ingest = createIngestHandler(deps);
+    const invalidate = createInvalidationHandler(deps);
     await ingest({
       content: CONTENT,
       source_ref: SOURCE_REF,
       valid_from: "2026-01-01T00:00:00.000Z",
     });
-    await ingest({
-      action: "invalidate",
+    await invalidate({
       source_ref: SOURCE_REF,
       invalidated_at: INVALIDATED_AT,
       triggered_by: "fin",
@@ -156,8 +162,7 @@ describe("T6 content invalidation", () => {
     await second({ content: CONTENT, source_ref: SOURCE_REF });
 
     const invalidated = invalidationPayload(
-      await first({
-        action: "invalidate",
+      await createInvalidationHandler(deps)({
         source_ref: SOURCE_REF,
         invalidated_at: INVALIDATED_AT,
         triggered_by: "fin",
@@ -173,11 +178,10 @@ describe("T6 content invalidation", () => {
 
   it("returns a typed error for an unknown source_ref", async () => {
     const deps = makeDeps();
-    const ingest = createIngestHandler(deps);
+    const invalidate = createInvalidationHandler(deps);
 
     await expect(
-      ingest({
-        action: "invalidate",
+      invalidate({
         source_ref: "t6/unknown",
         invalidated_at: INVALIDATED_AT,
         triggered_by: "fin",
@@ -185,21 +189,45 @@ describe("T6 content invalidation", () => {
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
   });
 
-  it("rejects invalid invalidation input before any storage write", async () => {
+  it("rejects invalid invalidation input before any storage write", () => {
     expect(
-      IngestInputSchema.safeParse({
-        action: "invalidate",
+      InvalidationInputSchema.safeParse({
         source_ref: SOURCE_REF,
         invalidated_at: "not-a-date",
         triggered_by: "fin",
       }).success
     ).toBe(false);
     expect(
+      InvalidationInputSchema.safeParse({
+        source_ref: SOURCE_REF,
+        invalidated_at: INVALIDATED_AT,
+        triggered_by: "",
+      }).success
+    ).toBe(false);
+  });
+
+  it("ingest no longer carries an invalidation action (SC2: write-only)", () => {
+    // specs/mcp-tool-surface.md SC2: `ingest` with action "invalidate"
+    // (or any invalidate-only field) is a validation error — the schema
+    // is strict and knows no such keys. Invalidation is only `invalidate`.
+    expect(
       IngestInputSchema.safeParse({
         action: "invalidate",
         source_ref: SOURCE_REF,
         invalidated_at: INVALIDATED_AT,
-        triggered_by: "",
+        triggered_by: "fin",
+      }).success
+    ).toBe(false);
+    expect(
+      IngestInputSchema.safeParse({
+        source_ref: SOURCE_REF,
+        triggered_by: "fin",
+      }).success
+    ).toBe(false);
+    expect(
+      IngestInputSchema.safeParse({
+        source_ref: SOURCE_REF,
+        invalidated_at: INVALIDATED_AT,
       }).success
     ).toBe(false);
   });
@@ -210,14 +238,13 @@ describe("T6 content invalidation", () => {
       search: async () => [],
       close: async () => {},
     };
-    const ingest = createIngestHandler({
+    const invalidate = createInvalidationHandler({
       embedder: new FakeEmbedder(TEST_DIM),
       storage,
     });
 
     await expect(
-      ingest({
-        action: "invalidate",
+      invalidate({
         source_ref: SOURCE_REF,
         invalidated_at: INVALIDATED_AT,
         triggered_by: "fin",

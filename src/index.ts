@@ -1,15 +1,14 @@
 /**
  * iknow-memory MCP server entry.
  *
- * Stage 0 scaffold: wires the tool registry into a stdio MCP server with
- * one placeholder tool (`echo`). Stage 1 (ticket #36) replaces the
- * registry with real GraphRAG memory tools.
+ * Wires the tool registry into a stdio MCP server. The catalog is the
+ * Host-facing contract frozen by specs/mcp-tool-surface.md: ingest,
+ * push, invalidate, retrieve (extract joins in a follow-up slice).
  *
  * Decoupling contract (per map #33 / ticket #35):
  *   - No import from iknow (`src/shared/schema.ts`, `src/config/`, etc.).
  *   - Provider key env-var names are looked up by NAME, never stored
- *     in code (this scaffold doesn't yet need any keys, but the pattern
- *     is established).
+ *     in code.
  *   - All logging goes to stderr; stdout is reserved for the MCP
  *     stdio JSON-RPC transport.
  *
@@ -30,7 +29,6 @@ import {
   textResult,
   type ToolRegistration,
 } from "./tools/registry.js";
-import { echoTool } from "./tools/echo.js";
 import { ingestTool } from "./tools/ingest.js";
 import { invalidationTool } from "./tools/invalidation.js";
 import { pushTool } from "./tools/push.js";
@@ -299,7 +297,6 @@ export async function createServer(): Promise<McpServer> {
   // Absent → no debug key.
   const debug = process.env.DEBUG === "1";
   const registry = buildRegistry([
-    echoTool,
     ingestTool({ ...deps, logger }),
     invalidationTool(deps),
     pushTool({ ...deps, logger }),

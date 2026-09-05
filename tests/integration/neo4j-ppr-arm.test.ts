@@ -52,6 +52,8 @@ import { createNeo4jPprRanker } from "../../src/core/graph/neo4j-ppr.js";
 import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
 import type { RetrieveConfig } from "../../src/core/retrieval/types.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
+import type { LexicalStorageBackend } from "../../src/core/storage/backend.js";
+import type { RetrievedChunk, SearchOptions } from "../../src/core/types.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
 import { redactDiagnostic } from "../../src/logging.js";
 import {
@@ -76,10 +78,49 @@ const {
 } = pgHarness;
 
 /**
+ * Minimal lexical-arm carrier. Since T14 the BM25 arm rides the
+ * `deps.lexical` seam (an ES precision-layer adapter in production, see
+ * index.ts lexicalAdapterFromPrecision); PgvectorBackend no longer
+ * implements it. This fake stands in that slot so the three-arm test
+ * exercises the same orchestration shape — vector + BM25 + graph running
+ * together through RRF/graph-priority — without dragging Elasticsearch
+ * into a Postgres+Neo4j suite. It asserts orchestration, not BM25
+ * quality; quality lives with the ES precision-layer suites.
+ */
+function makeFakeLexical(): LexicalStorageBackend {
+  const chunk: RetrievedChunk = {
+    id: C_MID,
+    content: "an unrelated middling note",
+    source_ref: `src/${C_MID}`,
+    valid_window: [new Date(Date.now() - 86_400_000).toISOString(), null],
+    score: 0.5,
+  };
+  // Same shape as the production adapter (index.ts lexicalAdapterFromPrecision):
+  // upsert / search / close are intentionally unimplemented — the lexical arm
+  // only ever reads searchLexical, and a call here would mean a wiring bug.
+  return {
+    upsert: () =>
+      Promise.reject(
+        new Error("fake lexical backend does not implement upsert")
+      ),
+    search: () =>
+      Promise.reject(
+        new Error("fake lexical backend does not implement vector search")
+      ),
+    searchLexical: async (
+      _query: string,
+      opts: SearchOptions
+    ): Promise<RetrievedChunk[]> => (opts.limit <= 0 ? [] : [chunk]),
+    close: async () => {},
+  };
+}
+
+/**
  * Production weights, one seed. `entityLinkTopK: 1` pins the anchor to
  * `alice` so the traversal — not the seed query — is what reaches `widget`.
  * BM25 is off so the fused order is pure vector + graph arithmetic; the
- * three-arm case below turns it back on.
+ * three-arm case below turns it back on and supplies the fake lexical
+ * carrier above.
  */
 const CFG: RetrieveConfig = {
   preset: "balanced",
@@ -295,7 +336,11 @@ describeGraph(
 
     async function retrieve(
       config: RetrieveConfig,
-      over: { ranker?: { rankEntities: never } } = {}
+      over: {
+        ranker?: { rankEntities: never };
+        /** Stand a lexical carrier in the deps.lexical slot (T14 seam). */
+        lexical?: LexicalStorageBackend;
+      } = {}
     ) {
       return assembleRetrievalResult(
         {
@@ -306,6 +351,7 @@ describeGraph(
         {
           embedder,
           storage: backend,
+          ...(over.lexical !== undefined ? { lexical: over.lexical } : {}),
           retrieveConfig: config,
           graphRanker: over.ranker ?? ranker,
           debug: true,
@@ -347,7 +393,16 @@ describeGraph(
     });
 
     it("runs all three production arms together on the default weights", async () => {
-      const on = await retrieve({ ...CFG, bm25Enabled: true });
+      // The fake lexical carrier stands where the ES precision adapter sits
+      // in production (deps.lexical, index.ts lexicalAdapterFromPrecision) —
+      // the T14 seam. bm25Hits >= 0 distinguishes "the arm ran" from the
+      // never-ran no-key case the buildDebug contract defines.
+      const on = await retrieve(
+        { ...CFG, bm25Enabled: true },
+        {
+          lexical: makeFakeLexical(),
+        }
+      );
       expect(on.debug?.vectorHits).toBe(3);
       expect(on.debug?.bm25Hits).toBeGreaterThanOrEqual(0);
       expect(on.debug?.graphHits).toBe(2);

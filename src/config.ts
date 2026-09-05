@@ -420,6 +420,7 @@ export const RETRIEVAL_RRF_ENABLED_VAR =
 export const RETRIEVAL_VECTOR_ENABLED_VAR =
   "GRAPHRAG_MEMORY_RETRIEVAL_VECTOR_ENABLED";
 const LLM_AUTH_TOKEN_VAR = "ANTHROPIC_AUTH_TOKEN";
+const RERANK_API_KEY_NAME_VAR = "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV";
 const ANTHROPIC_MODEL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_MODEL";
 const ANTHROPIC_BASE_URL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL";
 /** China MiniMax Anthropic-compatible SDK base (not api.minimax.io). */
@@ -739,8 +740,8 @@ function parseNeo4jConfig(): Neo4jConfig | undefined {
  * ADR-0006 fail-start: a process whose graph or rerank switch is on (the
  * default) must not boot without the dependency the production retrieve
  * path would need. Graph requires a usable Neo4j config; rerank requires
- * the dedicated HTTP endpoint the server wiring actually consults
- * (`env.rerankUrl`). An explicit off switch keeps missing deps legal — that
+ * the HTTP endpoint (`env.rerankUrl`) or the MiniMax/Anthropic LLM secret
+ * (`env.rerank`). An explicit off switch keeps missing deps legal — that
  * is a choice, not a degradation, so no degraded implication is recorded
  * here. Vector / BM25 / Elasticsearch keep ADR-0005 rule 1 (start + skip /
  * degraded) and are deliberately not consulted.
@@ -748,16 +749,21 @@ function parseNeo4jConfig(): Neo4jConfig | undefined {
 function assertFailStart(
   retrieval: RetrieveConfig,
   neo4j: Neo4jConfig | undefined,
-  rerankUrl: string | undefined
+  rerankUrl: string | undefined,
+  rerank: RerankConfig | undefined
 ): void {
   if (retrieval.graphEnabled && neo4j === undefined) {
     throw new ConfigError(
       `${RETRIEVAL_GRAPH_ENABLED_VAR} is on (default) but ${NEO4J_URI_VAR} is not configured: a default-on graph capability cannot start without its Neo4j sidecar (ADR-0006 fail-start). Set ${NEO4J_URI_VAR}, or explicitly set ${RETRIEVAL_GRAPH_ENABLED_VAR}=false to run without the graph arm.`
     );
   }
-  if (retrieval.rerankEnabled && rerankUrl === undefined) {
+  if (
+    retrieval.rerankEnabled &&
+    rerankUrl === undefined &&
+    rerank === undefined
+  ) {
     throw new ConfigError(
-      `${RETRIEVAL_RERANK_ENABLED_VAR} is on (default) but ${RETRIEVAL_RERANK_URL_VAR} is not configured: a default-on rerank capability cannot start without its rerank endpoint (ADR-0006 fail-start). Set ${RETRIEVAL_RERANK_URL_VAR}, or explicitly set ${RETRIEVAL_RERANK_ENABLED_VAR}=false to run without reranking.`
+      `${RETRIEVAL_RERANK_ENABLED_VAR} is on (default) but neither ${RETRIEVAL_RERANK_URL_VAR} nor ${LLM_AUTH_TOKEN_VAR} is configured: a default-on rerank capability cannot start without its HTTP endpoint or LLM secret (ADR-0006 fail-start). Set ${RETRIEVAL_RERANK_URL_VAR} or ${LLM_AUTH_TOKEN_VAR} (or ${RERANK_API_KEY_NAME_VAR}), or explicitly set ${RETRIEVAL_RERANK_ENABLED_VAR}=false to run without reranking.`
     );
   }
 }
@@ -765,13 +771,22 @@ function assertFailStart(
 /**
  * Load retrieve-rerank credentials.
  *
- * Key is `ANTHROPIC_AUTH_TOKEN`. Model / base URL default to China MiniMax
- * M3 (`MiniMax-M3` at `https://api.minimaxi.com/anthropic`) when unset.
- * No key → undefined; the retrieval orchestrator marks default-on rerank as
- * unattempted. Explicit MODEL / BASE_URL still override when a key exists.
+ * Key is `ANTHROPIC_AUTH_TOKEN`, or the var named by
+ * `GRAPHRAG_MEMORY_RERANK_API_KEY_ENV` (operator MiniMax pointer). Model /
+ * base URL default to China MiniMax M3 when unset. No key → undefined.
+ * Explicit MODEL / BASE_URL still override when a key exists.
  */
+function resolveRerankApiKey(): string | undefined {
+  const keyEnvName = readTrimmed(RERANK_API_KEY_NAME_VAR);
+  if (keyEnvName !== undefined) {
+    const pointed = readTrimmed(keyEnvName);
+    if (pointed !== undefined) return pointed;
+  }
+  return readTrimmed(LLM_AUTH_TOKEN_VAR);
+}
+
 function parseRerankConfig(): RerankConfig | undefined {
-  const apiKey = readTrimmed(LLM_AUTH_TOKEN_VAR);
+  const apiKey = resolveRerankApiKey();
   if (apiKey === undefined) return undefined;
   const model = readTrimmed(ANTHROPIC_MODEL_VAR) ?? DEFAULT_LLM_MODEL;
   const baseUrl = (
@@ -959,7 +974,7 @@ export function loadEnv(): GraphragEnv {
   // ADR-0006: after every block parses, refuse a default-on graph/rerank
   // boot whose dependency is missing. Runs after (not inside) the parsers
   // so the per-family parse errors keep naming their own vars first.
-  assertFailStart(retrieval, neo4j, rerankUrl);
+  assertFailStart(retrieval, neo4j, rerankUrl, rerank);
 
   return {
     logLevel,

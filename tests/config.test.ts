@@ -57,6 +57,8 @@ const ANTHROPIC_VARS = [
   "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
   "GRAPHRAG_MEMORY_ANTHROPIC_MODEL",
   "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL",
+  "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV",
+  "MINIMAX_API_KEY",
 ] as const;
 
 /**
@@ -238,6 +240,7 @@ const DOTENV_MASK_KEYS = [
   ...RETRIEVAL_VARS,
   ...PGVECTOR_VARS,
   ...NEO4J_VARS,
+  ...ANTHROPIC_VARS,
 ] as const;
 
 /**
@@ -1599,13 +1602,13 @@ describe("loadEnv — Neo4j sidecar config", () => {
  *
  * A process whose graph or rerank switch is on (the default) must refuse
  * to start when the dependency the production retrieve path would need is
- * missing: graph needs a Neo4j URI, rerank needs the dedicated HTTP
- * rerank URL. An explicit off switch is the only way to boot without the
- * deps, and that choice must not be treated as a degradation. The five
- * boundary classes map: empty/missing → ConfigError; negative (explicit
- * off) → boots; overflow (unusable URI) → still rejected by the existing
- * parse; concurrent → not applicable at boot (single loadEnv call);
- * exception → typed ConfigError naming both vars.
+ * missing: graph needs a Neo4j URI, rerank needs an HTTP rerank URL or
+ * the MiniMax/Anthropic LLM secret. An explicit off switch is the only
+ * way to boot without the deps, and that choice must not be treated as a
+ * degradation. The five boundary classes map: empty/missing → ConfigError;
+ * negative (explicit off) → boots; overflow (unusable URI) → still rejected
+ * by the existing parse; concurrent → not applicable at boot (single
+ * loadEnv call); exception → typed ConfigError naming both vars.
  */
 describe("loadEnv — graph/rerank fail-start (ADR-0006)", () => {
   const URI = "bolt://localhost:7687";
@@ -1651,6 +1654,65 @@ describe("loadEnv — graph/rerank fail-start (ADR-0006)", () => {
         expect(() => loadEnv()).toThrow(ConfigError);
         expect(() => loadEnv()).toThrow(
           /GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED[\s\S]*GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL/
+        );
+      }
+    );
+  });
+
+  it("boots default-on rerank when ANTHROPIC_AUTH_TOKEN is set and the HTTP URL is absent", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: URI,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+        ANTHROPIC_AUTH_TOKEN: "test-key-not-a-real-secret",
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.retrieval.rerankEnabled).toBe(true);
+        expect(env.rerankUrl).toBeUndefined();
+        expect(env.rerank).toEqual({
+          apiKey: "test-key-not-a-real-secret",
+          model: "MiniMax-M3",
+          baseUrl: "https://api.minimaxi.com/anthropic",
+        });
+      }
+    );
+  });
+
+  it("boots default-on rerank when GRAPHRAG_MEMORY_RERANK_API_KEY_ENV names a MiniMax key and the HTTP URL is absent", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: URI,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+        ANTHROPIC_AUTH_TOKEN: "",
+        GRAPHRAG_MEMORY_RERANK_API_KEY_ENV: "MINIMAX_API_KEY",
+        MINIMAX_API_KEY: "minimax-test-key-not-a-real-secret",
+        GRAPHRAG_MEMORY_ANTHROPIC_MODEL: "MiniMax-M3",
+        GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL:
+          "https://api.minimaxi.com/anthropic",
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.retrieval.rerankEnabled).toBe(true);
+        expect(env.rerankUrl).toBeUndefined();
+        expect(env.rerank?.apiKey).toBe("minimax-test-key-not-a-real-secret");
+        expect(env.rerank?.model).toBe("MiniMax-M3");
+      }
+    );
+  });
+
+  it("prefers GRAPHRAG_MEMORY_RERANK_API_KEY_ENV over ANTHROPIC_AUTH_TOKEN when both are set", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_NEO4J_URI: URI,
+        GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "",
+        ANTHROPIC_AUTH_TOKEN: "anthropic-token-should-not-win",
+        GRAPHRAG_MEMORY_RERANK_API_KEY_ENV: "MINIMAX_API_KEY",
+        MINIMAX_API_KEY: "minimax-test-key-not-a-real-secret",
+      },
+      () => {
+        expect(loadEnv().rerank?.apiKey).toBe(
+          "minimax-test-key-not-a-real-secret"
         );
       }
     );

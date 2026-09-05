@@ -53,6 +53,7 @@ import {
   type PprRanker,
 } from "./core/graph/neo4j-ppr.js";
 import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
+import { createAnthropicChunkReranker } from "./core/rerank/anthropic-reranker.js";
 import type { StorageBackend } from "./core/types.js";
 import type { SearchOptions } from "./core/types.js";
 import type { LexicalStorageBackend } from "./core/storage/backend.js";
@@ -103,7 +104,7 @@ interface ServerDeps {
    * See `buildRetrieveDeps`.
    */
   graphRanker?: PprRanker;
-  /** Dedicated HTTP retrieve rerank adapter, absent when no URL is configured. */
+  /** Retrieve rerank adapter: dedicated HTTP URL, else MiniMax LLM. */
   reranker?: {
     permute(
       query: string,
@@ -166,6 +167,24 @@ export function buildRetrieveDeps(
     ...(deps.reranker !== undefined ? { reranker: deps.reranker } : {}),
     debug,
   };
+}
+
+/**
+ * Pick the retrieve rerank adapter the production server actually calls.
+ * Dedicated HTTP URL wins when present (quality-stack T2); otherwise the
+ * MiniMax/Anthropic LLM adapter from slice 0. Neither → no adapter (fail-start
+ * already refused a default-on boot without one of these).
+ */
+export function buildRetrieveReranker(
+  env: Pick<GraphragEnv, "rerankUrl" | "rerank">
+): ServerDeps["reranker"] {
+  if (env.rerankUrl !== undefined) {
+    return createHttpChunkReranker(env.rerankUrl);
+  }
+  if (env.rerank !== undefined) {
+    return createAnthropicChunkReranker(env.rerank);
+  }
+  return undefined;
 }
 
 /**
@@ -280,6 +299,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
   // The ranker is constructed, not connected: `createNeo4jPprRanker` dials
   // Neo4j on the first ranking, so an unreachable sidecar degrades one
   // retrieve instead of stopping the server from starting.
+  const reranker = buildRetrieveReranker(env);
   return {
     embedder,
     storage,
@@ -288,9 +308,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     ...(env.neo4j !== undefined
       ? { graphRanker: createNeo4jPprRanker(env.neo4j) }
       : {}),
-    ...(env.rerankUrl !== undefined
-      ? { reranker: createHttpChunkReranker(env.rerankUrl) }
-      : {}),
+    ...(reranker !== undefined ? { reranker } : {}),
   };
 }
 

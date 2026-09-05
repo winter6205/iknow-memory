@@ -2,11 +2,10 @@
  * Q-T2 wiring — dedicated HTTP rerank adapter behind the retrieve hook
  * (specs/retrieve-graph-quality.md SC1, SC2, SC3, SC14).
  *
- * The orchestrator already routes through `maybeRerank`; the wiring under
- * test is `src/index.ts buildDeps`, which must build `createHttpChunkReranker`
- * only when `env.rerankUrl` is set, and pass `reranker: undefined` otherwise
- * — letting `getReranker()` gate on `rerankEnabled` and letting
- * `maybeRerank` mark the unattempted default-on rerank capability.
+ * The orchestrator already routes through `maybeRerank`. Server wiring
+ * (`buildRetrieveReranker`) builds `createHttpChunkReranker` when
+ * `env.rerankUrl` is set, otherwise the MiniMax LLM adapter when
+ * `env.rerank` creds exist, otherwise no adapter.
  *
  * SC14: no live HTTP. Every test injects `fetch` via `createHttpChunkReranker`
  * (or skips the adapter entirely), so `npm test` never opens a socket.

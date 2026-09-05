@@ -1,7 +1,11 @@
 import { describe, it, expect } from "vitest";
 import assert from "node:assert/strict";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
-import { buildRetrieveDeps, createServer } from "../src/index.ts";
+import {
+  buildRetrieveDeps,
+  buildRetrieveReranker,
+  createServer,
+} from "../src/index.ts";
 import { FakeEmbedder } from "../src/core/embedder.ts";
 import { MemoryBackend } from "../src/core/storage/memory-backend.ts";
 
@@ -33,6 +37,8 @@ const ENV_KEYS = [
   "GRAPHRAG_MEMORY_VECTOR_API_KEY",
   "NINE_ROUTER_KEY",
   "ANTHROPIC_AUTH_TOKEN",
+  "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV",
+  "MINIMAX_API_KEY",
   "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
 ] as const;
@@ -452,5 +458,37 @@ describe("buildRetrieveDeps — temporary LLM rerank wiring", () => {
       false
     );
     expect(deps.reranker).toBe(reranker);
+  });
+});
+
+describe("buildRetrieveReranker — HTTP URL or MiniMax LLM creds", () => {
+  const llm = {
+    apiKey: "test-key-not-a-real-secret",
+    model: "MiniMax-M3",
+    baseUrl: "https://api.minimaxi.com/anthropic",
+  };
+
+  it("omits the adapter when neither HTTP URL nor LLM creds exist", () => {
+    expect(
+      buildRetrieveReranker({ rerankUrl: undefined, rerank: undefined })
+    ).toBeUndefined();
+  });
+
+  it("builds an LLM adapter when MiniMax creds exist and no HTTP URL is set", () => {
+    const built = buildRetrieveReranker({
+      rerankUrl: undefined,
+      rerank: llm,
+    });
+    expect(built).toBeDefined();
+    expect(typeof built?.permute).toBe("function");
+  });
+
+  it("builds an HTTP adapter when a rerank URL is set, even if LLM creds also exist", () => {
+    const built = buildRetrieveReranker({
+      rerankUrl: "https://rerank.example.test/v1/",
+      rerank: llm,
+    });
+    expect(built).toBeDefined();
+    expect(typeof built?.permute).toBe("function");
   });
 });

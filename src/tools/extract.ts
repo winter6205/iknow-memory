@@ -12,8 +12,10 @@
  *
  * Selector — exactly one (xor, enforced by the schema AND re-checked
  * defensively in the handler):
- *   - `chunk_ids`: non-empty list of chunk UUIDs, at most the ingest batch
- *     limit (`readIngestBatchLimit`). Existing ids are processed in the
+ *   - `chunk_ids`: non-empty list of chunk UUIDs, at most the shared batch
+ *     limit (`resolveToolBatchLimit` — the frozen
+ *     GRAPHRAG_MEMORY_INGEST_BATCH_LIMIT cap, same as the ingest tool).
+ *     Existing ids are processed in the
  *     caller's order; re-extracting a known id is allowed (no pending
  *     filter — the caller named the chunks). Ids the store does not have
  *     are reported in `missing_chunk_ids` and counted nowhere.
@@ -41,7 +43,6 @@
  *     failures travel in the response as `failed_chunks` entries shaped
  *     like `extraction_records` rows (chunk_id / error_code / error_msg).
  */
-import type { PoolClient } from "pg";
 import { z } from "zod";
 
 import { GraphragError } from "../core/errors.js";
@@ -57,12 +58,14 @@ import {
   processBatch,
   selectChunksByIds,
   selectPendingChunksBySourceRef,
+  type BatchSummary,
   type ChunkOutcomeReport,
   type ExtractPipelineDeps,
 } from "../core/extraction/pipeline.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
 import { upSchemaP0 } from "../core/storage/schema-p0.js";
-import { ConfigError, readIngestBatchLimit } from "../config.js";
+import { ConfigError } from "../config.js";
+import { resolveToolBatchLimit } from "./batch-limit.js";
 import type { Logger } from "../logging.js";
 import {
   textResult,
@@ -245,25 +248,6 @@ const NOOP_LOGGER: Logger = {
   error: () => {},
 };
 
-/** Same contract as the ingest tool's batch-limit resolution. */
-function resolveBatchLimit(deps: ExtractDeps): number {
-  if (Object.hasOwn(deps, "batchLimit")) {
-    const value = deps.batchLimit;
-    if (
-      value === undefined ||
-      !Number.isFinite(value) ||
-      !Number.isInteger(value) ||
-      value <= 0
-    ) {
-      throw new ConfigError(
-        `extract batch limit must be a finite positive integer, got "${String(value)}"`
-      );
-    }
-    return value;
-  }
-  return readIngestBatchLimit();
-}
-
 /**
  * Build the real persist LLM client through the core credential guard.
  *
@@ -321,6 +305,108 @@ function assertExactlyOneSelector(input: ExtractInput): void {
 }
 
 /**
+ * A resolved selector: the chunks to run plus the selector's extra report
+ * fields (`missing_chunk_ids` for chunk_ids, `more_pending` for source_ref).
+ */
+interface ResolvedSelector {
+  chunks: { id: string; content: string }[];
+  /** chunk_ids selector only: requested ids the store does not have. */
+  missingChunkIds: string[];
+  /** source_ref selector only: a further call will find more pending chunks. */
+  morePending: boolean;
+}
+
+/**
+ * Resolve the xor selector against the store (xor already enforced by
+ * `assertExactlyOneSelector`).
+ *
+ * chunk_ids: existing ids are processed in the caller's order (no pending
+ * filter — the caller named the chunks); ids the store does not have are
+ * reported in `missingChunkIds` (deduplicated) and counted nowhere.
+ * source_ref: that source's pending chunks, oldest first, capped at the
+ * batch limit — `morePending` says a further call will find more (no silent
+ * truncation).
+ */
+async function resolveSelector(
+  client: ExtractClient,
+  input: ExtractInput,
+  batchLimit: number
+): Promise<ResolvedSelector> {
+  if (input.chunk_ids !== undefined) {
+    const chunks = await selectChunksByIds(client, input.chunk_ids);
+    const found = new Set(chunks.map((c) => c.id));
+    const missingChunkIds = [...new Set(input.chunk_ids)].filter(
+      (id) => !found.has(id)
+    );
+    return { chunks, missingChunkIds, morePending: false };
+  }
+  // source_ref is defined here by the xor check above.
+  const scan = await selectPendingChunksBySourceRef(
+    client,
+    input.source_ref as string,
+    batchLimit
+  );
+  return {
+    chunks: scan.chunks,
+    missingChunkIds: [],
+    morePending: scan.hasMore,
+  };
+}
+
+/**
+ * Map one pipeline outcome onto the response's `failed_chunks` entry (the
+ * `extraction_records` shape: chunk_id / error_code / error_msg). `ok`
+ * outcomes map to nothing — only `failed` and `write-failure` legs are
+ * Host-visible failures.
+ */
+function failedChunkFromOutcome(
+  outcome: ChunkOutcomeReport
+): ExtractFailedChunk | undefined {
+  if (outcome.kind === "ok") return undefined;
+  return {
+    chunk_id: outcome.chunkId,
+    error_code:
+      outcome.kind === "failed"
+        ? (outcome.errorCode ?? "UNKNOWN")
+        : // Write failures leave no extraction_records row (the whole chunk
+          // transaction rolled back), so the report code is named here
+          // rather than in the database.
+          "WRITE_FAILURE",
+    error_msg:
+      outcome.errorMsg ??
+      (outcome.kind === "failed"
+        ? "extraction failed"
+        : "database write failed; the chunk transaction rolled back"),
+  };
+}
+
+/**
+ * Assemble the Host-facing JSON payload from the batch summary plus the
+ * selector's report fields.
+ */
+function buildExtractOutput(
+  summary: BatchSummary,
+  failedChunks: ExtractFailedChunk[],
+  selector: ResolvedSelector
+): ExtractOutput {
+  return {
+    batch_id: summary.batchId,
+    processed: summary.processed,
+    succeeded: summary.succeeded,
+    // Host view: every chunk that did not succeed counts as failed;
+    // write_failures is the rolled-back-transaction subset.
+    failed: summary.failed + summary.writeFailures,
+    write_failures: summary.writeFailures,
+    ungrounded: summary.ungrounded,
+    failed_chunks: failedChunks,
+    ...(selector.missingChunkIds.length > 0
+      ? { missing_chunk_ids: selector.missingChunkIds }
+      : {}),
+    ...(selector.morePending ? { more_pending: true as const } : {}),
+  };
+}
+
+/**
  * Build the extract handler with the given dependencies closed over.
  *
  * Order of checks (and why this order):
@@ -342,13 +428,12 @@ export function createExtractHandler(deps: ExtractDeps) {
   // a long-lived caller.
   let schemaReady: Promise<void> | undefined;
   const ensureSchema = (client: ExtractClient): Promise<void> => {
-    schemaReady ??= upSchemaP0(
-      client as unknown as PoolClient,
-      deps.embedderEnv.dimensions
-    ).catch((err: unknown) => {
-      schemaReady = undefined;
-      throw err;
-    });
+    schemaReady ??= upSchemaP0(client, deps.embedderEnv.dimensions).catch(
+      (err: unknown) => {
+        schemaReady = undefined;
+        throw err;
+      }
+    );
     return schemaReady;
   };
 
@@ -356,15 +441,13 @@ export function createExtractHandler(deps: ExtractDeps) {
     input: ExtractInput
   ): Promise<ToolResult> {
     assertExactlyOneSelector(input);
-
-    const batchLimit = resolveBatchLimit(deps);
+    const batchLimit = resolveToolBatchLimit(deps, "extract");
     if (input.chunk_ids !== undefined && input.chunk_ids.length > batchLimit) {
       throw new ExtractBatchLimitExceededError(
         input.chunk_ids.length,
         batchLimit
       );
     }
-
     if (deps.pool === undefined) {
       throw new ExtractNotConfiguredError(
         "extract is not configured: no database. Persisting extraction " +
@@ -372,38 +455,16 @@ export function createExtractHandler(deps: ExtractDeps) {
           "without one, so extract cannot run here."
       );
     }
-
-    // Credentials next: fail fast, before the database is dialed (SC9 —
-    // never downgrade to a fake client to "make it run"). The injected
-    // clients (test seam) skip the guards; production wiring never sets
-    // them.
+    // Credentials next: fail fast before the database is dialed (SC9 —
+    // never a fake client to "make it run"); injected clients (test seam)
+    // skip the guards; production wiring never sets them.
     const llm = deps.llm ?? buildGuardedLlm(deps);
     const embedder = deps.embedder ?? buildGuardedEmbedder(deps);
 
     const client = await deps.pool.connect();
     try {
       await ensureSchema(client);
-
-      // Selector resolution (xor already enforced above).
-      let morePending = false;
-      let missingChunkIds: string[] = [];
-      let chunks: { id: string; content: string }[];
-      if (input.chunk_ids !== undefined) {
-        chunks = await selectChunksByIds(client, input.chunk_ids);
-        const found = new Set(chunks.map((c) => c.id));
-        missingChunkIds = [...new Set(input.chunk_ids)].filter(
-          (id) => !found.has(id)
-        );
-      } else {
-        // source_ref is defined here by the xor check above.
-        const scan = await selectPendingChunksBySourceRef(
-          client,
-          input.source_ref as string,
-          batchLimit
-        );
-        chunks = scan.chunks;
-        morePending = scan.hasMore;
-      }
+      const selector = await resolveSelector(client, input, batchLimit);
 
       const failedChunks: ExtractFailedChunk[] = [];
       const pipelineDeps: ExtractPipelineDeps = {
@@ -413,46 +474,23 @@ export function createExtractHandler(deps: ExtractDeps) {
         ...(deps.precision !== undefined ? { precision: deps.precision } : {}),
         ...(deps.now !== undefined ? { now: deps.now } : {}),
       };
-      const summary = await processBatch(pipelineDeps, client, chunks, {
-        // The source_ref selector is scan-capped at the batch limit; report
-        // the configured cap verbatim, same as the CLI's --batch-size.
-        ...(input.chunk_ids === undefined ? { batchSize: batchLimit } : {}),
-        onChunkOutcome: (outcome: ChunkOutcomeReport) => {
-          if (outcome.kind === "ok") return;
-          failedChunks.push({
-            chunk_id: outcome.chunkId,
-            error_code:
-              outcome.kind === "failed"
-                ? (outcome.errorCode ?? "UNKNOWN")
-                : // Write failures leave no extraction_records row (the
-                  // whole chunk transaction rolled back), so the report code
-                  // is named here rather than in the database.
-                  "WRITE_FAILURE",
-            error_msg:
-              outcome.errorMsg ??
-              (outcome.kind === "failed"
-                ? "extraction failed"
-                : "database write failed; the chunk transaction rolled back"),
-          });
-        },
-      });
-
-      const output: ExtractOutput = {
-        batch_id: summary.batchId,
-        processed: summary.processed,
-        succeeded: summary.succeeded,
-        // Host view: every chunk that did not succeed counts as failed;
-        // write_failures is the rolled-back-transaction subset.
-        failed: summary.failed + summary.writeFailures,
-        write_failures: summary.writeFailures,
-        ungrounded: summary.ungrounded,
-        failed_chunks: failedChunks,
-        ...(missingChunkIds.length > 0
-          ? { missing_chunk_ids: missingChunkIds }
-          : {}),
-        ...(morePending ? { more_pending: true as const } : {}),
-      };
-      return textResult(JSON.stringify(output));
+      const summary = await processBatch(
+        pipelineDeps,
+        client,
+        selector.chunks,
+        {
+          // The source_ref selector is scan-capped at the batch limit; report
+          // the configured cap verbatim, same as the CLI's --batch-size.
+          ...(input.chunk_ids === undefined ? { batchSize: batchLimit } : {}),
+          onChunkOutcome: (outcome: ChunkOutcomeReport) => {
+            const failed = failedChunkFromOutcome(outcome);
+            if (failed !== undefined) failedChunks.push(failed);
+          },
+        }
+      );
+      return textResult(
+        JSON.stringify(buildExtractOutput(summary, failedChunks, selector))
+      );
     } finally {
       client.release();
     }

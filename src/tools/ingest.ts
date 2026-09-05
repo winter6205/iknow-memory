@@ -12,7 +12,7 @@ import {
   type ToolRegistration,
   type ToolResult,
 } from "./registry.js";
-import { ConfigError, readIngestBatchLimit } from "../config.js";
+import { resolveToolBatchLimit } from "./batch-limit.js";
 import type { EmbeddingClient } from "../core/embedder.js";
 import type { ChunkRecord, StorageBackend } from "../core/types.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
@@ -177,24 +177,6 @@ interface NormalizedIngestItem {
   valid_until: string | undefined;
 }
 
-function resolveBatchLimit(deps: IngestDeps): number {
-  if (Object.hasOwn(deps, "batchLimit")) {
-    const value = deps.batchLimit;
-    if (
-      value === undefined ||
-      !Number.isFinite(value) ||
-      !Number.isInteger(value) ||
-      value <= 0
-    ) {
-      throw new ConfigError(
-        `ingest batch limit must be a finite positive integer, got "${String(value)}"`
-      );
-    }
-    return value;
-  }
-  return readIngestBatchLimit();
-}
-
 function normalizeIngestItems(input: IngestInput): NormalizedIngestItem[] {
   const content = input.content;
   if (content === undefined) {
@@ -322,7 +304,7 @@ export function createIngestHandler(deps: IngestDeps) {
         "INVALID_INPUT"
       );
     }
-    const batchLimit = resolveBatchLimit(deps);
+    const batchLimit = resolveToolBatchLimit(deps, "ingest");
     if (items.length > batchLimit) {
       throw new BatchLimitExceededError(items.length, batchLimit);
     }

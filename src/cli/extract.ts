@@ -30,7 +30,7 @@
  * keyless fakes are legal only for the non-persisting flags `--dry-run`,
  * `--list-unmapped` and `--list-failed`.
  */
-import { Pool, type PoolClient } from "pg";
+import { Pool } from "pg";
 
 import { loadEnv, ConfigError, type GraphragEnv } from "../config.js";
 import { createLogger, writeStderr, type Logger } from "../logging.js";
@@ -225,7 +225,7 @@ function reportFatal(logger: Logger, err: unknown): void {
 async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client as unknown as PoolClient, deps.dims);
+    await upSchemaP0(client, deps.dims);
     const chunks = await selectPendingChunks(client, {
       batchSize: flags.batchSize,
       since: flags.since,
@@ -248,7 +248,7 @@ async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
 async function listUnmapped(deps: CliDeps): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client as unknown as PoolClient, deps.dims);
+    await upSchemaP0(client, deps.dims);
     const { rows } = await client.query(
       `SELECT relation_raw, count(*)::int AS count
        FROM triples WHERE relation_norm = 'UNMAPPED'
@@ -282,7 +282,7 @@ async function listFailedReport(
 ): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client as unknown as PoolClient, deps.dims);
+    await upSchemaP0(client, deps.dims);
     const rows = await listFailed(
       client,
       flags.batchId ? { batchId: flags.batchId } : {}
@@ -323,7 +323,7 @@ async function listFailedReport(
 async function backfillEmbeddings(deps: CliDeps): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client as unknown as PoolClient, deps.dims);
+    await upSchemaP0(client, deps.dims);
     const { rows } = await client.query(
       `SELECT id, canonical_name,
               coalesce(metadata->>'description', '') AS description

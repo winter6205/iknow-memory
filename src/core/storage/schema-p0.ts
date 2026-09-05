@@ -12,15 +12,25 @@
  * docs/CONTEXT.md; the DDL contract (columns, constraints, FK actions,
  * indexes) is pinned in specs/p0-schema.md §"DDL Contract".
  *
- * `client` is a pg PoolClient acquired by the caller (opened inside the
- * caller's transaction scope). This module owns no connection lifecycle.
+ * `client` is any query-capable handle the caller leases (a pg PoolClient,
+ * a pg Pool, a CLI's leased client — see `SchemaP0Client`). This module owns
+ * no connection lifecycle.
  */
-import type { PoolClient } from "pg";
-
 import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
 import { GraphragError } from "../errors.js";
 import { upSchemaProjection } from "./schema-projection.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
+
+/**
+ * Minimal client surface the P0 bootstrap consumes: only `query`, with
+ * optional bind values (the only parameterized statements live in
+ * `schema-lock.ts`). A `pg.PoolClient`, a `pg.Pool`, the CLIs' leased
+ * clients and the extract tool's leased client all satisfy it structurally,
+ * so no call site needs a cast.
+ */
+export interface SchemaP0Client {
+  query(text: string, values?: unknown[]): Promise<{ rows: any[] }>;
+}
 
 /**
  * entities: canonical entity rows (+ soft-merge columns, #6 Q1-Q2).
@@ -32,7 +42,7 @@ import { acquireSchemaBootstrapLock } from "./schema-lock.js";
  * #6 Q1: N = chunks embedding dim).
  */
 async function createEntities(
-  client: PoolClient,
+  client: SchemaP0Client,
   dimensions: number
 ): Promise<void> {
   await client.query(`
@@ -53,7 +63,7 @@ async function createEntities(
 }
 
 /** entity_aliases: surface forms pointing at a canonical entity (CASCADE). */
-async function createEntityAliases(client: PoolClient): Promise<void> {
+async function createEntityAliases(client: SchemaP0Client): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS entity_aliases (
       id         uuid PRIMARY KEY,
@@ -72,7 +82,7 @@ async function createEntityAliases(client: PoolClient): Promise<void> {
 }
 
 /** triples: (head, relation, tail) edges with provenance + valid_window. */
-async function createTriples(client: PoolClient): Promise<void> {
+async function createTriples(client: SchemaP0Client): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS triples (
       id              uuid PRIMARY KEY,
@@ -118,7 +128,7 @@ async function createTriples(client: PoolClient): Promise<void> {
 }
 
 /** extraction_records: chunk-level extraction outcomes, batch_id aggregate. */
-async function createExtractionRecords(client: PoolClient): Promise<void> {
+async function createExtractionRecords(client: SchemaP0Client): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS extraction_records (
       id             uuid PRIMARY KEY,
@@ -184,7 +194,7 @@ export function assertPgvectorAnnDimensions(
 }
 
 async function createCommunitySummaries(
-  client: PoolClient,
+  client: SchemaP0Client,
   dimensions: number
 ): Promise<void> {
   await client.query(`
@@ -215,7 +225,7 @@ async function createCommunitySummaries(
  * Postgres (`postgres` superuser) and aligns with the existing backend.
  */
 export async function upSchemaP0(
-  client: PoolClient,
+  client: SchemaP0Client,
   dimensions: number,
   annMaxDimensions = readPgvectorAnnMaxDimensions()
 ): Promise<void> {

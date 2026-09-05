@@ -53,7 +53,7 @@ log "neo4j + gds sidecar (graph-arm integration tests need gds.pageRank)"
 # Best-effort: a VM without the sidecar still builds and still runs every
 # suite — the graph tests loud-skip instead, which is their designed
 # behaviour, not a broken environment.
-if ! bash "$REPO_ROOT/scripts/cursor-neo4j.sh" install; then
+if ! bash "$REPO_ROOT/scripts/neo4j.sh" install; then
   log "neo4j install failed — graph integration tests will loud-skip"
 fi
 

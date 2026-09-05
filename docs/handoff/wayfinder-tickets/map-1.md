@@ -18,6 +18,7 @@
 | 图优先排序                    | CLOSED        | PR #94 · `plans/retrieve-graph-priority.md`                                                        |
 | 临时 LLM 精排（quality T1）   | CLOSED        | PR #118 · `plans/retrieve-rerank-llm.md`                                                           |
 | 图/精排 fail-start + 证据留档 | **OPEN**      | `specs/graph-rerank-boot-and-evidence.md` · `plans/graph-rerank-boot-and-evidence.md`              |
+| MCP 工具面                    | **OPEN**      | `specs/mcp-tool-surface.md` · `plans/mcp-tool-surface.md`                                          |
 | 余下检索/图谱质量             | **OPEN 子图** | [map-retrieve-graph-quality.md](map-retrieve-graph-quality.md) · `plans/retrieve-graph-quality.md` |
 | #15 抽取 F1                   | **后置**      | 不进质量子图；勿开工                                                                               |
 

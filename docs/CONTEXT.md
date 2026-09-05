@@ -8,7 +8,7 @@
 
 ### Product identity
 
-**iknow-memory**: the standalone, host-agnostic knowledge memory MCP server. Stores, indexes, and retrieves semantic facts with temporal validity; exposes MCP tools (`ingest`, `retrieve`) over stdio. Does not assemble context, trigger retrieval, or manage conversation state — those are the host's job.
+**iknow-memory**: the standalone, host-agnostic knowledge memory MCP server. Stores, indexes, and retrieves semantic facts with temporal validity; exposes MCP tools (`ingest`, `push`, `invalidate`, `extract`, `retrieve`) over stdio. Does not assemble context, trigger retrieval, or manage conversation state — those are the host's job.
 _Avoid_: "knowledge base" (implies curated documents, not extracted facts); "memory backend" (too generic)
 
 **MCP tool**: a function exposed via Model Context Protocol (`tools/list` + `tools/call`). iknow-memory defines its own tool protocol — not constrained by any legacy tool contract.
@@ -111,19 +111,22 @@ _Avoid_: "cluster" (too generic, used in embedding clustering too); "topic group
 
 ### Pipeline
 
-**ingest**: the write pipeline for final pushed text: validate → size check → embed → store as-is. Pushed text is final text; fin is the sole chunking authority, and iknow-memory does not re-chunk, truncate, reassemble, or normalize/rewrite it. Exposed as MCP tool `ingest(input: {content, source_ref, metadata?, valid_from?, valid_until?}) → {chunk_ids}`. Stage 1: chunks-only. P0 adds: → extract triples → resolve entities → store graph.
+**ingest**: the write pipeline for final pushed text: validate → size check → embed → store as-is. Pushed text is final text; fin is the sole chunking authority, and iknow-memory does not re-chunk, truncate, reassemble, or normalize/rewrite it. Exposed as MCP tool `ingest` (content + `source_ref`, optional metadata / validity → `{chunk_ids}`). Does not invalidate and does not run **extract_triples**.
 _Avoid_: "index" (implies search-index building, not knowledge extraction); "import" (implies bulk file loading)
+
+**push**: the strict MCP write tool: every item requires metadata and a validity window; the idempotency key is `(source_ref, content identity)`; a re-push returns the same **chunk** ids without growing rows. Distinct from **ingest** (optional fields). Does not run **extract_triples**.
+_Avoid_: "upsert" (the guarantee is idempotent push, not the SQL verb); "fin port" (any Host may call it)
 
 **ingest idempotency**: the guarantee that repeated pushes of the same idempotency key — (`source_ref`, content identity, where content identity hashes chunk text plus the normalization / parsing-rule / parameter versions) — produce no second write and return the same **chunk** ids. A failed push is returned by name and is not counted against the idempotency assertion. _Stage: `specs/retrieval-stack.md` (C-9)._
 _Avoid_: "upsert" (idempotency is a result contract, not the SQL mechanism); "dedupe" (implies removing a duplicate after the fact); "at-least-once ingest" (transport property, not the guarantee)
 
-**content invalidation**: the ingest-side action that closes a **chunk**'s `valid_window` so the content stops matching any query time. It never physically deletes the row, is repeatable, and leaves a queryable invalidation record (chunk id, invalidation instant, triggering party). _Stage: `specs/retrieval-stack.md` (C-9)._
+**content invalidation**: the action that closes a **chunk**'s `valid_window` so the content stops matching any query time. Exposed as MCP tool `invalidate`. It never physically deletes the row, is repeatable, and leaves a queryable invalidation record (chunk id, invalidation instant, triggering party). Not an `ingest` action. _Stage: `specs/retrieval-stack.md` (C-9); MCP name `specs/mcp-tool-surface.md`._
 _Avoid_: "delete" (the row stays); "expire" (a scheduled TTL, not a change-triggered close); "tombstone" (no marker row replaces the chunk)
 
 **retrieve**: the read pipeline: embed query once → entity seeds + Neo4j **PPR** (when configured) mapping to chunks via `source_chunk_id` → non-empty graph hits lead Host `chunks[]`, else (and remainder slots) vector ∥ BM25 → **RRF fusion** → optional entity-embedding seeds / community-summary hits → optional **rerank** (slice 0 temporary Anthropic on main, default on; dedicated HTTP later) → optional **neighbor evidence** → top-K, with default-on graph/rerank missing deps refusing boot (ADR-0006) and other gaps or retrieve-time failures surfaced through `degraded` and `degraded_reasons`. Optional drain wait is default off; exposed as MCP tool `retrieve(input: {query, valid_at?, filters?, limit?}) → {chunks[]}`; wire stays `{ chunks[] }` (+ optional `degraded` / `degraded_reasons`). Host `chunks[]` does not carry **evidence span**. _Stage: graph-priority + default-on rerank + ADR-0006 boot on `specs/graph-rerank-boot-and-evidence.md`; later steps `specs/retrieve-graph-quality.md`._
 _Avoid_: "search" (too broad); "three-arm retrieve" (retired ranking); "recall" (one stage, not the whole pipeline)
 
-**extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. Not an MCP tool — it runs as the `extract` CLI batch pipeline, separate from `ingest`. _Stage: P0 (implemented)._
+**extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. Exposed as MCP tool `extract` (`chunk_ids` xor `source_ref`, synchronous, **mark-and-continue**) and as the extract CLI. CLI-only: `--dry-run`, `--list-failed`, `--list-unmapped`, `--backfill-embeddings`. Not folded into **ingest** or **push**. _Stage: CLI on main; MCP `extract` is `specs/mcp-tool-surface.md`._
 _Avoid_: "parse" (implies deterministic grammar, extraction is LLM-based); "NER" (NER is one sub-step, not the whole pipeline)
 
 **embedding backfill**: the idempotent NULL-embedding repair mode (CLI flag `--backfill-embeddings`) that embeds and UPDATEs every live entity row `WHERE embedding IS NULL` using the stored description; an immediate second run updates 0 rows. Never runs automatically inside a normal extraction run. _Stage: P0 (implemented per `specs/p0-wiring-closure.md`)._

@@ -11,13 +11,13 @@
 import { afterAll, beforeAll, describe, it, expect, vi } from "vitest";
 
 import {
-  loadEntities,
   parseArgs,
   runCli,
   type CliClient,
   type CliPool,
   type CliDeps,
 } from "../../src/cli/extract.js";
+import { loadEntities } from "../../src/core/extraction/persist.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js";

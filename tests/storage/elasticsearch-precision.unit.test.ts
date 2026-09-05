@@ -351,7 +351,7 @@ describe("ElasticsearchPrecisionLayer.invalidateSourceRef", () => {
   // The precision layer's invalidate is a derived-index mirror of the
   // authoritative Postgres close. Tests assert the request body the
   // adapter sends and the fail-fast contract used by the caller (the
-  // invalidation tool) for fail-open: a thrown PrecisionLayerError is
+  // `invalidate` tool) for fail-open: a thrown PrecisionLayerError is
   // what the tool catches and turns into a degraded response.
   it("issues an update_by_query that targets the chunk index by source_ref", async () => {
     const client = fakeClientWithInvalidation({ kind: "ok" });

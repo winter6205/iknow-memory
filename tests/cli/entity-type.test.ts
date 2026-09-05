@@ -12,7 +12,7 @@
  */
 import { describe, it, expect } from "vitest";
 
-import { normalizeEntityType } from "../../src/cli/entity-type.js";
+import { normalizeEntityType } from "../../src/core/extraction/entity-type.js";
 
 /** Capture the info-level fallback log so we can assert it fires. */
 function captureLogger() {

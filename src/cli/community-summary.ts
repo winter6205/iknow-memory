@@ -13,7 +13,7 @@
  *   3 documented skip — no Neo4j URI, so Louvain is not attempted
  */
 import { randomUUID } from "node:crypto";
-import { Pool, type PoolClient } from "pg";
+import { Pool } from "pg";
 
 import {
   ConfigError,
@@ -118,7 +118,7 @@ export async function runCli(
   const client = await deps.pool.connect();
   try {
     if (!parsed.flags.dryRun) {
-      await upSchemaP0(client as unknown as PoolClient, deps.dimensions);
+      await upSchemaP0(client, deps.dimensions);
     }
     let communities: Community[];
     try {

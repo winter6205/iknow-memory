@@ -134,22 +134,42 @@ function textOf(result: { content: unknown }): string {
 }
 
 describe("createServer — registered tool set (T7)", () => {
-  it("tools/list advertises echo, ingest, invalidation, push, and retrieve", async () => {
-    // Plan D0 I-T4 + I-T5: `push` and `invalidation` joined the tool
-    // set. The wire-level tool set is now echo + ingest + invalidation
-    // + push + retrieve.
+  it("tools/list advertises ingest, invalidate, push, extract, and retrieve", async () => {
+    // specs/mcp-tool-surface.md Catalog: the Host-facing tool set is
+    // exactly ingest + invalidate + push + extract + retrieve. `echo` is
+    // archived and the invalidation tool answers to `invalidate`.
     const { client, close } = await connectInProcess();
     try {
       const { tools } = await client.listTools();
-      expect(tools.map((t) => t.name).sort()).toEqual([
-        "echo",
+      const names = tools.map((t) => t.name).sort();
+      expect(names).toEqual([
+        "extract",
         "ingest",
-        "invalidation",
+        "invalidate",
         "push",
         "retrieve",
       ]);
+      // The archived names are gone from the wire, not merely shadowed.
+      expect(names).not.toContain("echo");
+      expect(names).not.toContain("invalidation");
       for (const tool of tools) {
         expect((tool.inputSchema as { type?: string }).type).toBe("object");
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("tool descriptions are Host-readable (no internal jargon)", async () => {
+    // specs/mcp-tool-surface.md assumption 12: descriptions on tools/list
+    // are for any Host. No "stage 0", no fin-port wire names.
+    const { client, close } = await connectInProcess();
+    try {
+      const { tools } = await client.listTools();
+      for (const tool of tools) {
+        expect(tool.description).not.toMatch(
+          /stage 0|fin\b|_port|invalidation_port/i
+        );
       }
     } finally {
       await close();
@@ -172,6 +192,47 @@ describe("createServer — registered tool set (T7)", () => {
       expect(textOf(result)).toMatch(
         /embedding credentials are not configured/
       );
+    } finally {
+      await close();
+    }
+  });
+
+  it("tools/call extract reports the typed no-database configuration error", async () => {
+    // The offline server has no GRAPHRAG_MEMORY_DB_URL, so the extract
+    // tool answers a typed configuration error instead of crashing the
+    // server or pretending to run (specs/mcp-tool-surface.md: extract
+    // persists, so it cannot run without a database — the other tools
+    // stay usable).
+    const { client, close } = await connectInProcess();
+    try {
+      const result = await client.callTool({
+        name: "extract",
+        arguments: { source_ref: "test://extract-no-db" },
+      });
+      expect(result.isError).toBe(true);
+      const text = textOf(result);
+      expect(text).toMatch(/GRAPHRAG_MEMORY_DB_URL/);
+      // The core guards' CLI-flag wording must not reach the Host.
+      expect(text).not.toMatch(/--dry-run/);
+    } finally {
+      await close();
+    }
+  });
+
+  it("tools/call extract rejects both selectors at once", async () => {
+    // v2 wraps input-validation failures as a CallToolResult with
+    // isError:true — the xor selector rule rides the zod superRefine.
+    const { client, close } = await connectInProcess();
+    try {
+      const result = await client.callTool({
+        name: "extract",
+        arguments: {
+          chunk_ids: ["0f0a3f8e-1c2b-4d5e-8f90-1a2b3c4d5e6f"],
+          source_ref: "test://both-selectors",
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toMatch(/exactly one selector/i);
     } finally {
       await close();
     }

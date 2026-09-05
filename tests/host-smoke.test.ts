@@ -5,14 +5,15 @@
  *   (a) stdio JSON-RPC handshake: initialize / initialized under a real
  *       MCP client (v2 @modelcontextprotocol/client's Client +
  *       StdioClientTransport spawning our dist/index.js).
- *   (b) tool discovery: tools/list returns echo + ingest + retrieve.
+ *   (b) tool discovery: tools/list returns ingest + invalidate + push
+ *       + retrieve.
  *   (c) tool call: tools/call round-trips the documented text shape.
- *   (d) negative input: empty message -> isError:true result (v2 wraps
+ *   (d) negative input: empty query -> isError:true result (v2 wraps
  *       input-validation failures as a tool result, not a JSON-RPC error).
  *   (e) concurrent clients: two clients against one server each complete.
- *   (f) zod4 JSON Schema: the echo inputSchema carries minLength:1 (zod
- *       v4 maps .min(1) to minLength, not the v3 minimum), proving the
- *       3.25 -> 4.2 upgrade did not silently drop the constraint.
+ *   (f) zod4 JSON Schema: the retrieve inputSchema carries minLength:1
+ *       (zod v4 maps .min(1) to minLength, not the v3 minimum), proving
+ *       the 3.25 -> 4.2 upgrade did not silently drop the constraint.
  *   (g) host-agnostic decoupling (negative check): the dist artifact's
  *       runtime imports do NOT include anything from the iknow repo.
  *
@@ -161,42 +162,68 @@ describe("host-smoke: real stdio MCP client against built server", () => {
   );
 
   test(
-    "tools/list returns echo, ingest, and retrieve with object inputSchemas",
+    "tools/list returns ingest, invalidate, push, extract, and retrieve with object inputSchemas",
     { timeout: 30_000 },
     async () => {
       const client = await connectClient();
       clients.push(client);
 
       const { tools } = await client.listTools();
-      // Plan D0 I-T4 + I-T5: `push` and `invalidation` joined the tool
-      // set alongside the existing `ingest` and `retrieve` entries.
-      expect(tools.map((t) => t.name).sort()).toEqual([
-        "echo",
+      // specs/mcp-tool-surface.md Catalog: exactly these write/read tools
+      // over the wire. `echo` is archived; the invalidation tool answers
+      // to `invalidate`; `extract` runs the lifted core pipeline.
+      const names = tools.map((t) => t.name).sort();
+      expect(names).toEqual([
+        "extract",
         "ingest",
-        "invalidation",
+        "invalidate",
         "push",
         "retrieve",
       ]);
+      expect(names).not.toContain("echo");
+      expect(names).not.toContain("invalidation");
 
-      const echo = tools.find((t) => t.name === "echo")!;
-      expect(echo.description).toMatch(/placeholder|stage/i);
       for (const tool of tools) {
         expect((tool.inputSchema as { type?: string }).type).toBe("object");
+        expect(tool.description.length).toBeGreaterThan(0);
       }
     }
   );
 
   test(
-    "tools/call round-trips the message as text content",
+    "tools/call extract answers the typed no-database error over stdio",
+    { timeout: 30_000 },
+    async () => {
+      // The smoke child runs memory storage with no GRAPHRAG_MEMORY_DB_URL:
+      // extract must fail as a typed tool result (not crash the server),
+      // and the error must be Host-readable without CLI-flag wording.
+      const client = await connectClient();
+      clients.push(client);
+
+      const result = await client.callTool({
+        name: "extract",
+        arguments: { source_ref: "host-smoke-extract-no-db" },
+      });
+      expect(result.isError).toBe(true);
+      const text = (result.content as Array<{ type: string; text?: string }>)
+        .filter((c) => c.type === "text")
+        .map((c) => c.text ?? "")
+        .join("");
+      expect(text).toMatch(/GRAPHRAG_MEMORY_DB_URL/);
+      expect(text).not.toMatch(/--dry-run/);
+    }
+  );
+
+  test(
+    "tools/call retrieve round-trips a JSON chunks envelope as text content",
     { timeout: 30_000 },
     async () => {
       const client = await connectClient();
       clients.push(client);
 
-      const message = "ping from host-smoke @ " + new Date().toISOString();
       const result = await client.callTool({
-        name: "echo",
-        arguments: { message },
+        name: "retrieve",
+        arguments: { query: "ping from host-smoke" },
       });
       expect(result.isError).not.toBe(true);
 
@@ -204,12 +231,14 @@ describe("host-smoke: real stdio MCP client against built server", () => {
         .filter((c) => c.type === "text")
         .map((c) => c.text ?? "")
         .join("");
-      expect(text).toBe(message);
+      // Empty store: "no results" is a valid, well-formed answer.
+      const payload = JSON.parse(text) as { chunks: unknown[] };
+      expect(Array.isArray(payload.chunks)).toBe(true);
     }
   );
 
   test(
-    "empty message returns isError:true result (v2 semantics)",
+    "empty query returns isError:true result (v2 semantics)",
     { timeout: 30_000 },
     async () => {
       const client = await connectClient();
@@ -219,8 +248,8 @@ describe("host-smoke: real stdio MCP client against built server", () => {
       // isError:true (tool-result semantics), NOT a JSON-RPC error that
       // rejects the promise. v1 rejected; the schema's min(1) still fires.
       const bad = await client.callTool({
-        name: "echo",
-        arguments: { message: "" },
+        name: "retrieve",
+        arguments: { query: "" },
       });
       expect(bad.isError).toBe(true);
 
@@ -237,14 +266,15 @@ describe("host-smoke: real stdio MCP client against built server", () => {
     { timeout: 30_000 },
     async () => {
       // Two independent clients against two independent server processes,
-      // both calling echo in parallel. A transport/event-loop regression
-      // (the v1 teardown-hang class) would surface as a hang or timeout.
+      // both calling retrieve in parallel. A transport/event-loop
+      // regression (the v1 teardown-hang class) would surface as a hang
+      // or timeout.
       const [a, b] = await Promise.all([connectClient(), connectClient()]);
       clients.push(a, b);
 
       const [ra, rb] = await Promise.all([
-        a.callTool({ name: "echo", arguments: { message: "from-A" } }),
-        b.callTool({ name: "echo", arguments: { message: "from-B" } }),
+        a.callTool({ name: "retrieve", arguments: { query: "from-A" } }),
+        b.callTool({ name: "retrieve", arguments: { query: "from-B" } }),
       ]);
       expect(ra.isError).not.toBe(true);
       expect(rb.isError).not.toBe(true);
@@ -252,7 +282,7 @@ describe("host-smoke: real stdio MCP client against built server", () => {
   );
 
   test(
-    "zod4 emits minLength:1 on echo inputSchema (3.25 -> 4.2 regression guard)",
+    "zod4 emits minLength:1 on retrieve inputSchema (3.25 -> 4.2 regression guard)",
     { timeout: 30_000 },
     async () => {
       // zod v3 mapped .min(1) on a string to `minimum` (wrong keyword for
@@ -264,13 +294,12 @@ describe("host-smoke: real stdio MCP client against built server", () => {
       clients.push(client);
 
       const { tools } = await client.listTools();
-      const echo = tools.find((t) => t.name === "echo")!;
-      const messageProp = (
-        echo.inputSchema as { properties?: Record<string, unknown> }
-      ).properties?.message as
-        { minLength?: number; type?: string } | undefined;
-      expect(messageProp?.type).toBe("string");
-      expect(messageProp?.minLength).toBe(1);
+      const retrieve = tools.find((t) => t.name === "retrieve")!;
+      const queryProp = (
+        retrieve.inputSchema as { properties?: Record<string, unknown> }
+      ).properties?.query as { minLength?: number; type?: string } | undefined;
+      expect(queryProp?.type).toBe("string");
+      expect(queryProp?.minLength).toBe(1);
     }
   );
 
@@ -410,8 +439,8 @@ describe("host-smoke: real stdio MCP client against built server", () => {
         });
         // The construction line is emitted before connect() resolves, but
         // the stderr pipe is only drained once a listener attaches; one
-        // echo round-trip is enough to flush it.
-        await client.callTool({ name: "echo", arguments: { message: "x" } });
+        // retrieve round-trip is enough to flush it.
+        await client.callTool({ name: "retrieve", arguments: { query: "x" } });
       } finally {
         for (const [k, v] of saved) {
           if (v === undefined) delete process.env[k];

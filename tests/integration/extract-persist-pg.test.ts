@@ -30,7 +30,8 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { loadEntities, runCli, type CliDeps } from "../../src/cli/extract.js";
+import { runCli, type CliDeps } from "../../src/cli/extract.js";
+import { loadEntities } from "../../src/core/extraction/persist.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { mergeEntitiesWithGating } from "../../src/core/entities/merge.js";

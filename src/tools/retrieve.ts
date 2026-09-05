@@ -263,13 +263,15 @@ function applyWaitOverrides(
 export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
   name: "retrieve",
   description:
-    "Semantic search over the knowledge memory store. Returns ranked chunks filtered by temporal validity.",
+    "Ranked chunk search over the knowledge memory store, filtered by " +
+    "temporal validity.",
   inputSchema:
     deps.inputValidationFailureCounter === undefined
       ? RetrieveInputSchema
       : createRetrieveInputSchema(deps.inputValidationFailureCounter),
   // The registry's erased `ToolRegistrationAny` takes `input: unknown`;
-  // the schema validates upstream, so this cast is sound (mirrors echo.ts).
+  // the schema validates upstream, so this cast is sound (mirrors the
+  // other tool files).
   handler: createRetrieveHandler(
     deps
   ) as unknown as ToolRegistration["handler"],

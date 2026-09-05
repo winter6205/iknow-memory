@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
-import type { PoolClient } from "pg";
 
+import type { SchemaP0Client } from "./schema-p0.js";
 import { GraphragError } from "../errors.js";
 
 const UINT64_MASK = (1n << 64n) - 1n;
@@ -60,12 +60,11 @@ export function schemaBootstrapLockKey(schemaName: string): bigint {
  * caller can then commit without replaying DDL against active writers.
  */
 export async function acquireSchemaBootstrapLock(
-  client: PoolClient
+  client: SchemaP0Client
 ): Promise<boolean> {
-  const result = await client.query<{ schema_name: string | null }>(
-    "SELECT current_schema() AS schema_name"
-  );
-  const schemaName = result.rows[0]?.schema_name;
+  const result = await client.query("SELECT current_schema() AS schema_name");
+  const schemaName = (result.rows as { schema_name: string | null }[])[0]
+    ?.schema_name;
   if (result.rows.length === 0) {
     return false;
   }
@@ -83,8 +82,10 @@ export async function acquireSchemaBootstrapLock(
   return schemaBootstrapIsReady(client);
 }
 
-async function schemaBootstrapIsReady(client: PoolClient): Promise<boolean> {
-  const result = await client.query<{ ready: boolean }>(
+async function schemaBootstrapIsReady(
+  client: SchemaP0Client
+): Promise<boolean> {
+  const result = await client.query(
     `SELECT
        EXISTS (
          SELECT 1 FROM pg_extension WHERE extname = 'vector'
@@ -126,5 +127,6 @@ async function schemaBootstrapIsReady(client: PoolClient): Promise<boolean> {
        ) AS ready`,
     [BOOTSTRAP_TABLES, BOOTSTRAP_INDEXES]
   );
-  return result.rows[0]?.ready === true;
+  const rows = result.rows as { ready: boolean }[];
+  return rows[0]?.ready === true;
 }

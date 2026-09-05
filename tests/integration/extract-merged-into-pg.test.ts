@@ -28,7 +28,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { linkMergedEntity } from "../../src/cli/extract.js";
+import { linkMergedEntity } from "../../src/core/extraction/persist.js";
 import { resolveCanonicalId } from "../../src/core/entities/resolve.js";
 import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
 import { warnPgUnavailable } from "./pg-test-harness.js";

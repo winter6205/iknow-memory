@@ -4,6 +4,7 @@ import { afterAll, beforeAll, expect, it } from "vitest";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { createIngestHandler } from "../../src/tools/ingest.js";
+import { createInvalidationHandler } from "../../src/tools/invalidation.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 32;
@@ -57,6 +58,12 @@ describePg("T6 content invalidation: live PostgreSQL", () => {
   it("keeps the row, removes it at and after the instant, and persists an idempotent record", async () => {
     const embedder = new FakeEmbedder(DIM);
     const ingest = createIngestHandler({ embedder, storage: backend! });
+    // The MCP tool is `invalidate` (specs/mcp-tool-surface.md); the
+    // close-window semantics under Postgres are unchanged.
+    const invalidate = createInvalidationHandler({
+      embedder,
+      storage: backend!,
+    });
     const ingested = await ingest({
       content: CONTENT,
       source_ref: SOURCE_REF,
@@ -70,13 +77,12 @@ describePg("T6 content invalidation: live PostgreSQL", () => {
     );
 
     const request = {
-      action: "invalidate" as const,
       source_ref: SOURCE_REF,
       invalidated_at: INVALIDATED_AT,
       triggered_by: "fin",
     };
-    const first = await ingest(request);
-    const second = await ingest(request);
+    const first = await invalidate(request);
+    const second = await invalidate(request);
     const retry = await ingest({
       content: CONTENT,
       source_ref: SOURCE_REF,
@@ -117,8 +123,7 @@ describePg("T6 content invalidation: live PostgreSQL", () => {
       },
     ]);
     await expect(
-      ingest({
-        action: "invalidate",
+      invalidate({
         source_ref: "t6/unknown",
         invalidated_at: INVALIDATED_AT,
         triggered_by: "fin",

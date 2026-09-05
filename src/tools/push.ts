@@ -171,11 +171,11 @@ export function createPushHandler(deps: PushDeps) {
 export const pushTool = (deps: PushDeps): ToolRegistration => ({
   name: "push",
   description:
-    "Idempotent text ingest for the fin push_port. Each item is keyed " +
-    "by (source_ref, content_identity); a re-push returns the same " +
-    "chunk_id without growing the row count. Pushes never chunk the " +
-    "input — the bytes that come back from retrieve equal the bytes " +
-    "that went in.",
+    "Strict batch text ingest. Each item is keyed by (source_ref, " +
+    "content_identity): an identical re-push returns the same chunk_id " +
+    "without adding rows. Every item requires metadata and a validity " +
+    "window (valid_from / valid_until); a missing required field rejects " +
+    "the whole batch. Text is stored verbatim — it is never re-chunked.",
   inputSchema: PushInputSchema,
   handler: createPushHandler(deps) as unknown as ToolRegistration["handler"],
 });

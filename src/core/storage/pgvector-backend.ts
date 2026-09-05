@@ -47,7 +47,6 @@ import {
   type PgvectorPoolConfig,
 } from "../../config.js";
 import { GraphragError } from "../errors.js";
-import type { PoolClient } from "pg";
 import { assertPgvectorAnnDimensions, upSchemaP0 } from "./schema-p0.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
 
@@ -610,15 +609,10 @@ export class PgvectorBackend
         // P0 schema: entities + entity_aliases + triples + extraction_records.
         // upSchemaP0 is idempotent (every statement is IF NOT EXISTS) and
         // owns its own BEGIN/COMMIT/ROLLBACK — we MUST NOT wrap it in an
-        // outer transaction. Cast our minimal PgClient to PoolClient: only
-        // .query is actually used by upSchemaP0, so the structural surface
-        // is sufficient. Pass this.dimensions so entities.embedding width
-        // matches chunks.embedding width (H1).
-        await upSchemaP0(
-          client as unknown as PoolClient,
-          this.dimensions,
-          annMaxDimensions
-        );
+        // outer transaction. The minimal PgClient satisfies upSchemaP0's
+        // `SchemaP0Client` surface structurally. Pass this.dimensions so
+        // entities.embedding width matches chunks.embedding width (H1).
+        await upSchemaP0(client, this.dimensions, annMaxDimensions);
       } finally {
         client.release();
       }

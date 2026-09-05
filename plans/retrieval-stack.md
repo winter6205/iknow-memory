@@ -72,8 +72,8 @@ Tracker index for this round: every bullet at a glance, with its dependencies an
 | T11 | Rerank on by default; fail-open keeps the mark                                       | `[implementation]` | T8                 | Yes      | Done    |
 | T12 | No deterministic pseudo-vectors when credentials are missing                         | `[implementation]` | T8                 | Yes      | Done    |
 | T13 | Vector index built in place, with a real dimension guard                             | `[implementation]` | —                  | Yes      | Done    |
-| T14 | Precision layer bring-up: CJK segmentation as one arm at both stages                 | `[implementation]` | —                  | Yes      | Pending |
-| T15 | Okapi BM25 parameters, phrase queries, and field boosting                            | `[implementation]` | T14                | —        | Pending |
+| T14 | Precision layer bring-up: CJK segmentation as one arm at both stages                 | `[implementation]` | —                  | Yes      | Done    |
+| T15 | Okapi BM25 parameters, phrase queries, and field boosting                            | `[implementation]` | T14                | —        | Done    |
 | T16 | Fusion parameters configurable (RRF k, vector / keyword weights)                     | `[implementation]` | —                  | Yes      | Done    |
 | T17 | Default configuration enables every capability, asserted hard                        | `[implementation]` | T10, T11, T15, T16 | —        | Pending |
 | T18 | Derived indexes rebuild from the authoritative source with no loss and no regression | `[implementation]` | T13, T14           | —        | Pending |

@@ -2,8 +2,8 @@
  * iknow-memory MCP server entry.
  *
  * Wires the tool registry into a stdio MCP server. The catalog is the
- * Host-facing contract frozen by specs/mcp-tool-surface.md: ingest,
- * push, invalidate, retrieve (extract joins in a follow-up slice).
+ * Host-facing contract frozen by specs/mcp-tool-surface.md: ingest, push,
+ * invalidate, extract, retrieve.
  *
  * Decoupling contract (per map #33 / ticket #35):
  *   - No import from iknow (`src/shared/schema.ts`, `src/config/`, etc.).
@@ -33,6 +33,11 @@ import { ingestTool } from "./tools/ingest.js";
 import { invalidationTool } from "./tools/invalidation.js";
 import { pushTool } from "./tools/push.js";
 import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
+import {
+  extractTool,
+  type ExtractDeps,
+  type ExtractPool,
+} from "./tools/extract.js";
 import {
   NineRouterEmbedder,
   UnavailableEmbedder,
@@ -289,6 +294,77 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
   };
 }
 
+/**
+ * Build the extract tool's dependencies from the loaded env.
+ *
+ * Pool lifecycle: the pg.Pool is created LAZILY on the first extract call
+ * that dials the database (`import("pg")` mirrors the memory-mode posture
+ * of buildDeps — a server that never calls extract never loads the driver).
+ * A server without GRAPHRAG_MEMORY_DB_URL gets no pool at all: extract
+ * answers a typed per-call configuration error and the server still boots.
+ * Once created, the pool lives for the server's lifetime — the same
+ * process-scoped posture as the pgvector backend's pool, so there is no
+ * per-call pool to leak (extract runs inside the caller's await, not in a
+ * detached task).
+ *
+ * LLM credentials ride the parsed ANTHROPIC block (`env.rerank` — the same
+ * ANTHROPIC_AUTH_TOKEN / GRAPHRAG_MEMORY_ANTHROPIC_* family the extract CLI
+ * reads raw from process.env, here already trimmed and defaulted by
+ * loadEnv). Embedding credentials come straight from the embed block.
+ * Missing credentials do NOT fail the build: extract reports a typed
+ * per-call error instead (SC9 — never a fake client), which keeps the
+ * offline server booting for the other tools.
+ *
+ * Exported so the wiring is directly assertable without Postgres
+ * (tests/index.test.ts).
+ */
+export function buildExtractDeps(
+  env: GraphragEnv,
+  logger: ReturnType<typeof createLogger>
+): ExtractDeps {
+  return {
+    llmEnv: {
+      authToken: env.rerank?.apiKey,
+      baseUrl: env.rerank?.baseUrl,
+      model: env.rerank?.model,
+    },
+    embedderEnv: {
+      apiKey: env.embedApiKey,
+      baseUrl: env.embedBaseUrl,
+      model: env.embedModel,
+      dimensions: env.embedDimensions,
+    },
+    ...(env.dbUrl !== undefined
+      ? { pool: createLazyPgExtractPool(env.dbUrl) }
+      : {}),
+    ...(env.elasticsearch !== undefined
+      ? {
+          precision: new ElasticsearchPrecisionLayer(env.elasticsearch, {
+            k1: env.retrieval.k1,
+            b: env.retrieval.b,
+          }),
+        }
+      : {}),
+    logger,
+  };
+}
+
+/**
+ * A pool placeholder that pays for the pg driver only when extract actually
+ * dials the database. The memoized promise keeps concurrent first calls from
+ * constructing two pools (the ??= check is synchronous, so JS's
+ * single-threaded event loop makes it atomic).
+ */
+function createLazyPgExtractPool(connectionString: string): ExtractPool {
+  let pool: Promise<import("pg").Pool> | undefined;
+  return {
+    connect: () => {
+      pool ??= import("pg").then(({ Pool }) => new Pool({ connectionString }));
+      return pool.then((p) => p.connect());
+    },
+  };
+}
+
 export async function createServer(): Promise<McpServer> {
   const env = loadEnv();
   const logger = createLogger(env.logLevel);
@@ -300,6 +376,7 @@ export async function createServer(): Promise<McpServer> {
     ingestTool({ ...deps, logger }),
     invalidationTool(deps),
     pushTool({ ...deps, logger }),
+    extractTool(buildExtractDeps(env, logger)),
     retrieveTool(buildRetrieveDeps(deps, debug)),
   ]);
 

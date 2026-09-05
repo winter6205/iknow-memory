@@ -1,19 +1,32 @@
 /**
  * Isolation guard for the extraction+merge bounded contexts.
  *
- * Success Criterion #14 (specs/p0-extraction.md §Success Criteria):
- * `src/index.ts` and every `src/tools/*.ts` file must NOT import from
- * `src/core/extraction/*` or `src/core/entities/merge`.
+ * Historical note: specs/p0-extraction.md SC14 forbade the MCP server from
+ * importing `src/core/extraction/*` at all ("extraction is an offline CLI
+ * trigger, never an MCP tool"). The MCP tool surface round REVERSED that
+ * boundary by design: specs/mcp-tool-surface.md (assumption 9 / Does #2)
+ * makes `extract` an MCP tool running the SAME lifted core pipeline
+ * (`src/core/extraction`), and its SC13 sets the hard boundary that replaced
+ * the old one — `src/tools` must never import `src/cli` (the CLI keeps only
+ * flags, exit codes and operator reports; the MCP tool and the CLI are two
+ * callers of one core module).
  *
- * The MCP server stays ingest+retrieve only — extraction is an offline CLI
- * trigger, never an MCP tool. This test enforces that architectural boundary
- * at the source level so any future import slips at code-review time.
+ * This test enforces the CURRENT boundary at the source level so any future
+ * import slip fails at test time:
+ *   - every `src/tools/*.ts` file must NOT import from `src/cli/*`
+ *     (SC13 of specs/mcp-tool-surface.md). `src/index.ts` is NOT in this
+ *     target set: the stdio entry legitimately imports the CLI's
+ *     `stdio-entry` argv parser;
+ *   - `src/index.ts` and every `src/tools/*.ts` file must NOT import
+ *     `src/core/entities/merge` directly (entity merging is an internal of
+ *     the extraction capability — callers go through the pipeline module,
+ *     never around it).
  *
  * Why regex instead of an AST parse: this is a negative assertion on file
  * imports. AST parsing would work, but regex over import statements is
  * sufficient because:
- *   - ESM in this project uses `from "../core/extraction/..."` form only
- *     (no dynamic imports, no namespace aliases that escape the path).
+ *   - ESM in this project uses `from "../cli/..."` form only (no dynamic
+ *     imports, no namespace aliases that escape the path).
  *   - The forbid-set is a literal path prefix; no alias resolution needed.
  *   - Regex reads in 2 lines; an AST dependency is one more thing to keep
  *     working.
@@ -25,13 +38,12 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const ROOT = join(import.meta.dirname, "..", "..");
-const FORBIDDEN_PATTERNS: RegExp[] = [
-  // from "../core/extraction/..." or from "../../core/extraction/..."
-  /from\s+["'][^"']*core\/extraction\//,
-  // from "../core/entities/merge" (only the merge module is forbidden;
-  // entities/types and entities/resolve are used elsewhere legitimately)
+
+/** SC13: the tool surface never reaches into the CLI. */
+const CLI_IMPORT = /from\s+["'][^"']*\/cli\//;
+/** Entity merging is pipeline-internal; no caller goes around it. */
+const MERGE_IMPORT = [
   /from\s+["'][^"']*core\/entities\/merge["']/,
-  // from "../core/entities/merge.js"
   /from\s+["'][^"']*core\/entities\/merge\.js["']/,
 ];
 
@@ -47,24 +59,39 @@ function collectSources(relDir: string): string[] {
   return out;
 }
 
-describe("isolation guard (Success Criterion #14)", () => {
-  const targets = ["src/index.ts", ...collectSources("src/tools")];
+describe("isolation guard (SC13, specs/mcp-tool-surface.md)", () => {
+  const toolSources = collectSources("src/tools");
 
-  it.each(targets)("%s has no forbidden imports", (relPath) => {
-    const abs = join(ROOT, relPath);
-    const src = readFileSync(abs, "utf8");
-    const hits: string[] = [];
-    for (const re of FORBIDDEN_PATTERNS) {
-      const match = src.match(re);
-      if (match) hits.push(match[0]);
-    }
-    if (hits.length > 0) {
+  it.each(toolSources)("%s has no src/cli imports (SC13)", (relPath) => {
+    const src = readFileSync(join(ROOT, relPath), "utf8");
+    const hit = src.match(CLI_IMPORT);
+    if (hit) {
       throw new Error(
-        `${relPath} imports from a forbidden module: ${hits.join("; ")}. ` +
-          `Extraction and merge are CLI-only — the MCP server must stay ` +
-          `unaware of them (Success Criterion #14).`
+        `${relPath} imports from src/cli: ${hit[0]}. src/tools must be a ` +
+          `reverse-dependency-free caller of src/core/extraction (SC13 of ` +
+          `specs/mcp-tool-surface.md) — flags, exit codes and operator ` +
+          `reports stay in the CLI.`
       );
     }
-    expect(hits).toEqual([]);
+    expect(hit).toBeNull();
   });
+
+  it.each(["src/index.ts", ...toolSources])(
+    "%s does not import the merge module directly",
+    (relPath) => {
+      const src = readFileSync(join(ROOT, relPath), "utf8");
+      const hits = MERGE_IMPORT.map((re) => src.match(re)).filter(
+        (m) => m !== null
+      );
+      if (hits.length > 0) {
+        throw new Error(
+          `${relPath} imports the entity merge module directly: ${hits
+            .map((m) => m[0])
+            .join("; ")}. Merging is internal to the extraction capability — ` +
+            `call it through src/core/extraction, never around it.`
+        );
+      }
+      expect(hits).toEqual([]);
+    }
+  );
 });

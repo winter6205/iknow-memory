@@ -11,9 +11,10 @@
 
 ## 当前状态
 
-- **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并 wiring；vector + BM25；Neo4j PPR 图臂；graph-priority 排序；rerank 默认开（缺依赖拒启动见 `specs/graph-rerank-boot-and-evidence.md`，尚未落地）
-- **进行中**：第一刀 `plans/graph-rerank-boot-and-evidence.md`；第二刀 `plans/mcp-tool-surface.md`；质量栈 T2–T11 仍见 `plans/retrieve-graph-quality.md`
-- **后置**：抽取 F1（#15）、多粒度切分、专用社区/因果等见该 plan 未勾选项
+- **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并；vector + BM25；Neo4j PPR 图臂；graph-priority；ES 精度层；质量栈 T1–T11；MCP 五件套 `ingest` / `push` / `invalidate` / `extract` / `retrieve`；图/精排 fail-start（ADR-0006）。
+- **精排**：默认走 MiniMax LLM（Anthropic 兼容 HTTP）。`GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL` 是可选的本地/专用 rerank sidecar，不是 MiniMax 那条。
+- **进行中**：`plans/retrieval-stack.md` T17–T24（自检 / 重灌 / 评测收口）。侧线 vitest flake [#170](https://github.com/winter6205/iknow-memory/issues/170)。
+- **后置**：多粒度切分、Neo4j 节点 embedding。进度入口：`docs/handoff/2026-09-05-status.md`。
 
 ## Elasticsearch 精度层（可选增强）
 
@@ -70,8 +71,10 @@ Host JSON 的 `env` 是 MCP 用户配置的 SSOT；`.env.local` 仅作本地开�
         "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
         "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3",
         "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "1536",
+        "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
         "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "true",
-        "ANTHROPIC_AUTH_TOKEN": "<rerank-api-token>",
+        "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV": "MINIMAX_API_KEY",
+        "MINIMAX_API_KEY": "<minimax-api-key>",
         "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
         "GRAPHRAG_MEMORY_ANTHROPIC_MODEL": "MiniMax-M3",
         "GRAPHRAG_MEMORY_ES_URL": "",
@@ -84,17 +87,24 @@ Host JSON 的 `env` 是 MCP 用户配置的 SSOT；`.env.local` 仅作本地开�
 }
 ```
 
-rerank 默认开启，模型和 endpoint 默认分别为 `MiniMax-M3` 与
-`https://api.minimaxi.com/anthropic`。Embedding key 的兼容 aliases 与 secret
-放置规则见 [`docs/mcp-config.md`](docs/mcp-config.md)。
+rerank 默认开启，走 MiniMax LLM。也可设 `ANTHROPIC_AUTH_TOKEN`；若同时设了
+`GRAPHRAG_MEMORY_RERANK_API_KEY_ENV`，以指针指向的密钥为准。
+`GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL` 留给专用 rerank sidecar（例如本机
+`http://localhost:8080/rerank`）。本机 pgvector HNSW 索引上限 2000 维，
+`GRAPHRAG_MEMORY_EMBED_DIMENSIONS` 必须 ≤ 该上限（不要用 2048）。
+Neo4j sidecar：`bash scripts/neo4j.sh start`。
+
+Embedding 与 secret 放置规则见 [`docs/mcp-config.md`](docs/mcp-config.md)。
 
 ## MCP Tools
 
-| Tool       | 输入                                                          | 输出          | 说明                                            |
-| ---------- | ------------------------------------------------------------- | ------------- | ----------------------------------------------- |
-| `ingest`   | `{content, source_ref, metadata?, valid_from?, valid_until?}` | `{chunk_ids}` | 写入：chunk → embed → store                     |
-| `retrieve` | `{query, valid_at?, filters?, limit?}`                        | `{chunks[]}`  | 读取：embed → vector search + valid_window 过滤 |
-| `echo`     | `{message}`                                                   | `{message}`   | 健康检查                                        |
+| Tool         | 输入                                                          | 输出                        | 说明                                   |
+| ------------ | ------------------------------------------------------------- | --------------------------- | -------------------------------------- |
+| `ingest`     | `{content, source_ref, metadata?, valid_from?, valid_until?}` | `{chunk_ids}`               | 写入：原样落库 → embed → store         |
+| `push`       | 与 ingest 相同的内容写入契约                                  | `{chunk_ids}`               | 写入（fin/host 推送入口）              |
+| `invalidate` | `{source_ref, triggered_by, invalidated_at?}`                 | `{invalidated_chunk_ids,…}` | 关闭有效窗口，不物理删除               |
+| `extract`    | `{chunk_ids}` xor `{source_ref}`                              | 抽取计数 / 失败列表         | 三元组抽取（与 CLI 同一管线）          |
+| `retrieve`   | `{query, valid_at?, filters?, limit?}`                        | `{chunks[]}`                | 图优先 + 向量/词法 + 可选 MiniMax 精排 |
 
 ## 项目结构
 

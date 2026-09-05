@@ -361,15 +361,27 @@ describe("invalidationTool.inputSchema — rejects malformed input at the bounda
   });
 });
 
-describe("invalidationTool", () => {
-  it("registers under the name 'invalidation' with a non-empty inputSchema", () => {
+describe("invalidateTool registration", () => {
+  it("registers under the name 'invalidate' with a non-empty inputSchema", () => {
     const tool = invalidationTool({
       embedder: new FakeEmbedder(TEST_DIM),
       storage: new MemoryBackend(TEST_DIM),
     });
-    expect(tool.name).toBe("invalidation");
+    // specs/mcp-tool-surface.md: the MCP name is `invalidate`
+    // (renamed from `invalidation`); the close-window semantics are
+    // unchanged.
+    expect(tool.name).toBe("invalidate");
     expect(typeof tool.description).toBe("string");
     expect(tool.description.length).toBeGreaterThan(0);
     expect(tool.inputSchema).toBeDefined();
+  });
+
+  it("description is Host-readable (no internal jargon)", () => {
+    const tool = invalidationTool({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    expect(tool.description).toMatch(/validity window|no physical delete/i);
+    expect(tool.description).not.toMatch(/stage 0|fin|port/i);
   });
 });

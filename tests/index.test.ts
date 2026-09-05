@@ -134,22 +134,38 @@ function textOf(result: { content: unknown }): string {
 }
 
 describe("createServer — registered tool set (T7)", () => {
-  it("tools/list advertises echo, ingest, invalidation, push, and retrieve", async () => {
-    // Plan D0 I-T4 + I-T5: `push` and `invalidation` joined the tool
-    // set. The wire-level tool set is now echo + ingest + invalidation
-    // + push + retrieve.
+  it("tools/list advertises ingest, invalidate, push, and retrieve", async () => {
+    // specs/mcp-tool-surface.md Catalog: the Host-facing tool set is
+    // exactly ingest + invalidate + push + retrieve. `echo` is archived
+    // and the invalidation tool is registered under the name
+    // `invalidate` (`extract` joins in the follow-up ticket).
     const { client, close } = await connectInProcess();
     try {
       const { tools } = await client.listTools();
       expect(tools.map((t) => t.name).sort()).toEqual([
-        "echo",
         "ingest",
-        "invalidation",
+        "invalidate",
         "push",
         "retrieve",
       ]);
       for (const tool of tools) {
         expect((tool.inputSchema as { type?: string }).type).toBe("object");
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  it("tool descriptions are Host-readable (no internal jargon)", async () => {
+    // specs/mcp-tool-surface.md assumption 12: descriptions on tools/list
+    // are for any Host. No "stage 0", no fin-port wire names.
+    const { client, close } = await connectInProcess();
+    try {
+      const { tools } = await client.listTools();
+      for (const tool of tools) {
+        expect(tool.description).not.toMatch(
+          /stage 0|fin\b|_port|invalidation_port/i
+        );
       }
     } finally {
       await close();

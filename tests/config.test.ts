@@ -561,7 +561,11 @@ describe("loadEnv — embed config boundary cases", () => {
 
   it("throws ConfigError when the pgvector ANN dimension ceiling is unset", () => {
     withRawEnv({ GRAPHRAG_MEMORY_EMBED_DIMENSIONS: "1536" }, () => {
-      delete process.env[PGVECTOR_VARS[0]];
+      // Blank, not delete: `readEnv` (src/config.ts) only falls back to
+      // `.env.local` for ABSENT keys, so `delete` would RE-OPEN the file
+      // fallback and let a developer's ANN ceiling leak in (the same
+      // blanking-beats-the-file convention as maskDotenvLocal, T-007/#169).
+      process.env[PGVECTOR_VARS[0]] = "";
       expect(() => loadEnv()).toThrow(ConfigError);
       expect(() => loadEnv()).toThrow(
         /GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS/

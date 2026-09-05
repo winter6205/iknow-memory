@@ -315,18 +315,31 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
  * per-call error instead (SC9 — never a fake client), which keeps the
  * offline server booting for the other tools.
  *
+ * Precision: the server's ONE ElasticsearchPrecisionLayer — the one
+ * `buildDeps` already constructed from `env.elasticsearch` — is threaded
+ * in by the caller, so a single ES client is shared by every tool on this
+ * server (never rebuilt from env here). Absent when ES is unconfigured;
+ * extract's ES mirror is fail-open inside the core pipeline either way.
+ *
  * Exported so the wiring is directly assertable without Postgres
  * (tests/index.test.ts).
  */
 export function buildExtractDeps(
   env: GraphragEnv,
-  logger: ReturnType<typeof createLogger>
+  logger: ReturnType<typeof createLogger>,
+  precision?: PrecisionIndexer
 ): ExtractDeps {
+  // The extraction LLM credentials ride the parsed ANTHROPIC block: despite
+  // its historical name, `env.rerank` IS the ANTHROPIC_AUTH_TOKEN /
+  // GRAPHRAG_MEMORY_ANTHROPIC_* family the extract CLI reads raw from
+  // process.env. The config field name and env vars are frozen; the local
+  // alias keeps the dual role readable at the use site.
+  const anthropicLlmCreds = env.rerank;
   return {
     llmEnv: {
-      authToken: env.rerank?.apiKey,
-      baseUrl: env.rerank?.baseUrl,
-      model: env.rerank?.model,
+      authToken: anthropicLlmCreds?.apiKey,
+      baseUrl: anthropicLlmCreds?.baseUrl,
+      model: anthropicLlmCreds?.model,
     },
     embedderEnv: {
       apiKey: env.embedApiKey,
@@ -337,14 +350,7 @@ export function buildExtractDeps(
     ...(env.dbUrl !== undefined
       ? { pool: createLazyPgExtractPool(env.dbUrl) }
       : {}),
-    ...(env.elasticsearch !== undefined
-      ? {
-          precision: new ElasticsearchPrecisionLayer(env.elasticsearch, {
-            k1: env.retrieval.k1,
-            b: env.retrieval.b,
-          }),
-        }
-      : {}),
+    ...(precision !== undefined ? { precision } : {}),
     logger,
   };
 }
@@ -376,7 +382,9 @@ export async function createServer(): Promise<McpServer> {
     ingestTool({ ...deps, logger }),
     invalidationTool(deps),
     pushTool({ ...deps, logger }),
-    extractTool(buildExtractDeps(env, logger)),
+    // buildDeps' single ES precision layer is threaded through so extract
+    // shares it instead of constructing a second ES client from env.
+    extractTool(buildExtractDeps(env, logger, deps.precision)),
     retrieveTool(buildRetrieveDeps(deps, debug)),
   ]);
 

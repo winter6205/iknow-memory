@@ -69,19 +69,28 @@ export interface PendingScanOptions {
 }
 
 /**
- * The undifferentiated pending scan: chunks with NO
- * `extraction_records.status='succeeded'` row, `created_at`-ascending,
- * capped at `batchSize`. Optional `since` / `onlyFailed` filters are
- * caller-supplied (the CLI maps its `--since` / `--only-failed` flags onto
- * them; an MCP caller would not use them).
+ * The pending-chunk invariant — chunks with NO `extraction_records.status=
+ * 'succeeded'` row — as a SQL fragment with ONE home. Both scans below
+ * (`selectPendingChunks`, `selectPendingChunksBySourceRef`) must express
+ * exactly this rule so a chunk's pending-ness is judged identically no
+ * matter which selector found it; the text is asserted by
+ * tests/extraction/pipeline.test.ts.
+ */
+const PENDING_CHUNK_PREDICATE =
+  "NOT EXISTS (SELECT 1 FROM extraction_records r WHERE r.chunk_id = c.id AND r.status = 'succeeded')";
+
+/**
+ * The undifferentiated pending scan: chunks matching
+ * `PENDING_CHUNK_PREDICATE`, `created_at`-ascending, capped at `batchSize`.
+ * Optional `since` / `onlyFailed` filters are caller-supplied (the CLI maps
+ * its `--since` / `--only-failed` flags onto them; an MCP caller would not
+ * use them).
  */
 export async function selectPendingChunks(
   client: Queryable,
   opts: PendingScanOptions
 ): Promise<ChunkInput[]> {
-  const where: string[] = [
-    `NOT EXISTS (SELECT 1 FROM extraction_records r WHERE r.chunk_id = c.id AND r.status = 'succeeded')`,
-  ];
+  const where: string[] = [PENDING_CHUNK_PREDICATE];
   const values: unknown[] = [];
   if (opts.since) {
     values.push(opts.since);
@@ -154,8 +163,8 @@ export interface SourceRefPendingScan {
 }
 
 /**
- * source_ref selector: pending chunks (same NOT-EXISTS-succeeded rule as
- * `selectPendingChunks`) for one `chunks.source_ref`, capped at `cap` (a
+ * source_ref selector: pending chunks (same `PENDING_CHUNK_PREDICATE` rule
+ * as `selectPendingChunks`) for one `chunks.source_ref`, capped at `cap` (a
  * non-positive cap selects zero chunks but still reports `hasMore`). The cap
  * is enforced by scanning `cap + 1` rows so "more remain" is observable
  * without a second count query.
@@ -169,7 +178,7 @@ export async function selectPendingChunksBySourceRef(
   const { rows } = await client.query(
     `SELECT c.id, c.content FROM chunks c
      WHERE c.source_ref = $1
-       AND NOT EXISTS (SELECT 1 FROM extraction_records r WHERE r.chunk_id = c.id AND r.status = 'succeeded')
+       AND ${PENDING_CHUNK_PREDICATE}
      ORDER BY c.created_at
      LIMIT $2`,
     [sourceRef, effectiveCap + 1]

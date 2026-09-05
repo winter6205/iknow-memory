@@ -95,6 +95,56 @@ describe("IngestInputSchema", () => {
   });
 });
 
+describe("IngestInputSchema — write-only (SC2, strict)", () => {
+  // specs/mcp-tool-surface.md SC2: `ingest` is write-only. The schema is
+  // strict (unknown keys rejected) and has no invalidate action, so an
+  // old-style `action: "invalidate"` call or a stray invalidate-only
+  // field can never be silently reinterpreted (or stripped) again.
+  it("rejects action: 'invalidate'", () => {
+    const result = IngestInputSchema.safeParse({
+      action: "invalidate",
+      source_ref: "docs/x.md",
+      invalidated_at: "2024-06-01T00:00:00Z",
+      triggered_by: "fin",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects the legacy action key even with the ingest value", () => {
+    const result = IngestInputSchema.safeParse({
+      action: "ingest",
+      content: "hello",
+      source_ref: "docs/x.md",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects invalidate-only fields without content (triggered_by)", () => {
+    const result = IngestInputSchema.safeParse({
+      source_ref: "docs/x.md",
+      triggered_by: "fin",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects invalidate-only fields without content (invalidated_at)", () => {
+    const result = IngestInputSchema.safeParse({
+      source_ref: "docs/x.md",
+      invalidated_at: "2024-06-01T00:00:00Z",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects any unknown top-level key", () => {
+    const result = IngestInputSchema.safeParse({
+      content: "hello",
+      source_ref: "docs/x.md",
+      force: true,
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
 describe("ingestHandler — normal write", () => {
   let deps: IngestDeps;
   let handler: ReturnType<typeof createIngestHandler>;

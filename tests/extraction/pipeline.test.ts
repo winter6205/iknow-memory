@@ -1,0 +1,324 @@
+/**
+ * Unit tests for the lifted extract batch/pipeline surface
+ * (`src/core/extraction/pipeline.ts`).
+ *
+ * The pipeline was lifted out of `src/cli/extract.ts` so that a second
+ * caller (the MCP extract tool, T3) can run the same scan → batch →
+ * per-chunk-transaction orchestration without importing `src/cli`. These
+ * tests pin the three selector shapes the core surface must cover:
+ *
+ *   1. the CLI's undifferentiated pending scan (optional since/only-failed
+ *      filters stay caller-supplied),
+ *   2. an explicit chunk_ids list,
+ *   3. a per-source_ref pending scan with a caller-supplied batch cap.
+ *
+ * Plus one end-to-end `processBatch` run on a fake Queryable proving the
+ * persist/batch is callable from core without going through CLI argv:
+ * per-chunk BEGIN/COMMIT, outbox emit inside the transaction, and
+ * mark-and-continue on a failed sibling chunk.
+ */
+import { describe, it, expect } from "vitest";
+
+import type { Queryable } from "../../src/core/extraction/records.js";
+import {
+  selectPendingChunks,
+  selectChunksByIds,
+  selectPendingChunksBySourceRef,
+  processBatch,
+  type ExtractPipelineDeps,
+} from "../../src/core/extraction/pipeline.js";
+import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
+import { FakeEmbedder } from "../../src/core/embedder.js";
+import { SELF_LOOP_REJECTED_CODE } from "../../src/core/extraction/records.js";
+import type { Logger } from "../../src/logging.js";
+
+/** Recording fake Queryable; rows are chosen per SQL text. */
+class FakeQueryable implements Queryable {
+  queries: string[] = [];
+  valuesList: unknown[][] = [];
+  rowsFor: (text: string) => any[] = () => [];
+
+  async query(text: string, values: unknown[] = []) {
+    this.queries.push(text);
+    this.valuesList.push(values);
+    return { rows: this.rowsFor(text) };
+  }
+
+  /** Index of the first query containing `fragment`, or -1. */
+  indexOf(fragment: string): number {
+    return this.queries.findIndex((q) => q.includes(fragment));
+  }
+}
+
+const SILENT_LOGGER: Logger = {
+  level: "error",
+  debug: () => {},
+  info: () => {},
+  warn: () => {},
+  error: () => {},
+};
+
+function makeDeps(llm: FakeLLMClient): ExtractPipelineDeps {
+  return {
+    llm,
+    embedder: new FakeEmbedder(8),
+    logger: SILENT_LOGGER,
+    now: () => "2026-01-01T00:00:00.000Z",
+  };
+}
+
+const GROUNDED_OUTPUT = {
+  head: "Alice",
+  headType: "person",
+  relationRaw: "works at",
+  relationNorm: "RELATED_TO",
+  tail: "Acme Corp",
+  tailType: "system",
+  description: "Alice works at Acme Corp",
+  evidenceSpan: "Alice works at Acme Corp",
+  confidence: 0.9,
+};
+
+describe("selectPendingChunks (CLI pending scan)", () => {
+  it("scans chunks with no succeeded extraction record, ordered by created_at", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = () => [{ id: "c1", content: "hello" }];
+
+    const chunks = await selectPendingChunks(client, { batchSize: 7 });
+
+    expect(chunks).toEqual([{ id: "c1", content: "hello" }]);
+    const sql = client.queries[0]!;
+    expect(sql).toContain(
+      "NOT EXISTS (SELECT 1 FROM extraction_records r WHERE r.chunk_id = c.id AND r.status = 'succeeded')"
+    );
+    expect(sql).toContain("ORDER BY c.created_at");
+    expect(sql).toContain("LIMIT $1");
+    expect(client.valuesList[0]).toEqual([7]);
+  });
+
+  it("applies --since as a created_at lower bound before the LIMIT", async () => {
+    const client = new FakeQueryable();
+    await selectPendingChunks(client, {
+      batchSize: 5,
+      since: "2026-01-01T00:00:00Z",
+    });
+
+    const sql = client.queries[0]!;
+    expect(sql).toContain("c.created_at >= $1");
+    expect(sql).toContain("LIMIT $2");
+    expect(client.valuesList[0]).toEqual(["2026-01-01T00:00:00Z", 5]);
+  });
+
+  it("applies --only-failed excluding SELF_LOOP_REJECTED rows", async () => {
+    const client = new FakeQueryable();
+    await selectPendingChunks(client, { batchSize: 5, onlyFailed: true });
+
+    const sql = client.queries[0]!;
+    expect(sql).toContain("row_number() OVER (PARTITION BY chunk_id");
+    expect(sql).toContain("error_code != 'SELF_LOOP_REJECTED'");
+    // Both filters compose with AND; the since filter stays absent.
+    expect(sql).toContain(" AND ");
+  });
+});
+
+describe("selectChunksByIds (explicit chunk_ids selector)", () => {
+  it("loads exactly the requested ids and preserves the caller's order", async () => {
+    const client = new FakeQueryable();
+    // DB returns rows in a different order than requested.
+    client.rowsFor = () => [
+      { id: "c2", content: "second" },
+      { id: "c1", content: "first" },
+      { id: "c3", content: "third" },
+    ];
+
+    const chunks = await selectChunksByIds(client, ["c3", "c1", "c2"]);
+
+    expect(chunks).toEqual([
+      { id: "c3", content: "third" },
+      { id: "c1", content: "first" },
+      { id: "c2", content: "second" },
+    ]);
+    const sql = client.queries[0]!;
+    expect(sql).toContain("FROM chunks");
+    expect(sql).toContain("IN ($1, $2, $3)");
+    expect(client.valuesList[0]).toEqual(["c3", "c1", "c2"]);
+  });
+
+  it("dedupes repeated ids so one chunk is processed once", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = () => [{ id: "c1", content: "only" }];
+
+    const chunks = await selectChunksByIds(client, ["c1", "c1"]);
+
+    expect(chunks).toEqual([{ id: "c1", content: "only" }]);
+    expect(client.valuesList[0]).toEqual(["c1"]);
+  });
+
+  it("returns an empty selection without querying when the id list is empty", async () => {
+    const client = new FakeQueryable();
+    const chunks = await selectChunksByIds(client, []);
+    expect(chunks).toEqual([]);
+    expect(client.queries).toHaveLength(0);
+  });
+});
+
+describe("selectPendingChunksBySourceRef (source_ref selector with cap)", () => {
+  it("scans pending chunks for the source_ref under the NOT EXISTS succeeded rule", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = () => [{ id: "c1", content: "a" }];
+
+    const scan = await selectPendingChunksBySourceRef(client, "doc-1", 10);
+
+    expect(scan).toEqual({
+      chunks: [{ id: "c1", content: "a" }],
+      hasMore: false,
+    });
+    const sql = client.queries[0]!;
+    expect(sql).toContain("c.source_ref = $1");
+    expect(sql).toContain(
+      "NOT EXISTS (SELECT 1 FROM extraction_records r WHERE r.chunk_id = c.id AND r.status = 'succeeded')"
+    );
+    expect(sql).toContain("ORDER BY c.created_at");
+    // Cap is enforced by a LIMIT of cap+1 so `hasMore` is observable.
+    expect(client.valuesList[0]).toEqual(["doc-1", 11]);
+  });
+
+  it("reports hasMore and truncates to the cap when more pending chunks exist", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = () => [
+      { id: "c1", content: "a" },
+      { id: "c2", content: "b" },
+      { id: "c3", content: "c" },
+    ];
+
+    const scan = await selectPendingChunksBySourceRef(client, "doc-1", 2);
+
+    expect(scan.hasMore).toBe(true);
+    expect(scan.chunks.map((c) => c.id)).toEqual(["c1", "c2"]);
+  });
+
+  it("returns zeros-shaped output for a source_ref with no pending chunks", async () => {
+    const client = new FakeQueryable();
+    const scan = await selectPendingChunksBySourceRef(client, "doc-404", 10);
+    expect(scan).toEqual({ chunks: [], hasMore: false });
+  });
+
+  it("treats a non-positive cap as zero work while still reporting remaining pending", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = () => [{ id: "c1", content: "a" }];
+
+    const scan = await selectPendingChunksBySourceRef(client, "doc-1", 0);
+
+    expect(scan.chunks).toEqual([]);
+    expect(scan.hasMore).toBe(true);
+  });
+});
+
+describe("processBatch (core batch orchestration, no CLI argv)", () => {
+  it("runs one transaction per chunk, emitting outbox intents inside it, and mark-and-continues past a failed sibling", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [
+        { kind: "ok", outputs: [GROUNDED_OUTPUT] },
+        { kind: "5xx", message: "provider down" },
+      ],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [
+        { id: "chunk-ok", content: "Alice works at Acme Corp." },
+        { id: "chunk-bad", content: "Bob works at Beta Corp." },
+      ],
+      { batchSize: 2 }
+    );
+
+    expect(summary.processed).toBe(2);
+    expect(summary.succeeded).toBe(1);
+    expect(summary.failed).toBe(1);
+    expect(summary.writeFailures).toBe(0);
+    expect(summary.ungrounded).toBe(0);
+    expect(summary.batchId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    );
+
+    // Transaction 1 (chunk-ok): BEGIN → record insert → entity/triple
+    // writes → outbox emit → markSucceeded → COMMIT, in that order.
+    const begin1 = client.indexOf("BEGIN");
+    const record1 = client.indexOf("INSERT INTO extraction_records");
+    const outbox1 = client.indexOf("INSERT INTO projection_outbox");
+    const succeeded1 = client.indexOf("SET status = 'succeeded'");
+    const commit1 = client.indexOf("COMMIT");
+    expect(begin1).toBeGreaterThanOrEqual(0);
+    expect(
+      begin1 < record1 &&
+        record1 < outbox1 &&
+        outbox1 < succeeded1 &&
+        succeeded1 < commit1
+    ).toBe(true);
+
+    // Transaction 2 (chunk-bad): the failed chunk is marked failed with the
+    // LLM error code and still commits its own record row.
+    const failed2 = client.indexOf("SET status = 'failed'");
+    expect(failed2).toBeGreaterThan(commit1);
+    const failedValues = client.valuesList[failed2]!;
+    expect(failedValues).toContain("5xx");
+    expect(client.indexOf("ROLLBACK")).toBe(-1);
+  });
+
+  it("counts per-triple ungrounded rejections without failing the chunk", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [
+        {
+          kind: "ok",
+          outputs: [
+            {
+              ...GROUNDED_OUTPUT,
+              evidenceSpan: "not a substring of the chunk",
+            },
+          ],
+        },
+      ],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    expect(summary.failed).toBe(0);
+    expect(summary.ungrounded).toBe(1);
+    // The ungrounded triple never lands: no INSERT INTO triples fired.
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+  });
+
+  it("marks an all-self-loop chunk failed with the SELF_LOOP_REJECTED sentinel", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [
+        {
+          kind: "ok",
+          outputs: [{ ...GROUNDED_OUTPUT, tail: "Alice", tailType: "person" }],
+        },
+      ],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Alice." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.succeeded).toBe(0);
+    expect(summary.failed).toBe(1);
+    const failedIdx = client.indexOf("SET status = 'failed'");
+    expect(failedIdx).toBeGreaterThanOrEqual(0);
+    expect(client.valuesList[failedIdx]).toContain(SELF_LOOP_REJECTED_CODE);
+  });
+});

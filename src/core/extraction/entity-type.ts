@@ -9,7 +9,7 @@
  * the CHECK would reject the whole chunk transaction → write-failure → exit 2
  * (CR High #2 finding).
  *
- * This module maps any LLM-emitted type into the closed set at the CLI
+ * This module maps any LLM-emitted type into the closed set at the persist
  * boundary so the pipeline only persists CHECK-safe values. The mapping is
  * a conservative, defensible default that operators can tune later.
  *
@@ -25,7 +25,7 @@
  * `location`/`place` to `system` because the P0 schema does not model
  * geographic entities and the four-type set is the contract.
  */
-import { createLogger, type Logger } from "../logging.js";
+import { createLogger, type Logger } from "../../logging.js";
 
 export const ENTITY_TYPES = ["person", "concept", "system", "event"] as const;
 export type EntityType = (typeof ENTITY_TYPES)[number];

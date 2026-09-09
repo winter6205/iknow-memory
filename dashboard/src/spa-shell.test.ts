@@ -72,6 +72,9 @@ describe("theme tokens", () => {
 describe("chrome", () => {
   it("uses the iknow-memory wordmark and three named fonts", () => {
     expect(WORDMARK).toBe("iknow-memory");
+    expect(readDashboard("src/chrome/Chrome.tsx")).toMatch(
+      /iknow<span[^>]*>-memory<\/span>/
+    );
     const html = readDashboard("index.html");
     expect(html).toMatch(/Playfair[+ ]Display/);
     expect(html).toMatch(/Space[+ ]Grotesk/);

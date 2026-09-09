@@ -9,9 +9,9 @@ export function Chrome() {
   const paperOn = theme === "晨纸";
 
   return (
-    <header className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-line px-6 py-5">
+    <header className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-line px-6 pb-5 pt-6">
       <p className="font-display text-[1.35rem] font-semibold tracking-tight text-title">
-        {WORDMARK}
+        iknow<span className="font-medium opacity-55">-memory</span>
       </p>
       <nav className="flex gap-1" aria-label="主导航">
         {NAV_ITEMS.map((item) => (

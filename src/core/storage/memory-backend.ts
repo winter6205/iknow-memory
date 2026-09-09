@@ -12,6 +12,14 @@ import type {
   RetrievedChunk,
   SearchOptions,
   StorageBackend,
+  StorageChunkView,
+  StorageCounts,
+  StorageEntityView,
+  StorageListOptions,
+  StoragePage,
+  StorageReadPort,
+  StorageReadResult,
+  StorageTimelineEvent,
 } from "../types.js";
 import {
   appendContentInvalidation,
@@ -22,6 +30,13 @@ import {
   type ContentInvalidationStorage,
   type LexicalStorageBackend,
 } from "./backend.js";
+import {
+  lookupReadId,
+  normalizeStorageListOptions,
+  paginateItems,
+  projectTimelineEvents,
+  toChunkView,
+} from "./storage-reads.js";
 import { cosineSimilarity } from "../cosine.js";
 import { GraphragError } from "../errors.js";
 
@@ -80,7 +95,11 @@ interface LexicalDoc {
  * chunk id, and O(1) clear() on close().
  */
 export class MemoryBackend
-  implements StorageBackend, LexicalStorageBackend, ContentInvalidationStorage
+  implements
+    StorageBackend,
+    LexicalStorageBackend,
+    ContentInvalidationStorage,
+    StorageReadPort
 {
   private readonly store = new Map<string, ChunkRecord>();
 
@@ -187,6 +206,56 @@ export class MemoryBackend
       records.push(...readContentInvalidations(chunk.metadata));
     }
     return sortInvalidationRecords(records);
+  }
+
+  async counts(): Promise<StorageCounts> {
+    const invalidations = await this.listInvalidations();
+    return {
+      chunks: this.store.size,
+      entities: 0,
+      invalidations: invalidations.length,
+    };
+  }
+
+  async listChunks(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageChunkView>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    const items = [...this.store.values()]
+      .sort(compareIngestOrder)
+      .map((chunk) => toChunkView(chunk));
+    return paginateItems(items, limit, offset);
+  }
+
+  async getChunk(id: string): Promise<StorageReadResult<StorageChunkView>> {
+    const lookedUp = lookupReadId(id);
+    if (!lookedUp.ok) return lookedUp;
+    const chunk = this.store.get(lookedUp.value);
+    if (chunk === undefined) return { ok: false, code: "NOT_FOUND" };
+    return { ok: true, value: toChunkView(chunk) };
+  }
+
+  async listEntities(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageEntityView>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    return paginateItems([], limit, offset);
+  }
+
+  async getEntity(id: string): Promise<StorageReadResult<StorageEntityView>> {
+    const lookedUp = lookupReadId(id);
+    if (!lookedUp.ok) return lookedUp;
+    return { ok: false, code: "NOT_FOUND" };
+  }
+
+  async listTimeline(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageTimelineEvent>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    const chunks = [...this.store.values()]
+      .sort(compareIngestOrder)
+      .map((chunk) => toChunkView(chunk));
+    return paginateItems(projectTimelineEvents(chunks), limit, offset);
   }
 
   /**

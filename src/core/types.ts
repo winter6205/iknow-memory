@@ -60,6 +60,80 @@ export interface StorageBackend {
   close(): Promise<void>;
 }
 
+/**
+ * Dedicated core read port for operator browse/stats/timeline.
+ * Not on StorageBackend so chunk-only fakes stay valid; both production
+ * backends implement it. SQL for the pg path lives in core, not HTTP.
+ */
+export const STORAGE_LIST_LIMIT_DEFAULT = 20;
+export const STORAGE_LIST_LIMIT_MAX = 100;
+
+export interface StorageListOptions {
+  limit?: number;
+  offset?: number;
+}
+
+export interface StorageCounts {
+  chunks: number;
+  entities: number;
+  invalidations: number;
+}
+
+export interface StorageChunkView {
+  id: string;
+  content: string;
+  source_ref: string;
+  valid_from: string;
+  valid_until: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface StorageEntityView {
+  id: string;
+  canonical_name: string;
+  type: string;
+  retired: boolean;
+  aliases: string[];
+}
+
+export type StorageTimelineEvent =
+  | {
+      kind: "chunk_valid_from" | "chunk_valid_until";
+      at: string;
+      chunk_id: string;
+      source_ref: string;
+    }
+  | {
+      kind: "invalidation";
+      at: string;
+      chunk_id: string;
+      source_ref: string;
+      triggered_by: string;
+    };
+
+export interface StoragePage<T> {
+  items: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export type StorageReadResult<T> =
+  { ok: true; value: T } | { ok: false; code: "NOT_FOUND" | "INVALID_INPUT" };
+
+export interface StorageReadPort {
+  counts(): Promise<StorageCounts>;
+  listChunks(opts?: StorageListOptions): Promise<StoragePage<StorageChunkView>>;
+  getChunk(id: string): Promise<StorageReadResult<StorageChunkView>>;
+  listEntities(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageEntityView>>;
+  getEntity(id: string): Promise<StorageReadResult<StorageEntityView>>;
+  listTimeline(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageTimelineEvent>>;
+}
+
 export interface SearchOptions {
   limit: number;
   validAt: string; // ISO 8601 — filter: valid_from <= validAt AND (valid_until IS NULL OR valid_until > validAt)

@@ -137,6 +137,63 @@ docs/
 
 详见 `docs/CONTEXT.md` 词汇表与各份 ADR/spec 的自我说明。
 
+## iknow-memory dashboard（只读操作看板）
+
+本仓库内的只读 HTTP API（`src/dashboard-api`）+ React SPA（`dashboard/`）。绑定 `127.0.0.1`。不要合入已关的 PR 187。规格见 `specs/iknow-memory-dashboard.md`。
+
+一条命令同时起 API 与 SPA（推荐）：
+
+```bash
+npm run dashboard
+```
+
+浏览器打开 `http://127.0.0.1:18868/`。端口：
+
+| 进程        | 默认              | 说明                                                    |
+| ----------- | ----------------- | ------------------------------------------------------- |
+| SPA（Vite） | `127.0.0.1:18868` | 不是 5173；`/api` 代理到 API                            |
+| API         | `127.0.0.1:4174`  | `GRAPHRAG_MEMORY_DASHBOARD_PORT` 可覆盖，且不得为 18868 |
+
+`Ctrl-C`（或任一侧退出）会结束整棵进程树，释放 18868 与 4174。
+
+也可以分开跑：
+
+```bash
+npm run dashboard-api    # src/dashboard-api/main.ts，默认 127.0.0.1:4174
+npm run dashboard:dev    # dashboard Vite，18868，/api → 4174
+```
+
+**存储：** 未设置 `GRAPHRAG_MEMORY_STORAGE` / `GRAPHRAG_MEMORY_DB_URL` / `GRAPHRAG_MEMORY_NEO4J_URI` 时，`npm run dashboard` 自动用 memory 后端（空库、无外部依赖），并关闭图臂与精排（`GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED=false`、`GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false`），避免 ADR-0006 fail-start。设置了任一项则原样透传 MCP 那套 `GRAPHRAG_MEMORY_*`。
+
+**memory vs pg：** memory 可看 stats / query / browse / timeline（空库为空态）。`GRAPHRAG_MEMORY_STORAGE=pgvector` 且配置 `GRAPHRAG_MEMORY_DB_URL` 时读 Postgres。
+
+**Neo4j：** 可选。未配置或不可达时图页返回结构化错误，不是空图。配置 `GRAPHRAG_MEMORY_NEO4J_URI`（及既有 Neo4j 凭据）后图投影可读。`GET /api/entities/:id/backlinks`（邻域页）同样：缺 Neo4j 是错误+重试，不是空态。
+
+**Vite `/api` 代理：** 与 API 同一环境变量 `GRAPHRAG_MEMORY_DASHBOARD_PORT`（默认 4174）。`npm run dashboard` 会把解析后的端口写入子进程 env，Vite 按该端口转发。
+
+### SC6 浏览器核对（operator checklist）
+
+在 `npm run dashboard` 起来后打开 `http://127.0.0.1:18868/`：
+
+1. **冷墨默认：** 底色近 `#0e1218`、字近 `#e8e4d9`；页头字标 `iknow-memory`。
+2. **晨纸切换：** 打开页头「晨纸」开关，底色近 `#f3f1ea`、字近 `#1c1e22`；再关回冷墨。
+3. **空态页（至少一页）：** memory 空账本下「统计」或「浏览」显示空态文案，不是错误条。
+4. **能力缺口：** 「图谱」以及 entity「邻域」在未配置 Neo4j 时显示 `NEO4J_UNAVAILABLE` +「重试」，不是空图。
+
+未加 Playwright（栈里没有）。2026-09-09 实测（memory 零配置，`curl` 经 18868 代理）：
+
+| 命令                                                                                          | 结果                                                  |
+| --------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18868/`                             | `200`                                                 |
+| `curl -sS http://127.0.0.1:18868/api/stats`                                                   | `200` `{"chunks":0,"entities":0,"invalidations":0}`   |
+| `curl -sS http://127.0.0.1:18868/api/chunks`                                                  | `200` 空 page                                         |
+| `curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:18868/browse`                       | `200`（SPA）                                          |
+| `curl -sS http://127.0.0.1:18868/api/graph`                                                   | `503` `NEO4J_UNAVAILABLE`                             |
+| `curl -sS http://127.0.0.1:18868/api/entities/11111111-1111-1111-1111-111111111111/backlinks` | `503` `NEO4J_UNAVAILABLE`                             |
+| `curl -sS http://127.0.0.1:18868/src/index.css`                                               | 含冷墨 `#0e1218`/`#e8e4d9` 与晨纸 `#f3f1ea`/`#1c1e22` |
+
+晨纸开关是客户端 CSS 变量（`document.documentElement` `data-theme`）；`curl` 不能点开关。主题默认与切换由 `dashboard/src/spa-shell.test.ts` 覆盖。
+
 ## 约束
 
 - TS strict ESM · Node ≥20 · Vitest

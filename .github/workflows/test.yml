@@ -44,7 +44,8 @@ jobs:
             --exclude tests/cli/extract-e2e-graph.test.ts \
             --exclude tests/cli/consolidate-pg.test.ts \
             --exclude tests/schema-p0.test.ts \
-            --exclude tests/storage/pgvector-startup.test.ts
+            --exclude tests/storage/pgvector-startup.test.ts \
+            --exclude tests/storage/storage-reads-pg.test.ts
 
   test-full:
     runs-on: ubuntu-latest

@@ -35,31 +35,42 @@ export function StatsPage() {
   }, []);
 
   const state: PageState = view.state;
+  const tiles =
+    view.state === "ready"
+      ? view.data
+      : view.state === "empty"
+        ? { chunks: 0, entities: 0, invalidations: 0 }
+        : null;
   return (
     <PageChrome title="统计" state={state}>
+      {tiles ? (
+        <dl className="mb-4 grid max-w-3xl grid-cols-3 gap-3">
+          {(
+            [
+              ["Chunks", tiles.chunks],
+              ["Entities", tiles.entities],
+              ["Invalidations", tiles.invalidations],
+            ] as const
+          ).map(([label, value]) => (
+            <div
+              key={label}
+              className="rounded-lg border border-line bg-surface p-4"
+            >
+              <dt className="mb-1 text-[0.7rem] uppercase tracking-[0.06em] text-[var(--text-tertiary)]">
+                {label}
+              </dt>
+              <dd className="font-display text-[1.75rem] leading-none text-title">
+                {value.toLocaleString("en-US")}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
       {view.state === "empty" ? (
         <EmptyCopy message="账本为空。memory 空账本是合法空态，不是错误。" />
       ) : null}
       {view.state === "error" ? (
         <ErrorCopy code={view.code} message={view.message} />
-      ) : null}
-      {view.state === "ready" ? (
-        <dl className="grid max-w-md grid-cols-3 gap-4 font-mono text-sm">
-          <div>
-            <dt className="text-[var(--text-tertiary)]">chunks</dt>
-            <dd className="mt-1 text-xl text-title">{view.data.chunks}</dd>
-          </div>
-          <div>
-            <dt className="text-[var(--text-tertiary)]">entities</dt>
-            <dd className="mt-1 text-xl text-title">{view.data.entities}</dd>
-          </div>
-          <div>
-            <dt className="text-[var(--text-tertiary)]">invalidations</dt>
-            <dd className="mt-1 text-xl text-title">
-              {view.data.invalidations}
-            </dd>
-          </div>
-        </dl>
       ) : null}
     </PageChrome>
   );

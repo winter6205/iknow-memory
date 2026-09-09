@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root,
+[data-theme="冷墨"] {
+  --bg: #0e1218;
+  --text: #e8e4d9;
+  --title: #eee6d8;
+  --text-secondary: rgba(232, 228, 217, 0.72);
+  --text-tertiary: rgba(232, 228, 217, 0.42);
+  --border: rgba(232, 228, 217, 0.18);
+  --surface: rgba(232, 228, 217, 0.05);
+  --accent: #3d7ea6;
+  --glow: rgba(138, 164, 184, 0.35);
+  --danger: #c45c4a;
+  --btn-text: #0e1218;
+}
+
+[data-theme="晨纸"] {
+  --bg: #f3f1ea;
+  --text: #1c1e22;
+  --title: #141618;
+  --text-secondary: rgba(28, 30, 34, 0.72);
+  --text-tertiary: rgba(28, 30, 34, 0.45);
+  --border: rgba(28, 30, 34, 0.12);
+  --surface: rgba(28, 30, 34, 0.04);
+  --accent: #3d7ea6;
+  --glow: rgba(61, 126, 166, 0.12);
+  --danger: #b84335;
+  --btn-text: #fff;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Space Grotesk", system-ui, sans-serif;
+}

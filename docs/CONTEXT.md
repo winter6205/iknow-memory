@@ -17,6 +17,9 @@ _Avoid_: "tool" alone (ambiguous with host tools); "API endpoint" (MCP is not RE
 **host**: any MCP client that discovers and calls iknow-memory tools (Claude Code, iknow harness, custom agents). The host owns context engineering (JIT retrieval triggers, cache layout, prompt assembly). iknow-memory never reaches into the host.
 _Avoid_: "client" (too generic); "consumer" (implies passive reading, hosts actively orchestrate)
 
+**iknow-memory dashboard**: the operator HTTP read facade in this repo over the same core as **MCP tool**s — not a **host** and not an MCP client. Graph canvas reads the Neo4j read-only projection; entity / **chunk** / timeline read the **authoritative source**. _Stage: named (wayfinder #188 / #198); not on main._
+_Avoid_: "I know dashboard" / "iknow dashboard" (wrong product); "dashboard-api" (implementation folder, not the term); "WorkBuddyHome" (a local directory name)
+
 ### Memory units
 
 **chunk**: pushed text is final text. fin is the sole chunking authority; iknow-memory stores and recalls the pushed text as-is without re-chunking, truncation, reassembly, or normalization/rewrite. Identified by UUID, carries `embedding`, `source_ref`, `metadata`, `valid_from`, `valid_until`, `created_at`. The atomic unit of vector storage and retrieval in stage 1; returned chunk text is byte-identical to the pushed text.
@@ -184,6 +187,7 @@ _Avoid_: "load test" (implies capacity discovery); "stress test" (we do not push
 - **entity → Neo4j node; triple → Neo4j edge**: read-only projection of Postgres via **projection outbox** + backfill (#69/#70; ADR-0001). Operator path: `npm run graph:backfill` then `npm run graph:drain` — see `docs/runbooks/neo4j-projection.md`
 - **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for entities, triples, aliases, and extraction_records; Neo4j is a derived read-only projection. Sync = projection outbox + full backfill (eventually consistent by default; optional retrieve wait in `specs/retrieve-graph-quality.md`). Do not propose writing to Neo4j outside the projection path, or "just use Postgres for everything" without addressing the native-traversal constraint (PPR / Louvain / later).
 - **community → Louvain → ledger summary → optional retrieve hits**: topic retrieve; Host still generates the answer
+- **core → MCP tools (stdio) ∥ iknow-memory dashboard (HTTP)**: two facades, one capability origin; the dashboard is not a host
 
 ## Flagged ambiguities
 
@@ -193,6 +197,7 @@ _Avoid_: "load test" (implies capacity discovery); "stress test" (we do not push
 - **rerank fail-open**: rerank failure returns the pre-rerank Host order unchanged (graph-priority list, or vector+BM25 RRF). A dead reranker must not block retrieval — but the response must still carry `degraded` and name the rerank item in `degraded_reasons`. Do not add retry/fallback logic that changes this contract without explicit decision.
 - **graph-priority vs three-arm RRF**: Host ranking is graph-priority (`specs/retrieve-graph-priority.md`). Do not describe production retrieve as vector+BM25+graph RRF at 0.7/0.15/0.15.
 - **context engineering is NOT our job**: JIT retrieval triggers, cache breakpoint planning, prompt assembly, budget allocation — these belong to the host. iknow-memory returns ranked chunks; what the host does with them is the host's problem.
+- **iknow-memory dashboard is not a host**: it is an in-process HTTP read facade. Do not implement it as an MCP client (`tools/call`) or as the iknow harness UI.
 - **zero external runtime dependency on any reference implementation**: design decisions (RRF k=60, cosine re-score 0.7/0.3, rerank fail-open, PPR) are first-class product choices documented in CONTEXT.md and PRDs; rationale is independent of any particular reference codebase. Any locally tracked upstream reference directory is read-only and not linked at runtime (zero import/link/symlink/dynamic load). We implement from first principles, not by copying.
 
 ## Bootstrap mode

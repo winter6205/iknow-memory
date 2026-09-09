@@ -20,7 +20,19 @@
  * dependency entirely: see the dynamic import in the constructor and in
  * src/index.ts:buildDeps.
  */
-import type { ChunkRecord, RetrievedChunk, SearchOptions } from "../types.js";
+import type {
+  ChunkRecord,
+  RetrievedChunk,
+  SearchOptions,
+  StorageChunkView,
+  StorageCounts,
+  StorageEntityView,
+  StorageListOptions,
+  StoragePage,
+  StorageReadPort,
+  StorageReadResult,
+  StorageTimelineEvent,
+} from "../types.js";
 import {
   appendContentInvalidation,
   CONTENT_INVALIDATIONS_METADATA_KEY,
@@ -49,6 +61,26 @@ import {
 import { GraphragError } from "../errors.js";
 import { assertPgvectorAnnDimensions, upSchemaP0 } from "./schema-p0.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
+import {
+  CHUNK_BY_ID_SQL,
+  CHUNK_COUNT_SQL,
+  CHUNK_LIST_SQL,
+  ENTITY_BY_ID_SQL,
+  ENTITY_LIST_SQL,
+  ENTITY_LIVE_COUNT_SQL,
+  TIMELINE_CHUNKS_SQL,
+  isPgInvalidTextRepresentation,
+  wrapPgRead,
+  lookupReadId,
+  normalizeStorageListOptions,
+  paginateItems,
+  projectTimelineEvents,
+  readSqlCount,
+  toChunkView,
+  toEntityView,
+  type StorageChunkRow,
+  type StorageEntityRow,
+} from "./storage-reads.js";
 
 /**
  * Minimal structural subset of the `pg` package we use. Declared as an
@@ -363,7 +395,8 @@ export class PgvectorBackend
     GraphRagStorageBackend,
     ContentInvalidationStorage,
     NeighborChunkStorage,
-    ProjectionDrainWaiter
+    ProjectionDrainWaiter,
+    StorageReadPort
 {
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
@@ -916,6 +949,110 @@ export class PgvectorBackend
         "STORAGE_ERROR"
       );
     }
+  }
+
+  async counts(): Promise<StorageCounts> {
+    return wrapPgRead("counts", async () => {
+      const pool = await this.ensureReady();
+      const [chunks, entities, invalidations] = await Promise.all([
+        pool.query(CHUNK_COUNT_SQL, []),
+        pool.query(ENTITY_LIVE_COUNT_SQL, []),
+        this.listInvalidations(),
+      ]);
+      return {
+        chunks: readSqlCount(chunks.rows as Array<Record<string, unknown>>),
+        entities: readSqlCount(entities.rows as Array<Record<string, unknown>>),
+        invalidations: invalidations.length,
+      };
+    });
+  }
+
+  async listChunks(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageChunkView>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    return wrapPgRead("listChunks", async () => {
+      const pool = await this.ensureReady();
+      const [countResult, pageResult] = await Promise.all([
+        pool.query(CHUNK_COUNT_SQL, []),
+        pool.query(CHUNK_LIST_SQL, [limit, offset]),
+      ]);
+      return {
+        items: (pageResult.rows as StorageChunkRow[]).map(toChunkView),
+        total: readSqlCount(countResult.rows as Array<Record<string, unknown>>),
+        limit,
+        offset,
+      };
+    });
+  }
+
+  async getChunk(id: string): Promise<StorageReadResult<StorageChunkView>> {
+    const lookedUp = lookupReadId(id);
+    if (!lookedUp.ok) return lookedUp;
+    return wrapPgRead<StorageReadResult<StorageChunkView>>(
+      "getChunk",
+      async () => {
+        const pool = await this.ensureReady();
+        const result = await pool.query(CHUNK_BY_ID_SQL, [lookedUp.value]);
+        const row = result.rows[0] as StorageChunkRow | undefined;
+        if (row === undefined) return { ok: false, code: "NOT_FOUND" };
+        return { ok: true, value: toChunkView(row) };
+      },
+      (err) =>
+        isPgInvalidTextRepresentation(err)
+          ? { ok: false, code: "INVALID_INPUT" }
+          : undefined
+    );
+  }
+
+  async listEntities(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageEntityView>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    return wrapPgRead("listEntities", async () => {
+      const pool = await this.ensureReady();
+      const [countResult, pageResult] = await Promise.all([
+        pool.query(ENTITY_LIVE_COUNT_SQL, []),
+        pool.query(ENTITY_LIST_SQL, [limit, offset]),
+      ]);
+      return {
+        items: (pageResult.rows as StorageEntityRow[]).map(toEntityView),
+        total: readSqlCount(countResult.rows as Array<Record<string, unknown>>),
+        limit,
+        offset,
+      };
+    });
+  }
+
+  async getEntity(id: string): Promise<StorageReadResult<StorageEntityView>> {
+    const lookedUp = lookupReadId(id);
+    if (!lookedUp.ok) return lookedUp;
+    return wrapPgRead<StorageReadResult<StorageEntityView>>(
+      "getEntity",
+      async () => {
+        const pool = await this.ensureReady();
+        const result = await pool.query(ENTITY_BY_ID_SQL, [lookedUp.value]);
+        const row = result.rows[0] as StorageEntityRow | undefined;
+        if (row === undefined) return { ok: false, code: "NOT_FOUND" };
+        return { ok: true, value: toEntityView(row) };
+      },
+      (err) =>
+        isPgInvalidTextRepresentation(err)
+          ? { ok: false, code: "INVALID_INPUT" }
+          : undefined
+    );
+  }
+
+  async listTimeline(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageTimelineEvent>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    return wrapPgRead("listTimeline", async () => {
+      const pool = await this.ensureReady();
+      const result = await pool.query(TIMELINE_CHUNKS_SQL, []);
+      const chunks = (result.rows as StorageChunkRow[]).map(toChunkView);
+      return paginateItems(projectTimelineEvents(chunks), limit, offset);
+    });
   }
 
   async close(): Promise<void> {

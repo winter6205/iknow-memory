@@ -39,6 +39,13 @@ const baseDbUrl =
   "postgresql://postgres@localhost:5432/postgres";
 const schema = `vector_startup_${Math.random().toString(16).slice(2, 10)}`;
 
+// Startup budget for one compiled-server boot, and the enclosing per-test
+// budget. The test budget must stay strictly above the startup budget so the
+// process-level timer reports a clean `timedOut` result instead of vitest
+// cutting the test off first.
+const STARTUP_BUDGET_MS = 20_000;
+const TEST_TIMEOUT_MS = STARTUP_BUDGET_MS + 10_000;
+
 interface ProcessResult {
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -130,19 +137,27 @@ function runServer(
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [serverPath], {
       env: serverEnv(dimensions, options),
-      stdio: ["ignore", "pipe", "pipe"],
+      // stdin stays open like a real MCP host: /dev/null EOF makes the stdio
+      // transport shut down and the process exit 0 on its own, which would
+      // masquerade as the "keeps running" assertion failing.
+      stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+    // Startup budget, not an assertion: the compiled server needs a cold
+    // `node dist/index.js` boot plus a live Postgres round-trip. A loaded
+    // dev box (4 cores, load > 10) starves that well past 5s and turns the
+    // "should die" cases into false timeouts, so the budget is generous;
+    // the timedOut flag still proves a graceful SIGTERM when it does fire.
     const startupTimer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
       forceKillTimer = setTimeout(() => {
         if (child.exitCode === null) child.kill("SIGKILL");
       }, 1_000);
-    }, 5_000);
+    }, STARTUP_BUDGET_MS);
 
     child.stdout.on("data", (data) => {
       stdout += data.toString();
@@ -170,21 +185,25 @@ function reportProcess(label: string, result: ProcessResult): void {
   );
 }
 
-it("redacts a password from fatal startup stderr", async () => {
-  const secret = "startup-fatal-password";
-  const connectionString = `postgresql://ci-user:${secret}@db.example.test:5432/graph`;
-  const result = await runServer(1_536, {
-    connectionString,
-    nodeOptions: `--no-warnings --experimental-loader=${failingPgLoaderPath}`,
-  });
+it(
+  "redacts a password from fatal startup stderr",
+  async () => {
+    const secret = "startup-fatal-password";
+    const connectionString = `postgresql://ci-user:${secret}@db.example.test:5432/graph`;
+    const result = await runServer(1_536, {
+      connectionString,
+      nodeOptions: `--no-warnings --experimental-loader=${failingPgLoaderPath}`,
+    });
 
-  reportProcess("fatal-redaction", result);
+    reportProcess("fatal-redaction", result);
 
-  expect(result.timedOut).toBe(false);
-  expect(result.code).toBe(1);
-  expect(result.stderr).not.toContain(secret);
-  expect(result.stderr).toContain("iknow-memory fatal");
-});
+    expect(result.timedOut).toBe(false);
+    expect(result.code).toBe(1);
+    expect(result.stderr).not.toContain(secret);
+    expect(result.stderr).toContain("iknow-memory fatal");
+  },
+  TEST_TIMEOUT_MS
+);
 
 it("redacts captured child stderr before replaying it", () => {
   const secret = "replayed-child-password";
@@ -230,40 +249,52 @@ describePg("pgvector startup self-check (SC-2 Check 4)", () => {
     }
   });
 
-  it("exits with code 2 when dimensions exceed the ANN limit", async () => {
-    const result = await runServer(2_001);
-    reportProcess("dimension-over-limit", result);
+  it(
+    "exits with code 2 when dimensions exceed the ANN limit",
+    async () => {
+      const result = await runServer(2_001);
+      reportProcess("dimension-over-limit", result);
 
-    expect(result.timedOut).toBe(false);
-    expect(result.code).toBe(2);
-    expect(result.stderr.trim()).not.toBe("");
-    expect(result.stderr).toMatch(/GRAPHRAG_MEMORY_EMBED_DIMENSIONS|2000/);
-  });
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(2);
+      expect(result.stderr.trim()).not.toBe("");
+      expect(result.stderr).toMatch(/GRAPHRAG_MEMORY_EMBED_DIMENSIONS|2000/);
+    },
+    TEST_TIMEOUT_MS
+  );
 
-  it("exits with code 1 when the chunk index cannot be built", async () => {
-    await client!.query(`
+  it(
+    "exits with code 1 when the chunk index cannot be built",
+    async () => {
+      await client!.query(`
       CREATE TABLE "${schema}".chunks (
         id uuid PRIMARY KEY,
         content text NOT NULL
       )
     `);
 
-    const result = await runServer(1_536);
-    reportProcess("index-build-failure", result);
+      const result = await runServer(1_536);
+      reportProcess("index-build-failure", result);
 
-    expect(result.timedOut).toBe(false);
-    expect(result.code).toBe(1);
-    expect(result.stderr.trim()).not.toBe("");
-    expect(result.stderr).toMatch(/chunks_embedding_idx|embedding|index/i);
-  });
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(result.stderr.trim()).not.toBe("");
+      expect(result.stderr).toMatch(/chunks_embedding_idx|embedding|index/i);
+    },
+    TEST_TIMEOUT_MS
+  );
 
-  it("keeps a correctly configured pgvector server running after startup", async () => {
-    const result = await runServer(1_536, { logLevel: "info" });
-    reportProcess("startup-success", result);
+  it(
+    "keeps a correctly configured pgvector server running after startup",
+    async () => {
+      const result = await runServer(1_536, { logLevel: "info" });
+      reportProcess("startup-success", result);
 
-    expect(result.timedOut).toBe(true);
-    expect(result.code).toBeNull();
-    expect(result.signal).toBe("SIGTERM");
-    expect(result.stderr).toContain("stdio transport connected");
-  }, 10_000);
+      expect(result.timedOut).toBe(true);
+      expect(result.code).toBeNull();
+      expect(result.signal).toBe("SIGTERM");
+      expect(result.stderr).toContain("stdio transport connected");
+    },
+    TEST_TIMEOUT_MS
+  );
 });

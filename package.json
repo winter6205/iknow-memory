@@ -24,6 +24,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint:s5": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed",
+    "lint:s5:staged": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed --staged",
+    "lint:s5:all": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs src",
     "test": "vitest run",
     "check:retrieval-baseline": "tsx scripts/check-retrieval-baseline.ts",
     "dev": "tsx src/index.ts",
@@ -57,11 +60,13 @@
   "devDependencies": {
     "@types/node": "^22.13.10",
     "@types/pg": "^8.11.0",
+    "eslint": "^10.10.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.3.0",
     "prettier": "^3.9.6",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
+    "typescript-eslint": "^8.70.0",
     "vitest": "^3.2.7"
   }
 }

@@ -38,3 +38,9 @@ docs/archive/.tmp-*
 .husky/prepare-commit-msg
 # Local study HTML (not iknow-memory SSOT; generated to a personal path)
 .reference/
+
+# Local operator-board UI snapshot (not product source; keep on disk only)
+docs/wayfinder/prototypes/operator-board/
+
+# Playwright CLI page snapshots / console logs (local debugging scratch)
+.playwright-cli/

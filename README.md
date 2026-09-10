@@ -147,6 +147,8 @@ docs/
 npm run dashboard
 ```
 
+根目录 `npm install` 不会装上 `dashboard/` 的依赖。`npm run dashboard` 发现缺 Vite 时会自动执行 `npm install --prefix dashboard`；只有自动安装失败才需要你手动跑同一条命令。
+
 浏览器打开 `http://127.0.0.1:18868/`。端口：
 
 | 进程        | 默认              | 说明                                                    |

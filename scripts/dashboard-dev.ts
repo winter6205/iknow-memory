@@ -6,7 +6,8 @@
  * Zero-config: when no storage env is set, the API child boots memory mode
  * with graph + rerank explicitly off so ADR-0006 fail-start does not fire.
  */
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -22,6 +23,56 @@ export type ChildSpawnSpec = {
   args: string[];
   cwd: string;
 };
+
+export type DashboardInstaller = (dashboardPrefix: string) => number;
+
+const VITE_BIN_REL = "dashboard/node_modules/.bin/vite";
+
+const MISSING_VITE_HINT =
+  "dashboard Vite binary is missing. Run: npm install --prefix dashboard";
+
+function defaultDashboardInstaller(dashboardPrefix: string): number {
+  const result = spawnSync("npm", ["install", "--prefix", dashboardPrefix], {
+    stdio: "inherit",
+  });
+  return result.status ?? 1;
+}
+
+export function ensureDashboardVite(
+  root: string,
+  installer: DashboardInstaller = defaultDashboardInstaller
+): void {
+  const vite = join(root, VITE_BIN_REL);
+  if (existsSync(vite)) return;
+  const status = installer(join(root, "dashboard"));
+  if (status !== 0 || !existsSync(vite)) {
+    throw new Error(MISSING_VITE_HINT);
+  }
+}
+
+export type ChildLifecycleHooks = {
+  isShuttingDown: () => boolean;
+  shutdown: (exitCode: number) => void;
+};
+
+export function attachChildLifecycle(
+  child: Pick<ChildProcess, "on">,
+  spec: Pick<ChildSpawnSpec, "name">,
+  hooks: ChildLifecycleHooks
+): void {
+  child.on("exit", (code, signal) => {
+    if (hooks.isShuttingDown()) return;
+    console.error(
+      `[dashboard] ${spec.name} exited (code=${code} signal=${signal}), stopping all`
+    );
+    hooks.shutdown(code === 0 ? 0 : (code ?? 1));
+  });
+  child.on("error", (err) => {
+    if (hooks.isShuttingDown()) return;
+    console.error(`[dashboard] ${spec.name} failed to start: ${String(err)}`);
+    hooks.shutdown(1);
+  });
+}
 
 export function dashboardChildSpawns(root: string): ChildSpawnSpec[] {
   return [
@@ -46,12 +97,52 @@ const STORAGE_ENV_KEYS = [
   "GRAPHRAG_MEMORY_NEO4J_URI",
 ] as const;
 
+function stripQuotes(value: string): string {
+  const quoted =
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"));
+  return quoted ? value.slice(1, -1) : value;
+}
+
+/** Parse one `.env.local` line into a storage key/value pair, or null. */
+function parseStorageLine(line: string): [string, string] | null {
+  const trimmed = line.trim();
+  if (trimmed === "" || trimmed.startsWith("#")) return null;
+  const eq = trimmed.indexOf("=");
+  if (eq <= 0) return null;
+  const key = trimmed.slice(0, eq).trim();
+  if (!STORAGE_ENV_KEYS.includes(key as (typeof STORAGE_ENV_KEYS)[number])) {
+    return null;
+  }
+  const value = stripQuotes(trimmed.slice(eq + 1).trim());
+  if (value.startsWith("<") && value.endsWith(">")) return null;
+  return [key, value];
+}
+
+export function readStorageFileEnv(root: string): NodeJS.ProcessEnv {
+  const path = join(root, ".env.local");
+  if (!existsSync(path)) return {};
+  const out: NodeJS.ProcessEnv = {};
+  for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+    const parsed = parseStorageLine(line);
+    if (parsed === null) continue;
+    const [key, value] = parsed;
+    out[key] = value;
+  }
+  return out;
+}
+
 const children: ChildProcess[] = [];
 let shuttingDown = false;
 
-export function isStorageConfigured(env: NodeJS.ProcessEnv): boolean {
+export function isStorageConfigured(
+  env: NodeJS.ProcessEnv,
+  fileEnv: NodeJS.ProcessEnv = {}
+): boolean {
   return STORAGE_ENV_KEYS.some((key) => {
-    const raw = env[key];
+    const raw = Object.prototype.hasOwnProperty.call(env, key)
+      ? env[key]
+      : fileEnv[key];
     return raw !== undefined && raw.trim() !== "";
   });
 }
@@ -77,9 +168,10 @@ export function resolveDashboardApiPort(env: NodeJS.ProcessEnv): number {
 }
 
 export function buildDashboardChildEnv(
-  inherited: NodeJS.ProcessEnv
+  inherited: NodeJS.ProcessEnv,
+  fileEnv: NodeJS.ProcessEnv = {}
 ): NodeJS.ProcessEnv {
-  const next = isStorageConfigured(inherited)
+  const next = isStorageConfigured(inherited, fileEnv)
     ? { ...inherited }
     : {
         ...inherited,
@@ -117,12 +209,9 @@ function start(spec: ChildSpawnSpec, env: NodeJS.ProcessEnv): ChildProcess {
     detached: true,
   });
   children.push(child);
-  child.on("exit", (code, signal) => {
-    if (shuttingDown) return;
-    console.error(
-      `[dashboard] ${spec.name} exited (code=${code} signal=${signal}), stopping all`
-    );
-    shutdown(code === 0 ? 0 : (code ?? 1));
+  attachChildLifecycle(child, spec, {
+    isShuttingDown: () => shuttingDown,
+    shutdown,
   });
   console.error(`[dashboard] started ${spec.name} (pid ${child.pid})`);
   return child;
@@ -181,12 +270,14 @@ if (isMain()) {
   process.on("SIGTERM", () => shutdown(143));
   process.on("SIGHUP", () => shutdown(129));
 
-  const env = buildDashboardChildEnv(process.env);
-  if (!isStorageConfigured(process.env)) {
+  const fileEnv = readStorageFileEnv(DASHBOARD_ROOT);
+  const env = buildDashboardChildEnv(process.env, fileEnv);
+  if (!isStorageConfigured(process.env, fileEnv)) {
     console.error(
       "[dashboard] no GRAPHRAG_MEMORY_* storage env set — starting dashboard-api in memory mode (empty store; Neo4j graph routes stay optional / error until configured)"
     );
   }
+  ensureDashboardVite(DASHBOARD_ROOT);
   for (const spec of dashboardChildSpawns(DASHBOARD_ROOT)) {
     start(spec, env);
   }

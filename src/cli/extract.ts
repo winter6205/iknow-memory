@@ -106,6 +106,16 @@ export interface CliDeps {
    * transaction. Absent when no precision layer is configured.
    */
   precision?: import("../core/storage/elasticsearch-precision.js").PrecisionIndexer;
+  /**
+   * T4 write-time supersede switch. Forwarded to the persist half so a
+   * contradicting older row is retired in the same per-chunk transaction
+   * instead of accumulating until an offline consolidate `--apply`.
+   * The wiring (`runCliFromEnv`) reads `env.extractWriteTimeSupersede`,
+   * which is ON by default per ADR-0009 with an explicit off as the
+   * escape hatch; an omitted value (test injection) keeps the pre-T4
+   * merge-on-overlap shape.
+   */
+  writeTimeSupersede?: boolean;
 }
 
 type ParsedArgs = { ok: true; flags: CliFlags } | { ok: false; error: string };
@@ -415,6 +425,52 @@ function persistsEmbeddings(flags: CliFlags): boolean {
   return !(flags.dryRun || flags.listUnmapped || flags.listFailed);
 }
 
+/**
+ * Assemble the CLI's dependency bundle from the validated env.
+ *
+ * Split out of `runCliFromEnv` the same way `src/index.ts` splits
+ * `buildStorage` / `buildEmbedder` / `buildPrecision` out of `buildDeps`, so
+ * the entry point carries only the one branch pair that decides which client
+ * each credential guard builds. The ES precision layer stays there — its
+ * `close()` shares the pool's `finally`.
+ *
+ * The credential guards (`buildLlmClient` / `buildEmbedderClient`) still run
+ * inside this call, so the caller keeps them within its ConfigError → exit 1
+ * mapping. Optional pieces keep the `...(cond ? {k: v} : {})` form so an
+ * unconfigured one leaves its key absent — the shape the inline literal had.
+ */
+function buildCliDeps(
+  env: GraphragEnv,
+  pool: CliPool,
+  precision: CliDeps["precision"],
+  flags: CliFlags
+): CliDeps {
+  return {
+    pool,
+    llm: buildLlmClient(
+      {
+        authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+        baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
+        model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
+      },
+      { extraction: isRealExtraction(flags) }
+    ),
+    embedder: buildEmbedderClient(
+      {
+        apiKey: env.embedApiKey,
+        baseUrl: env.embedBaseUrl,
+        model: env.embedModel,
+        dimensions: env.embedDimensions,
+      },
+      { persistsEmbeddings: persistsEmbeddings(flags) }
+    ),
+    dims: env.embedDimensions,
+    logger: createLogger(env.logLevel),
+    ...(precision !== undefined ? { precision } : {}),
+    writeTimeSupersede: env.extractWriteTimeSupersede,
+  };
+}
+
 /** Wire real deps from env and run; used by main(). */
 export async function runCliFromEnv(argv: string[]): Promise<number> {
   let env: GraphragEnv;
@@ -451,34 +507,11 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
           b: env.retrieval.b,
         });
   try {
-    // The credential guards (buildLlmClient / buildEmbedderClient) run inside
-    // the try: a ConfigError here is the typed "refusing to persist without
+    // The credential guards run inside `buildCliDeps` (hence inside this
+    // try): a ConfigError here is the typed "refusing to persist without
     // credentials" failure mapped to exit 1 below — never a silent fake
     // fallback on a persisting path (CR High #1 / #3).
-    const deps: CliDeps = {
-      pool,
-      llm: buildLlmClient(
-        {
-          authToken: process.env.ANTHROPIC_AUTH_TOKEN,
-          baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
-          model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
-        },
-        { extraction: isRealExtraction(parsed.flags) }
-      ),
-      embedder: buildEmbedderClient(
-        {
-          apiKey: env.embedApiKey,
-          baseUrl: env.embedBaseUrl,
-          model: env.embedModel,
-          dimensions: env.embedDimensions,
-        },
-        { persistsEmbeddings: persistsEmbeddings(parsed.flags) }
-      ),
-      dims: env.embedDimensions,
-      logger: createLogger(env.logLevel),
-      ...(precision !== undefined ? { precision } : {}),
-    };
-    return await runCli(argv, deps);
+    return await runCli(argv, buildCliDeps(env, pool, precision, parsed.flags));
   } catch (err) {
     if (err instanceof ConfigError) {
       writeStderr(`extract config error: ${err.message}\n`);

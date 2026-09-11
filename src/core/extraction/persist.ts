@@ -49,6 +49,15 @@ export interface ExtractPersistDeps {
   logger: Logger;
   /** Injectable clock for deterministic started_at in tests. */
   now?: () => string;
+  /**
+   * T4 write-time supersede switch. Forwarded to `upsertTriple` so a
+   * contradicting older row is retired in the same per-chunk transaction
+   * instead of accumulating until an offline consolidate `--apply`.
+   * Production threads the `loadEnv()` value — ON by default per ADR-0009,
+   * explicit off as the escape hatch. Omitted (test injection) keeps the
+   * pre-T4 merge-on-overlap shape.
+   */
+  writeTimeSupersede?: boolean;
 }
 
 /** Injectable clock fallback: every log/timestamp site reads the time here. */
@@ -152,6 +161,7 @@ export async function persistOutputs(
     }
     const relationNorm = await vetRelationNorm(deps, out);
     const upserted = await resolveAndUpsertTriple(
+      deps,
       client,
       chunkId,
       out,
@@ -161,6 +171,11 @@ export async function persistOutputs(
       startedAt
     );
     projected.push({ kind: "triple", id: upserted.tripleId });
+    if (upserted.retiredTripleId !== undefined) {
+      // The retired row's validity window just closed; Neo4j re-reads the
+      // row on drain, so it needs an intent of its own (same transaction).
+      projected.push({ kind: "triple", id: upserted.retiredTripleId });
+    }
     triples += 1;
     if (relationNorm === UNMAPPED) unmapped += 1;
   }
@@ -270,8 +285,24 @@ function logUngroundedRejection(
  * Upsert one grounded triple. A merge returns the surviving row's id: its
  * confidence just moved, so the edge still needs re-projecting (the caller
  * pushes it onto `projected` either way).
+ *
+ * `extractor` is set explicitly to `'llm'` here — every triple this module
+ * produces comes from the LLM extraction path; a rule-based or human writer
+ * has its own call site and sets its own tag.
+ *
+ * T4: the write-time supersede switch from `deps.writeTimeSupersede` is
+ * forwarded to `upsertTriple` as `options.writeTimeSupersede`. The
+ * supersede boundary uses `startedAt` (the per-chunk transaction start,
+ * already injected as the deterministic clock) instead of `now()` so two
+ * parallel chunks picking the same contradiction stamp a consistent
+ * boundary.
+ *
+ * A supersede also retires an older row, whose closed `valid_window` must
+ * reach Neo4j — so the caller emits a projection intent for
+ * `retiredTripleId` too (the offline `--apply` path does the same).
  */
 async function resolveAndUpsertTriple(
+  deps: ExtractPersistDeps,
   client: Queryable,
   chunkId: string,
   out: ExtractionOutput,
@@ -279,17 +310,26 @@ async function resolveAndUpsertTriple(
   tailId: string,
   relationNorm: string,
   startedAt: string
-): Promise<{ tripleId: string }> {
-  return upsertTriple(client, {
-    headId,
-    tailId,
-    relationRaw: out.relationRaw,
-    relationNorm,
-    confidence: out.confidence,
-    sourceChunkId: chunkId,
-    evidenceSpan: out.evidenceSpan,
-    validWindow: { start: startedAt, end: null },
-  });
+): Promise<{ tripleId: string; retiredTripleId?: string }> {
+  return upsertTriple(
+    client,
+    {
+      headId,
+      tailId,
+      relationRaw: out.relationRaw,
+      relationNorm,
+      confidence: out.confidence,
+      sourceChunkId: chunkId,
+      evidenceSpan: out.evidenceSpan,
+      validWindow: { start: startedAt, end: null },
+      extractor: "llm",
+    },
+    {
+      ...(deps.writeTimeSupersede === true
+        ? { writeTimeSupersede: true, now: () => startedAt }
+        : {}),
+    }
+  );
 }
 
 /**

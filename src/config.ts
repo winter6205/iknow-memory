@@ -80,6 +80,19 @@ export const PGVECTOR_ANN_MAX_DIMENSIONS_VAR =
   "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
 /** Environment variable for the maximum number of items in one ingest call. */
 export const INGEST_BATCH_LIMIT_VAR = "GRAPHRAG_MEMORY_INGEST_BATCH_LIMIT";
+/**
+ * Environment variable that gates write-time contradiction resolution
+ * (extract pipeline T4). When ON, a triple whose (head, relation_norm)
+ * matches an existing row with a DIFFERENT tail and an overlapping valid
+ * window supersedes the older row in the same transaction (pointer +
+ * closed validity upper bound) instead of coexisting until an operator
+ * runs the offline consolidate CLI. Default ON per ADR-0009: resolving
+ * contradictions at write time is ledger infrastructure, not an optional
+ * retrieval feature. Explicit off is the test/escape hatch only, the same
+ * shape as `graphEnabled=false`; the offline CLI stays the backfill path.
+ */
+export const EXTRACT_WRITE_TIME_SUPERSEDE_VAR =
+  "GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE";
 /** A bounded default keeps embedding requests and writes reasonably sized. */
 export const DEFAULT_INGEST_BATCH_LIMIT = 100;
 /** Environment variable for the PostgreSQL pool connection cap. */
@@ -197,6 +210,25 @@ export interface GraphragEnv {
   rerank: RerankConfig | undefined;
   /** Dedicated HTTP rerank endpoint; undefined means the adapter is skipped. */
   rerankUrl: string | undefined;
+  /**
+   * Write-time contradiction resolution switch (extract pipeline T4).
+   *
+   * ON (default, ADR-0009): a triple whose (head, relation_norm) matches an
+   * existing row with a DIFFERENT tail and an overlapping valid window
+   * supersedes the older row in the same per-chunk transaction —
+   * `superseded_by` is set, `valid_window` is closed at the new row's
+   * `created_at`, the new row is inserted. The shape is byte-identical to
+   * the offline CLI's `--apply` (same deterministic newest-wins rule, same
+   * predicates); nothing is deleted.
+   *
+   * OFF: write-time behaviour is exactly the pre-T4 behaviour
+   * (merge-on-overlap, otherwise insert); contradictions accumulate until
+   * an operator runs `consolidate --apply`. Explicit off is the
+   * test/escape hatch only, so it lives in global settings the same way
+   * `graphEnabled=false` does. The consolidate CLI remains the offline
+   * backfill / dry-run path, not the daily master switch.
+   */
+  extractWriteTimeSupersede: boolean;
 }
 
 /**
@@ -971,6 +1003,14 @@ export function loadEnv(): GraphragEnv {
   const elasticsearch = parseElasticsearchConfig();
   const rerank = parseRerankConfig();
   const rerankUrl = readTrimmed(RETRIEVAL_RERANK_URL_VAR);
+  // Extract write-time supersede switch (T4). ADR-0009: defaults to ON —
+  // resolving contradictions at write time is ledger infrastructure, and
+  // the explicit off is the test/escape hatch (graphEnabled-shaped).
+  const extractWriteTimeSupersede = parseBoolean(
+    EXTRACT_WRITE_TIME_SUPERSEDE_VAR,
+    readEnv(EXTRACT_WRITE_TIME_SUPERSEDE_VAR),
+    true
+  );
   // ADR-0006: after every block parses, refuse a default-on graph/rerank
   // boot whose dependency is missing. Runs after (not inside) the parsers
   // so the per-family parse errors keep naming their own vars first.
@@ -995,6 +1035,7 @@ export function loadEnv(): GraphragEnv {
     elasticsearch,
     rerank,
     rerankUrl,
+    extractWriteTimeSupersede,
   };
 }
 

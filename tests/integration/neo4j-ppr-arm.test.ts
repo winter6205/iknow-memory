@@ -28,13 +28,16 @@
  *     GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 \
  *     GRAPHRAG_MEMORY_NEO4J_URI=bolt://localhost:7687 \
  *     GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false \
+ *     GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false \
  *     npx vitest run tests/integration/neo4j-ppr-arm.test.ts
  *
  * EMBED_DIMENSIONS only has to satisfy loadEnv()'s must-be-set rule (the
  * fixture's own tables are vector(DIM=8)); it must stay at or below
- * PGVECTOR_ANN_MAX_DIMENSIONS or loadEnv fails-start (ADR-0006). Rerank is
- * off because loadEnv also fail-starts a default-on rerank with no
- * GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL configured.
+ * PGVECTOR_ANN_MAX_DIMENSIONS or loadEnv fails-start (ADR-0006). Rerank and
+ * BM25 are off because loadEnv also fail-starts a default-on rerank with no
+ * GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL and a default-on precision layer with
+ * no GRAPHRAG_MEMORY_ES_URL (ADR-0007); the fixture drives the vector and PPR
+ * arms only.
  */
 import { randomUUID } from "node:crypto";
 import neo4j, { type Driver } from "neo4j-driver";
@@ -65,7 +68,7 @@ const DIM = 8;
 const pgHarness = await createPgIntegrationHarness({
   label: "neo4j-ppr-arm",
   testPath: "tests/integration/neo4j-ppr-arm.test.ts",
-  expectedCommand: `GRAPHRAG_MEMORY_EMBED_DIMENSIONS=2000 GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 ${NEO4J_URI_VAR}=bolt://localhost:7687 GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false npx vitest run tests/integration/neo4j-ppr-arm.test.ts`,
+  expectedCommand: `GRAPHRAG_MEMORY_EMBED_DIMENSIONS=2000 GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 ${NEO4J_URI_VAR}=bolt://localhost:7687 GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false npx vitest run tests/integration/neo4j-ppr-arm.test.ts`,
   schemaPrefix: "neo4j_ppr",
   defaultConnectionString: "postgresql://postgres@localhost:5432/postgres",
   requiresVector: true,
@@ -177,7 +180,7 @@ function skipLoudly(reason: string): void {
   console.warn(
     "Validation:\n" +
       "- Not run: tests/integration/neo4j-ppr-arm.test.ts\n" +
-      `- Expected command: GRAPHRAG_MEMORY_EMBED_DIMENSIONS=2000 GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 ${NEO4J_URI_VAR}=bolt://localhost:7687 GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false npx vitest run tests/integration/neo4j-ppr-arm.test.ts\n` +
+      `- Expected command: GRAPHRAG_MEMORY_EMBED_DIMENSIONS=2000 GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 ${NEO4J_URI_VAR}=bolt://localhost:7687 GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false npx vitest run tests/integration/neo4j-ppr-arm.test.ts\n` +
       `- Blocking issue: ${reason}\n`
   );
 }

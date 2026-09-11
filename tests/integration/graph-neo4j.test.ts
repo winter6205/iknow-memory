@@ -20,13 +20,15 @@
  *     GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 \
  *     GRAPHRAG_MEMORY_NEO4J_URI=neo4j://localhost:7687 \
  *     GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false \
+ *     GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false \
  *     npx vitest run tests/integration/graph-neo4j.test.ts
  *
  * EMBED_DIMENSIONS here only has to satisfy loadEnv()'s must-be-set rule
  * (the fixture's own tables are vector(DIM=8)); it must stay at or below
- * PGVECTOR_ANN_MAX_DIMENSIONS or loadEnv fails-start (ADR-0006). Rerank is
- * off because loadEnv also fail-starts a default-on rerank with no
- * GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL configured.
+ * PGVECTOR_ANN_MAX_DIMENSIONS or loadEnv fails-start (ADR-0006). Rerank and
+ * BM25 are off because loadEnv also fail-starts a default-on rerank with no
+ * GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL and a default-on precision layer with
+ * no GRAPHRAG_MEMORY_ES_URL (ADR-0007); this suite never exercises either.
  *
  * Fixture rows carry per-run UUIDs and are DETACH DELETEd on teardown, so the
  * suite neither collides with nor destroys anything else in the database.
@@ -80,7 +82,7 @@ function skipLoudly(reason: string): void {
   console.warn(
     "Validation:\n" +
       "- Not run: tests/integration/graph-neo4j.test.ts\n" +
-      `- Expected command: GRAPHRAG_MEMORY_EMBED_DIMENSIONS=2000 GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 ${NEO4J_URI_VAR}=neo4j://localhost:7687 GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false npx vitest run tests/integration/graph-neo4j.test.ts\n` +
+      `- Expected command: GRAPHRAG_MEMORY_EMBED_DIMENSIONS=2000 GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS=2000 ${NEO4J_URI_VAR}=neo4j://localhost:7687 GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false npx vitest run tests/integration/graph-neo4j.test.ts\n` +
       `- Blocking issue: ${reason}\n`
   );
 }

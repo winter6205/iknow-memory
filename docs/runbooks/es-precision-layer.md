@@ -202,8 +202,8 @@ When the indexes are too far out of sync to repair chunk-by-chunk (mass
 outage, mapping accidentally recreated with wrong analyzer settings,
 operator "let's start over"), the recovery is:
 
-1. Stop ingestion (set `GRAPHRAG_MEMORY_ES_URL` empty, restart the
-   server, or just pause the extract CLI).
+1. Stop ingestion (set `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false`
+   and restart the server, or just pause the extract CLI).
 2. Use the `es:reindex` CLI (see the section below).
 3. Postgres rows are never modified by the rebuild; only the two
    derived indexes are dropped and re-populated.
@@ -243,8 +243,11 @@ Behavior:
   malformed flag).
 - An unconfigured ES block is a **config error (exit 1)**, not a silent
   skip: the tool was invoked specifically to push to ES, so "no target
-  configured" is an operator mistake. Pass `--dry-run` for a
-  Postgres-only scan.
+  configured" is an operator mistake. Since ADR-0007 that refusal now
+  surfaces earlier — `loadEnv()` itself fails the boot when the
+  default-on precision layer has no address — so even `--dry-run` needs
+  `GRAPHRAG_MEMORY_ES_URL` set or `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false`
+  set for the run.
 - **Postgres is read-only.** The CLI never issues a write against the
   ledger; only `iknow-memory-chunks` and `iknow-memory-entities` are
   dropped and re-populated.
@@ -258,7 +261,7 @@ your host's MCP JSON `env` block or `.env.local`, never in source
 
 | Variable                                             | Purpose                                           | Default                                   |
 | ---------------------------------------------------- | ------------------------------------------------- | ----------------------------------------- |
-| `GRAPHRAG_MEMORY_ES_URL` (alias `_NODE`)             | Single ES node URL (`http(s)://…`).               | unset                                     |
+| `GRAPHRAG_MEMORY_ES_URL` (alias `_NODE`)             | Single ES node URL (`http(s)://…`).               | unset (fail-start, see below)             |
 | `GRAPHRAG_MEMORY_ES_USERNAME`                        | Basic-auth user (with `_PASSWORD`).               | unset                                     |
 | `GRAPHRAG_MEMORY_ES_PASSWORD`                        | Basic-auth password (with `_USERNAME`).           | unset                                     |
 | `GRAPHRAG_MEMORY_ES_API_KEY`                         | API key (mutually exclusive with user/password).  | unset                                     |
@@ -274,13 +277,16 @@ your host's MCP JSON `env` block or `.env.local`, never in source
 | `GRAPHRAG_MEMORY_RETRIEVAL_RRF_ENABLED`              | RRF fusion of vector+BM25 (fallback + remainder). | `true`                                    |
 | `GRAPHRAG_MEMORY_RETRIEVAL_VECTOR_ENABLED`           | Vector arm on/off.                                | `true`                                    |
 
-Leaving `GRAPHRAG_MEMORY_ES_URL` unset keeps the lexical arm
-**loud-skipped** — no `degraded` flag, vector-only retrieve. Partial
-configuration (a username without a password, or credentials without a
-URL) is rejected at startup as a typed `ConfigError` naming the missing
-variable.
+The precision layer is default-on with no address here, so
+`GRAPHRAG_MEMORY_ES_URL` unset makes `loadEnv()` throw `ConfigError` and
+refuse process start (ADR-0007 fail-start) — the same shape as the
+graph / rerank refusals. Set the address, or take the explicit-off escape
+hatch `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false` to boot
+vector-only. Partial configuration (a username without a password, or
+credentials without a URL) is still rejected at startup as a typed
+`ConfigError` naming the missing variable.
 
-## Exit codes / loud-skip behavior
+## Exit codes / fail-start behavior
 
 When ES is configured but unreachable at query time:
 
@@ -296,9 +302,13 @@ When ES is configured but unreachable at ingest write time:
 
 When ES is **not** configured (`GRAPHRAG_MEMORY_ES_URL` unset):
 
-- Lexical arm is not attempted at all. No `degraded` flag (per
-  `degraded=true` rule 4: a capability the caller / operator switched
-  off is not a degradation).
+- A default-on precision layer with no address refuses process start
+  (`ConfigError`, ADR-0007 fail-start). This is not a retrieve-time
+  state — the process never boots, so no `degraded` envelope is produced.
+- Only an explicit `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false` boots
+  without ES; the lexical arm is then not attempted at all and no
+  `degraded` flag is set (per `degraded=true` rule 4: a capability the
+  caller / operator switched off is not a degradation).
 
 ## Troubleshooting
 

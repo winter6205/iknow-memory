@@ -117,6 +117,8 @@ function serverEnv(
     // succeed (or fail on pgvector grounds) without sidecar credentials.
     GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
     GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+    // ADR-0007: the startup self-check never exercises the lexical arm.
+    GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
     PATH: process.env.PATH ?? "",
     ...(options.nodeOptions === undefined
       ? {}

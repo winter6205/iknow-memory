@@ -1,6 +1,7 @@
 /**
  * dashboard-dev orchestrator: zero-config must disable graph + rerank
- * (ADR-0006 fail-start) and tear down the child process group.
+ * (ADR-0006 fail-start) and the ES precision layer (ADR-0007 fail-start),
+ * and tear down the child process group.
  */
 import { describe, it } from "vitest";
 import assert from "node:assert/strict";
@@ -76,9 +77,10 @@ describe("dashboard-dev zero-config env", () => {
     assert.equal(env.GRAPHRAG_MEMORY_STORAGE, undefined);
     assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED, undefined);
     assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED, undefined);
+    assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED, undefined);
   });
 
-  it("sets memory mode and disables graph and rerank when unconfigured", () => {
+  it("sets memory mode and disables graph, rerank, and the precision layer when unconfigured", () => {
     const env = buildDashboardChildEnv({
       PATH: "/usr/bin",
       HOME: "/tmp",
@@ -88,20 +90,25 @@ describe("dashboard-dev zero-config env", () => {
     assert.equal(env.GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS, "8");
     assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED, "false");
     assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED, "false");
+    // ADR-0007: memory mode has no ES address, so the default-on precision
+    // layer must be explicitly off or the API child refuses to boot.
+    assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED, "false");
     assert.equal(env.PATH, "/usr/bin");
   });
 
-  it("passes through operator storage env without forcing graph or rerank off", () => {
+  it("passes through operator storage env without forcing graph, rerank, or BM25 off", () => {
     const env = buildDashboardChildEnv({
       PATH: "/usr/bin",
       GRAPHRAG_MEMORY_STORAGE: "pgvector",
       GRAPHRAG_MEMORY_DB_URL: "postgresql://localhost/iknow_memory",
       GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "true",
       GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "true",
+      GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "true",
     });
     assert.equal(env.GRAPHRAG_MEMORY_STORAGE, "pgvector");
     assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED, "true");
     assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED, "true");
+    assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED, "true");
     assert.equal(env.GRAPHRAG_MEMORY_EMBED_DIMENSIONS, undefined);
   });
 

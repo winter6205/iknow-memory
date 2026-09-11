@@ -48,6 +48,16 @@ const RETRIEVAL_VARS = [
 const PGVECTOR_VARS = ["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] as const;
 
 /**
+ * Write-time contradiction resolution (ADR-0009). Scrubbed with the other
+ * families so a developer's real opt-out cannot leak into a default
+ * assertion — the switch is default-on, so a stray `false` would flip the
+ * pinned boot value.
+ */
+const EXTRACT_SUPERSEDE_VARS = [
+  "GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE",
+] as const;
+
+/**
  * Extract Anthropic trio reused as the temporary rerank adapter.
  * Scrubbed so a developer machine with extract credentials cannot turn
  * a "skip" assertion into a configured rerank block.
@@ -130,6 +140,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "embedBaseUrl",
       "embedDimensions",
       "embedModel",
+      "extractWriteTimeSupersede",
       "ingestBatchLimit",
       "logLevel",
       "neo4j",
@@ -241,6 +252,7 @@ const DOTENV_MASK_KEYS = [
   ...PGVECTOR_VARS,
   ...NEO4J_VARS,
   ...ANTHROPIC_VARS,
+  ...EXTRACT_SUPERSEDE_VARS,
 ] as const;
 
 /**
@@ -1856,4 +1868,59 @@ describe("loadEnv — graph/rerank fail-start (ADR-0006)", () => {
       }
     );
   });
+});
+
+/**
+ * ADR-0009 write-time contradiction resolution: ledger infrastructure, so
+ * it is ON unless an operator explicitly opts out. The switch's shape
+ * mirrors `graphEnabled` (default-on, explicit off is the test/escape
+ * hatch), so its boundary matrix is the same: unset/blank → on; "false" /
+ * "0" → off; unparseable → typed ConfigError naming the var.
+ */
+describe("loadEnv — write-time supersede switch (ADR-0009)", () => {
+  it("defaults to on when the switch is unset", () => {
+    withEnv({}, () => {
+      expect(loadEnv().extractWriteTimeSupersede).toBe(true);
+    });
+  });
+
+  it("treats a blank switch as unset and keeps it on", () => {
+    withEnv({ GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE: "   " }, () => {
+      expect(loadEnv().extractWriteTimeSupersede).toBe(true);
+    });
+  });
+
+  it("turns it off on an explicit false / 0 (escape hatch, not degradation)", () => {
+    withEnv({ GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE: "false" }, () => {
+      expect(loadEnv().extractWriteTimeSupersede).toBe(false);
+    });
+    withEnv({ GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE: "0" }, () => {
+      expect(loadEnv().extractWriteTimeSupersede).toBe(false);
+    });
+    withEnv({ GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE: "FALSE" }, () => {
+      expect(loadEnv().extractWriteTimeSupersede).toBe(false);
+    });
+  });
+
+  it("accepts 1 / true / mixed case as on", () => {
+    withEnv({ GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE: "1" }, () => {
+      expect(loadEnv().extractWriteTimeSupersede).toBe(true);
+    });
+    withEnv({ GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE: " true " }, () => {
+      expect(loadEnv().extractWriteTimeSupersede).toBe(true);
+    });
+  });
+
+  const BAD_SUPERSEDE_FLAGS = ["maybe", "2", "on", "yes", "-1"];
+
+  for (const value of BAD_SUPERSEDE_FLAGS) {
+    it(`rejects an unparseable switch "${value}" instead of guessing`, () => {
+      withEnv({ GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE: value }, () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_EXTRACT_WRITE_TIME_SUPERSEDE/
+        );
+      });
+    });
+  }
 });

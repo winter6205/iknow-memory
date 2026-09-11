@@ -237,6 +237,17 @@ export interface ExtractDeps {
   batchLimit?: number;
   /** Injectable clock for deterministic started_at in tests. */
   now?: () => string;
+  /**
+   * T4 write-time supersede switch. Forwarded to the persist half so a
+   * contradicting older row is retired in the same per-chunk transaction
+   * instead of accumulating until an offline consolidate `--apply`.
+   * The production wiring (`buildExtractDeps` in src/index.ts) threads the
+   * validated env value — ON by default per ADR-0009, explicit off as the
+   * escape hatch — so one operator setting governs both the MCP tool and
+   * the offline CLI; tests inject it explicitly via this seam, where an
+   * omitted value keeps the pre-T4 merge-on-overlap shape.
+   */
+  writeTimeSupersede?: boolean;
 }
 
 /** No-op logger for dep constructions that did not thread one in. */
@@ -407,6 +418,34 @@ function buildExtractOutput(
 }
 
 /**
+ * Assemble the core pipeline deps from the handler's injection seams.
+ *
+ * Split out of `extractHandler` so the handler reads as the straight-line
+ * check → dial → run sequence it documents. Every optional seam is spread in
+ * only when present, so an absent seam stays equivalent to the core's own
+ * default (no precision layer, wall-clock `now`, supersede OFF) without
+ * materializing `undefined` keys.
+ *
+ * `llm` / `embedder` arrive already built: the credential guards run in the
+ * handler, where their `ConfigError` becomes the Host-readable
+ * `ExtractNotConfiguredError` (SC9).
+ */
+function buildPipelineDeps(
+  deps: ExtractDeps,
+  llm: LLMClient,
+  embedder: EmbeddingClient
+): ExtractPipelineDeps {
+  return {
+    llm,
+    embedder,
+    logger: deps.logger ?? NOOP_LOGGER,
+    ...(deps.precision !== undefined ? { precision: deps.precision } : {}),
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+    ...(deps.writeTimeSupersede === true ? { writeTimeSupersede: true } : {}),
+  };
+}
+
+/**
  * Build the extract handler with the given dependencies closed over.
  *
  * Order of checks (and why this order):
@@ -420,7 +459,7 @@ function buildExtractOutput(
  *  4. Schema bootstrap → selector → batch.
  */
 export function createExtractHandler(deps: ExtractDeps) {
-  // The P0 schema bootstrap is idempotent DDL (CREATE ... IF NOT EXISTS)
+  // The schema bootstrap is idempotent DDL (CREATE ... IF NOT EXISTS)
   // behind a transaction-scoped advisory lock. Memoize ONE run per tool
   // registration (per server) so repeated calls do not replay it; a failed
   // attempt clears the memo so the next call retries instead of caching the
@@ -468,13 +507,7 @@ export function createExtractHandler(deps: ExtractDeps) {
       const selector = await resolveSelector(client, input, batchLimit);
 
       const failedChunks: ExtractFailedChunk[] = [];
-      const pipelineDeps: ExtractPipelineDeps = {
-        llm,
-        embedder,
-        logger: deps.logger ?? NOOP_LOGGER,
-        ...(deps.precision !== undefined ? { precision: deps.precision } : {}),
-        ...(deps.now !== undefined ? { now: deps.now } : {}),
-      };
+      const pipelineDeps = buildPipelineDeps(deps, llm, embedder);
       const summary = await processBatch(
         pipelineDeps,
         client,

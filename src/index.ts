@@ -369,6 +369,11 @@ export function buildExtractDeps(
       ? { pool: createLazyPgExtractPool(env.dbUrl) }
       : {}),
     ...(precision !== undefined ? { precision } : {}),
+    // Write-time supersede switch: the MCP tool path reads the same
+    // validated env field the offline CLI does, so one operator setting
+    // governs both entry points. Defaults ON in loadEnv (ADR-0009);
+    // explicit off is the test/escape hatch.
+    writeTimeSupersede: env.extractWriteTimeSupersede,
     logger,
   };
 }

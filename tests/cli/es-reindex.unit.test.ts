@@ -167,6 +167,9 @@ function makeEnv(
     elasticsearch,
     rerank: undefined,
     rerankUrl: undefined,
+    // Required on GraphragEnv since the ADR-0009 default flip; this fake
+    // env never threads it (the reindex CLI does not extract).
+    extractWriteTimeSupersede: true,
   };
 }
 

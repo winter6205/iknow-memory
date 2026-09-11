@@ -82,6 +82,26 @@ const NEO4J_VARS = [
   "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
 ] as const;
 
+/**
+ * The identity-critical GRAPHRAG_MEMORY_ES_* vars (precision layer). Since
+ * ADR-0007 the bare `_URL`/`_NODE` pair is fail-start when the lexical
+ * switch is on (the default), so every scrubbed baseline must either plant
+ * an address or switch the layer off — otherwise `loadEnv()` refuses to
+ * boot. The index-name / timeout vars are not masked: they carry
+ * defaults, cannot trip the fail-start decision, and no assertion reads
+ * them.
+ */
+const ELASTICSEARCH_VARS = [
+  "GRAPHRAG_MEMORY_ES_URL",
+  "GRAPHRAG_MEMORY_ES_NODE",
+  "GRAPHRAG_MEMORY_ES_USERNAME",
+  "GRAPHRAG_MEMORY_ES_PASSWORD",
+  "GRAPHRAG_MEMORY_ES_API_KEY",
+] as const;
+
+/** A syntactically valid, never-dialed address for default-on baselines. */
+const ES_BASELINE_URL = "http://es.example.test:9200";
+
 describe("loadEnv — stage 0 stdio-only contract", () => {
   // GRAPHRAG_MEMORY_EMBED_DIMENSIONS is now always required; scrub
   // NINE_ROUTER_KEY (and the now-coupled BASE_URL/MODEL fields) for the
@@ -102,6 +122,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     ...PGVECTOR_VARS,
     ...NEO4J_VARS,
     ...ANTHROPIC_VARS,
+    ...ELASTICSEARCH_VARS,
   ];
   const saved = new Map<string, string | undefined>();
   beforeAll(() => {
@@ -115,13 +136,14 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_VEC"] = "0.7";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_BM25"] = "0.15";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH"] = "0.15";
-    // ADR-0006 fail-start: with the graph/rerank switches default-on, a
-    // scrubbed baseline (no URI, no rerank URL) would refuse to boot. The
-    // block asserts non-graph contracts, so supply the two deps instead of
-    // flipping the switches off.
+    // ADR-0006 / ADR-0007 fail-start: with the graph/rerank/lexical
+    // switches default-on, a scrubbed baseline (no URI, no rerank URL, no
+    // ES address) would refuse to boot. The block asserts non-graph
+    // contracts, so supply the deps instead of flipping the switches off.
     process.env["GRAPHRAG_MEMORY_NEO4J_URI"] = "bolt://localhost:7687";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL"] =
       "https://rerank.example.test/v1/";
+    process.env["GRAPHRAG_MEMORY_ES_URL"] = ES_BASELINE_URL;
   });
   afterAll(() => {
     for (const k of SCRUBBED) {
@@ -253,6 +275,7 @@ const DOTENV_MASK_KEYS = [
   ...NEO4J_VARS,
   ...ANTHROPIC_VARS,
   ...EXTRACT_SUPERSEDE_VARS,
+  ...ELASTICSEARCH_VARS,
 ] as const;
 
 /**
@@ -277,6 +300,10 @@ function withEnv(patch: Record<string, string | undefined>, fn: () => void) {
       // exercising their intended paths.
       GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
       GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
+      // ADR-0007 fail-start: default-on precision layer + no ES address is
+      // the same shape of refusal. Supply the address rather than flipping
+      // the switch off, mirroring the ADR-0006 convention above.
+      GRAPHRAG_MEMORY_ES_URL: ES_BASELINE_URL,
       ...patch,
     },
     fn
@@ -418,9 +445,11 @@ describe("loadEnv — embed config boundary cases", () => {
         GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
         GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
         GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
-        // ADR-0006 fail-start deps for the default-on scrubbed baseline.
+        // ADR-0006 / ADR-0007 fail-start deps for the default-on scrubbed
+        // baseline.
         GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
+        GRAPHRAG_MEMORY_ES_URL: ES_BASELINE_URL,
         ...patch,
       },
       fn
@@ -679,9 +708,11 @@ describe("loadEnv — embedding API key resolution", () => {
         GRAPHRAG_MEMORY_RETRIEVAL_W_VEC: "0.7",
         GRAPHRAG_MEMORY_RETRIEVAL_W_BM25: "0.15",
         GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH: "0.15",
-        // ADR-0006 fail-start deps for the default-on scrubbed baseline.
+        // ADR-0006 / ADR-0007 fail-start deps for the default-on scrubbed
+        // baseline.
         GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
+        GRAPHRAG_MEMORY_ES_URL: ES_BASELINE_URL,
         ...patch,
       },
       fn
@@ -903,12 +934,14 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_VEC"] = "0.7";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_BM25"] = "0.15";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_W_GRAPH"] = "0.15";
-    // ADR-0006 fail-start: the scrubbed baseline keeps graph + rerank
-    // default-on (several tests below assert that default), so the
-    // baseline must carry both deps or loadEnv would refuse to boot.
+    // ADR-0006 / ADR-0007 fail-start: the scrubbed baseline keeps
+    // graph + rerank + lexical default-on (several tests below assert that
+    // default), so the baseline must carry all three deps or loadEnv would
+    // refuse to boot.
     process.env["GRAPHRAG_MEMORY_NEO4J_URI"] = "bolt://localhost:7687";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL"] =
       "https://rerank.example.test/v1/";
+    process.env["GRAPHRAG_MEMORY_ES_URL"] = ES_BASELINE_URL;
     for (const [k, v] of Object.entries(patch)) {
       if (!saved.has(k)) saved.set(k, process.env[k]);
       if (v === undefined) delete process.env[k];
@@ -1431,6 +1464,7 @@ describe("loadEnv — Neo4j sidecar config", () => {
     const keys = [
       ...NEO4J_VARS,
       ...PGVECTOR_VARS,
+      ...ELASTICSEARCH_VARS,
       "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
       "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
       "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
@@ -1444,10 +1478,12 @@ describe("loadEnv — Neo4j sidecar config", () => {
     }
     process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
     process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
-    // ADR-0006: explicit off is the only way to boot without the sidecar
-    // deps, and rerank off keeps the missing rerank URL legal.
+    // ADR-0006 / ADR-0007: explicit off is the only way to boot without the
+    // sidecar deps and the ES address, and rerank off keeps the missing
+    // rerank URL legal.
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"] = "false";
     process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
+    process.env["GRAPHRAG_MEMORY_ES_URL"] = ES_BASELINE_URL;
     for (const [k, v] of Object.entries(patch)) {
       if (!saved.has(k)) saved.set(k, process.env[k]);
       if (v === undefined) delete process.env[k];
@@ -1923,4 +1959,132 @@ describe("loadEnv — write-time supersede switch (ADR-0009)", () => {
       });
     });
   }
+});
+
+/**
+ * ADR-0007 ES fail-start.
+ *
+ * `GRAPHRAG_MEMORY_ES_URL` is the precision layer's address, not a feature
+ * switch: a default-on lexical capability with no address must refuse
+ * process start (`ConfigError`), the same shape as the ADR-0006 graph /
+ * rerank refusals. Explicit off (`GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false`)
+ * is the only way to boot without ES, and a configured-but-failing ES at
+ * retrieve time still fail-opens with `degraded=true`.
+ *
+ * The baseline in `withEnv` plants an address, so each test here blanks it
+ * to exercise the missing-address class.
+ */
+describe("loadEnv — ES precision-layer fail-start (ADR-0007)", () => {
+  const ES_URL = ES_BASELINE_URL;
+
+  it("throws ConfigError when the precision layer is default-on and no ES address exists (empty/missing)", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_URL: "", GRAPHRAG_MEMORY_ES_NODE: "" }, () => {
+      expect(() => loadEnv()).toThrow(ConfigError);
+      expect(() => loadEnv()).toThrow(
+        /GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED[\s\S]*GRAPHRAG_MEMORY_ES_URL/
+      );
+    });
+  });
+
+  it("names ADR-0007 fail-start in the ES ConfigError message", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_URL: "" }, () => {
+      expect(() => loadEnv()).toThrow(/ADR-0007/);
+    });
+  });
+
+  it("treats a blank address as missing (empty class)", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_URL: "   " }, () => {
+      expect(() => loadEnv()).toThrow(ConfigError);
+      expect(() => loadEnv()).toThrow(/GRAPHRAG_MEMORY_ES_URL/);
+    });
+  });
+
+  it("accepts the legacy GRAPHRAG_MEMORY_ES_NODE alias as the address", () => {
+    withEnv(
+      { GRAPHRAG_MEMORY_ES_URL: "", GRAPHRAG_MEMORY_ES_NODE: ES_URL },
+      () => {
+        expect(loadEnv().elasticsearch?.node).toBe(ES_URL);
+      }
+    );
+  });
+
+  it("boots without an address when the lexical switch is explicitly off (negative/escape hatch)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_ES_URL: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
+      },
+      () => {
+        const env = loadEnv();
+        expect(env.elasticsearch).toBeUndefined();
+        expect(env.retrieval.bm25Enabled).toBe(false);
+      }
+    );
+  });
+
+  it("still rejects an unusable address under explicit off (overflow: parse runs first)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_ES_URL: "ftp://es.example.test:9200",
+        GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_ES_URL must be an http:\/\/ or https:\/\/ URL/
+        );
+      }
+    );
+  });
+
+  it("rejects an unparseable lexical switch before fail-start can run (exception ordering)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_ES_URL: "",
+        GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "yes",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+        expect(() => loadEnv()).toThrow(
+          /GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED must be one of/
+        );
+      }
+    );
+  });
+
+  it("error is an instance of ConfigError naming both vars (exception)", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_URL: "" }, () => {
+      let caught: unknown;
+      try {
+        loadEnv();
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ConfigError);
+      const message = (caught as Error).message;
+      expect(message).toContain("GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED");
+      expect(message).toContain("GRAPHRAG_MEMORY_ES_URL");
+    });
+  });
+
+  it("boots with the lexical switch on + address present", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_URL: ES_URL }, () => {
+      const env = loadEnv();
+      expect(env.retrieval.bm25Enabled).toBe(true);
+      expect(env.elasticsearch?.node).toBe(ES_URL);
+    });
+  });
+
+  it("credentials without an address are still rejected (existing parse, no switch needed)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_ES_URL: "",
+        GRAPHRAG_MEMORY_ES_USERNAME: "elastic",
+        GRAPHRAG_MEMORY_ES_PASSWORD: "test-password-not-real",
+      },
+      () => {
+        expect(() => loadEnv()).toThrow(ConfigError);
+      }
+    );
+  });
 });

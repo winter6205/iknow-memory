@@ -565,6 +565,10 @@ describe("eval CLI — loadEnv switches (SC4, ADR-0006)", () => {
     "GRAPHRAG_MEMORY_NEO4J_URI",
     "GRAPHRAG_MEMORY_NEO4J_USER",
     "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
+    // ADR-0007 fail-start: the default-on precision layer refuses to boot
+    // without an address, so the family is scrubbed / supplied below.
+    "GRAPHRAG_MEMORY_ES_URL",
+    "GRAPHRAG_MEMORY_ES_NODE",
   ] as const;
 
   function withEnv(
@@ -627,7 +631,9 @@ describe("eval CLI — loadEnv switches (SC4, ADR-0006)", () => {
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_NEO4J_URI: "bolt://localhost:7687",
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL: "https://rerank.example.test/v1/",
-        // Both switches left unset: default-on env (the SC4 subject).
+        // ADR-0007: the default-on precision layer needs its address too.
+        GRAPHRAG_MEMORY_ES_URL: "http://es.example.test:9200",
+        // All three switches left unset: default-on env (the SC4 subject).
         GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: undefined,
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: undefined,
       },
@@ -664,6 +670,10 @@ describe("eval CLI — loadEnv switches (SC4, ADR-0006)", () => {
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+        // ADR-0007: the two-arm baseline still runs the lexical arm, so the
+        // precision layer keeps its address (explicit off would change the
+        // arm set this test pins).
+        GRAPHRAG_MEMORY_ES_URL: "http://es.example.test:9200",
       },
       async () => {
         const out = join(scratchDir(), "baseline.json");

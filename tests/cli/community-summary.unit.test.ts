@@ -70,12 +70,14 @@ const COMMUNITY_SUMMARY_ENV_KEYS = [
   "GRAPHRAG_MEMORY_NEO4J_URI",
   "GRAPHRAG_MEMORY_NEO4J_USER",
   "GRAPHRAG_MEMORY_NEO4J_PASSWORD",
-  // ADR-0006 fail-start knobs: the scrubbed baseline has no Neo4j URI or
-  // rerank URL, so the default-on switches must be explicitly off or
-  // loadEnv refuses to boot before the CLI's own skip path can run.
+  // ADR-0006 / ADR-0007 fail-start knobs: the scrubbed baseline has no
+  // Neo4j URI, rerank URL, or ES address, so the default-on switches must
+  // be explicitly off or loadEnv refuses to boot before the CLI's own skip
+  // path can run.
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
+  "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
   "GRAPHRAG_MEMORY_EMBED_DIMENSIONS",
   "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS",
   "GRAPHRAG_MEMORY_EMBED_BASE_URL",
@@ -96,11 +98,14 @@ async function withMissingNeo4jEnv<T>(fn: () => Promise<T>): Promise<T> {
   process.env["GRAPHRAG_MEMORY_DB_URL"] = "postgres://localhost:5432/test";
   process.env["GRAPHRAG_MEMORY_EMBED_DIMENSIONS"] = "1536";
   process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
-  // ADR-0006: this suite types a MISSING Neo4j block as the CLI's own
-  // documented skip (exit 3), which is only reachable with the graph
-  // switch explicitly off; default-on now refuses to boot (exit 1).
+  // ADR-0006 / ADR-0007: this suite types a MISSING Neo4j block as the
+  // CLI's own documented skip (exit 3), which is only reachable with the
+  // graph switch explicitly off; default-on now refuses to boot (exit 1).
+  // The community-summary CLI never runs the lexical arm, so it takes the
+  // same explicit-off escape hatch for the precision layer.
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"] = "false";
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
+  process.env["GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED"] = "false";
   try {
     return await fn();
   } finally {

@@ -73,6 +73,7 @@ const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
   "GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
+  "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
 ] as const;
 
 /**
@@ -103,6 +104,11 @@ function hostSmokeEnv(): Record<string, string> {
   // Rerank has no corpus to permute over stdio smoke traffic; explicit off
   // is the ADR-0006-legal way to boot without a rerank URL.
   env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
+  // ADR-0007: the precision layer is default-on with no ES address here, so
+  // the child takes the same explicit-off escape hatch — the smoke suite
+  // never exercises the lexical arm, and materializing it would attempt a
+  // nonexistent cluster.
+  env["GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED"] = "false";
   return env;
 }
 

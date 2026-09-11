@@ -11,14 +11,14 @@
 
 ## 当前状态
 
-- **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并；vector + BM25；Neo4j PPR 图臂；graph-priority；ES 精度层；质量栈 T1–T11；MCP 五件套 `ingest` / `push` / `invalidate` / `extract` / `retrieve`；图/精排 fail-start（ADR-0006）。
+- **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并；vector + BM25；Neo4j PPR 图臂；graph-priority；ES 精度层；质量栈 T1–T11；MCP 五件套 `ingest` / `push` / `invalidate` / `extract` / `retrieve`；图/精排/ES fail-start（ADR-0006 / ADR-0007）。
 - **精排**：默认走 MiniMax LLM（Anthropic 兼容 HTTP）。`GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL` 是可选的本地/专用 rerank sidecar，不是 MiniMax 那条。
 - **进行中**：`plans/retrieval-stack.md` T17–T24（自检 / 重灌 / 评测收口）。侧线 vitest flake [#170](https://github.com/winter6205/iknow-memory/issues/170)。
 - **后置**：多粒度切分、Neo4j 节点 embedding。进度入口：`docs/handoff/2026-09-05-status.md`。
 
-## Elasticsearch 精度层（可选增强）
+## Elasticsearch 精度层（默认开启）
 
-当 `GRAPHRAG_MEMORY_ES_URL` 未设置时，`retrieve` 行为与现状完全一致（向量单臂，词法臂 loud-skip，`degraded` 不变）。
+`GRAPHRAG_MEMORY_ES_URL` 是精度层的**地址**，不是 feature switch。默认开启的精度层缺地址时 `loadEnv()` 抛 `ConfigError` 拒绝启动（ADR-0007 fail-start）——和 graph / rerank 缺依赖同形。只有显式 `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false` 才能在无 ES 地址时启动（测试/逃生门，不是产品故事）。已配置但调用期失败的 ES 仍 fail-open：向量结果照常返回并置 `degraded`。
 
 设置后启用四项词法能力（中文分词 + Okapi BM25 + 短语 + 字段加权），同一引擎同一词元流承载：
 
@@ -27,7 +27,7 @@
   `src/core/storage/elasticsearch-precision.ts` 的 `chunkMappings()` / `entityMappings()` 定义，首次写入时自动建索引）。
 - **两路词法召回**：Host 排序的 fallback + remainder fill 接 ES 词法臂，
   Neo4j 图臂种子由向量路 + ES 词法路 RRF 融合产生（同一 RRF 常数 k=60，两次独立调用）。
-- **降级语义**：`unconfigured` → 词法臂缺席、不设 degraded（loud-skip）；
+- **降级语义**：`unconfigured` → 缺地址拒绝启动（ADR-0007 fail-start，见上）；
   `configured-but-failing at call time` → 词法臂填命名条目（`keyword_bm25` 等），
   向量结果照常返回。
 
@@ -77,10 +77,10 @@ Host JSON 的 `env` 是 MCP 用户配置的 SSOT；`.env.local` 仅作本地开�
         "MINIMAX_API_KEY": "<minimax-api-key>",
         "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
         "GRAPHRAG_MEMORY_ANTHROPIC_MODEL": "MiniMax-M3",
-        "GRAPHRAG_MEMORY_ES_URL": "",
+        "GRAPHRAG_MEMORY_ES_URL": "http://localhost:9200",
         "GRAPHRAG_MEMORY_ES_CHUNK_INDEX": "",
         "GRAPHRAG_MEMORY_ES_ENTITY_INDEX": "",
-        "GRAPHRAG_MEMORY_ES_REQUEST_TIMEOUT_MS": ""
+        "GRAPHRAG_MEMORY_ES_REQUEST_TIMEOUT_MS": "5000"
       }
     }
   }
@@ -165,7 +165,7 @@ npm run dashboard-api    # src/dashboard-api/main.ts，默认 127.0.0.1:4174
 npm run dashboard:dev    # dashboard Vite，18868，/api → 4174
 ```
 
-**存储：** 未设置 `GRAPHRAG_MEMORY_STORAGE` / `GRAPHRAG_MEMORY_DB_URL` / `GRAPHRAG_MEMORY_NEO4J_URI` 时，`npm run dashboard` 自动用 memory 后端（空库、无外部依赖），并关闭图臂与精排（`GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED=false`、`GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false`），避免 ADR-0006 fail-start。设置了任一项则原样透传 MCP 那套 `GRAPHRAG_MEMORY_*`。
+**存储：** 未设置 `GRAPHRAG_MEMORY_STORAGE` / `GRAPHRAG_MEMORY_DB_URL` / `GRAPHRAG_MEMORY_NEO4J_URI` 时，`npm run dashboard` 自动用 memory 后端（空库、无外部依赖），并关闭图臂、精排与 ES 精度层（`GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED=false`、`GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED=false`、`GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false`），避免 ADR-0006 / ADR-0007 fail-start。设置了任一项则原样透传 MCP 那套 `GRAPHRAG_MEMORY_*`。
 
 **memory vs pg：** memory 可看 stats / query / browse / timeline（空库为空态）。`GRAPHRAG_MEMORY_STORAGE=pgvector` 且配置 `GRAPHRAG_MEMORY_DB_URL` 时读 Postgres。
 

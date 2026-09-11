@@ -77,11 +77,13 @@ function runCliSubprocess(
         GRAPHRAG_MEMORY_EMBED_DIMENSIONS: String(DIM),
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "2000",
         GRAPHRAG_MEMORY_LOG_LEVEL: "error",
-        // ADR-0006 fail-start: the child's env has no Neo4j URI or rerank
-        // URL, which a default-on graph/rerank boot refuses. The extract
-        // CLI exercises neither arm, so switch them off explicitly.
+        // ADR-0006 / ADR-0007 fail-start: the child's env has no Neo4j URI,
+        // rerank URL, or ES address, which a default-on graph/rerank/lexical
+        // boot refuses. The extract CLI exercises none of those arms, so
+        // switch them off explicitly.
         GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+        GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
         ...envOverrides,
         PATH: process.env.PATH ?? "",
       },
@@ -124,6 +126,13 @@ async function connectServer(envOverrides: Record<string, string>): Promise<{
       // `rerank:unattempted` is no longer reachable at this layer.
       GRAPHRAG_MEMORY_NEO4J_URI: "bolt://127.0.0.1:1",
       GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+      // ADR-0007: the precision layer is default-on with no address here,
+      // which would refuse the boot outright. Cases 3/4 pin the
+      // vector/graph degraded-reason shapes and never exercise the lexical
+      // arm, so take the explicit-off escape hatch — materializing an ES
+      // adapter would attempt (and fail) the lexical arm against a
+      // nonexistent cluster and flip these envelopes to all-arms-failed.
+      GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
       ...envOverrides,
       PATH: process.env.PATH ?? "",
     },

@@ -198,8 +198,10 @@ export interface GraphragEnv {
   neo4j: Neo4jConfig | undefined;
   /**
    * Elasticsearch precision layer, or undefined when no ES node is
-   * configured. The absence is an intentional loud-skip signal for the
-   * lexical capability; it is not a startup error.
+   * configured. Since ADR-0007 the parse function itself stays silent about
+   * that case, but loadEnv refuses to start when the lexical switch is on
+   * (the default); an undefined block therefore only ever coexists with an
+   * explicit off switch.
    */
   elasticsearch: ElasticsearchConfig | undefined;
   /**
@@ -769,20 +771,22 @@ function parseNeo4jConfig(): Neo4jConfig | undefined {
 }
 
 /**
- * ADR-0006 fail-start: a process whose graph or rerank switch is on (the
- * default) must not boot without the dependency the production retrieve
- * path would need. Graph requires a usable Neo4j config; rerank requires
- * the HTTP endpoint (`env.rerankUrl`) or the MiniMax/Anthropic LLM secret
- * (`env.rerank`). An explicit off switch keeps missing deps legal — that
- * is a choice, not a degradation, so no degraded implication is recorded
- * here. Vector / BM25 / Elasticsearch keep ADR-0005 rule 1 (start + skip /
- * degraded) and are deliberately not consulted.
+ * ADR-0006 / ADR-0007 fail-start: a process whose graph, rerank, or lexical
+ * switch is on (the default) must not boot without the dependency the
+ * production retrieve path would need. Graph requires a usable Neo4j
+ * config; rerank requires the HTTP endpoint (`env.rerankUrl`) or the
+ * MiniMax/Anthropic LLM secret (`env.rerank`); the precision layer requires
+ * an Elasticsearch address (`env.elasticsearch`). An explicit off switch
+ * keeps missing deps legal — that is a choice, not a degradation, so no
+ * degraded implication is recorded here. Vector keeps ADR-0005 rule 1
+ * (start + skip / degraded) and is deliberately not consulted.
  */
 function assertFailStart(
   retrieval: RetrieveConfig,
   neo4j: Neo4jConfig | undefined,
   rerankUrl: string | undefined,
-  rerank: RerankConfig | undefined
+  rerank: RerankConfig | undefined,
+  elasticsearch: ElasticsearchConfig | undefined
 ): void {
   if (retrieval.graphEnabled && neo4j === undefined) {
     throw new ConfigError(
@@ -796,6 +800,11 @@ function assertFailStart(
   ) {
     throw new ConfigError(
       `${RETRIEVAL_RERANK_ENABLED_VAR} is on (default) but neither ${RETRIEVAL_RERANK_URL_VAR} nor ${LLM_AUTH_TOKEN_VAR} is configured: a default-on rerank capability cannot start without its HTTP endpoint or LLM secret (ADR-0006 fail-start). Set ${RETRIEVAL_RERANK_URL_VAR} or ${LLM_AUTH_TOKEN_VAR} (or ${RERANK_API_KEY_NAME_VAR}), or explicitly set ${RETRIEVAL_RERANK_ENABLED_VAR}=false to run without reranking.`
+    );
+  }
+  if (retrieval.bm25Enabled && elasticsearch === undefined) {
+    throw new ConfigError(
+      `${RETRIEVAL_BM25_ENABLED_VAR} is on (default) but neither ${ELASTICSEARCH_URL_VAR} nor ${ELASTICSEARCH_NODE_VAR} is configured: a default-on precision layer cannot start without its Elasticsearch address (ADR-0007 fail-start). Set ${ELASTICSEARCH_URL_VAR}, or explicitly set ${RETRIEVAL_BM25_ENABLED_VAR}=false to run vector-only.`
     );
   }
 }
@@ -838,10 +847,11 @@ function isElasticsearchIndexName(value: string): boolean {
 /**
  * Load the optional Elasticsearch precision-layer connection block.
  *
- * A missing node is deliberate: the production caller leaves the lexical
- * capability unconfigured and the retrieval orchestrator loud-skips it.
- * Values that look like an attempted configuration are rejected early so a
- * typo cannot silently select a different deployment.
+ * No address → undefined. Since ADR-0007 `assertFailStart` refuses to
+ * start when the precision layer is default-on, so an undefined block only
+ * ever coexists with an explicit off switch. Values that look like an
+ * attempted configuration are rejected early so a typo cannot silently
+ * select a different deployment.
  */
 function parseElasticsearchConfig(): ElasticsearchConfig | undefined {
   const node =
@@ -1011,10 +1021,11 @@ export function loadEnv(): GraphragEnv {
     readEnv(EXTRACT_WRITE_TIME_SUPERSEDE_VAR),
     true
   );
-  // ADR-0006: after every block parses, refuse a default-on graph/rerank
-  // boot whose dependency is missing. Runs after (not inside) the parsers
-  // so the per-family parse errors keep naming their own vars first.
-  assertFailStart(retrieval, neo4j, rerankUrl, rerank);
+  // ADR-0006 / ADR-0007: after every block parses, refuse a default-on
+  // graph/rerank/precision-layer boot whose dependency is missing. Runs
+  // after (not inside) the parsers so the per-family parse errors keep
+  // naming their own vars first.
+  assertFailStart(retrieval, neo4j, rerankUrl, rerank, elasticsearch);
 
   return {
     logLevel,

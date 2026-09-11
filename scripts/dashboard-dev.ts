@@ -4,7 +4,8 @@
  * full process tree so ports 4174 / 18868 are not left occupied.
  *
  * Zero-config: when no storage env is set, the API child boots memory mode
- * with graph + rerank explicitly off so ADR-0006 fail-start does not fire.
+ * with graph + rerank + the ES precision layer explicitly off so the
+ * ADR-0006 / ADR-0007 fail-start checks do not fire.
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
@@ -180,6 +181,10 @@ export function buildDashboardChildEnv(
         GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS: "8",
         GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED: "false",
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
+        // ADR-0007: the precision layer is default-on and there is no ES
+        // address in memory mode, so take the explicit-off escape hatch —
+        // the dashboard reads the ledger, never the lexical arm.
+        GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
       };
   return {
     ...next,

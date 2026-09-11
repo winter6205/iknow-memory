@@ -9,7 +9,7 @@
  *
  * Harness contract mirrors tests/cli/extract.test.ts: a unique schema plus a
  * per-connection `search_path` (libpq `options=`), because the parallel
- * schema-p0 worker drops/recreates the P0 tables in `public`.
+ * schema-bootstrap worker drops/recreates the ledger tables in `public`.
  *
  * The run is driven through `runCli` with an injected FakeLLMClient rather
  * than the compiled subprocess: a real extraction refuses to run keyless
@@ -26,7 +26,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { ALLOWED } from "../../src/core/extraction/vocabulary.js";
@@ -172,7 +172,7 @@ describePg("persisted relation_norm follows the A10 trust policy (SC8)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM, 2000);
+    await upSchemaBootstrap(c, DIM, 2000);
   }
 
   /** Extract one chunk whose scripted output carries the given triples. */

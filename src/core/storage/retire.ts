@@ -7,7 +7,7 @@
  * soft-merge pointer that Q-T5 also writes into; this helper is the narrow
  * surface for the Q-T3 projection-GC slice, not the merge writer itself.
  *
- * The `retired` column already exists in `entities` (schema-p0.ts); no schema
+ * The `retired` column already exists in `entities` (schema-bootstrap.ts); no schema
  * migration is needed here.
  *
  * The function returns `true` iff a row with that id exists in `entities`,

@@ -32,7 +32,7 @@ import {
   AnthropicCommunitySummaryClient,
   type CommunitySummaryClient,
 } from "../core/graph/community-summary-llm.js";
-import { upSchemaP0 } from "../core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
 
 export type {
   Community,
@@ -118,7 +118,7 @@ export async function runCli(
   const client = await deps.pool.connect();
   try {
     if (!parsed.flags.dryRun) {
-      await upSchemaP0(client, deps.dimensions);
+      await upSchemaBootstrap(client, deps.dimensions);
     }
     let communities: Community[];
     try {

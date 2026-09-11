@@ -1,11 +1,11 @@
 /**
- * retrieval-pg: real-Postgres integration tests for the P0 graph-arm retrieval
+ * retrieval-pg: real-Postgres integration tests for the ledger graph-arm retrieval
  * pipeline (spec-3 p0-integration T6).
  *
  * Reuses spec-2 schema isolation: a unique SCHEMA reached via search_path
  * libpq options, dropped on teardown. Both the fixture client and the shared
  * PgvectorBackend pool use the same SCHEMA-scoped URL, so unqualified table
- * names resolve here and cannot race the parallel schema-p0 worker.
+ * names resolve here and cannot race the parallel schema-bootstrap worker.
  *
  * Coverage: #8 single-hop end-to-end, #13 soft-merge survivor-only, #17
  * latency probe. Cases: JOIN path; triples.valid_window excludes past triple;
@@ -36,7 +36,7 @@ import { writeFileSync } from "node:fs";
 import pg from "pg";
 import { afterAll, beforeAll, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
 import type { RetrieveConfig } from "../../src/core/retrieval/types.js";
@@ -124,7 +124,7 @@ async function resetSchema(c: pg.Client): Promise<void> {
       ) STORED
     )
   `);
-  await upSchemaP0(c, DIM, 2000);
+  await upSchemaBootstrap(c, DIM, 2000);
 }
 
 async function seedChunk(
@@ -579,7 +579,7 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
     expect(direct.map((r) => r.id)).not.toContain(chunkA); // A's triple unreachable from survivors
   });
 
-  it("7. empty P0 schema returns { chunks: [] } degraded without throwing", async () => {
+  it("7. empty ledger schema returns { chunks: [] } degraded without throwing", async () => {
     const c = client!;
     await resetSchema(c);
     const out = await assembleRetrievalResult(

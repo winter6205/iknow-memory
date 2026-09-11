@@ -15,7 +15,7 @@
  * Harness follows tests/cli/extract.test.ts: a unique schema inside the default
  * `postgres` database, reached by the CLI through the libpq
  * `options=-c search_path=<schema>,public` startup string, so the parallel
- * schema-p0 worker cannot race this suite's rows. Per
+ * schema-bootstrap worker cannot race this suite's rows. Per
  * docs/.claude/rules/test.md the suite SKIPS LOUDLY when Postgres is
  * unreachable — a top-level probe flips it to `describe.skip` and prints the
  * documented Validation block, the same shape
@@ -36,7 +36,7 @@ import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { mergeEntitiesWithGating } from "../../src/core/entities/merge.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import type { ExtractionResponse } from "../../src/core/extraction/types.js";
 import { warnPgUnavailable } from "./pg-test-harness.js";
 
@@ -193,7 +193,7 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM, 2000);
+    await upSchemaBootstrap(c, DIM, 2000);
   }
 
   /** Seed `contents.length` chunks in a deterministic created_at order. */

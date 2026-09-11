@@ -59,7 +59,10 @@ import {
   type PgvectorPoolConfig,
 } from "../../config.js";
 import { GraphragError } from "../errors.js";
-import { assertPgvectorAnnDimensions, upSchemaP0 } from "./schema-p0.js";
+import {
+  assertPgvectorAnnDimensions,
+  upSchemaBootstrap,
+} from "./schema-bootstrap.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
 import {
   CHUNK_BY_ID_SQL,
@@ -98,7 +101,7 @@ interface PgModule {
 interface PgPool {
   query: (text: string, values: unknown[]) => Promise<{ rows: unknown[] }>;
   end: () => Promise<void>;
-  // Acquired client carries a single in-flight transaction; upSchemaP0
+  // Acquired client carries a single in-flight transaction; upSchemaBootstrap
   // takes ownership of the BEGIN/COMMIT/ROLLBACK and releases via finally
   // — see ensureTable().
   connect: () => Promise<PgClient>;
@@ -581,7 +584,7 @@ export class PgvectorBackend
       this.annMaxDimensions ?? readPgvectorAnnMaxDimensions();
     assertPgvectorAnnDimensions(this.dimensions, annMaxDimensions);
     const pool = this.pool!;
-    // Acquire a dedicated client so upSchemaP0 can wrap its DDL in a
+    // Acquire a dedicated client so upSchemaBootstrap can wrap its DDL in a
     // BEGIN/COMMIT/ROLLBACK transaction without conflicting with the
     // pool-level `query` path used elsewhere in this class. Release in
     // finally whether the transaction commits or rolls back. connect() is
@@ -640,12 +643,12 @@ export class PgvectorBackend
           []
         );
         // P0 schema: entities + entity_aliases + triples + extraction_records.
-        // upSchemaP0 is idempotent (every statement is IF NOT EXISTS) and
+        // upSchemaBootstrap is idempotent (every statement is IF NOT EXISTS) and
         // owns its own BEGIN/COMMIT/ROLLBACK — we MUST NOT wrap it in an
-        // outer transaction. The minimal PgClient satisfies upSchemaP0's
+        // outer transaction. The minimal PgClient satisfies upSchemaBootstrap's
         // `SchemaP0Client` surface structurally. Pass this.dimensions so
         // entities.embedding width matches chunks.embedding width (H1).
-        await upSchemaP0(client, this.dimensions, annMaxDimensions);
+        await upSchemaBootstrap(client, this.dimensions, annMaxDimensions);
       } finally {
         client.release();
       }

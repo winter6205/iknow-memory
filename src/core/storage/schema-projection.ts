@@ -2,13 +2,13 @@
  * Projection schema bootstrap: the `projection_outbox` intent log that carries
  * ledger→Neo4j sync (specs/neo4j-graph-arm.md; ADR-0001).
  *
- * Sibling of schema-p0.ts rather than a fifth table inside it: the four P0
- * tables are the Postgres ledger (system of record), this one is the sync
- * mechanism for a downstream read-only projection. `upSchemaP0` still calls it
+ * Sibling of schema-bootstrap.ts rather than a fifth table inside it: the four
+ * ledger tables are the Postgres system of record, this one is the sync
+ * mechanism for a downstream read-only projection. `upSchemaBootstrap` still calls it
  * so a single bootstrap keeps the extract CLI's per-chunk transaction able to
  * INSERT an intent without a separate migration step.
  *
- * Same migration mechanism as P0: CREATE ... IF NOT EXISTS only, no version
+ * Same migration mechanism: CREATE ... IF NOT EXISTS only, no version
  * tracking, no ALTER path. That is why the columns a later ticket needs
  * (`attempts` / `last_error` for T3's drain retries) ship now — a column added
  * later would never appear on an already-bootstrapped database.

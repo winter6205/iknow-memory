@@ -33,7 +33,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import {
   score,
   type ScoreReport,
@@ -150,10 +150,10 @@ describePg("extraction-eval-pg: scoring persisted triples (E-T7)", () => {
   /**
    * Recreate the isolated schema. `chunks` carries a minimal shape
    * (id + content + created_at) — the eval reads only `content` for
-   * the hallucination grounding check. The P0 tables come up through
-   * `upSchemaP0` so a re-run is idempotent; we DROP+CREATE the schema
+   * the hallucination grounding check. The ledger tables come up through
+   * `upSchemaBootstrap` so a re-run is idempotent; we DROP+CREATE the schema
    * wrapper so the run starts deterministic without touching the
-   * `public`-schema tables the parallel schema-p0 worker owns.
+   * `public`-schema tables the parallel schema-bootstrap worker owns.
    */
   async function resetSchema(c: pg.Client): Promise<void> {
     await c.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
@@ -166,7 +166,7 @@ describePg("extraction-eval-pg: scoring persisted triples (E-T7)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM, ANN_MAX_DIMENSIONS);
+    await upSchemaBootstrap(c, DIM, ANN_MAX_DIMENSIONS);
   }
 
   /** Mint one entity row; returns its uuid. */

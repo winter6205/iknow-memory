@@ -30,7 +30,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { linkMergedEntity } from "../../src/core/extraction/persist.js";
 import { resolveCanonicalId } from "../../src/core/entities/resolve.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { warnPgUnavailable } from "./pg-test-harness.js";
 
 /** Embedding width for the entities.embedding column; mirrors the suite scope. */
@@ -91,7 +91,7 @@ describePg(
       await c.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
       await c.query(`CREATE SCHEMA "${SCHEMA}"`);
       await c.query(`SET search_path TO "${SCHEMA}", public`);
-      await upSchemaP0(c, DIM, 2000);
+      await upSchemaBootstrap(c, DIM, 2000);
     }
 
     /**

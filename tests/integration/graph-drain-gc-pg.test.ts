@@ -38,7 +38,7 @@ import {
   type GraphNode,
   type GraphWriter,
 } from "../../src/core/graph/types.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { warnPgUnavailable } from "./pg-test-harness.js";
 
 const DIM = 8;
@@ -142,7 +142,7 @@ describePg(
           content text NOT NULL,
           embedding vector(${DIM}) NOT NULL
         )`);
-      await upSchemaP0(client, DIM, 2000);
+      await upSchemaBootstrap(client, DIM, 2000);
       await seedLedger();
     });
 
@@ -264,7 +264,7 @@ describePg(
           content text NOT NULL,
           embedding vector(${DIM}) NOT NULL
         )`);
-      await upSchemaP0(client, DIM, 2000);
+      await upSchemaBootstrap(client, DIM, 2000);
       // No entities / triples seeded: the ledger is empty.
     });
 

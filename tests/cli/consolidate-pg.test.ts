@@ -1,7 +1,7 @@
 /**
  * Real-Postgres coverage for the consolidate CLI's dry-run/apply contract.
  *
- * The schema is isolated per file because the P0 bootstrap uses unqualified
+ * The schema is isolated per file because the schema bootstrap uses unqualified
  * table names and other integration suites recreate their own schemas.
  */
 import { randomUUID } from "node:crypto";
@@ -9,7 +9,7 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { runCli, type ConsolidateDeps } from "../../src/cli/consolidate.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { warnPgUnavailable } from "../integration/pg-test-harness.js";
 
 const DIM = 8;
@@ -76,7 +76,7 @@ describePg("consolidate CLI against Postgres", () => {
         content text NOT NULL
       )
     `);
-    await upSchemaP0(client, DIM, 2000);
+    await upSchemaBootstrap(client, DIM, 2000);
   }
 
   async function seedConflictingFacts(client: pg.Client): Promise<void> {

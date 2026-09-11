@@ -26,7 +26,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { NEO4J_URI_VAR } from "../../src/config.js";
 import { warnPgUnavailable } from "./pg-test-harness.js";
 
@@ -117,7 +117,7 @@ describePg("extract-outbox-pg: outbox emit rides the chunk transaction", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM, 2000);
+    await upSchemaBootstrap(c, DIM, 2000);
   }
 
   async function seedChunk(c: pg.Client, content: string): Promise<string> {

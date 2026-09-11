@@ -1,9 +1,9 @@
 /**
- * Entity-type normalization for the closed P0 DDL set.
+ * Entity-type normalization for the closed bootstrap DDL set.
  *
  * `entities.type` is pinned by a CHECK constraint to exactly
  *   ('person','concept','system','event')
- * (src/core/storage/schema-p0.ts §createEntities). The LLM open-string world
+ * (src/core/storage/schema-bootstrap.ts §createEntities). The LLM open-string world
  * produces arbitrary-capitalized types ("Organization", "Location", ...). If
  * a raw `headType` / `tailType` were written verbatim into `entities.type`,
  * the CHECK would reject the whole chunk transaction → write-failure → exit 2
@@ -22,7 +22,7 @@
  *   concept   ← any other / empty / unknown (fallback, logged at info)
  *
  * `organization` is intentionally mapped to `concept` (the catch-all family);
- * `location`/`place` to `system` because the P0 schema does not model
+ * `location`/`place` to `system` because the bootstrap schema does not model
  * geographic entities and the four-type set is the contract.
  */
 import { createLogger, type Logger } from "../../logging.js";
@@ -48,7 +48,7 @@ function defaultLogger(): Logger {
 }
 
 /**
- * Map an LLM-emitted `headType` / `tailType` into the closed P0 entity-type
+ * Map an LLM-emitted `headType` / `tailType` into the closed bootstrap entity-type
  * set. Pure (only depends on `log` for the unknown→concept fallback). Logs
  * a structured `info` entry whenever an unknown type is folded to `concept`
  * so operators can audit the mapping and tune it.

@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 
-import type { SchemaP0Client } from "./schema-p0.js";
+import type { SchemaBootstrapClient } from "./schema-bootstrap.js";
 import { GraphragError } from "../errors.js";
 
 const UINT64_MASK = (1n << 64n) - 1n;
@@ -51,7 +51,7 @@ export function schemaBootstrapLockKey(schemaName: string): bigint {
 }
 
 /**
- * Serialize P0 DDL for the connection's current schema.
+ * Serialize bootstrap DDL for the connection's current schema.
  *
  * The caller must already have started a transaction. PostgreSQL releases
  * this advisory lock automatically when that transaction commits or rolls
@@ -60,7 +60,7 @@ export function schemaBootstrapLockKey(schemaName: string): bigint {
  * caller can then commit without replaying DDL against active writers.
  */
 export async function acquireSchemaBootstrapLock(
-  client: SchemaP0Client
+  client: SchemaBootstrapClient
 ): Promise<boolean> {
   const result = await client.query("SELECT current_schema() AS schema_name");
   const schemaName = (result.rows as { schema_name: string | null }[])[0]
@@ -83,7 +83,7 @@ export async function acquireSchemaBootstrapLock(
 }
 
 async function schemaBootstrapIsReady(
-  client: SchemaP0Client
+  client: SchemaBootstrapClient
 ): Promise<boolean> {
   const result = await client.query(
     `SELECT

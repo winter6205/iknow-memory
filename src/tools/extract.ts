@@ -63,7 +63,7 @@ import {
   type ExtractPipelineDeps,
 } from "../core/extraction/pipeline.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
-import { upSchemaP0 } from "../core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
 import { ConfigError } from "../config.js";
 import { resolveToolBatchLimit } from "./batch-limit.js";
 import type { Logger } from "../logging.js";
@@ -428,12 +428,13 @@ export function createExtractHandler(deps: ExtractDeps) {
   // a long-lived caller.
   let schemaReady: Promise<void> | undefined;
   const ensureSchema = (client: ExtractClient): Promise<void> => {
-    schemaReady ??= upSchemaP0(client, deps.embedderEnv.dimensions).catch(
-      (err: unknown) => {
-        schemaReady = undefined;
-        throw err;
-      }
-    );
+    schemaReady ??= upSchemaBootstrap(
+      client,
+      deps.embedderEnv.dimensions
+    ).catch((err: unknown) => {
+      schemaReady = undefined;
+      throw err;
+    });
     return schemaReady;
   };
 

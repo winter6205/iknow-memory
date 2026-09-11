@@ -30,7 +30,7 @@ import {
   type DrainPool,
 } from "../../src/cli/graph-drain.js";
 import { claimPendingIntents } from "../../src/core/storage/projection-outbox.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import {
   GraphUnavailableError,
   type GraphEdge,
@@ -123,7 +123,7 @@ describePg("graph-drain-pg: outbox lifecycle against real Postgres", () => {
         content text NOT NULL,
         embedding vector(${DIM}) NOT NULL
       )`);
-    await upSchemaP0(client, DIM, 2000);
+    await upSchemaBootstrap(client, DIM, 2000);
     await seedLedger();
   });
 

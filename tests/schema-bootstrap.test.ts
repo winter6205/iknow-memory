@@ -1,5 +1,5 @@
 /**
- * schema-p0: integration tests for the four P0 tables
+ * schema-bootstrap: integration tests for the four ledger tables
  * (entities / entity_aliases / triples / extraction_records).
  *
  * Runs against a real Postgres 16 at postgresql://postgres@localhost/postgres
@@ -11,7 +11,7 @@
  * Coverage contract (per specs/p0-schema.md §"Testing Strategy", but T2
  * only requires the first row to land; later T3-T8 rows are added by
  * later tickets):
- *   1. Idempotency: upSchemaP0() twice in a row -> no error, table/index
+ *   1. Idempotency: upSchemaBootstrap() twice in a row -> no error, table/index
  *      counts unchanged.   <- THIS FILE
  *   2-9. (FK SET NULL / RESTRICT / CASCADE, CHECK, @>, index inventory)
  *      - added by later tickets.
@@ -19,17 +19,17 @@
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../src/core/storage/schema-bootstrap.js";
 import {
   redactPgConnectionString,
   warnPgUnavailable,
 } from "./integration/pg-test-harness.js";
 
 /**
- * The four P0 tables we own. Keep in sync with specs/p0-schema.md.
+ * The four ledger tables we own. Keep in sync with specs/p0-schema.md.
  * `chunks` is stage-1 owned and listed for cross-table FK count only.
  */
-const P0_TABLES = [
+const LEDGER_TABLES = [
   "entities",
   "entity_aliases",
   "triples",
@@ -37,15 +37,15 @@ const P0_TABLES = [
 ] as const;
 
 /**
- * The projection tables `upSchemaP0` also bootstraps (specs/neo4j-graph-arm.md
- * T2). Not a P0 table — it carries the ledger→Neo4j sync intent log — but it
+ * The projection tables `upSchemaBootstrap` also bootstraps (specs/neo4j-graph-arm.md
+ * T2). Not a ledger table — it carries the ledger→Neo4j sync intent log — but it
  * rides the same idempotent bootstrap, so the drop/count/presence invariants
  * below cover it too.
  */
 const PROJECTION_TABLES = ["projection_outbox"] as const;
 
 /** Every table the bootstrap owns; dropped and re-created by the first test. */
-const BOOTSTRAP_TABLES = [...P0_TABLES, ...PROJECTION_TABLES] as const;
+const BOOTSTRAP_TABLES = [...LEDGER_TABLES, ...PROJECTION_TABLES] as const;
 
 /**
  * The table names we count via pg_tables: everything the bootstrap owns +
@@ -56,7 +56,7 @@ const COUNTED_TABLES = [...BOOTSTRAP_TABLES, "chunks"] as const;
 
 const DB_URL = "postgresql://postgres@localhost/postgres";
 
-describe("schema-p0: idempotent up() against real Postgres", () => {
+describe("schema-bootstrap: idempotent up() against real Postgres", () => {
   let client: pg.Client | undefined;
 
   beforeAll(async () => {
@@ -66,10 +66,10 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       await client.connect();
     } catch (err) {
       warnPgUnavailable({
-        label: "schema-p0",
-        testPath: "tests/schema-p0.test.ts (idempotent)",
+        label: "schema-bootstrap",
+        testPath: "tests/schema-bootstrap.test.ts (idempotent)",
         expectedCommand:
-          "npx vitest run tests/schema-p0.test.ts -t 'idempotent'",
+          "npx vitest run tests/schema-bootstrap.test.ts -t 'idempotent'",
         connectionString: DB_URL,
         error: err,
         requiresVector: false,
@@ -84,7 +84,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     if (client) await client.end();
   });
 
-  it("calling upSchemaP0 twice yields the same pg_tables count and does not throw", async () => {
+  it("calling upSchemaBootstrap twice yields the same pg_tables count and does not throw", async () => {
     if (!client) {
       throw new Error(
         `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
@@ -109,11 +109,11 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     `);
 
     // First invocation.
-    await upSchemaP0(c, 1536, 2000);
+    await upSchemaBootstrap(c, 1536, 2000);
     const firstCount = await countPgTables(c);
 
     // Second invocation must not throw AND must not change the table count.
-    await expect(upSchemaP0(c, 1536, 2000)).resolves.toBeUndefined();
+    await expect(upSchemaBootstrap(c, 1536, 2000)).resolves.toBeUndefined();
     const secondCount = await countPgTables(c);
 
     expect(secondCount).toBe(firstCount);
@@ -356,7 +356,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
   // -------------------------------------------------------------------
   // T4: DDL contract lock for triples.
   //
-  // Runs after the idempotency test (which drops + recreates all P0 tables
+  // Runs after the idempotency test (which drops + recreates all ledger tables
   // and the minimal `chunks` stand-in), so `triples` and `chunks` exist with
   // the pinned DDL when these tests execute (vitest is sequential within a
   // describe). Each test pins one row of specs/p0-schema.md
@@ -420,6 +420,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
         "valid_window",
         "superseded_by",
         "evidence_span",
+        "extractor",
         "created_at",
       ];
       for (const col of expected) {
@@ -606,7 +607,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
   // by specs/p0-schema.md §"Indexes").
   //
   // Runs after the idempotency test which drops + recreates the schema,
-  // so all four P0 tables + the minimal `chunks` stand-in are present.
+  // so all four ledger tables + the minimal `chunks` stand-in are present.
   // Each test pins one row of §"Testing Strategy" coverage contract 8
   // (@> probes) and §"Success Criteria" row 6 (13-index inventory).
   // -------------------------------------------------------------------
@@ -633,12 +634,12 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
     }
 
     /**
-     * Read pg_indexes rows for the named P0 tables (entities,
+     * Read pg_indexes rows for the named ledger tables (entities,
      * entity_aliases, triples, extraction_records). Returns a map keyed
      * by index name with the raw `indexdef` string so callers can assert
      * uniqueness / access method without re-querying pg_class.
      */
-    async function readP0Indexes(
+    async function readLedgerIndexes(
       c: pg.Client
     ): Promise<Map<string, { tablename: string; indexdef: string }>> {
       const res = await c.query<{
@@ -695,7 +696,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
 
     it("extraction_records has the four pinned btree indexes", async () => {
       const c = requireClient();
-      const idx = await readP0Indexes(c);
+      const idx = await readLedgerIndexes(c);
       for (const name of [
         "extraction_records_chunk_id_idx",
         "extraction_records_batch_id_idx",
@@ -722,11 +723,11 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       );
     });
 
-    it("the full P0 index inventory contains exactly the 12 pinned indexes", async () => {
+    it("the full ledger index inventory contains exactly the 12 pinned indexes", async () => {
       // Spec §"Success Criteria" row 6 + §"Testing Strategy" row 9:
       // introspect every index in the §"Indexes" table; the count must
       // match exactly and the names must be the ones we pinned in
-      // schema-p0.ts. We assert by explicit name-list rather than a raw
+      // schema-bootstrap.ts. We assert by explicit name-list rather than a raw
       // count so the test fails loudly if a stray index appears or a
       // pinned one is renamed.
       //
@@ -735,7 +736,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       // 4 extraction_records). The DDL is ground truth — this test
       // pins what the schema ships, not the prose summary.
       const c = requireClient();
-      const idx = await readP0Indexes(c);
+      const idx = await readLedgerIndexes(c);
       const pinned = [
         // entities (1)
         "entities_canonical_name_idx",
@@ -758,7 +759,7 @@ describe("schema-p0: idempotent up() against real Postgres", () => {
       for (const name of pinned) {
         expect(idx.has(name), `${name} missing from pg_indexes`).toBe(true);
       }
-      // No foreign P0-name indexes (defends against accidental duplicates).
+      // No foreign ledger-name indexes (defends against accidental duplicates).
       // Implicit `_pkey` indexes from the PK constraints are owned by
       // Postgres itself, not by our DDL — exclude them so the comparison
       // matches the 12 modeled indexes we ship.

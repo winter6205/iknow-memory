@@ -48,7 +48,7 @@ import {
 } from "../../src/cli/graph-drain.js";
 import { connectNeo4j } from "../../src/core/graph/neo4j-writer.js";
 import { NEO4J_URI_VAR, loadEnv, type Neo4jConfig } from "../../src/config.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { redactDiagnostic } from "../../src/logging.js";
 
 const DIM = 8;
@@ -143,7 +143,7 @@ describeGraph("graph-neo4j: idempotent projection into a live graph", () => {
         content text NOT NULL,
         embedding vector(${DIM}) NOT NULL
       )`);
-    await upSchemaP0(pgClient, DIM);
+    await upSchemaBootstrap(pgClient, DIM);
     await seedLedger();
     driver = probeDriver(SETTINGS!);
   });

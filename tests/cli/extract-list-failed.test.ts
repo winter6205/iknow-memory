@@ -15,7 +15,7 @@
  *
  * Harness contract mirrors tests/cli/extract.test.ts: a unique schema plus a
  * per-connection `search_path` (libpq `options=`), because the parallel
- * schema-p0 worker drops/recreates the P0 tables in `public`.
+ * schema-bootstrap worker drops/recreates the ledger tables in `public`.
  *
  * Per docs/.claude/rules/test.md: if Postgres is unreachable the suite SKIPS
  * LOUDLY — a top-level probe flips the suite to `describe.skip` and prints the
@@ -30,7 +30,7 @@ import { join } from "node:path";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
@@ -158,7 +158,7 @@ describePg("extract CLI --list-failed (T5 / SC11)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM, 2000);
+    await upSchemaBootstrap(c, DIM, 2000);
   }
 
   async function insertChunk(c: pg.Client, content: string): Promise<string> {

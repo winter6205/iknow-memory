@@ -1,11 +1,11 @@
 /**
- * P0 schema bootstrap: the four entity/triple tables + their indexes.
+ * Schema bootstrap: the four entity/triple ledger tables + their indexes.
  *
  * Decomposed by table (one small helper per table) so each function stays
- * well under 40 lines and the public `upSchemaP0` is a thin orchestrator
+ * well under 40 lines and the public `upSchemaBootstrap` is a thin orchestrator
  * wrapping them in a single transaction. Every statement is idempotent
  * (CREATE ... IF NOT EXISTS) so a re-run is a safe no-op — this is the
- * P0 migration mechanism (spec: CREATE TABLE IF NOT EXISTS only, no
+ * standing migration mechanism (spec: CREATE TABLE IF NOT EXISTS only, no
  * migration framework, no version tracking).
  *
  * snake_case columns and singular table names follow the glossary in
@@ -13,7 +13,7 @@
  * indexes) is pinned in specs/p0-schema.md §"DDL Contract".
  *
  * `client` is any query-capable handle the caller leases (a pg PoolClient,
- * a pg Pool, a CLI's leased client — see `SchemaP0Client`). This module owns
+ * a pg Pool, a CLI's leased client — see `SchemaBootstrapClient`). This module owns
  * no connection lifecycle.
  */
 import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
@@ -22,13 +22,13 @@ import { upSchemaProjection } from "./schema-projection.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 
 /**
- * Minimal client surface the P0 bootstrap consumes: only `query`, with
+ * Minimal client surface the bootstrap consumes: only `query`, with
  * optional bind values (the only parameterized statements live in
  * `schema-lock.ts`). A `pg.PoolClient`, a `pg.Pool`, the CLIs' leased
  * clients and the extract tool's leased client all satisfy it structurally,
  * so no call site needs a cast.
  */
-export interface SchemaP0Client {
+export interface SchemaBootstrapClient {
   query(text: string, values?: unknown[]): Promise<{ rows: any[] }>;
 }
 
@@ -42,7 +42,7 @@ export interface SchemaP0Client {
  * #6 Q1: N = chunks embedding dim).
  */
 async function createEntities(
-  client: SchemaP0Client,
+  client: SchemaBootstrapClient,
   dimensions: number
 ): Promise<void> {
   await client.query(`
@@ -63,7 +63,9 @@ async function createEntities(
 }
 
 /** entity_aliases: surface forms pointing at a canonical entity (CASCADE). */
-async function createEntityAliases(client: SchemaP0Client): Promise<void> {
+async function createEntityAliases(
+  client: SchemaBootstrapClient
+): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS entity_aliases (
       id         uuid PRIMARY KEY,
@@ -82,7 +84,7 @@ async function createEntityAliases(client: SchemaP0Client): Promise<void> {
 }
 
 /** triples: (head, relation, tail) edges with provenance + valid_window. */
-async function createTriples(client: SchemaP0Client): Promise<void> {
+async function createTriples(client: SchemaBootstrapClient): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS triples (
       id              uuid PRIMARY KEY,
@@ -95,9 +97,10 @@ async function createTriples(client: SchemaP0Client): Promise<void> {
       valid_window    tstzrange NOT NULL,
       superseded_by   uuid REFERENCES triples(id) ON DELETE SET NULL,
       evidence_span   text,
+      extractor       text NOT NULL DEFAULT 'llm',
       created_at      timestamptz NOT NULL DEFAULT now()
     )`);
-  // Keep existing P0 installations forward-compatible with the supersession
+  // Keep existing bootstrap installations forward-compatible with the supersession
   // ledger column; CREATE TABLE IF NOT EXISTS does not alter an old table.
   await client.query(`
     ALTER TABLE triples
@@ -109,6 +112,13 @@ async function createTriples(client: SchemaP0Client): Promise<void> {
   await client.query(`
     ALTER TABLE triples
       ADD COLUMN IF NOT EXISTS evidence_span text`);
+  // Forward-compat for the extraction-provenance column. The default exists
+  // because rows written before this column shipped were all LLM-produced
+  // (the schema has no other write path); a non-LLM producer must set it
+  // explicitly on its INSERT.
+  await client.query(`
+    ALTER TABLE triples
+      ADD COLUMN IF NOT EXISTS extractor text NOT NULL DEFAULT 'llm'`);
   await client.query(`
     CREATE INDEX IF NOT EXISTS triples_valid_window_idx
       ON triples USING gist (valid_window)`);
@@ -128,7 +138,9 @@ async function createTriples(client: SchemaP0Client): Promise<void> {
 }
 
 /** extraction_records: chunk-level extraction outcomes, batch_id aggregate. */
-async function createExtractionRecords(client: SchemaP0Client): Promise<void> {
+async function createExtractionRecords(
+  client: SchemaBootstrapClient
+): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS extraction_records (
       id             uuid PRIMARY KEY,
@@ -194,7 +206,7 @@ export function assertPgvectorAnnDimensions(
 }
 
 async function createCommunitySummaries(
-  client: SchemaP0Client,
+  client: SchemaBootstrapClient,
   dimensions: number
 ): Promise<void> {
   await client.query(`
@@ -213,7 +225,7 @@ async function createCommunitySummaries(
 }
 
 /**
- * Create all four P0 tables + indexes (plus the projection outbox that rides
+ * Create all four ledger tables + indexes (plus the projection outbox that rides
  * the same bootstrap — see schema-projection.ts), atomically. Idempotent: safe
  * to call repeatedly (each statement is IF NOT EXISTS). On any failure the
  * whole transaction rolls back so a partial schema can never be left behind.
@@ -224,8 +236,8 @@ async function createCommunitySummaries(
  * superuser or extension-create privilege; that is fine for our local dev
  * Postgres (`postgres` superuser) and aligns with the existing backend.
  */
-export async function upSchemaP0(
-  client: SchemaP0Client,
+export async function upSchemaBootstrap(
+  client: SchemaBootstrapClient,
   dimensions: number,
   annMaxDimensions = readPgvectorAnnMaxDimensions()
 ): Promise<void> {

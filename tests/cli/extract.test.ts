@@ -11,7 +11,7 @@
  * Plus the three documented exit codes (0 success, 2 usage, 1 fatal).
  *
  * Why a unique schema (mirrors tests/integration/extraction-pg.test.ts):
- * the parallel schema-p0.test.ts worker drops/recreates P0 tables in the
+ * the parallel schema-bootstrap.test.ts worker drops/recreates ledger tables in the
  * `public` schema. Bare-name SQL in the pipeline resolves through the
  * per-connection `search_path`, so we point our subprocess's pg.Pool at the
  * isolated schema via the libpq `options=-c search_path=<schema>,public`
@@ -44,7 +44,7 @@ import { join } from "node:path";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { listFailed } from "../../src/core/extraction/records.js";
@@ -172,7 +172,7 @@ describe("extract CLI subprocess e2e (T9)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM, 2000);
+    await upSchemaBootstrap(c, DIM, 2000);
   }
 
   /** Insert one chunk row with a unique content string; returns its id. */

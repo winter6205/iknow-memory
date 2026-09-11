@@ -32,7 +32,7 @@ import { Client as McpClient } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
@@ -222,7 +222,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         ) STORED
       )
     `);
-    await upSchemaP0(c, DIM, 2000);
+    await upSchemaBootstrap(c, DIM, 2000);
   }
 
   /**
@@ -487,7 +487,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
     );
 
     // Ensure the pgvector extension is committed before the two CLIs run
-    // their concurrent upSchemaP0 (which both issue
+    // their concurrent upSchemaBootstrap (which both issue
     // `CREATE EXTENSION IF NOT EXISTS vector`). Without this guard, the
     // concurrent IF NOT EXISTS check can race on pg_type_typname_nsp_index
     // when neither connection sees the extension committed yet. We use
@@ -554,7 +554,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
     let code1 = 1;
     let code2 = 1;
     // Bounded retry on the spec-2 concurrent-CLI deadlock race. Two
-    // concurrent runCli calls (each runs upSchemaP0 DDL + write-path
+    // concurrent runCli calls (each runs upSchemaBootstrap DDL + write-path
     // transactions) can deadlock on catalog locks at ~3% rate even with
     // disjoint chunks (confirmed via empirical reproduction). On a
     // deadlock the losing CLI's transaction rolls back; we reset and

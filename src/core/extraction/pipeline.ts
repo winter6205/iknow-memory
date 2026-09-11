@@ -6,7 +6,7 @@
  * the MCP layer importing `src/cli`. This module is pure orchestration:
  * callers bring a `Queryable` (pool client), clients (LLM / embedder built
  * via `clients.ts`), a logger and an optional precision layer; the schema
- * migration (`upSchemaP0`) and the process exit codes stay caller concerns.
+ * migration (`upSchemaBootstrap`) and the process exit codes stay caller concerns.
  *
  * Mark-and-continue: one chunk = one transaction. An LLM failure or an
  * all-self-loop reject is a sealed per-chunk outcome (the batch proceeds); a

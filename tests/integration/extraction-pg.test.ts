@@ -1,13 +1,13 @@
 /**
- * extraction-pg: real-Postgres integration tests for the P0 extraction +
+ * extraction-pg: real-Postgres integration tests for the ledger extraction +
  * merge pipeline (T7).
  *
- * Reuses the schema-p0.test.ts harness contract: connect in beforeAll, build
- * a deterministic spec-1 schema (drop P0 tables + a minimal `chunks` stand-in,
- * then upSchemaP0), and SKIP LOUDLY with the project Validation block when
+ * Reuses the schema-bootstrap.test.ts harness contract: connect in beforeAll, build
+ * a deterministic spec-1 schema (drop ledger tables + a minimal `chunks` stand-in,
+ * then upSchemaBootstrap), and SKIP LOUDLY with the project Validation block when
  * Postgres is unreachable — never silently pass (per docs/.claude/rules/test.md).
  * The client uses a unique schema within the required default `postgres`
- * database so Vitest's parallel schema-p0.test.ts worker cannot tear down this
+ * database so Vitest's parallel schema-bootstrap.test.ts worker cannot tear down this
  * suite's rows; all application SQL remains unqualified through search_path.
  *
  * Coverage maps to specs/p0-extraction.md §"Testing Strategy" Integration row
@@ -28,7 +28,7 @@
  * dimensions are covered by the T8 defensive-contract suite.
  *
  * Isolation: this suite runs in a Vitest worker that is parallel to
- * schema-p0.test.ts, which owns the `public` P0 tables. To avoid a teardown
+ * schema-bootstrap.test.ts, which owns the `public` ledger tables. To avoid a teardown
  * race, this client uses a unique schema (search_path) and drops it at the
  * end; the bare-table-name SQL in the pipeline code is unchanged.
  */
@@ -36,7 +36,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import {
   insertRecord,
   listFailed,
@@ -56,13 +56,13 @@ import {
   warnPgUnavailable,
 } from "./pg-test-harness.js";
 
-/** Embedding width for the schema — mirrors schema-p0.test.ts. */
+/** Embedding width for the schema — mirrors schema-bootstrap.test.ts. */
 const DIM = 1536;
 
 const DB_URL = "postgresql://postgres@localhost/postgres";
 
-/** Unique schema for this file, so the parallel schema-p0.test.ts worker
- * (which drops P0 tables in the public schema) cannot race this suite. */
+/** Unique schema for this file, so the parallel schema-bootstrap.test.ts worker
+ * (which drops ledger tables in the public schema) cannot race this suite. */
 const SCHEMA = `extraction_pg_${randomUUID().slice(0, 8)}`;
 
 describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)", () => {
@@ -114,7 +114,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
    * Build a fresh spec-1 schema from an empty state. Dropping + recreating the
    * unique schema (rather than the individual unqualified table names) makes
    * the run deterministic without touching the public-schema tables that the
-   * parallel schema-p0 worker owns. search_path points only at this schema.
+   * parallel schema-bootstrap worker owns. search_path points only at this schema.
    */
   async function bootstrapSchema(c: pg.Client): Promise<void> {
     // Drop + recreate the isolated schema so the run starts deterministic.
@@ -123,7 +123,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
     // statements target only this suite's schema. We deliberately do NOT issue
     // unqualified DROP TABLE statements here: against a freshly recreated empty
     // schema they would resolve to `public` and wipe the parallel
-    // schema-p0.test.ts worker's rows. Dropping the schema clears everything.
+    // schema-bootstrap.test.ts worker's rows. Dropping the schema clears everything.
     await c.query(`DROP SCHEMA IF EXISTS "${SCHEMA}" CASCADE`);
     await c.query(`CREATE SCHEMA "${SCHEMA}"`);
     await c.query(`SET search_path TO "${SCHEMA}", public`);
@@ -133,7 +133,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
         content text NOT NULL
       )
     `);
-    await upSchemaP0(c, DIM, 2000);
+    await upSchemaBootstrap(c, DIM, 2000);
   }
 
   /** Mint one entity row with a unique canonical_name; returns its id. */
@@ -321,7 +321,7 @@ describe("extraction-pg: extraction + merge pipeline against real Postgres (T7)"
   // -----------------------------------------------------------------
   // Spec Integration row: all four tables touched in one flow.
   // -----------------------------------------------------------------
-  it("one flow touches all four P0 tables", async () => {
+  it("one flow touches all four ledger tables", async () => {
     const c = requireClient();
     await bootstrapSchema(c);
 

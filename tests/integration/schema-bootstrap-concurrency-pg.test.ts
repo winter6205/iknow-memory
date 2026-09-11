@@ -1,5 +1,5 @@
 /**
- * Real-Postgres reproduction for concurrent P0 schema bootstrap.
+ * Real-Postgres reproduction for concurrent schema bootstrap.
  *
  * Each invocation uses a separate connection with the same search_path.
  * Before the bootstrap lock exists, concurrent catalog DDL can deadlock.
@@ -8,7 +8,7 @@
 import pg from "pg";
 import { afterAll, beforeAll, expect, it } from "vitest";
 
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 8;
@@ -36,7 +36,7 @@ const BOOTSTRAP_TABLES = [
   "projection_outbox",
 ] as const;
 
-describePg("P0 schema bootstrap concurrency", () => {
+describePg("schema bootstrap concurrency", () => {
   let admin: pg.Client | undefined;
 
   beforeAll(async () => {
@@ -68,7 +68,7 @@ describePg("P0 schema bootstrap concurrency", () => {
         Array.from({ length: 8 }, async () => {
           const client = await pool.connect();
           try {
-            await upSchemaP0(client, DIM, 2000);
+            await upSchemaBootstrap(client, DIM, 2000);
             return undefined;
           } catch (err) {
             return err;

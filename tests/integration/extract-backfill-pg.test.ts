@@ -19,7 +19,7 @@
  *
  * Harness mirrors tests/integration/extract-persist-pg.test.ts: a unique schema
  * reached through the libpq `options=-c search_path=<schema>,public` startup
- * string, so the parallel schema-p0 worker cannot race these rows.
+ * string, so the parallel schema-bootstrap worker cannot race these rows.
  *
  * Per .claude/rules/test.md: if Postgres is unreachable the suite SKIPS LOUDLY
  * — a top-level probe flips it to `describe.skip` and prints the documented
@@ -37,7 +37,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
-import { upSchemaP0 } from "../../src/core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
 import { warnPgUnavailable } from "./pg-test-harness.js";
 
@@ -241,7 +241,7 @@ describePg("extract-backfill-pg: --backfill-embeddings (T6 / SC5)", () => {
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);
-    await upSchemaP0(c, DIM, ANN_MAX_DIMENSIONS);
+    await upSchemaBootstrap(c, DIM, ANN_MAX_DIMENSIONS);
   }
 
   async function seedEntity(c: pg.Client, entity: SeedEntity): Promise<void> {

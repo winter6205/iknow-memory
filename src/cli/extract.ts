@@ -35,7 +35,7 @@ import { Pool } from "pg";
 import { loadEnv, ConfigError, type GraphragEnv } from "../config.js";
 import { createLogger, writeStderr, type Logger } from "../logging.js";
 import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
-import { upSchemaP0 } from "../core/storage/schema-p0.js";
+import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
 import { listFailed } from "../core/extraction/records.js";
 import { extractChunk, type ChunkInput } from "../core/extraction/extract.js";
 import {
@@ -225,7 +225,7 @@ function reportFatal(logger: Logger, err: unknown): void {
 async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client, deps.dims);
+    await upSchemaBootstrap(client, deps.dims);
     const chunks = await selectPendingChunks(client, {
       batchSize: flags.batchSize,
       since: flags.since,
@@ -248,7 +248,7 @@ async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
 async function listUnmapped(deps: CliDeps): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client, deps.dims);
+    await upSchemaBootstrap(client, deps.dims);
     const { rows } = await client.query(
       `SELECT relation_raw, count(*)::int AS count
        FROM triples WHERE relation_norm = 'UNMAPPED'
@@ -282,7 +282,7 @@ async function listFailedReport(
 ): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client, deps.dims);
+    await upSchemaBootstrap(client, deps.dims);
     const rows = await listFailed(
       client,
       flags.batchId ? { batchId: flags.batchId } : {}
@@ -323,7 +323,7 @@ async function listFailedReport(
 async function backfillEmbeddings(deps: CliDeps): Promise<number> {
   const client = await deps.pool.connect();
   try {
-    await upSchemaP0(client, deps.dims);
+    await upSchemaBootstrap(client, deps.dims);
     const { rows } = await client.query(
       `SELECT id, canonical_name,
               coalesce(metadata->>'description', '') AS description

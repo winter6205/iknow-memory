@@ -38,7 +38,7 @@ import { ConfigError } from "../../src/config.js";
 import type { Logger } from "../../src/logging.js";
 import type { ToolResult } from "../../src/tools/registry.js";
 
-// upSchemaP0 reads the ANN ceiling from the env at call time; the server
+// upSchemaBootstrap reads the ANN ceiling from the env at call time; the server
 // path always has it (loadEnv requires it to boot), so pin it for the tests.
 process.env["GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS"] = "2000";
 

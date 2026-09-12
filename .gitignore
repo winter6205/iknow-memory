@@ -25,12 +25,6 @@ docs/vector-memory-upgrade-archive.html
 # Serena MCP 本地索引 / 缓存 / memories（机器本地，非产品源）
 .serena/
 
-# docs/archive holds superseded specs, removed-implementation notes, and other
-# historical reference files. Each file in there must remain git-tracked so a
-# PR can reference a concrete archive commit; we only ignore ephemeral
-# scratch / temp files that an operator may leave inside that directory.
-docs/archive/*.tmp
-docs/archive/.tmp-*
 .tmp-tickets
 # Nested git worktrees (local checkouts, not product source)
 .claude/worktrees/
@@ -41,8 +35,12 @@ docs/archive/.tmp-*
 # Local study HTML (not iknow-memory SSOT; generated to a personal path)
 .reference/
 
-# Local operator-board UI snapshot (not product source; keep on disk only)
-docs/wayfinder/prototypes/operator-board/
+# Docs local-only (keep on disk). Product SSOT stays tracked:
+# docs/CONTEXT.md, docs/adr/, specs/, active plans/, docs/runbooks/, docs/mcp-config.md
+docs/wayfinder/
+docs/handoff/
+docs/archive/
+docs/visualizations/
 
 # Playwright CLI page snapshots / console logs (local debugging scratch)
 .playwright-cli/

@@ -1,45 +1,45 @@
 # MCP 配置
 
-本文说明 operator 如何为 host 注册 `iknow-memory` MCP server。
+本文说明 operator 如何为 host **启动** `iknow-memory` MCP server。
 
 ## 配置原则
 
-- Host JSON 中 `mcpServers.iknow-memory.env` 是 MCP 用户配置的 SSOT。
-- `.env.local` 仅是本地开发 fallback；生产或共享 host 不依赖它。
-- API key、数据库密码等 secret 只使用下文的 placeholder 代替，实际值由
-  operator 写入 host 的 secret 管理或未被 git 跟踪的配置。
-- `args` 中的路径必须替换为本机已经构建的 `dist/index.js` 路径。
+- 跟踪的 MCP JSON（仓库 `.mcp.json`）只负责 launch：`command` / `args` /
+  `cwd`。形状与 aiterm 类似（`command` + `args`）；本仓库未发布到 npm，因此
+  `args` 指向已构建的 `dist/index.js`，并用 `cwd` 固定到仓库根，以便
+  `loadEnv()` 读取 `.env.local`。
+- **设置 SSOT 是 `GraphragEnv`**（`loadEnv()` / 真实 `process.env` /
+  `.env.local`）。MCP JSON 不是第二份 RetrieveConfig。
+- 未跟踪的 host JSON（例如 `.cursor/mcp.json`、`~/.claude.json`）**可以**注入
+  `env`，仅用于密钥或覆盖；这是可选注入，不是第二份 settings 文件。
+- **禁止空字符串 pin**（`"GRAPHRAG_MEMORY_ES_URL": ""` 等）。键一旦出现在
+  `process.env` 就会挡住 `.env.local`，空地址还会触发 ADR-0007 fail-start。
+- 开关：显式 `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false` 等。地址：真实
+  URL，永远不要用空串当开关。
+- API key、数据库密码等 secret 只使用下文的 placeholder 代替，实际值放在
+  `.env.local`、真实 process env，或未跟踪 host 的可选 `env` 注入。
+- 跟踪文件里的 `args` 必须是相对路径（`dist/index.js`），`cwd` 用 `"."`；
+  不要提交本机绝对路径。
 
-## 推荐注册：pgvector + Neo4j
+## 推荐注册（launch-only）
 
-把以下 server 条目合并到 host 的 MCP JSON（例如 `.mcp.json` 或
-`.cursor/mcp.json`）：
+把以下 server 条目合并到 host 的 MCP JSON。跟踪副本见仓库根 `.mcp.json`。
+本机未跟踪副本把 `cwd` 换成仓库绝对路径即可。
 
 ```json
 {
   "mcpServers": {
     "iknow-memory": {
       "command": "node",
-      "args": ["path/to/iknow-memory/dist/index.js"],
-      "env": {
-        "GRAPHRAG_MEMORY_STORAGE": "pgvector",
-        "GRAPHRAG_MEMORY_DB_URL": "postgresql://iknow_memory:<db-password>@localhost:5432/iknow_memory",
-        "GRAPHRAG_MEMORY_NEO4J_URI": "bolt://localhost:7687",
-        "GRAPHRAG_MEMORY_EMBED_API_KEY": "<embedding-api-key>",
-        "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
-        "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3",
-        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "1536",
-        "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
-        "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "true",
-        "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV": "MINIMAX_API_KEY",
-        "MINIMAX_API_KEY": "<minimax-api-key>",
-        "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
-        "GRAPHRAG_MEMORY_ANTHROPIC_MODEL": "MiniMax-M3"
-      }
+      "args": ["dist/index.js"],
+      "cwd": "."
     }
   }
 }
 ```
+
+生产设置（pgvector、Neo4j、embedding、rerank、ES 地址）写在 `GraphragEnv`
+里，而不是写进跟踪的 MCP JSON。未跟踪 host 若要注入密钥，只写真实非空值。
 
 rerank 默认开启，生产路径是 MiniMax LLM（Anthropic 兼容 HTTP）。
 `GRAPHRAG_MEMORY_RERANK_API_KEY_ENV` 指向真实密钥变量（例如 `MINIMAX_API_KEY`）；
@@ -50,6 +50,8 @@ rerank 默认开启，生产路径是 MiniMax LLM（Anthropic 兼容 HTTP）。
 本地图 sidecar：`bash scripts/neo4j.sh start`。
 
 ## 环境变量
+
+下表是 `GraphragEnv` / `loadEnv()` 消费的变量，不是 MCP JSON 必填字段。
 
 | 变量                                          | 用途                           | 示例或默认值                                                          |
 | --------------------------------------------- | ------------------------------ | --------------------------------------------------------------------- |
@@ -68,6 +70,7 @@ rerank 默认开启，生产路径是 MiniMax LLM（Anthropic 兼容 HTTP）。
 | `GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL`          | Anthropic-compatible endpoint  | `https://api.minimaxi.com/anthropic`（默认）                          |
 | `GRAPHRAG_MEMORY_ANTHROPIC_MODEL`             | rerank / extract model         | `MiniMax-M3`（默认）                                                  |
 | `GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL`        | 可选专用 rerank HTTP sidecar   | 留空则走 MiniMax LLM                                                  |
+| `GRAPHRAG_MEMORY_ES_URL`                      | Elasticsearch 地址（非开关）   | 真实 `http(s)://…`；缺省且 BM25 默认开 → ADR-0007 fail-start          |
 
 Neo4j 开启认证时，另行设置 `GRAPHRAG_MEMORY_NEO4J_USER` 和
 `GRAPHRAG_MEMORY_NEO4J_PASSWORD`；后者只能使用 secret placeholder 或 secret
@@ -88,7 +91,10 @@ secret。
 ## 上线前检查
 
 1. 运行 `npm run build`，确认 `dist/index.js` 存在。
-2. 确认 host JSON 的 `env` 已包含 pgvector、DB URL、Neo4j URI、embedding key
-   和 MiniMax 精排配置（或显式 `RERANK_ENABLED=false`）。
-3. 确认实际 secret 没有写入 git 跟踪文件或日志。
-4. 重启 host 后调用 `tools/list`，再用 `ingest` / `retrieve` 做最小链路检查。
+2. 确认 MCP JSON 是 launch-only（无 `env`，或未跟踪注入里没有空串 pin）。
+3. 确认 `GraphragEnv`（`.env.local` 或真实 process env）已提供 pgvector、
+   DB URL、Neo4j URI、embedding key、MiniMax 精排配置（或显式
+   `RERANK_ENABLED=false`），以及 ES 地址（或显式
+   `GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false`）。
+4. 确认实际 secret 没有写入 git 跟踪文件或日志。
+5. 重启 host 后调用 `tools/list`，再用 `ingest` / `retrieve` 做最小链路检查。

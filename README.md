@@ -53,39 +53,29 @@ npm run typecheck  # tsc --noEmit
 
 ## MCP 注册
 
-在 host 的 MCP JSON（例如 `.mcp.json` 或 `.cursor/mcp.json`）中注册。
-Host JSON 的 `env` 是 MCP 用户配置的 SSOT；`.env.local` 仅作本地开发 fallback。
-完整说明见 [`docs/mcp-config.md`](docs/mcp-config.md)。
+在 host 的 MCP JSON（例如仓库内跟踪的 `.mcp.json`，或本机 `.cursor/mcp.json`）
+中**只登记如何启动进程**：`command` / `args` / `cwd`。设置 SSOT 是
+`GraphragEnv`（`loadEnv()` / 真实 `process.env` / `.env.local`），不是 MCP JSON。
+`cwd` 必须是本仓库根，这样 `.env.local` 才能被读到。完整说明见
+[`docs/mcp-config.md`](docs/mcp-config.md)。
 
 ```json
 {
   "mcpServers": {
     "iknow-memory": {
       "command": "node",
-      "args": ["path/to/iknow-memory/dist/index.js"],
-      "env": {
-        "GRAPHRAG_MEMORY_STORAGE": "pgvector",
-        "GRAPHRAG_MEMORY_DB_URL": "postgresql://iknow_memory:<db-password>@localhost:5432/iknow_memory",
-        "GRAPHRAG_MEMORY_NEO4J_URI": "bolt://localhost:7687",
-        "GRAPHRAG_MEMORY_EMBED_API_KEY": "<embedding-api-key>",
-        "GRAPHRAG_MEMORY_EMBED_BASE_URL": "https://open.bigmodel.cn/api/paas/v4",
-        "GRAPHRAG_MEMORY_EMBED_MODEL": "embedding-3",
-        "GRAPHRAG_MEMORY_EMBED_DIMENSIONS": "1536",
-        "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS": "2000",
-        "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED": "true",
-        "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV": "MINIMAX_API_KEY",
-        "MINIMAX_API_KEY": "<minimax-api-key>",
-        "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL": "https://api.minimaxi.com/anthropic",
-        "GRAPHRAG_MEMORY_ANTHROPIC_MODEL": "MiniMax-M3",
-        "GRAPHRAG_MEMORY_ES_URL": "http://localhost:9200",
-        "GRAPHRAG_MEMORY_ES_CHUNK_INDEX": "",
-        "GRAPHRAG_MEMORY_ES_ENTITY_INDEX": "",
-        "GRAPHRAG_MEMORY_ES_REQUEST_TIMEOUT_MS": "5000"
-      }
+      "args": ["dist/index.js"],
+      "cwd": "."
     }
   }
 }
 ```
+
+未跟踪的 host JSON **可以**额外注入 `env`（密钥等），那是可选注入，不是第二份
+RetrieveConfig。禁止空字符串 pin（例如 `"GRAPHRAG_MEMORY_ES_URL": ""`）：
+键一旦出现在 `process.env` 就会挡住 `.env.local`，并触发 ADR-0007 fail-start。
+开关用显式值（`GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED=false`）；地址用真实 URL，
+不要用空串当开关。
 
 rerank 默认开启，走 MiniMax LLM。也可设 `ANTHROPIC_AUTH_TOKEN`；若同时设了
 `GRAPHRAG_MEMORY_RERANK_API_KEY_ENV`，以指针指向的密钥为准。

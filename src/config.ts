@@ -45,12 +45,13 @@ function isStorageMode(value: string): value is StorageMode {
  * Embedding API key resolution — host-agnostic, no provider knowledge.
  *
  * config.ts is a pure consumer: it decides NOTHING about which key to use.
- * The choice is declared entirely in the MCP registration layer (the
- * `.mcp.json` / `~/.claude.json` env block), via two knobs, resolved in
- * order (first non-blank wins):
+ * Settings SSOT is GraphragEnv (`loadEnv` / real `process.env` / `.env.local`).
+ * Tracked `.mcp.json` is launch-only (`command` / `args` / `cwd`), not a
+ * second RetrieveConfig. Untracked host JSON may optionally inject `env`
+ * for secrets (never empty-string pins). Knobs, first non-blank wins:
  *   1. GRAPHRAG_MEMORY_EMBED_API_KEY     — the secret VALUE itself. Only
- *      ever set in a host-local, untracked registration (e.g. Claude Code's
- *      `~/.claude.json` local scope). NEVER in a git-tracked `.mcp.json`.
+ *      ever set in process env or a host-local, untracked injection (e.g.
+ *      Claude Code `~/.claude.json` local scope). NEVER in tracked `.mcp.json`.
  *   2. GRAPHRAG_MEMORY_VECTOR_API_KEY — the preferred vector/embedding alias.
  *   3. GRAPHRAG_MEMORY_ANTHROPIC_API_KEY — the legacy vector/embedding alias
  *      (not the LLM token).

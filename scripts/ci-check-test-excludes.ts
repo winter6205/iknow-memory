@@ -95,19 +95,31 @@ for (const f of files) {
 const workflowPath = join(repoRoot, ".github", "workflows", "test.yml");
 const workflow = readFileSync(workflowPath, "utf8");
 
-const fastMarker = "test-fast:";
-const fullMarker = "test-full:";
-const fastStart = workflow.indexOf(fastMarker);
-const fullStart = workflow.indexOf(fullMarker);
-if (fastStart === -1 || fullStart === -1 || fullStart <= fastStart) {
+// Slice by real job boundaries. This guard reasons about test-fast and
+// test-full only, but other jobs can sit between them (test-es); folding
+// their `--exclude` text into test-fast's set would let a violation pass
+// on entries that never run in that job.
+const jobsStart = workflow.indexOf("\njobs:");
+const jobs: Array<{ name: string; index: number }> = [];
+if (jobsStart !== -1) {
+  for (const m of workflow.matchAll(/^ {2}([A-Za-z0-9_-]+):$/gm)) {
+    if (m.index > jobsStart) jobs.push({ name: m[1]!, index: m.index });
+  }
+}
+function jobSection(name: string): string | undefined {
+  const i = jobs.findIndex((j) => j.name === name);
+  if (i === -1) return undefined;
+  const end = i + 1 < jobs.length ? jobs[i + 1]!.index : workflow.length;
+  return workflow.slice(jobs[i]!.index, end);
+}
+const fastSection = jobSection("test-fast");
+const fullSection = jobSection("test-full");
+if (fastSection === undefined || fullSection === undefined) {
   console.error(
     "FAIL: could not locate test-fast: / test-full: sections in test.yml"
   );
   process.exit(1);
 }
-
-const fastSection = workflow.slice(fastStart, fullStart);
-const fullSection = workflow.slice(fullStart);
 const fastExcludes = parseExcludes(fastSection);
 const fullExcludes = parseExcludes(fullSection);
 

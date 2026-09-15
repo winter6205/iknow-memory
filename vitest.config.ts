@@ -19,6 +19,13 @@ export default defineConfig({
     // fast job excludes these files and the nightly full job retries once,
     // so this ceiling only changes how long a real hang takes to surface.
     testTimeout: 45_000,
+    // Same starvation argument as testTimeout, one level up: a `beforeAll`
+    // in the live suites does the setup work of a whole test (bootstrap the
+    // schema, backfill a projection) and the 10s default killed
+    // neo4j-ppr-arm's hook on a machine where the work was healthy but
+    // slow. Kept equal to testTimeout so a real hang still surfaces with
+    // the same wall-clock budget at both levels.
+    hookTimeout: 45_000,
     // Issue #169: many tests spawn subprocesses that assert on `dist/`
     // artifacts. Without a build step `npm test` runs against a stale
     // `dist/` and produces false failures (pgvector-startup, host-smoke,

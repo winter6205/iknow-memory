@@ -2,11 +2,13 @@
  * schema-bootstrap: integration tests for the four ledger tables
  * (entities / entity_aliases / triples / extraction_records).
  *
- * Runs against a real Postgres 16 at postgresql://postgres@localhost/postgres
- * (no password — local trust auth per dev environment).
+ * Runs against a unique schema on whatever Postgres `resolvePgConnectionString`
+ * selects (`.env.local` / `GRAPHRAG_MEMORY_DB_URL` / legacy localhost).
+ * It must never DROP `public.chunks` — that table is the product ledger.
  *
  * Per docs/.claude/rules/test.md: if Postgres is unreachable the suite must
  * SKIP LOUDLY with the documented Validation block — never silently pass.
+ * In CI (`CI=true`) the same miss is a hard failure.
  *
  * Coverage contract (per specs/p0-schema.md §"Testing Strategy", but T2
  * only requires the first row to land; later T3-T8 rows are added by
@@ -21,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { upSchemaBootstrap } from "../src/core/storage/schema-bootstrap.js";
 import {
+  createPgIntegrationHarness,
   redactPgConnectionString,
   warnPgUnavailable,
 } from "./integration/pg-test-harness.js";
@@ -54,16 +57,24 @@ const BOOTSTRAP_TABLES = [...LEDGER_TABLES, ...PROJECTION_TABLES] as const;
  */
 const COUNTED_TABLES = [...BOOTSTRAP_TABLES, "chunks"] as const;
 
-const DB_URL = "postgresql://postgres@localhost/postgres";
+const pgHarness = await createPgIntegrationHarness({
+  label: "schema-bootstrap",
+  testPath: "tests/schema-bootstrap.test.ts",
+  expectedCommand: "npx vitest run tests/schema-bootstrap.test.ts",
+  schemaPrefix: "schema_bootstrap",
+  defaultConnectionString: "postgresql://postgres@localhost/postgres",
+});
+const { connectionString: DB_URL, schema: SCHEMA, describePg } = pgHarness;
 
-describe("schema-bootstrap: idempotent up() against real Postgres", () => {
+describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
   let client: pg.Client | undefined;
 
   beforeAll(async () => {
-    // T2 contract: skip loudly (never silently pass) when no Postgres.
     try {
-      client = new pg.Client({ connectionString: DB_URL });
+      client = pgHarness.createClient(DB_URL);
       await client.connect();
+      await pgHarness.resetSchema(client);
+      await client.query(`SET search_path TO "${SCHEMA}", public`);
     } catch (err) {
       warnPgUnavailable({
         label: "schema-bootstrap",
@@ -74,14 +85,17 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
         error: err,
         requiresVector: false,
       });
-      // Mark the client undefined so every test bails; vitest's it() will
-      // still count the run as a skip when the body throws before assertions.
       client = undefined;
     }
   });
 
   afterAll(async () => {
-    if (client) await client.end();
+    if (!client) return;
+    try {
+      await pgHarness.dropSchema(client);
+    } finally {
+      await client.end();
+    }
   });
 
   it("calling upSchemaBootstrap twice yields the same pg_tables count and does not throw", async () => {
@@ -92,19 +106,20 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
     }
     const c = client;
 
-    // Drop pre-existing bootstrap tables so the test starts from a
-    // known-empty state. Cascade is required because triples /
-    // entity_aliases / extraction_records carry FKs to entities / chunks.
-    for (const t of BOOTSTRAP_TABLES) {
-      await c.query(`DROP TABLE IF EXISTS "${t}" CASCADE`);
-    }
-    // Also drop `chunks` so the entity FK that references chunks doesn't
-    // block the recreation. We recreate it as a minimal stand-in below.
-    await c.query(`DROP TABLE IF EXISTS chunks CASCADE`);
+    // Isolated schema only — never DROP public.chunks (product ledger).
+    await pgHarness.resetSchema(c);
+    await c.query(`SET search_path TO "${SCHEMA}", public`);
+    await c.query("CREATE EXTENSION IF NOT EXISTS vector");
     await c.query(`
-      CREATE TABLE IF NOT EXISTS chunks (
+      CREATE TABLE chunks (
         id uuid PRIMARY KEY,
-        content text NOT NULL
+        content text NOT NULL,
+        embedding vector(1536) NOT NULL,
+        valid_from timestamptz NOT NULL,
+        valid_until timestamptz NULL,
+        source_ref text NOT NULL,
+        metadata jsonb NOT NULL,
+        created_at timestamptz NOT NULL
       )
     `);
 
@@ -117,13 +132,16 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
     const secondCount = await countPgTables(c);
 
     expect(secondCount).toBe(firstCount);
-    // Sanity: every table the bootstrap owns is present after the first
-    // invocation — including `projection_outbox`, which the extract emit
-    // path writes into inside its per-chunk transaction.
     const tableNames = await listTableNames(c);
     for (const t of BOOTSTRAP_TABLES) {
       expect(tableNames).toContain(t);
     }
+    const chunkCols = await c.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+         WHERE table_schema = $1 AND table_name = 'chunks'`,
+      [SCHEMA]
+    );
+    expect(chunkCols.rows.map((r) => r.column_name)).toContain("embedding");
   });
 
   // -------------------------------------------------------------------
@@ -163,8 +181,8 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
     ): Promise<Set<string>> {
       const res = await c.query<{ column_name: string }>(
         `SELECT column_name FROM information_schema.columns
-           WHERE table_name = $1 AND table_schema = 'public'`,
-        [tableName]
+           WHERE table_name = $1 AND table_schema = $2`,
+        [tableName, SCHEMA]
       );
       return new Set(res.rows.map((r) => r.column_name));
     }
@@ -185,8 +203,9 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
         indexdef: string;
       }>(
         `SELECT indexname, indexdef FROM pg_indexes
-           WHERE schemaname = 'public'
-             AND tablename IN ('entities','entity_aliases')`
+           WHERE schemaname = $1
+             AND tablename IN ('entities','entity_aliases')`,
+        [SCHEMA]
       );
       const map = new Map<string, { isUnique: boolean; definition: string }>();
       for (const row of res.rows) {
@@ -235,7 +254,8 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
            JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
           WHERE pg_class.relname = 'entities'
             AND pg_attribute.attname = 'embedding'
-            AND pg_namespace.nspname = 'public'`
+            AND pg_namespace.nspname = $1`,
+        [SCHEMA]
       );
       expect(res.rowCount).toBe(1);
       expect(res.rows[0].column_type).toBe("vector(1536)");
@@ -382,8 +402,8 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
     ): Promise<Set<string>> {
       const res = await c.query<{ column_name: string }>(
         `SELECT column_name FROM information_schema.columns
-           WHERE table_name = $1 AND table_schema = 'public'`,
-        [tableName]
+           WHERE table_name = $1 AND table_schema = $2`,
+        [tableName, SCHEMA]
       );
       return new Set(res.rows.map((r) => r.column_name));
     }
@@ -401,7 +421,8 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
            FROM pg_indexes i
            JOIN pg_class r ON r.relname = i.indexname
            JOIN pg_am am ON am.oid = r.relam
-          WHERE i.schemaname = 'public' AND i.tablename = 'triples'`
+          WHERE i.schemaname = $1 AND i.tablename = 'triples'`,
+        [SCHEMA]
       );
       return new Map(res.rows.map((r) => [r.indexname, r.amname]));
     }
@@ -529,10 +550,7 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
       const c = requireClient();
       const { headId, tailId } = await mintTripleEntities(c);
       const chunkId = crypto.randomUUID();
-      await c.query(`INSERT INTO chunks (id, content) VALUES ($1, $2)`, [
-        chunkId,
-        "chunk-for-set-null",
-      ]);
+      await insertFkProbeChunk(c, chunkId, "chunk-for-set-null");
       const tripleId = crypto.randomUUID();
       await c.query(
         `INSERT INTO triples
@@ -627,8 +645,8 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
     ): Promise<Set<string>> {
       const res = await c.query<{ column_name: string }>(
         `SELECT column_name FROM information_schema.columns
-           WHERE table_name = $1 AND table_schema = 'public'`,
-        [tableName]
+           WHERE table_name = $1 AND table_schema = $2`,
+        [tableName, SCHEMA]
       );
       return new Set(res.rows.map((r) => r.column_name));
     }
@@ -648,8 +666,9 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
         indexdef: string;
       }>(
         `SELECT indexname, tablename, indexdef FROM pg_indexes
-           WHERE schemaname = 'public'
-             AND tablename IN ('entities','entity_aliases','triples','extraction_records')`
+           WHERE schemaname = $1
+             AND tablename IN ('entities','entity_aliases','triples','extraction_records')`,
+        [SCHEMA]
       );
       const map = new Map<string, { tablename: string; indexdef: string }>();
       for (const row of res.rows) {
@@ -827,10 +846,11 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
       // Spec coverage-contract row 4: chunks -> extraction_records.chunk_id.
       const c = requireClient();
       const chunkId = crypto.randomUUID();
-      await c.query(`INSERT INTO chunks (id, content) VALUES ($1, $2)`, [
+      await insertFkProbeChunk(
+        c,
         chunkId,
-        "chunk-for-extraction-record-set-null",
-      ]);
+        "chunk-for-extraction-record-set-null"
+      );
 
       const recordId = crypto.randomUUID();
       const batchId = crypto.randomUUID();
@@ -880,8 +900,8 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
     ): Promise<Set<string>> {
       const res = await c.query<{ column_name: string }>(
         `SELECT column_name FROM information_schema.columns
-           WHERE table_name = $1 AND table_schema = 'public'`,
-        [tableName]
+           WHERE table_name = $1 AND table_schema = $2`,
+        [tableName, SCHEMA]
       );
       return new Set(res.rows.map((r) => r.column_name));
     }
@@ -892,7 +912,8 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
     ): Promise<Map<string, string>> {
       const res = await c.query<{ indexname: string; indexdef: string }>(
         `SELECT indexname, indexdef FROM pg_indexes
-           WHERE schemaname = 'public' AND tablename = 'projection_outbox'`
+           WHERE schemaname = $1 AND tablename = 'projection_outbox'`,
+        [SCHEMA]
       );
       return new Map(res.rows.map((r) => [r.indexname, r.indexdef]));
     }
@@ -1028,14 +1049,30 @@ describe("schema-bootstrap: idempotent up() against real Postgres", () => {
       const c = requireClient();
       const res = await c.query<{ n: string }>(
         `SELECT count(*)::text AS n FROM information_schema.table_constraints
-           WHERE table_schema = 'public'
+           WHERE table_schema = $1
              AND table_name = 'projection_outbox'
-             AND constraint_type = 'FOREIGN KEY'`
+             AND constraint_type = 'FOREIGN KEY'`,
+        [SCHEMA]
       );
       expect(Number(res.rows[0]!.n)).toBe(0);
     });
   });
 });
+
+async function insertFkProbeChunk(
+  c: pg.Client,
+  id: string,
+  content: string
+): Promise<void> {
+  const embedding = `[${Array.from({ length: 1536 }, () => 0).join(",")}]`;
+  await c.query(
+    `INSERT INTO chunks
+       (id, content, embedding, valid_from, valid_until, source_ref, metadata, created_at)
+     VALUES
+       ($1, $2, $3::vector, '2026-01-01T00:00:00Z', NULL, 'fk-probe', '{}'::jsonb, '2026-01-01T00:00:00Z')`,
+    [id, content, embedding]
+  );
+}
 
 /**
  * Mint two fresh entities to be used as a triple's head_id / tail_id. type
@@ -1073,16 +1110,14 @@ function tstzrangeAll(c: pg.Client): unknown {
  * the idempotency invariant: a no-op second up() must leave the count
  * unchanged.
  *
- * Qualified to `public` for the same reason the embedding-column probe above
- * is: the integration suites each bootstrap the SAME table names inside their
- * own throwaway schema, so an unqualified count moves whenever a parallel
- * vitest worker happens to create one between the two invocations.
+ * Qualified to this suite's isolated schema so parallel workers that create
+ * the same table names elsewhere cannot move the count.
  */
 async function countPgTables(c: pg.Client): Promise<number> {
   const res = await c.query<{ count: string }>(
     `SELECT count(*)::text AS count FROM pg_tables
-       WHERE schemaname = 'public' AND tablename = ANY ($1::text[])`,
-    [COUNTED_TABLES as unknown as string[]]
+       WHERE schemaname = $1 AND tablename = ANY ($2::text[])`,
+    [SCHEMA, COUNTED_TABLES as unknown as string[]]
   );
   return Number(res.rows[0]?.count ?? "0");
 }
@@ -1095,8 +1130,8 @@ async function countPgTables(c: pg.Client): Promise<number> {
 async function listTableNames(c: pg.Client): Promise<string[]> {
   const res = await c.query<{ tablename: string }>(
     `SELECT tablename FROM pg_tables
-       WHERE schemaname = 'public' AND tablename = ANY ($1::text[])`,
-    [COUNTED_TABLES as unknown as string[]]
+       WHERE schemaname = $1 AND tablename = ANY ($2::text[])`,
+    [SCHEMA, COUNTED_TABLES as unknown as string[]]
   );
   return res.rows.map((r) => r.tablename);
 }

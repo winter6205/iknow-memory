@@ -33,9 +33,21 @@
 
 部署、版本对齐（ES 8.x / analysis-ik 同 patch / `@elastic/elasticsearch` 8.x）、
 安装、映射、重灌与重写恢复详见 [`docs/runbooks/es-precision-layer.md`](docs/runbooks/es-precision-layer.md)。
-环境变量见 `.env.example` 末尾“Elasticsearch precision layer”块。
+环境变量见 `.env.example`（文首 Compose 连接块 + Elasticsearch precision layer 段）。
 
 ## 运行
+
+本地重依赖（Postgres + pgvector、Neo4j + GDS、Elasticsearch 8.x + analysis-ik）用仓库根目录的 Compose，**不要**把 TypeScript MCP 服务放进容器：
+
+```bash
+docker compose up -d --wait
+```
+
+端口与开发凭据、以及宿主机要写的 `GRAPHRAG_MEMORY_*` 见 [`.env.example`](.env.example) 和 [`docs/runbooks/local-infra.md`](docs/runbooks/local-infra.md)。图 / 精排 / 精度层仍是默认开启 + fail-start（ADR-0006 / ADR-0007）；Compose 只是让地址好填，不会改成可缺依赖启动。
+
+无 Docker 时 Neo4j 仍可用 `bash scripts/neo4j.sh install && bash scripts/neo4j.sh start`（`127.0.0.1`、关闭认证；与 Compose 不要同时占 `7687`）。
+
+然后在**宿主机**跑 MCP：
 
 ```bash
 npm install
@@ -82,7 +94,7 @@ rerank 默认开启，走 MiniMax LLM。也可设 `ANTHROPIC_AUTH_TOKEN`；若�
 `GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL` 留给专用 rerank sidecar（例如本机
 `http://localhost:8080/rerank`）。本机 pgvector HNSW 索引上限 2000 维，
 `GRAPHRAG_MEMORY_EMBED_DIMENSIONS` 必须 ≤ 该上限（不要用 2048）。
-Neo4j sidecar：`bash scripts/neo4j.sh start`。
+本地图 sidecar：Compose（`docs/runbooks/local-infra.md`，需同时设 Neo4j USER/PASSWORD）或 `bash scripts/neo4j.sh start`（无认证，仅 URI）。
 
 Embedding 与 secret 放置规则见 [`docs/mcp-config.md`](docs/mcp-config.md)。
 

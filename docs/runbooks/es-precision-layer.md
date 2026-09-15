@@ -11,11 +11,11 @@ spin up the cluster, install the analyzer, verify, recover.
 
 ## Version alignment
 
-| Side   | Component                      | Required version           |
-| ------ | ------------------------------ | -------------------------- |
-| Server | Elasticsearch                  | **8.x** (currently 8.x).   |
-| Server | `analysis-ik` plugin           | **exact 8.x patch match**. |
-| Client | `@elastic/elasticsearch` (npm) | **8.x** (currently 8.x).   |
+| Side   | Component                      | Required version                                  |
+| ------ | ------------------------------ | ------------------------------------------------- |
+| Server | Elasticsearch                  | **8.x** (compose pin **8.19.20**).                |
+| Server | `analysis-ik` plugin           | **exact 8.x patch match** (compose: **8.19.20**). |
+| Client | `@elastic/elasticsearch` (npm) | **8.x** (currently 8.x).                          |
 
 > **Why the triple must match.** IK plugins are compiled against a
 > specific Elasticsearch build. An IK built for 8.15.0 will not load
@@ -32,15 +32,24 @@ The local / dev shape is one node, no replicas, IK installed once. The
 single-node path is sufficient for production triage and any environment
 where a managed ES service is not in use.
 
+**Happy path for this repo:** root `docker compose up -d --wait` builds
+`docker/elasticsearch` (Elasticsearch **8.19.20** + `analysis-ik` **8.19.20**)
+together with Postgres and Neo4j. The MCP app stays on the host. See
+`docs/runbooks/local-infra.md`.
+
+The one-off `docker run` below is for triage **outside** that compose file
+(you must still install IK at the exact patch, next section):
+
 ```bash
 # Elasticsearch 8.x, single-node, security off for local dev.
+# Pin must match the analysis-ik zip (currently 8.19.20 in compose).
 docker run --rm --name iknow-es \
   -p 9200:9200 \
   -e "discovery.type=single-node" \
   -e "xpack.security.enabled=false" \
   -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
   -e "cluster.routing.allocation.disk.threshold_enabled=false" \
-  docker.elastic.co/elasticsearch/elasticsearch:8.x.y
+  docker.elastic.co/elasticsearch/elasticsearch:8.19.20
 ```
 
 Memory / JVM guidance — keep it simple:
@@ -63,6 +72,17 @@ curl -fsS http://localhost:9200
 # {"name":"iknow-es","cluster_name":"docker-cluster",...}
 ```
 
+> **WSL / `localhost` host field.** Prefer `127.0.0.1` over `localhost` in
+> `GRAPHRAG_MEMORY_ES_URL`. Under WSL `/etc/hosts` maps `localhost` to
+> both `127.0.0.1` and `::1`, and the resolver order decides which one
+> wins — the two standard resolvers disagree on this very machine
+> (`getent hosts localhost` → `::1`, Node `dns.lookup("localhost")` →
+> `127.0.0.1`). Compose's plain `9200:9200` publishes on **both**
+> `0.0.0.0` and `[::]`, so today both paths answer; a publish bound to
+> IPv4 only (`127.0.0.1:9200:9200`) turns the IPv6 path into
+> `ECONNREFUSED` / `ECONNRESET`. Pinning `127.0.0.1` removes that
+> variable. Same rule in `docs/mcp-config.md`.
+
 ## Installing `analysis-ik`
 
 IK is **not** bundled with the official Elasticsearch image. Install the
@@ -70,22 +90,24 @@ plugin into the running container — the version **must match the
 cluster's exact 8.x patch version**:
 
 ```bash
-ES_VERSION="8.x.y"
+ES_VERSION="8.19.20"
 
 docker exec -it iknow-es bash -c "
-  bin/elasticsearch-plugin install \
-    https://github.com/medcl/analysis-ik/releases/download/v${ES_VERSION}/elasticsearch-analysis-ik-${ES_VERSION}.zip
+  bin/elasticsearch-plugin install --batch \
+    https://release.infinilabs.com/analysis-ik/stable/elasticsearch-analysis-ik-${ES_VERSION}.zip
 "
-# Answer 'y' to the security exception prompt (ik is under the standard
-# plugin security exception list).
+# --batch accepts the plugin security exception (ik is on the standard list).
 docker restart iknow-es
 ```
 
 > **Why a release-zip install (not the docker image's bundled plugin
-> helper).** Medcl's release artefacts are the source of truth for IK;
-> the `bin/elasticsearch-plugin install <URL>` path keeps the plugin on
-> the same lifecycle as the cluster image and is what every production
-> install guide recommends.
+> helper).** INFINI Labs (`release.infinilabs.com/analysis-ik/stable/`)
+> is the current IK release channel (the older `medcl` GitHub release
+> zips stopped at earlier 8.x patches). The
+> `bin/elasticsearch-plugin install <URL>` path keeps the plugin on
+> the same lifecycle as the cluster image. Compose bakes this into
+> `docker/elasticsearch/Dockerfile` so `up --wait` does not need a
+> second install step.
 
 Verify the plugin loaded:
 

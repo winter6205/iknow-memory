@@ -8,11 +8,11 @@
  * a real cluster with the analysis-ik plugin installed (see
  * `docs/runbooks/es-precision-layer.md`).
  *
- * Per docs/.claude/rules/test.md: when Elasticsearch is unreachable the suite
- * SKIPS LOUDLY with the documented Validation block, never silently passes.
- * The probe mirrors the Postgres harness: a lightweight HEAD against the
- * configured ES_URL is enough to confirm reachability; analyzer correctness
- * is proven by the unit tests in tests/storage/elasticsearch-precision.unit.test.ts.
+ * Per docs/.claude/rules/test.md: when Elasticsearch is unreachable locally the
+ * suite SKIPS LOUDLY with the documented Validation block, never silently
+ * passes. In CI (`CI=true`) the same miss is a hard failure so compose/ES
+ * jobs cannot exit 0 via describe.skip. The probe is a lightweight GET
+ * against the configured ES_URL.
  */
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -34,6 +34,24 @@ interface EsProbeResult {
   error?: unknown;
 }
 
+/**
+ * undici collapses every connection failure into a bare `TypeError: fetch
+ * failed`; the actionable code (ECONNREFUSED / ENOTFOUND / ECONNRESET)
+ * lives on `cause`. Without it a red CI probe says only "fetch failed",
+ * which cannot distinguish "nothing is listening" from "the name resolved
+ * to the wrong family" — the two failures this suite exists to surface.
+ */
+function describeFetchFailure(caught: unknown): Error {
+  if (!(caught instanceof Error)) return new Error(String(caught));
+  const cause = (caught as { cause?: unknown }).cause;
+  if (cause instanceof Error && cause.message.length > 0) {
+    const code = (cause as { code?: unknown }).code;
+    const suffix = typeof code === "string" ? ` (${code})` : "";
+    return new Error(`${caught.message}: ${cause.message}${suffix}`);
+  }
+  return caught;
+}
+
 async function probeElasticsearch(url: string): Promise<EsProbeResult> {
   try {
     const response = await fetch(url, { method: "GET" });
@@ -46,11 +64,7 @@ async function probeElasticsearch(url: string): Promise<EsProbeResult> {
     }
     return { available: true, url };
   } catch (caught: unknown) {
-    return {
-      available: false,
-      url,
-      error: caught instanceof Error ? caught : new Error(String(caught)),
-    };
+    return { available: false, url, error: describeFetchFailure(caught) };
   }
 }
 
@@ -72,7 +86,14 @@ function warnEsUnavailable(probe: EsProbeResult): void {
 const ES_URL =
   process.env[ES_URL_ENV] ?? process.env[ES_NODE_ENV] ?? DEFAULT_ES_URL;
 const probe = await probeElasticsearch(ES_URL);
-if (!probe.available) warnEsUnavailable(probe);
+if (!probe.available) {
+  warnEsUnavailable(probe);
+  if (process.env.CI === "true") {
+    throw new Error(
+      `Elasticsearch unreachable at ${probe.url} in CI; loud-skip is local-only`
+    );
+  }
+}
 const describeEs = probe.available ? describe : describe.skip;
 
 const NOW = "2026-01-01T00:00:00.000Z";
@@ -203,15 +224,24 @@ describeEs("es-precision: Elasticsearch precision layer", () => {
     }
   });
 
-  it("phrase switch produces a different ranking than phrase-off", async () => {
+  it("phrase-on ranks the contiguous-phrase chunk first", async () => {
+    // The fixture must make the phrase shoulder DECIDE the ordering, not
+    // merely agree with it. Two traps learned from the IK token stream:
+    //   - a trailing period merges into the index token ("chunks."), so
+    //     match_phrase can never join the query token "chunks" — the
+    //     target must end without punctuation;
+    //   - a distractor that only matches fewer terms loses under plain
+    //     multi_match anyway, so it carries more term occurrences to tie
+    //     or win without the phrase boost.
     const phraseTarget = makeChunk(
-      "graph priority ranks seed entities before chunks.",
+      "graph priority ranks seed entities before chunks",
       "es/phrase/target"
     );
     const bagOfWords = makeChunk(
-      "graphs prioritize seed entities and chunks in different orders.",
+      "seed entities chunks seed entities chunks before chunks seed entities",
       "es/phrase/distractor"
     );
+    await layer!.deleteChunkIndex();
     await layer!.indexChunks([phraseTarget, bagOfWords]);
 
     const phraseOn = await layer!.searchLexical("seed entities before chunks", {
@@ -228,10 +258,18 @@ describeEs("es-precision: Elasticsearch precision layer", () => {
       }
     );
 
-    expect(phraseOn.length).toBeGreaterThan(0);
-    expect(phraseOff.length).toBeGreaterThan(0);
-    expect(JSON.stringify(phraseOn.map((h) => h.id))).not.toBe(
-      JSON.stringify(phraseOff.map((h) => h.id))
+    const scoreOf = (hits: Array<{ id: string; score?: number }>, id: string) =>
+      hits.find((h) => h.id === id)?.score;
+    // The switch must be observable: both docs are retrievable either way,
+    // and only the phrase shoulder lifts the contiguous-phrase target
+    // from equal-or-behind to first.
+    expect(phraseOn.map((h) => h.id)).toContain(phraseTarget.id);
+    expect(phraseOn.map((h) => h.id)).toContain(bagOfWords.id);
+    expect(phraseOn[0]?.id).toBe(phraseTarget.id);
+    expect(phraseOff.map((h) => h.id)).toContain(phraseTarget.id);
+    expect(phraseOff[0]?.id).toBe(bagOfWords.id);
+    expect(scoreOf(phraseOn, phraseTarget.id)).toBeGreaterThan(
+      scoreOf(phraseOff, phraseTarget.id)!
     );
   });
 });

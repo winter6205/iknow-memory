@@ -11,12 +11,9 @@
  * Plus the three documented exit codes (0 success, 2 usage, 1 fatal).
  *
  * Why a unique schema (mirrors tests/integration/extraction-pg.test.ts):
- * the parallel schema-bootstrap.test.ts worker drops/recreates ledger tables in the
- * `public` schema. Bare-name SQL in the pipeline resolves through the
- * per-connection `search_path`, so we point our subprocess's pg.Pool at the
- * isolated schema via the libpq `options=-c search_path=<schema>,public`
- * startup string — verified empirically against the same Postgres 16 the
- * other suites use.
+ * a parallel schema-bootstrap.test.ts worker used to drop/recreate ledger
+ * tables in `public`. That suite now uses its own throwaway schema too;
+ * we still isolate so bare-name SQL cannot collide across workers.
  *
  * Keyless real-run refusal (CR High #1): T6's `buildLlm()` throws
  * ConfigError for a real extraction when ANTHROPIC_AUTH_TOKEN is
@@ -50,22 +47,45 @@ import { FakeEmbedder } from "../../src/core/embedder.js";
 import { listFailed } from "../../src/core/extraction/records.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
 import {
+  describeWhenPostgresAvailable,
+  probePostgres,
   redactPgConnectionString,
+  resolvePgConnectionString,
   warnPgUnavailable,
 } from "../integration/pg-test-harness.js";
 
 const DIM = 8;
+// Legacy fallback; resolvePgConnectionString lets a host whose Postgres is
+// not at this address (e.g. the Docker Compose stack) point the suite at
+// its own instance via GRAPHRAG_MEMORY_DB_URL without editing this file.
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
+const DB_URL = resolvePgConnectionString(BASE_DB_URL);
 // Random suffix so parallel runs (CI sharding) never collide on schema name.
 const SCHEMA = `extract_cli_e2e_${randomUUID().slice(0, 8)}`;
 const CLI_PATH = join(process.cwd(), "dist/cli/extract.js");
 const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
 const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
-/** Build a subprocess DB_URL whose per-connection search_path targets SCHEMA. */
+/** Build a DB_URL whose per-connection search_path targets SCHEMA. */
 function schemaDbUrl(): string {
-  return `${BASE_DB_URL}?options=-c%20search_path%3D${SCHEMA}%2Cpublic`;
+  // A resolved URL may already carry a query string (e.g. connection_timeout),
+  // so append with `&` in that case.
+  const separator = DB_URL.includes("?") ? "&" : "?";
+  return `${DB_URL}${separator}options=-c%20search_path%3D${SCHEMA}%2Cpublic`;
 }
+
+// Per docs/.claude/rules/test.md: probe at module scope so an unreachable
+// Postgres SKIPS LOUDLY via the Validation block instead of hard-failing
+// every `it()` — mirrors tests/integration/bm25-pg.test.ts.
+const probe = await probePostgres(DB_URL, false);
+const describePg = describeWhenPostgresAvailable(probe, {
+  label: "extract-cli-e2e",
+  testPath: "tests/cli/extract.test.ts",
+  expectedCommand: "npx vitest run tests/cli/extract.test.ts",
+  connectionString: DB_URL,
+  error: probe.error,
+  requiresVector: false,
+});
 
 interface ProcResult {
   code: number | null;
@@ -115,14 +135,14 @@ function runCliSubprocess(
   });
 }
 
-describe("extract CLI subprocess e2e (T9)", () => {
+describePg("extract CLI subprocess e2e (T9)", () => {
   let client: pg.Client | undefined;
 
   beforeAll(async () => {
     process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     // Per test.md: skip loudly (never silently pass) when Postgres is down.
     try {
-      client = new pg.Client({ connectionString: BASE_DB_URL });
+      client = new pg.Client({ connectionString: DB_URL });
       await client.connect();
       await resetSchema(client);
     } catch (err) {
@@ -130,7 +150,7 @@ describe("extract CLI subprocess e2e (T9)", () => {
         label: "extract-cli-e2e",
         testPath: "tests/cli/extract.test.ts",
         expectedCommand: "npx vitest run tests/cli/extract.test.ts",
-        connectionString: BASE_DB_URL,
+        connectionString: DB_URL,
         error: err,
         requiresVector: false,
       });
@@ -153,7 +173,7 @@ describe("extract CLI subprocess e2e (T9)", () => {
   function requireClient(): pg.Client {
     if (!client) {
       throw new Error(
-        `Postgres not reachable at ${redactPgConnectionString(BASE_DB_URL)} — see Validation block in beforeAll`
+        `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
       );
     }
     return client;

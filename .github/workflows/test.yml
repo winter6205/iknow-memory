@@ -1,9 +1,13 @@
 name: test
 
-# Two-tier CI:
+# Three jobs:
 #
 #   test-fast  — PR gate (required check). Fast vitest subset without Postgres.
-#   test-full  — nightly cron + manual dispatch. Full suite with Postgres service.
+#   test-full  — nightly cron + manual dispatch. Full suite with Postgres
+#                service plus Compose Elasticsearch (+ analysis-ik) so
+#                tests/integration/bm25-pg.test.ts cannot loud-skip.
+#   test-es    — PR/main gate. Builds only the elasticsearch compose
+#                service and runs the live precision-layer suite.
 #
 # Local WSL `npm test` is ground truth; excludes only affect CI runners.
 # Do not delete tests — use --exclude to express CI policy.
@@ -47,9 +51,51 @@ jobs:
             --exclude tests/storage/pgvector-startup.test.ts \
             --exclude tests/storage/storage-reads-pg.test.ts
 
-  test-full:
+  test-es:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Start Elasticsearch + analysis-ik
+        # ES refuses to boot below vm.max_map_count=262144; the runner may
+        # already satisfy this, but setting it keeps the job independent of
+        # the host default (docker-compose.yml documents the same requirement).
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          docker compose up -d --wait --no-deps elasticsearch
+      - name: Verify ES is reachable from the runner
+        # The compose healthcheck only proves the container's own loopback
+        # answers; `up --wait` returning "healthy" does NOT prove the host's
+        # published path works. scripts/wait-for-es.ts polls the same client
+        # the suite uses and reports the real error code. See its header for
+        # the failure that motivated it.
+        env:
+          ES_URL: http://127.0.0.1:9200
+        run: npx tsx scripts/wait-for-es.ts
+      - name: ES reachability diagnostics
+        if: failure()
+        run: |
+          echo "::group::ES host reachability diagnostics"
+          docker compose ps
+          ss -ltn | grep -E '9200|9300' || echo "(no host listener on 9200/9300)"
+          docker inspect iknow-memory-es \
+            --format '{{json .NetworkSettings.Ports}}' || true
+          docker logs --tail 60 iknow-memory-es || true
+          echo "::endgroup::"
+      - name: Live precision-layer suite
+        env:
+          GRAPHRAG_MEMORY_ES_URL: http://127.0.0.1:9200
+        run: npx vitest run --retry 1 tests/integration/bm25-pg.test.ts
+
+  test-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     services:
       postgres:
@@ -68,6 +114,11 @@ jobs:
           --health-retries 5
     env:
       GRAPHRAG_MEMORY_DB_URL: postgresql://postgres@localhost:5432/postgres
+      # 127.0.0.1 rather than localhost, per docs/mcp-config.md: the host
+      # side should not depend on where getaddrinfo puts ::1 vs 127.0.0.1.
+      # (Not the cause of the first test-es failure — that was a transient
+      # connection reset from the published port; see wait-for-es.ts.)
+      GRAPHRAG_MEMORY_ES_URL: http://127.0.0.1:9200
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -79,5 +130,29 @@ jobs:
       - run: npm run typecheck
       - name: Check test excludes (CI guard)
         run: npx tsx scripts/ci-check-test-excludes.ts
+      - name: Start Elasticsearch + analysis-ik
+        # Same vm.max_map_count step as test-es; the Postgres service above
+        # is the workflow service, not compose — only ES comes from compose.
+        run: |
+          sudo sysctl -w vm.max_map_count=262144
+          docker compose up -d --wait --no-deps elasticsearch
+      - name: Verify ES is reachable from the runner
+        # Same gate as test-es. Without it, an unreachable ES does not fail
+        # this job — it makes bm25-pg loud-skip, which is exactly the hole
+        # #226 closes (the nightly reported `fetch failed` + 4 skipped for
+        # weeks without ever going red).
+        env:
+          ES_URL: http://127.0.0.1:9200
+        run: npx tsx scripts/wait-for-es.ts
+      - name: ES reachability diagnostics
+        if: failure()
+        run: |
+          echo "::group::ES host reachability diagnostics"
+          docker compose ps
+          ss -ltn | grep -E '9200|9300' || echo "(no host listener on 9200/9300)"
+          docker inspect iknow-memory-es \
+            --format '{{json .NetworkSettings.Ports}}' || true
+          docker logs --tail 60 iknow-memory-es || true
+          echo "::endgroup::"
       - name: Vitest full suite (retry-1)
         run: npx vitest run --retry 1

@@ -36,6 +36,14 @@ rule between them and a re-drain can never push a stale value.
   sidecar has auth on). Neo4j CE with the GDS plugin — the retrieve arm
   calls `gds.graph.project` and `gds.pageRank.stream`.
 
+Local sidecar options (do not bind both to `:7687`):
+
+- **Docker (common case):** `docker compose up -d --wait` — Neo4j `5.26.0`
+  + GDS `2.13.2` baked in `docker/neo4j`, auth `neo4j` / `iknow-memory-dev`.
+  Set URI, USER, and PASSWORD. See `docs/runbooks/local-infra.md`.
+- **No Docker:** `bash scripts/neo4j.sh install && bash scripts/neo4j.sh start`
+  — same version pin, auth disabled on `127.0.0.1`, URI only.
+
 Both CLIs bootstrap `projection_outbox` themselves, so there is no
 separate migration step.
 

@@ -164,6 +164,35 @@ describe("ElasticsearchPrecisionLayer", () => {
     expect(query).not.toContain('"b"');
   });
 
+  it("omits the match_phrase shoulder when phrase is off", async () => {
+    const client = fakeClient();
+    const layer = new ElasticsearchPrecisionLayer(
+      {
+        node: "http://localhost:9200",
+        chunkIndex: "chunks",
+        entityIndex: "entities",
+      },
+      { client }
+    );
+
+    await layer.searchLexical("中文 分词", {
+      limit: 5,
+      validAt: NOW,
+      precision: { phrase: false },
+    });
+
+    const request = client.search.mock.calls[0]?.[0] as {
+      index: string;
+      query: unknown;
+    };
+    const query = JSON.stringify(request.query);
+    // Paired with the `phrase: true` case above: the switch must be
+    // observable in both directions, or a regression that hard-wires
+    // phrase off would still pass every test.
+    expect(query).not.toContain("match_phrase");
+    expect(query).toContain("multi_match");
+  });
+
   it("ignores query-time k1/b entirely (index-time-only semantics)", async () => {
     const client = fakeClient();
     const layer = new ElasticsearchPrecisionLayer(

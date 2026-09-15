@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # Local Neo4j + GDS sidecar (also used by Cloud Agent install/start).
 #
+# Common case when Docker is available: repo-root `docker compose up`
+# (docs/runbooks/local-infra.md). This script is the no-Docker path —
+# tarball + GDS jar under $HOME, used by cursor-install.sh / cursor-start.sh
+# and any machine that should not run the compose Neo4j. Do not bind this
+# listener and compose to :7687 at the same time.
+#
 # The graph arm (specs/neo4j-graph-arm.md T4) needs a Neo4j that can run
-# `gds.pageRank.stream`, and environments without Docker use the tarball
-# plus the GDS plugin jar. Both are unpacked under $HOME, outside the repo,
+# `gds.pageRank.stream`. Both are unpacked under $HOME, outside the repo,
 # so nothing here can reach git.
 #
 # Auth is disabled rather than given a password: the listener is bound to

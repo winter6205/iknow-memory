@@ -32,7 +32,6 @@ import type {
   PrecisionIndexer,
   EntityIndexRecord,
 } from "../../src/core/storage/elasticsearch-precision.js";
-import { ConfigError } from "../../src/config.js";
 
 const CHUNK_A = "11111111-1111-4111-8111-111111111111";
 const CHUNK_B = "22222222-2222-4222-8222-222222222222";
@@ -600,29 +599,50 @@ describe("es-reindex default mode", () => {
 
 describe("es-reindex env wiring", () => {
   it("runCliFromEnv rejects a missing GRAPHRAG_MEMORY_DB_URL as exit 1", async () => {
-    // Spy on stderr to keep test output clean.
+    // The static import at the top of this file already cached the
+    // es-reindex -> config module edge, and vi.doMock only rewrites the
+    // registry for edges resolved *after* it runs. Without resetModules()
+    // the dynamic import below returns the cached module and runCliFromEnv
+    // runs the real loadEnv(), reading the developer's .env.local — the
+    // assertion then passes or fails depending on the machine. A sentinel
+    // message (not producible by config.ts) makes the mock path provable.
+    const mockMessage = "SENTINEL-DB-URL: mocked missing db url";
+    let loadEnvCalls = 0;
+    vi.resetModules();
+    // Spy on stderr to keep test output clean; captured text is asserted
+    // below to prove the mock path ran.
+    const output: string[] = [];
     const stderrSpy = vi
       .spyOn(process.stderr, "write")
-      .mockImplementation(() => true);
+      .mockImplementation((chunk: unknown) => {
+        output.push(String(chunk));
+        return true;
+      });
     try {
-      // vi.mock lifts the stub above the dynamic import so the call to
-      // `loadEnv` inside runCliFromEnv sees the mocked function. The
-      // module-import assignment trick used in earlier drafts is forbidden
-      // by ESM (read-only live bindings), so we go through the mock layer.
       vi.doMock("../../src/config.js", async () => {
+        // The thrown error must come from *this* graph's config module:
+        // after resetModules() the statically imported ConfigError is a
+        // different class identity, so runCliFromEnv's `instanceof` check
+        // would miss it and rethrow instead of returning 1.
         const actual = await vi.importActual<
           typeof import("../../src/config.js")
         >("../../src/config.js");
         return {
           ...actual,
           loadEnv: () => {
-            throw new ConfigError("GRAPHRAG_MEMORY_DB_URL is required");
+            loadEnvCalls += 1;
+            throw new actual.ConfigError(mockMessage);
           },
         };
       });
       try {
         const { runCliFromEnv } = await import("../../src/cli/es-reindex.js");
         expect(await runCliFromEnv([])).toBe(1);
+        // Direct evidence the mocked loadEnv ran, and that the exit-1
+        // surface carries the mock's own message rather than a real config
+        // error from .env.local.
+        expect(loadEnvCalls).toBe(1);
+        expect(output.join("")).toContain(mockMessage);
       } finally {
         vi.doUnmock("../../src/config.js");
       }
@@ -632,9 +652,18 @@ describe("es-reindex env wiring", () => {
   });
 
   it("runCliFromEnv rejects a missing GRAPHRAG_MEMORY_ES_URL as exit 1", async () => {
+    // resetModules() is required here too: without it the first test's
+    // mocked config stays in the registry and this dynamic import would
+    // reuse that stale mock.
+    let loadEnvCalls = 0;
+    vi.resetModules();
+    const output: string[] = [];
     const stderrSpy = vi
       .spyOn(process.stderr, "write")
-      .mockImplementation(() => true);
+      .mockImplementation((chunk: unknown) => {
+        output.push(String(chunk));
+        return true;
+      });
     try {
       vi.doMock("../../src/config.js", async () => {
         const actual = await vi.importActual<
@@ -642,12 +671,26 @@ describe("es-reindex env wiring", () => {
         >("../../src/config.js");
         return {
           ...actual,
-          loadEnv: () => makeEnv({ elasticsearch: undefined }),
+          loadEnv: () => {
+            loadEnvCalls += 1;
+            // `makeEnv`'s override merges with `??`, so passing
+            // `elasticsearch: undefined` would fall back to its default
+            // block; overwrite the field directly to model "no ES block".
+            return { ...makeEnv(), elasticsearch: undefined };
+          },
         };
       });
       try {
         const { runCliFromEnv } = await import("../../src/cli/es-reindex.js");
         expect(await runCliFromEnv([])).toBe(1);
+        expect(loadEnvCalls).toBe(1);
+        // This sentence is written only by runCliFromEnv's
+        // `env.elasticsearch === undefined` branch; neither loadEnv() nor
+        // the fatal-error path can produce it, so it discriminates the
+        // mocked env from the real one.
+        expect(output.join("")).toContain(
+          "GRAPHRAG_MEMORY_ES_URL is required to rebuild the precision layer"
+        );
       } finally {
         vi.doUnmock("../../src/config.js");
       }

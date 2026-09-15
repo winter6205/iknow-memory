@@ -37,22 +37,46 @@ import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { runCli, type CliDeps } from "../../src/cli/extract.js";
 import {
+  describeWhenPostgresAvailable,
+  probePostgres,
   redactPgConnectionString,
+  resolvePgConnectionString,
   warnPgUnavailable,
 } from "../integration/pg-test-harness.js";
 
 const DIM = 8;
+/** Fallback for hosts whose Postgres is still at the legacy address. */
 const BASE_DB_URL = "postgresql://postgres@localhost/postgres";
+const resolvedDbUrl = resolvePgConnectionString(BASE_DB_URL);
 const SCHEMA = `graph_e2e_${randomUUID().slice(0, 8)}`;
 const CLI_PATH = join(process.cwd(), "dist/cli/extract.js");
 const SERVER_PATH = join(process.cwd(), "dist/index.js");
 const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
 const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
 
-/** Per-connection search_path targeting SCHEMA via libpq `options=`. */
+/**
+ * Per-connection search_path targeting SCHEMA via libpq `options=`.
+ *
+ * The separator flips to `&` when the resolved URL already carries a query
+ * string (e.g. a hosted GRAPHRAG_MEMORY_DB_URL with `sslmode=require`), so
+ * the appended `options` stays a valid parameter.
+ */
 function schemaDbUrl(): string {
-  return `${BASE_DB_URL}?options=-c%20search_path%3D${SCHEMA}%2Cpublic`;
+  const separator = resolvedDbUrl.includes("?") ? "&" : "?";
+  return `${resolvedDbUrl}${separator}options=-c%20search_path%3D${SCHEMA}%2Cpublic`;
 }
+
+// Probe at module scope so an unreachable Postgres skips the whole suite
+// loudly (Validation block) instead of failing each `it()` via requireClient().
+const probe = await probePostgres(resolvedDbUrl, false);
+const describePg = describeWhenPostgresAvailable(probe, {
+  label: "extract-e2e-graph",
+  testPath: "tests/cli/extract-e2e-graph.test.ts",
+  expectedCommand: "npx vitest run tests/cli/extract-e2e-graph.test.ts",
+  connectionString: resolvedDbUrl,
+  error: probe.error,
+  requiresVector: false,
+});
 
 interface ProcResult {
   code: number | null;
@@ -159,13 +183,13 @@ function textOf(result: { content: unknown }): string {
     .join("");
 }
 
-describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
+describePg("extract CLI + graph-arm subprocess e2e (T7)", () => {
   let client: PgClient | undefined;
 
   beforeAll(async () => {
     process.env[ANN_MAX_DIMENSIONS_VAR] = "2000";
     try {
-      client = new PgClient({ connectionString: BASE_DB_URL });
+      client = new PgClient({ connectionString: resolvedDbUrl });
       await client.connect();
       await resetSchema(client);
     } catch (err) {
@@ -173,7 +197,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
         label: "extract-e2e-graph",
         testPath: "tests/cli/extract-e2e-graph.test.ts",
         expectedCommand: "npx vitest run tests/cli/extract-e2e-graph.test.ts",
-        connectionString: BASE_DB_URL,
+        connectionString: resolvedDbUrl,
         error: err,
         requiresVector: false,
       });
@@ -196,7 +220,7 @@ describe("extract CLI + graph-arm subprocess e2e (T7)", () => {
   function requireClient(): PgClient {
     if (!client) {
       throw new Error(
-        `Postgres not reachable at ${redactPgConnectionString(BASE_DB_URL)} — see Validation block in beforeAll`
+        `Postgres not reachable at ${redactPgConnectionString(resolvedDbUrl)} — see Validation block in beforeAll`
       );
     }
     return client;

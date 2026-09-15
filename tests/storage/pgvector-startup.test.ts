@@ -24,6 +24,7 @@ import {
 
 import {
   redactPgDiagnostic,
+  resolvePgConnectionString,
   warnPgUnavailable,
 } from "../integration/pg-test-harness.js";
 
@@ -34,9 +35,9 @@ const failingPgLoaderPath = path.join(
   here,
   "pgvector-startup-failing-pg-loader.mjs"
 );
-const baseDbUrl =
-  process.env.GRAPHRAG_MEMORY_DB_URL ??
-  "postgresql://postgres@localhost:5432/postgres";
+const baseDbUrl = resolvePgConnectionString(
+  "postgresql://postgres@localhost:5432/postgres"
+);
 const schema = `vector_startup_${Math.random().toString(16).slice(2, 10)}`;
 
 // Startup budget for one compiled-server boot, and the enclosing per-test

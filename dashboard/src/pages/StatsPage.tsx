@@ -1,60 +1,91 @@
-import { useEffect, useState } from "react";
-import { fetchJson, isEmptyStats, type StatsBody } from "../api";
-import { EmptyCopy, ErrorCopy, PageChrome, type PageState } from "./PageChrome";
+import { useCallback, useEffect, useState } from "react";
+import {
+  fetchJson,
+  isEmptyStats,
+  sourcesTotal,
+  type PageBody,
+  type StatsBody,
+} from "../api";
+import {
+  BOARD_CODE,
+  EmptyCopy,
+  ErrorCopy,
+  PageChrome,
+  type PageState,
+} from "./PageChrome";
 
 type View =
   | { state: "loading" }
   | { state: "empty" }
-  | { state: "ready"; data: StatsBody }
+  | { state: "ready"; data: StatsBody; sources: number }
   | { state: "error"; code: string; message: string };
 
 export function StatsPage() {
   const [view, setView] = useState<View>({ state: "loading" });
 
-  useEffect(() => {
-    let cancelled = false;
-    void fetchJson<StatsBody>("/api/stats").then((res) => {
-      if (cancelled) return;
-      if (!res.ok) {
+  const load = useCallback(() => {
+    setView({ state: "loading" });
+    void Promise.all([
+      fetchJson<StatsBody>("/api/stats"),
+      fetchJson<PageBody<unknown>>("/api/sources?limit=1&offset=0"),
+    ]).then(([stats, sources]) => {
+      if (!stats.ok) {
         setView({
           state: "error",
-          code: res.error.code,
-          message: res.error.message,
+          code: stats.error.code,
+          message: stats.error.message,
         });
         return;
       }
+      if (!sources.ok) {
+        setView({
+          state: "error",
+          code: sources.error.code,
+          message: sources.error.message,
+        });
+        return;
+      }
+      const sourceCount = sourcesTotal(sources.data);
       setView(
-        isEmptyStats(res.data)
+        isEmptyStats(stats.data) && sourceCount === 0
           ? { state: "empty" }
-          : { state: "ready", data: res.data }
+          : { state: "ready", data: stats.data, sources: sourceCount }
       );
     });
-    return () => {
-      cancelled = true;
-    };
   }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const state: PageState = view.state;
   const tiles =
     view.state === "ready"
-      ? view.data
+      ? {
+          资料: view.sources,
+          Chunks: view.data.chunks,
+          Entities: view.data.entities,
+          Invalidations: view.data.invalidations,
+        }
       : view.state === "empty"
-        ? { chunks: 0, entities: 0, invalidations: 0 }
+        ? { 资料: 0, Chunks: 0, Entities: 0, Invalidations: 0 }
         : null;
   return (
     <PageChrome title="统计" state={state}>
       {tiles ? (
-        <dl className="mb-4 grid max-w-3xl grid-cols-3 gap-3">
+        <dl className="mb-4 grid max-w-4xl grid-cols-4 gap-3">
           {(
             [
-              ["Chunks", tiles.chunks],
-              ["Entities", tiles.entities],
-              ["Invalidations", tiles.invalidations],
+              ["资料", tiles.资料],
+              ["Chunks", tiles.Chunks],
+              ["Entities", tiles.Entities],
+              ["Invalidations", tiles.Invalidations],
             ] as const
           ).map(([label, value]) => (
             <div
               key={label}
               className="rounded-lg border border-line bg-surface p-4"
+              data-testid={`stat-tile-${label}`}
             >
               <dt className="mb-1 text-[0.7rem] uppercase tracking-[0.06em] text-[var(--text-tertiary)]">
                 {label}
@@ -67,10 +98,10 @@ export function StatsPage() {
         </dl>
       ) : null}
       {view.state === "empty" ? (
-        <EmptyCopy message="账本为空。memory 空账本是合法空态，不是错误。" />
+        <EmptyCopy code={BOARD_CODE.EMPTY_LEDGER} />
       ) : null}
       {view.state === "error" ? (
-        <ErrorCopy code={view.code} message={view.message} />
+        <ErrorCopy code={view.code} message={view.message} onRetry={load} />
       ) : null}
     </PageChrome>
   );

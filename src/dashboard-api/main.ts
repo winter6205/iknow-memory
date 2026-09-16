@@ -1,6 +1,8 @@
 /**
  * dashboard-api bin entry — loadEnv + same boot helpers as MCP, then listen.
  */
+import { Pool } from "pg";
+
 import { ConfigError, loadEnv, type GraphragEnv } from "../config.js";
 import { createLogger, writeStderr } from "../logging.js";
 import { buildRetrieveDeps, buildRetrieveReranker } from "../index.js";
@@ -8,17 +10,26 @@ import { NineRouterEmbedder, UnavailableEmbedder } from "../core/embedder.js";
 import { MemoryBackend } from "../core/storage/memory-backend.js";
 import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { createNeo4jPprRanker } from "../core/graph/neo4j-ppr.js";
-import type { StorageBackend } from "../core/types.js";
+import { connectNeo4j } from "../core/graph/neo4j-writer.js";
+import type { StorageBackend, StorageReadPort } from "../core/types.js";
 
+import { alignEmbeddingDimensions } from "../core/storage/embed-dim-align.js";
 import { createDashboardServer, readDashboardConfig } from "./index.js";
 import { createNeo4jSessionFactory } from "./graph-session.js";
+import type {
+  BackfillPool,
+  DrainPool,
+  ExtractPool,
+} from "./handlers/writes.js";
 
 const EXIT_CODES = {
   FATAL_RUNTIME: 1,
   BAD_CONFIG: 2,
 } as const;
 
-async function buildStorage(env: GraphragEnv): Promise<StorageBackend> {
+async function buildStorage(
+  env: GraphragEnv
+): Promise<StorageBackend & StorageReadPort> {
   if (env.storage !== "pgvector") {
     return new MemoryBackend(env.embedDimensions);
   }
@@ -97,6 +108,73 @@ export async function main(): Promise<void> {
   const openGraphSession =
     env.neo4j !== undefined ? createNeo4jSessionFactory(env.neo4j) : undefined;
 
+  // T8 — wire the thin-write deps (operator-console T8). Ingest and
+  // invalidate only need storage + embedder, so they stay available
+  // even in memory mode. Extract needs LLM/embedding credentials +
+  // Postgres; graph backfill/drain need a Postgres pool + Neo4j.
+  // When the env does not provide them the dashboard-api still
+  // boots; the corresponding routes register as typed-503 stubs.
+  const pgPoolRaw =
+    env.dbUrl !== undefined && env.storage === "pgvector"
+      ? new Pool({
+          connectionString: env.dbUrl,
+        })
+      : undefined;
+  if (pgPoolRaw !== undefined) {
+    await alignEmbeddingDimensions(pgPoolRaw, env.embedDimensions);
+  }
+  const pgPool: (ExtractPool & BackfillPool & DrainPool) | undefined =
+    pgPoolRaw !== undefined
+      ? (pgPoolRaw as unknown as ExtractPool & BackfillPool & DrainPool)
+      : undefined;
+  const writes: Parameters<typeof createDashboardServer>[0]["writes"] = {
+    ingest: {
+      embedder,
+      storage,
+      ...(precision !== undefined ? { precision } : {}),
+      logger,
+    },
+    invalidate: {
+      embedder,
+      storage,
+      ...(precision !== undefined ? { precision } : {}),
+    },
+    ...(pgPool !== undefined && env.embedApiKey !== undefined
+      ? {
+          extract: {
+            llmEnv: {
+              authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+              baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
+              model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
+            },
+            embedderEnv: {
+              apiKey: env.embedApiKey,
+              baseUrl: env.embedBaseUrl,
+              model: env.embedModel,
+              dimensions: env.embedDimensions,
+            },
+            pool: pgPool,
+            ...(precision !== undefined ? { precision } : {}),
+            logger,
+          },
+        }
+      : {}),
+    ...(pgPool !== undefined && env.neo4j !== undefined
+      ? {
+          graphBackfill: {
+            pool: pgPool,
+            logger,
+            connectGraph: () => connectNeo4j(env.neo4j!),
+          },
+          graphDrain: {
+            pool: pgPool,
+            logger,
+            connectGraph: () => connectNeo4j(env.neo4j!),
+          },
+        }
+      : {}),
+  };
+
   const server = createDashboardServer({
     storage,
     embedder,
@@ -110,6 +188,7 @@ export async function main(): Promise<void> {
     ...(graphRanker !== undefined ? { graphRanker } : {}),
     ...(reranker !== undefined ? { reranker } : {}),
     ...(openGraphSession !== undefined ? { openGraphSession } : {}),
+    writes,
     storageMode: env.storage,
     version: "0.0.0",
     host,

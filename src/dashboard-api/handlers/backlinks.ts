@@ -1,5 +1,5 @@
 /**
- * GET /api/entities/:id/backlinks — inbound Neo4j edges for one entity.
+ * GET /api/entities/:id/backlinks — inbound + outbound Neo4j neighbors.
  */
 import type { RouteHandler } from "../router.js";
 import { errorEnvelope } from "../responses.js";
@@ -9,7 +9,11 @@ import {
   withGraphSession,
   type OpenGraphSession,
 } from "../graph-session.js";
-import { readEntityBacklinks } from "../../core/graph/projection-reads.js";
+import {
+  inboundNeighbor,
+  outboundNeighbor,
+  readEntityBacklinks,
+} from "../../core/graph/projection-reads.js";
 
 export function backlinksHandler(
   openSession: OpenGraphSession | undefined
@@ -29,7 +33,11 @@ export function backlinksHandler(
       }
       return {
         status: 200,
-        body: { entity: result.entity, inbound: result.inbound },
+        body: {
+          entity: result.entity,
+          inbound: result.inbound.map(inboundNeighbor),
+          outbound: result.outbound.map(outboundNeighbor),
+        },
       };
     } catch (err) {
       return neo4jFailureResponse(err);

@@ -81,8 +81,27 @@ describe("chrome", () => {
     expect(html).toMatch(/Fira[+ ]Code/);
   });
 
-  it("hosts routes for the five operator surfaces", () => {
+  it("hosts routes for the six operator surfaces", () => {
     const paths = NAV_ITEMS.map((item) => item.path);
-    expect(paths).toEqual(["/", "/query", "/browse", "/timeline", "/graph"]);
+    expect(paths).toEqual([
+      "/",
+      "/sources",
+      "/import",
+      "/browse",
+      "/timeline",
+      "/graph",
+    ]);
+  });
+
+  it("keeps operator-board header order: wordmark, nav, typeahead", () => {
+    const src = readDashboard("src/chrome/Chrome.tsx");
+    const logo = src.indexOf('data-testid="header-logo"');
+    const nav = src.indexOf('data-testid="header-nav"');
+    const search = src.indexOf('data-testid="header-search-cell"');
+    expect(logo).toBeGreaterThan(-1);
+    expect(nav).toBeGreaterThan(logo);
+    expect(search).toBeGreaterThan(nav);
+    expect(src).toMatch(/grid-cols-\[auto_1fr_auto_auto\]/);
+    expect(src).toMatch(/header-nav[\s\S]*header-search/);
   });
 });

@@ -24,6 +24,9 @@ const READ_PORT_METHODS = [
   "listEntities",
   "getEntity",
   "listTimeline",
+  "listSourceDocs",
+  "getSourceDoc",
+  "getSourceDocById",
 ] as const satisfies readonly (keyof StorageReadPort)[];
 
 export function asReadPort(storage: unknown): StorageReadPort {

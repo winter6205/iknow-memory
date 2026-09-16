@@ -1,19 +1,35 @@
 import * as Switch from "@radix-ui/react-switch";
 import { NavLink } from "react-router-dom";
 import { applyTheme, useThemeStore } from "../theme/store";
-import { NAV_ITEMS, WORDMARK } from "./brand";
+import { NAV_ITEMS } from "./brand";
+import { HeaderSearch } from "./HeaderSearch";
 
+/**
+ * Operator-board chrome: wordmark | nav (1fr) | typeahead | 晨纸.
+ * PR 214 had put search in the 1fr slot and shoved nav aside; the frozen
+ * prototype (`docs/wayfinder/prototypes/operator-board` App.vue header)
+ * is logo → nav → search.
+ */
 export function Chrome() {
   const theme = useThemeStore((state) => state.theme);
   const setTheme = useThemeStore((state) => state.setTheme);
   const paperOn = theme === "晨纸";
 
   return (
-    <header className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-line px-6 pb-5 pt-6">
-      <p className="font-display text-[1.35rem] font-semibold tracking-tight text-title">
-        iknow<span className="font-medium opacity-55">-memory</span>
-      </p>
-      <nav className="flex gap-1" aria-label="主导航">
+    <header
+      className="dashboard-header grid grid-cols-[auto_1fr_auto_auto] items-stretch border-y border-line"
+      data-testid="dashboard-header"
+    >
+      <div className="header-cell header-logo" data-testid="header-logo">
+        <p className="font-display text-[1.35rem] font-semibold tracking-tight text-title">
+          iknow<span className="font-medium opacity-55">-memory</span>
+        </p>
+      </div>
+      <nav
+        className="header-cell header-nav flex gap-6 border-l border-line"
+        aria-label="主导航"
+        data-testid="header-nav"
+      >
         {NAV_ITEMS.map((item) => (
           <NavLink
             key={item.path}
@@ -21,9 +37,9 @@ export function Chrome() {
             end={item.path === "/"}
             className={({ isActive }) =>
               [
-                "rounded-md px-3 py-1.5 text-sm no-underline",
+                "text-sm uppercase tracking-wide no-underline",
                 isActive
-                  ? "bg-surface text-ink"
+                  ? "text-ink"
                   : "text-[var(--text-secondary)] hover:text-ink",
               ].join(" ")
             }
@@ -32,7 +48,13 @@ export function Chrome() {
           </NavLink>
         ))}
       </nav>
-      <label className="flex items-center gap-2 font-mono text-xs text-[var(--text-secondary)]">
+      <div
+        className="header-cell header-search min-w-[16rem] border-l border-line"
+        data-testid="header-search-cell"
+      >
+        <HeaderSearch />
+      </div>
+      <label className="header-cell flex items-center gap-2 border-l border-line font-mono text-xs text-[var(--text-secondary)]">
         晨纸
         <Switch.Root
           checked={paperOn}

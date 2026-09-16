@@ -1,13 +1,64 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { fetchJson, type EntityDetail } from "../api";
-import { EmptyCopy, ErrorCopy, PageChrome, type PageState } from "./PageChrome";
+import {
+  fetchJson,
+  type EntityDetail,
+  type NeighborhoodBody,
+  type NeighborhoodNeighbor,
+} from "../api";
+import {
+  BOARD_CODE,
+  EmptyCopy,
+  ErrorCopy,
+  PageChrome,
+  type PageState,
+} from "./PageChrome";
 
 type View =
   | { state: "loading" }
   | { state: "empty" }
-  | { state: "ready"; data: EntityDetail }
+  | {
+      state: "ready";
+      data: EntityDetail;
+      inbound: NeighborhoodNeighbor[];
+      outbound: NeighborhoodNeighbor[];
+    }
   | { state: "error"; code: string; message: string };
+
+function NeighborCard({
+  title,
+  items,
+}: {
+  title: string;
+  items: NeighborhoodNeighbor[];
+}) {
+  return (
+    <div className="card">
+      <div className="card-title">
+        {title} ({items.length})
+      </div>
+      {items.length === 0 ? (
+        <div className="text-[13px] text-[var(--text-tertiary)]">
+          暂无{title}
+        </div>
+      ) : (
+        <ul className="space-y-1 text-[13px]">
+          {items.map((item, index) => (
+            <li key={`${item.id}-${item.relation ?? ""}-${index}`}>
+              <Link
+                to={`/browse/entities/${item.id}`}
+                className="text-accent no-underline"
+              >
+                {item.name}
+              </Link>
+              {item.relation ? ` · ${item.relation}` : ""}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 export function EntityDetailPage() {
   const { id = "" } = useParams();
@@ -30,7 +81,25 @@ export function EntityDetailPage() {
         );
         return;
       }
-      setView({ state: "ready", data: res.data });
+      void fetchJson<NeighborhoodBody>(`/api/entities/${id}/backlinks`).then(
+        (links) => {
+          if (cancelled) return;
+          if (!links.ok) {
+            setView({
+              state: "error",
+              code: links.error.code,
+              message: links.error.message,
+            });
+            return;
+          }
+          setView({
+            state: "ready",
+            data: res.data,
+            inbound: links.data.inbound,
+            outbound: links.data.outbound,
+          });
+        }
+      );
     });
     return () => {
       cancelled = true;
@@ -46,7 +115,7 @@ export function EntityDetailPage() {
         </Link>
       </p>
       {view.state === "empty" ? (
-        <EmptyCopy message="没有这条 entity。" />
+        <EmptyCopy code={BOARD_CODE.NOT_FOUND} />
       ) : null}
       {view.state === "error" ? (
         <ErrorCopy code={view.code} message={view.message} />
@@ -63,6 +132,8 @@ export function EntityDetailPage() {
           >
             邻域
           </Link>
+          <NeighborCard title="出链" items={view.outbound} />
+          <NeighborCard title="入链" items={view.inbound} />
         </div>
       ) : null}
     </PageChrome>

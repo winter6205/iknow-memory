@@ -15,6 +15,7 @@ import {
   dashboardChildSpawns,
   ensureDashboardVite,
   isStorageConfigured,
+  readOperatorSetting,
   readStorageFileEnv,
   resolveDashboardApiPort,
   terminateChildGroup,
@@ -94,6 +95,27 @@ describe("dashboard-dev zero-config env", () => {
     // layer must be explicitly off or the API child refuses to boot.
     assert.equal(env.GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED, "false");
     assert.equal(env.PATH, "/usr/bin");
+  });
+
+  it("does not force memory when ~/.iknow-memory/setting.json has storage", () => {
+    const home = join(tmpdir(), `iknow-setting-${process.pid}-${Date.now()}`);
+    mkdirSync(join(home, ".iknow-memory"), { recursive: true });
+    writeFileSync(
+      join(home, ".iknow-memory", "setting.json"),
+      JSON.stringify({
+        GRAPHRAG_MEMORY_STORAGE: "pgvector",
+        GRAPHRAG_MEMORY_DB_URL: "postgresql://localhost/iknow_memory",
+      })
+    );
+    const setting = readOperatorSetting(home);
+    assert.equal(setting.GRAPHRAG_MEMORY_STORAGE, "pgvector");
+    assert.equal(isStorageConfigured({ HOME: home }, setting), true);
+    const env = buildDashboardChildEnv(
+      { PATH: "/usr/bin", HOME: home },
+      setting
+    );
+    assert.equal(env.GRAPHRAG_MEMORY_STORAGE, undefined);
+    assert.equal(env.GRAPHRAG_MEMORY_DB_URL, undefined);
   });
 
   it("passes through operator storage env without forcing graph, rerank, or BM25 off", () => {

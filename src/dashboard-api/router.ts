@@ -9,6 +9,14 @@ export interface DashboardRequest {
   path: string;
   query: string;
   params: Record<string, string>;
+  /**
+   * Parsed JSON body attached by the http layer for non-GET requests. GET
+   * (and other body-less) requests leave this `undefined`. Thin write
+   * handlers in `handlers/writes.ts` read this; read-only handlers ignore
+   * it. The dashboard-api does not buffer the request body for GET paths
+   * — only POST handlers trigger a drain.
+   */
+  body?: unknown;
 }
 
 export type RouteHandler = (

@@ -1,7 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { fetchJson, type ChunkDetail } from "../api";
-import { EmptyCopy, ErrorCopy, PageChrome, type PageState } from "./PageChrome";
+import {
+  BOARD_CODE,
+  EmptyCopy,
+  ErrorCopy,
+  PageChrome,
+  type PageState,
+} from "./PageChrome";
 
 type View =
   | { state: "loading" }
@@ -45,7 +51,9 @@ export function ChunkDetailPage() {
           ← 浏览
         </Link>
       </p>
-      {view.state === "empty" ? <EmptyCopy message="没有这条 chunk。" /> : null}
+      {view.state === "empty" ? (
+        <EmptyCopy code={BOARD_CODE.NOT_FOUND} />
+      ) : null}
       {view.state === "error" ? (
         <ErrorCopy code={view.code} message={view.message} />
       ) : null}

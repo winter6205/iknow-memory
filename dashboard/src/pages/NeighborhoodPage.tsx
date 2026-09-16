@@ -1,13 +1,57 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { fetchJson, isEmptyNeighborhood, type NeighborhoodBody } from "../api";
-import { EmptyCopy, ErrorCopy, PageChrome, type PageState } from "./PageChrome";
+import {
+  fetchJson,
+  isEmptyNeighborhood,
+  type NeighborhoodBody,
+  type NeighborhoodNeighbor,
+} from "../api";
+import {
+  BOARD_CODE,
+  EmptyCopy,
+  ErrorCopy,
+  PageChrome,
+  type PageState,
+} from "./PageChrome";
 
 type View =
   | { state: "loading" }
   | { state: "empty" }
   | { state: "ready"; data: NeighborhoodBody }
   | { state: "error"; code: string; message: string };
+
+function NeighborList({
+  title,
+  items,
+}: {
+  title: string;
+  items: NeighborhoodNeighbor[];
+}) {
+  if (items.length === 0) return null;
+  return (
+    <section className="space-y-2">
+      <h2 className="font-mono text-xs uppercase tracking-wide text-[var(--text-tertiary)]">
+        {title}
+      </h2>
+      <ul className="space-y-2 text-sm">
+        {items.map((item, index) => (
+          <li
+            key={`${item.id}-${item.relation ?? ""}-${index}`}
+            className="rounded-md border border-line p-3 font-mono text-xs"
+          >
+            <Link
+              to={`/browse/entities/${item.id}`}
+              className="text-accent no-underline"
+            >
+              {item.name || item.id}
+            </Link>
+            {item.relation ? ` · ${item.relation}` : ""}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
 
 export function NeighborhoodPage() {
   const { id = "" } = useParams();
@@ -53,22 +97,17 @@ export function NeighborhoodPage() {
           ← entity
         </Link>
       </p>
-      {view.state === "empty" ? <EmptyCopy message="没有入边。" /> : null}
+      {view.state === "empty" ? (
+        <EmptyCopy code={BOARD_CODE.EMPTY_NEIGHBORHOOD} />
+      ) : null}
       {view.state === "error" ? (
         <ErrorCopy code={view.code} message={view.message} onRetry={load} />
       ) : null}
       {view.state === "ready" ? (
-        <ul className="space-y-2 text-sm">
-          {view.data.inbound.map((edge, index) => (
-            <li
-              key={`${edge.from}-${edge.to}-${edge.type ?? ""}-${index}`}
-              className="rounded-md border border-line p-3 font-mono text-xs"
-            >
-              {edge.from} → {edge.to}
-              {edge.type ? ` · ${edge.type}` : ""}
-            </li>
-          ))}
-        </ul>
+        <div className="space-y-4">
+          <NeighborList title="出链" items={view.data.outbound} />
+          <NeighborList title="入链" items={view.data.inbound} />
+        </div>
       ) : null}
     </PageChrome>
   );

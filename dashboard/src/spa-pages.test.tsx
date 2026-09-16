@@ -1,5 +1,5 @@
 /**
- * T6 SPA pages — empty ledger vs capability error, plus query degraded.
+ * T6 SPA pages — empty ledger vs capability error.
  * Fixtures copy T2–T4 handler JSON (tests/dashboard/*.test.ts). No invented contract.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -21,7 +21,6 @@ import { ChunkDetailPage } from "./pages/ChunkDetailPage";
 import { EntityDetailPage } from "./pages/EntityDetailPage";
 import { GraphPage } from "./pages/GraphPage";
 import { NeighborhoodPage } from "./pages/NeighborhoodPage";
-import { QueryPage } from "./pages/QueryPage";
 import { StatsPage } from "./pages/StatsPage";
 import { TimelinePage } from "./pages/TimelinePage";
 
@@ -62,6 +61,8 @@ describe("StatsPage", () => {
     render(<StatsPage />);
     expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
     expect(screen.queryByTestId("page-state-error")).toBeNull();
+    expect(screen.getByTestId("board-code").textContent).toBe("EMPTY_LEDGER");
+    expect(screen.queryByText(/账本为空/)).toBeNull();
   });
 
   it("shows error chrome, not empty, when /api/stats returns STORAGE_ERROR", async () => {
@@ -74,6 +75,7 @@ describe("StatsPage", () => {
     expect(await screen.findByTestId("page-state-error")).toBeTruthy();
     expect(screen.getByText(/STORAGE_ERROR/)).toBeTruthy();
     expect(screen.queryByTestId("page-state-empty")).toBeNull();
+    expect(screen.getByRole("button", { name: /重试/ })).toBeTruthy();
   });
 
   it("shows counts when the ledger has data", async () => {
@@ -83,76 +85,6 @@ describe("StatsPage", () => {
     render(<StatsPage />);
     expect(await screen.findByTestId("page-state-ready")).toBeTruthy();
     expect(screen.getByText("2")).toBeTruthy();
-  });
-});
-
-describe("QueryPage", () => {
-  it("shows empty hits for 200 { chunks: [] }", async () => {
-    mockFetch((url) => {
-      expect(url).toContain("/api/query?q=");
-      return jsonResponse(200, { chunks: [] });
-    });
-    render(<QueryPage />);
-    await userEvent.type(screen.getByRole("searchbox"), "nothing matches");
-    await userEvent.click(screen.getByRole("button", { name: /检索/ }));
-    expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
-    expect(screen.queryByTestId("degraded-banner")).toBeNull();
-    expect(screen.queryByTestId("page-state-error")).toBeNull();
-  });
-
-  it("shows error chrome for 503 RETRIEVAL_FAILED, not an empty hit list", async () => {
-    mockFetch(() =>
-      jsonResponse(503, {
-        error: { code: "RETRIEVAL_FAILED", message: "vector arm exploded" },
-      })
-    );
-    render(<QueryPage />);
-    await userEvent.type(screen.getByRole("searchbox"), "x");
-    await userEvent.click(screen.getByRole("button", { name: /检索/ }));
-    expect(await screen.findByTestId("page-state-error")).toBeTruthy();
-    expect(screen.getByText(/RETRIEVAL_FAILED/)).toBeTruthy();
-    expect(screen.queryByTestId("page-state-empty")).toBeNull();
-  });
-
-  it("surfaces degraded when the retrieve envelope sets degraded:true", async () => {
-    mockFetch(() =>
-      jsonResponse(200, {
-        chunks: [
-          {
-            id: UUID_A,
-            content: "alpha beta",
-            source_ref: "test://query-a",
-            valid_window: ["2024-01-01T00:00:00.000Z", null],
-            score: 0.9,
-          },
-        ],
-        degraded: true,
-        degraded_reasons: ["graph_arm_failed"],
-      })
-    );
-    render(<QueryPage />);
-    await userEvent.type(screen.getByRole("searchbox"), "alpha");
-    await userEvent.click(screen.getByRole("button", { name: /检索/ }));
-    expect(await screen.findByTestId("page-state-ready")).toBeTruthy();
-    expect(screen.getByTestId("degraded-banner")).toBeTruthy();
-    expect(screen.getByText(/graph_arm_failed/)).toBeTruthy();
-  });
-
-  it("surfaces degraded on empty hits when the envelope sets degraded:true", async () => {
-    mockFetch(() =>
-      jsonResponse(200, {
-        chunks: [],
-        degraded: true,
-        degraded_reasons: ["graph_arm_failed"],
-      })
-    );
-    render(<QueryPage />);
-    await userEvent.type(screen.getByRole("searchbox"), "nothing");
-    await userEvent.click(screen.getByRole("button", { name: /检索/ }));
-    expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
-    expect(screen.getByTestId("degraded-banner")).toBeTruthy();
-    expect(screen.getByText(/graph_arm_failed/)).toBeTruthy();
-    expect(screen.queryByTestId("page-state-error")).toBeNull();
   });
 });
 
@@ -184,6 +116,7 @@ describe("BrowsePage", () => {
     );
     expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
     expect(screen.queryByTestId("page-state-error")).toBeNull();
+    expect(screen.getByTestId("board-code").textContent).toBe("EMPTY_BROWSE");
   });
 
   it("shows error when /api/chunks returns STORAGE_ERROR", async () => {
@@ -261,6 +194,7 @@ describe("ChunkDetailPage", () => {
     );
     expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
     expect(screen.queryByTestId("page-state-error")).toBeNull();
+    expect(screen.getByTestId("board-code").textContent).toBe("NOT_FOUND");
   });
 
   it("shows chunk fields from GET /api/chunks/:id", async () => {
@@ -304,18 +238,29 @@ describe("EntityDetailPage", () => {
     );
     expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
     expect(screen.queryByTestId("page-state-error")).toBeNull();
+    expect(screen.getByTestId("board-code").textContent).toBe("NOT_FOUND");
   });
 
   it("links to the neighborhood page from entity detail", async () => {
-    mockFetch(() =>
-      jsonResponse(200, {
-        id: ENT_ID,
-        canonical_name: "Alice",
-        type: "person",
-        retired: false,
-        aliases: [],
-      })
-    );
+    mockFetch((url) => {
+      if (url === `/api/entities/${ENT_ID}/backlinks`) {
+        return jsonResponse(200, {
+          entity: { id: ENT_ID, name: "Alice", type: "person" },
+          inbound: [],
+          outbound: [],
+        });
+      }
+      if (url === `/api/entities/${ENT_ID}`) {
+        return jsonResponse(200, {
+          id: ENT_ID,
+          canonical_name: "Alice",
+          type: "person",
+          retired: false,
+          aliases: [],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
     render(
       <MemoryRouter initialEntries={[`/browse/entities/${ENT_ID}`]}>
         <Routes>
@@ -329,15 +274,66 @@ describe("EntityDetailPage", () => {
       screen.getByRole("link", { name: /邻域/ }).getAttribute("href")
     ).toBe(`/browse/entities/${ENT_ID}/neighborhood`);
   });
+
+  it("shows 出链 / 入链 cards with named neighbor links from GET backlinks", async () => {
+    mockFetch((url) => {
+      if (url === `/api/entities/${ENT_ID}/backlinks`) {
+        return jsonResponse(200, {
+          entity: { id: ENT_ID, name: "Alice", type: "person" },
+          inbound: [
+            {
+              id: OTHER_ID,
+              name: "Acme",
+              type: "system",
+              relation: "delegates_to",
+            },
+          ],
+          outbound: [
+            {
+              id: OTHER_ID,
+              name: "Acme",
+              type: "system",
+              relation: "works_for",
+            },
+          ],
+        });
+      }
+      if (url === `/api/entities/${ENT_ID}`) {
+        return jsonResponse(200, {
+          id: ENT_ID,
+          canonical_name: "Alice",
+          type: "person",
+          retired: false,
+          aliases: [],
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    render(
+      <MemoryRouter initialEntries={[`/browse/entities/${ENT_ID}`]}>
+        <Routes>
+          <Route path="/browse/entities/:id" element={<EntityDetailPage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    expect(await screen.findByText(/出链\s*\(1\)/)).toBeTruthy();
+    expect(screen.getByText(/入链\s*\(1\)/)).toBeTruthy();
+    const links = screen.getAllByRole("link", { name: "Acme" });
+    expect(links).toHaveLength(2);
+    expect(links[0]?.getAttribute("href")).toBe(`/browse/entities/${OTHER_ID}`);
+    expect(screen.getByText(/works_for/)).toBeTruthy();
+    expect(screen.getByText(/delegates_to/)).toBeTruthy();
+  });
 });
 
 describe("NeighborhoodPage", () => {
-  it("shows empty when GET backlinks returns an empty inbound list", async () => {
+  it("shows empty when GET backlinks returns empty inbound and outbound lists", async () => {
     mockFetch((url) => {
       expect(url).toBe(`/api/entities/${ENT_ID}/backlinks`);
       return jsonResponse(200, {
         entity: { id: ENT_ID, name: "Alice", type: "person" },
         inbound: [],
+        outbound: [],
       });
     });
     render(
@@ -354,6 +350,9 @@ describe("NeighborhoodPage", () => {
     );
     expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
     expect(screen.queryByTestId("page-state-error")).toBeNull();
+    expect(screen.getByTestId("board-code").textContent).toBe(
+      "EMPTY_NEIGHBORHOOD"
+    );
   });
 
   it("shows error + retry when Neo4j is missing, not empty chrome", async () => {
@@ -397,7 +396,15 @@ describe("NeighborhoodPage", () => {
       }
       return jsonResponse(200, {
         entity: { id: ENT_ID, name: "Alice", type: "person" },
-        inbound: [{ from: OTHER_ID, to: ENT_ID, type: "delegates_to" }],
+        inbound: [
+          {
+            id: OTHER_ID,
+            name: "Acme",
+            type: "system",
+            relation: "delegates_to",
+          },
+        ],
+        outbound: [],
       });
     });
     render(
@@ -419,6 +426,45 @@ describe("NeighborhoodPage", () => {
     });
     expect(calls).toBe(2);
     expect(screen.getByText(/delegates_to/)).toBeTruthy();
+    expect(screen.getByText(/入链/)).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: "Acme" }).getAttribute("href")
+    ).toBe(`/browse/entities/${OTHER_ID}`);
+  });
+
+  it("shows 出链 section when inbound is empty and outbound is not", async () => {
+    mockFetch(() =>
+      jsonResponse(200, {
+        entity: { id: ENT_ID, name: "Alice", type: "person" },
+        inbound: [],
+        outbound: [
+          {
+            id: OTHER_ID,
+            name: "Acme",
+            type: "system",
+            relation: "works_for",
+          },
+        ],
+      })
+    );
+    render(
+      <MemoryRouter
+        initialEntries={[`/browse/entities/${ENT_ID}/neighborhood`]}
+      >
+        <Routes>
+          <Route
+            path="/browse/entities/:id/neighborhood"
+            element={<NeighborhoodPage />}
+          />
+        </Routes>
+      </MemoryRouter>
+    );
+    expect(await screen.findByTestId("page-state-ready")).toBeTruthy();
+    expect(screen.getByText(/出链/)).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: "Acme" }).getAttribute("href")
+    ).toBe(`/browse/entities/${OTHER_ID}`);
+    expect(screen.queryByTestId("page-state-empty")).toBeNull();
   });
 });
 
@@ -435,6 +481,16 @@ describe("App browse detail routes", () => {
           metadata: {},
         });
       }
+      // Full <App /> mounts the persistent header whose HeaderSearch loads
+      // the summaries pool once on mount.
+      if (url.startsWith("/api/sources")) {
+        return jsonResponse(200, {
+          items: [],
+          total: 0,
+          limit: 200,
+          offset: 0,
+        });
+      }
       throw new Error(`unexpected ${url}`);
     });
     render(
@@ -447,6 +503,47 @@ describe("App browse detail routes", () => {
   });
 });
 
+describe("App query route removal", () => {
+  it("redirects /query to the stats surface and never fetches /api/query", async () => {
+    const seenUrls: string[] = [];
+    mockFetch((url) => {
+      seenUrls.push(url);
+      // Full <App /> mounts the persistent header whose HeaderSearch loads
+      // the summaries pool once on mount.
+      if (url.startsWith("/api/sources")) {
+        return jsonResponse(200, {
+          items: [],
+          total: 0,
+          limit: 200,
+          offset: 0,
+        });
+      }
+      if (url === "/api/stats") {
+        return jsonResponse(200, {
+          chunks: 0,
+          entities: 0,
+          invalidations: 0,
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    render(
+      <MemoryRouter initialEntries={["/query"]}>
+        <App />
+      </MemoryRouter>
+    );
+    // /query must not be a route: the catch-all
+    // <Route path="*" element={<Navigate to="/" replace />} /> redirects to
+    // the stats surface. Re-adding a /query route would render that page
+    // instead, so this assertion fails — a behavioral guard stronger than a
+    // source string match (a rename cannot satisfy it).
+    expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "统计" })).toBeTruthy();
+    expect(seenUrls).toContain("/api/stats");
+    expect(seenUrls.some((u) => u.includes("/api/query"))).toBe(false);
+  });
+});
+
 describe("TimelinePage", () => {
   it("shows empty when /api/timeline returns an empty page", async () => {
     mockFetch(() =>
@@ -455,6 +552,7 @@ describe("TimelinePage", () => {
     render(<TimelinePage />);
     expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
     expect(screen.queryByTestId("page-state-error")).toBeNull();
+    expect(screen.getByTestId("board-code").textContent).toBe("EMPTY_TIMELINE");
   });
 
   it("shows error when /api/timeline returns STORAGE_ERROR", async () => {
@@ -477,7 +575,11 @@ describe("GraphPage", () => {
         },
       })
     );
-    render(<GraphPage />);
+    render(
+      <MemoryRouter initialEntries={["/graph"]}>
+        <GraphPage />
+      </MemoryRouter>
+    );
     expect(await screen.findByTestId("page-state-error")).toBeTruthy();
     expect(screen.getByText(/NEO4J_UNAVAILABLE/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /重试/ })).toBeTruthy();
@@ -487,21 +589,34 @@ describe("GraphPage", () => {
 
   it("shows empty-projection chrome only for 200 { nodes: [], edges: [] }", async () => {
     mockFetch(() => jsonResponse(200, { nodes: [], edges: [] }));
-    render(<GraphPage />);
+    render(
+      <MemoryRouter initialEntries={["/graph"]}>
+        <GraphPage />
+      </MemoryRouter>
+    );
     expect(await screen.findByTestId("page-state-empty")).toBeTruthy();
     expect(screen.queryByTestId("page-state-error")).toBeNull();
   });
 
   it("retries GET /api/graph when the operator clicks 重试", async () => {
     let calls = 0;
-    mockFetch(() => {
+    mockFetch((url) => {
       calls += 1;
       if (calls === 1) {
-        return jsonResponse(503, {
-          error: {
-            code: "NEO4J_UNAVAILABLE",
-            message: "Neo4j sidecar is not configured",
-          },
+        // GraphPage fetches /api/graph + /api/stats in parallel; the
+        // graph fetch fails first, surfacing the NEO4J_UNAVAILABLE error.
+        if (url.startsWith("/api/graph")) {
+          return jsonResponse(503, {
+            error: {
+              code: "NEO4J_UNAVAILABLE",
+              message: "Neo4j sidecar is not configured",
+            },
+          });
+        }
+        return jsonResponse(200, {
+          chunks: 0,
+          entities: 0,
+          invalidations: 0,
         });
       }
       return jsonResponse(200, {
@@ -512,12 +627,15 @@ describe("GraphPage", () => {
         edges: [{ from: ENT_ID, to: OTHER_ID, type: "works_for" }],
       });
     });
-    render(<GraphPage />);
+    render(
+      <MemoryRouter initialEntries={["/graph"]}>
+        <GraphPage />
+      </MemoryRouter>
+    );
     await screen.findByTestId("page-state-error");
     await userEvent.click(screen.getByRole("button", { name: /重试/ }));
     await waitFor(() => {
       expect(screen.getByTestId("page-state-ready")).toBeTruthy();
     });
-    expect(calls).toBe(2);
   });
 });

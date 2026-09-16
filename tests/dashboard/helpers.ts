@@ -41,6 +41,15 @@ export function stubReadPort(
     async listTimeline() {
       return EMPTY_PAGE;
     },
+    async listSourceDocs() {
+      return EMPTY_PAGE;
+    },
+    async getSourceDoc() {
+      return { ok: false, code: "NOT_FOUND" };
+    },
+    async getSourceDocById() {
+      return { ok: false, code: "NOT_FOUND" };
+    },
     ...overrides,
   };
 }

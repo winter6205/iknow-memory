@@ -27,6 +27,15 @@ function fullPort(): StorageReadPort {
     async listTimeline() {
       return { items: [], total: 0, limit: 20, offset: 0 };
     },
+    async listSourceDocs() {
+      return { items: [], total: 0, limit: 20, offset: 0 };
+    },
+    async getSourceDoc() {
+      return { ok: false, code: "NOT_FOUND" };
+    },
+    async getSourceDocById() {
+      return { ok: false, code: "NOT_FOUND" };
+    },
   };
 }
 
@@ -41,5 +50,13 @@ describe("asReadPort", () => {
   it("accepts an object that implements every StorageReadPort method", () => {
     const port = fullPort();
     expect(asReadPort(port)).toBe(port);
+  });
+
+  it("rejects a port that is missing getSourceDocById", () => {
+    const incomplete = { ...fullPort() } as Record<string, unknown>;
+    delete incomplete.getSourceDocById;
+    expect(() => asReadPort(incomplete)).toThrow(
+      /does not implement StorageReadPort/
+    );
   });
 });

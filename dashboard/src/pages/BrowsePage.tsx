@@ -7,7 +7,13 @@ import {
   type EntityListItem,
   type PageBody,
 } from "../api";
-import { EmptyCopy, ErrorCopy, PageChrome, type PageState } from "./PageChrome";
+import {
+  BOARD_CODE,
+  EmptyCopy,
+  ErrorCopy,
+  PageChrome,
+  type PageState,
+} from "./PageChrome";
 
 type View =
   | { state: "loading" }
@@ -60,13 +66,16 @@ export function BrowsePage() {
   return (
     <PageChrome title="浏览" state={state}>
       {view.state === "empty" ? (
-        <EmptyCopy message="没有 chunk 或 entity。" />
+        <EmptyCopy code={BOARD_CODE.EMPTY_BROWSE} />
       ) : null}
       {view.state === "error" ? (
         <ErrorCopy code={view.code} message={view.message} />
       ) : null}
       {view.state === "ready" ? (
         <div className="grid gap-8 md:grid-cols-2">
+          <p className="font-mono text-xs text-[var(--text-tertiary)] md:col-span-2">
+            派生索引：资料切出的 chunk 与抽出的 entity，不是资料库本身。
+          </p>
           <section>
             <h2 className="font-mono text-xs text-[var(--text-tertiary)]">
               chunks

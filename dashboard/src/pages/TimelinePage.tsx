@@ -5,7 +5,13 @@ import {
   type PageBody,
   type TimelineItem,
 } from "../api";
-import { EmptyCopy, ErrorCopy, PageChrome, type PageState } from "./PageChrome";
+import {
+  BOARD_CODE,
+  EmptyCopy,
+  ErrorCopy,
+  PageChrome,
+  type PageState,
+} from "./PageChrome";
 
 type View =
   | { state: "loading" }
@@ -42,22 +48,29 @@ export function TimelinePage() {
   const state: PageState = view.state;
   return (
     <PageChrome title="时间线" state={state}>
-      {view.state === "empty" ? <EmptyCopy message="没有时间线事件。" /> : null}
+      {view.state === "empty" ? (
+        <EmptyCopy code={BOARD_CODE.EMPTY_TIMELINE} />
+      ) : null}
       {view.state === "error" ? (
         <ErrorCopy code={view.code} message={view.message} />
       ) : null}
       {view.state === "ready" ? (
-        <ol className="space-y-2 font-mono text-sm">
-          {view.data.items.map((item, index) => (
-            <li
-              key={`${item.kind}-${item.at}-${index}`}
-              className="border-l border-line pl-3"
-            >
-              <span className="text-[var(--text-tertiary)]">{item.at}</span>{" "}
-              {item.kind}
-            </li>
-          ))}
-        </ol>
+        <>
+          <p className="mb-3 font-mono text-xs text-[var(--text-tertiary)]">
+            窗口事件：ingest / invalidate 等写入时刻，不是资料阅读顺序。
+          </p>
+          <ol className="space-y-2 font-mono text-sm">
+            {view.data.items.map((item, index) => (
+              <li
+                key={`${item.kind}-${item.at}-${index}`}
+                className="border-l border-line pl-3"
+              >
+                <span className="text-[var(--text-tertiary)]">{item.at}</span>{" "}
+                {item.kind}
+              </li>
+            ))}
+          </ol>
+        </>
       ) : null}
     </PageChrome>
   );

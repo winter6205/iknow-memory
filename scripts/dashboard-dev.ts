@@ -3,7 +3,9 @@
  * (`npm run dashboard`). Either child exiting, or Ctrl-C, tears down the
  * full process tree so ports 4174 / 18868 are not left occupied.
  *
- * Zero-config: when no storage env is set, the API child boots memory mode
+ * Storage: process env wins, then the global operator setting
+ * (`~/.iknow-memory/setting.json`), then `.env.local` storage keys.
+ * Only when those lack a storage key does this script force memory mode
  * with graph + rerank + the ES precision layer explicitly off so the
  * ADR-0006 / ADR-0007 fail-start checks do not fire.
  */
@@ -136,14 +138,36 @@ export function readStorageFileEnv(root: string): NodeJS.ProcessEnv {
 const children: ChildProcess[] = [];
 let shuttingDown = false;
 
+export function readOperatorSetting(
+  home: string | undefined
+): Record<string, string> {
+  if (home === undefined || home.trim() === "") return {};
+  const path = join(home, ".iknow-memory", "setting.json");
+  if (!existsSync(path)) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return {};
+  }
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value === "string" && value.trim() !== "") out[key] = value;
+  }
+  return out;
+}
+
 export function isStorageConfigured(
   env: NodeJS.ProcessEnv,
-  fileEnv: NodeJS.ProcessEnv = {}
+  extra: NodeJS.ProcessEnv | Record<string, string> = {}
 ): boolean {
   return STORAGE_ENV_KEYS.some((key) => {
     const raw = Object.prototype.hasOwnProperty.call(env, key)
       ? env[key]
-      : fileEnv[key];
+      : extra[key];
     return raw !== undefined && raw.trim() !== "";
   });
 }
@@ -170,9 +194,14 @@ export function resolveDashboardApiPort(env: NodeJS.ProcessEnv): number {
 
 export function buildDashboardChildEnv(
   inherited: NodeJS.ProcessEnv,
-  fileEnv: NodeJS.ProcessEnv = {}
+  extra: NodeJS.ProcessEnv | Record<string, string> = readOperatorSetting(
+    inherited.HOME
+  )
 ): NodeJS.ProcessEnv {
-  const next = isStorageConfigured(inherited, fileEnv)
+  // When operator setting / .env.local already has storage, do not inject
+  // memory and do not copy secrets into the child env — dashboard-api
+  // loadEnv reads ~/.iknow-memory/setting.json itself.
+  const next = isStorageConfigured(inherited, extra)
     ? { ...inherited }
     : {
         ...inherited,
@@ -275,11 +304,17 @@ if (isMain()) {
   process.on("SIGTERM", () => shutdown(143));
   process.on("SIGHUP", () => shutdown(129));
 
+  const setting = readOperatorSetting(process.env.HOME);
   const fileEnv = readStorageFileEnv(DASHBOARD_ROOT);
-  const env = buildDashboardChildEnv(process.env, fileEnv);
-  if (!isStorageConfigured(process.env, fileEnv)) {
+  const extra = { ...fileEnv, ...setting };
+  const env = buildDashboardChildEnv(process.env, extra);
+  if (!isStorageConfigured(process.env, extra)) {
     console.error(
-      "[dashboard] no GRAPHRAG_MEMORY_* storage env set — starting dashboard-api in memory mode (empty store; Neo4j graph routes stay optional / error until configured)"
+      "[dashboard] no operator setting / GRAPHRAG_MEMORY_* storage — starting dashboard-api in memory mode (empty store; Neo4j graph routes stay optional / error until configured)"
+    );
+  } else if (!isStorageConfigured(process.env)) {
+    console.error(
+      "[dashboard] storage from ~/.iknow-memory/setting.json (env does not override)"
     );
   }
   ensureDashboardVite(DASHBOARD_ROOT);

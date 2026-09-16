@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
-export type PageState = "loading" | "empty" | "error" | "ready" | "idle";
+export type PageState =
+  "loading" | "empty" | "error" | "ready" | "idle" | "graph-lag";
 
 type PageChromeProps = {
   title: string;
@@ -19,10 +20,27 @@ export function PageChrome({ title, state, children }: PageChromeProps) {
   );
 }
 
-type EmptyProps = { message: string };
+export const BOARD_CODE = {
+  EMPTY_LEDGER: "EMPTY_LEDGER",
+  EMPTY_GRAPH: "EMPTY_GRAPH",
+  GRAPH_LAG: "GRAPH_LAG",
+  EMPTY_BROWSE: "EMPTY_BROWSE",
+  EMPTY_TIMELINE: "EMPTY_TIMELINE",
+  EMPTY_NEIGHBORHOOD: "EMPTY_NEIGHBORHOOD",
+  NOT_FOUND: "NOT_FOUND",
+} as const;
 
-export function EmptyCopy({ message }: EmptyProps) {
-  return <p className="text-sm text-[var(--text-secondary)]">{message}</p>;
+type EmptyProps = { code?: string; message?: string };
+
+export function EmptyCopy({ code }: EmptyProps) {
+  return (
+    <p
+      data-testid="board-code"
+      className="text-sm uppercase tracking-wide text-[var(--text-secondary)]"
+    >
+      <code className="font-mono">{code ?? ""}</code>
+    </p>
+  );
 }
 
 type ErrorCopyProps = {
@@ -35,7 +53,7 @@ export function ErrorCopy({ code, message, onRetry }: ErrorCopyProps) {
   return (
     <div className="space-y-3">
       <p className="text-sm text-[var(--danger)]">
-        {code}
+        <code className="font-mono">{code}</code>
         {message ? ` · ${message}` : ""}
       </p>
       {onRetry ? (

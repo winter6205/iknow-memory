@@ -8,6 +8,7 @@
   "types": "dist/index.d.ts",
   "bin": {
     "iknow-memory": "bin/iknow-memory.js",
+    "iknow-memory-config": "bin/iknow-memory-config.js",
     "extract": "bin/extract.js",
     "consolidate": "bin/consolidate.js",
     "eval": "bin/eval.js"

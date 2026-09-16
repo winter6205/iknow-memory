@@ -14,8 +14,11 @@ import type {
   StorageTimelineEvent,
 } from "../types.js";
 import {
+  SOURCE_DOC_COLLECTION_NAME,
+  SOURCE_DOC_STATUS,
   STORAGE_LIST_LIMIT_DEFAULT,
   STORAGE_LIST_LIMIT_MAX,
+  type SourceDocStatus,
 } from "../types.js";
 import { readContentInvalidations } from "./backend.js";
 
@@ -51,6 +54,115 @@ export const ENTITY_BY_ID_SQL = `SELECT e.id, e.canonical_name, e.type, e.retire
 export const TIMELINE_CHUNKS_SQL = `SELECT id, source_ref, valid_from, valid_until, metadata
    FROM chunks
   ORDER BY created_at, id`;
+
+/**
+ * 资料 (source_documents) reads — corpus-ready retrieve T3.
+ *
+ * `chunk_count` is a correlated COUNT over the chunk back-pointers, never a
+ * stored column: the derived index is the SSOT for the count, so a rebuild
+ * (deleteChunksForSourceDoc + upsert) can never leave the count stale.
+ * Status / failure_code ARE stored columns — 失败 has to survive a restart
+ * even though the failing envelope produced no row to derive it from.
+ */
+const SOURCE_DOC_SUMMARY_COLUMNS = `sd.id, sd.source_ref, sd.title, sd.created_at, sd.valid_until,
+         sd.status, sd.failure_code,
+         (SELECT count(*)::bigint FROM chunks c WHERE c.source_doc_id = sd.id) AS chunk_count`;
+
+/** Detail reads additionally carry the body the operator opened the row for. */
+const SOURCE_DOC_DETAIL_COLUMNS = `${SOURCE_DOC_SUMMARY_COLUMNS}, sd.content`;
+
+export const SOURCE_DOC_COUNT_SQL =
+  "SELECT count(*)::bigint AS total FROM source_documents";
+
+export const SOURCE_DOC_LIST_SQL = `SELECT ${SOURCE_DOC_SUMMARY_COLUMNS}
+   FROM source_documents sd
+  ORDER BY sd.created_at, sd.id
+  LIMIT $1 OFFSET $2`;
+
+export const SOURCE_DOC_BY_REF_SQL = `SELECT ${SOURCE_DOC_DETAIL_COLUMNS}
+   FROM source_documents sd
+  WHERE sd.source_ref = $1`;
+
+export const SOURCE_DOC_BY_ID_SQL = `SELECT ${SOURCE_DOC_DETAIL_COLUMNS}
+   FROM source_documents sd
+  WHERE sd.id = $1`;
+
+/**
+ * 就绪 is only ever reached through a successful push, so the transition is
+ * a targeted UPDATE (no upsert): an unknown id is a silent no-op rather
+ * than an invented row.
+ *
+ * The status is a bind parameter, not an inlined literal: the vocabulary
+ * lives in SOURCE_DOC_STATUS (types.ts), and the CHECK constraint on the
+ * column is derived from that same constant, so the two cannot drift.
+ * Callers pass `SOURCE_DOC_STATUS.READY` as $2.
+ */
+export const SOURCE_DOC_MARK_READY_SQL = `UPDATE source_documents
+   SET status = $2, failure_code = NULL
+ WHERE id = $1`;
+
+/**
+ * A failed push names the 资料 it was pushing. Best-effort by contract: an
+ * unknown source_ref matches zero rows and invents nothing.
+ *
+ * Callers pass `SOURCE_DOC_STATUS.FAILED` as $3 (see the ready-SQL note).
+ */
+export const SOURCE_DOC_RECORD_FAILURE_SQL = `UPDATE source_documents
+   SET status = $3, failure_code = $2
+ WHERE source_ref = $1`;
+
+export interface StorageSourceDocRow {
+  id: string;
+  source_ref: string;
+  title: string | null;
+  created_at: unknown;
+  valid_until: unknown;
+  status: string | null;
+  failure_code: string | null;
+  chunk_count: string | number | bigint | null;
+}
+
+/**
+ * Map a stored status value onto the three-value vocabulary. Anything else
+ * — `null` from a row written before the column existed, or a value the
+ * CHECK constraint would have rejected — reads as 进行中, the state a row
+ * is in until a push proves otherwise.
+ */
+export function normalizeSourceDocStatus(
+  status: string | null
+): SourceDocStatus {
+  if (status === SOURCE_DOC_STATUS.READY) return SOURCE_DOC_STATUS.READY;
+  if (status === SOURCE_DOC_STATUS.FAILED) return SOURCE_DOC_STATUS.FAILED;
+  return SOURCE_DOC_STATUS.IN_PROGRESS;
+}
+
+/** Map a `source_documents` SELECT row to the read-port summary/detail shape. */
+export function toSourceDocFields(row: StorageSourceDocRow): {
+  id: string;
+  source_ref: string;
+  title: string | null;
+  created_at: string;
+  valid_until: string | null;
+  collection: string;
+  status: SourceDocStatus;
+  failure_code: string | null;
+  chunk_count: number;
+} {
+  return {
+    id: row.id,
+    source_ref: row.source_ref,
+    title: row.title,
+    created_at: asIsoTimestamp(row.created_at),
+    valid_until:
+      row.valid_until === null || row.valid_until === undefined
+        ? null
+        : asIsoTimestamp(row.valid_until),
+    collection: SOURCE_DOC_COLLECTION_NAME,
+    status: normalizeSourceDocStatus(row.status),
+    failure_code: row.failure_code ?? null,
+    chunk_count: Number(row.chunk_count ?? 0),
+  };
+}
 
 export function normalizeStorageListOptions(
   opts: StorageListOptions | undefined
@@ -112,6 +224,10 @@ export interface StorageChunkRow {
   valid_from: unknown;
   valid_until: unknown;
   metadata: Record<string, unknown> | null;
+  /** Operator-console T3 back-pointer columns. Optional on the row so the
+   *  existing P0 / stage-1 SELECT shapes remain valid. */
+  source_doc_id?: string | null;
+  ordinal?: number | null;
 }
 
 export interface StorageEntityRow {
@@ -131,6 +247,8 @@ export function toChunkView(row: StorageChunkRow): StorageChunkView {
     valid_until:
       row.valid_until === null ? null : asIsoTimestamp(row.valid_until),
     metadata: row.metadata ?? {},
+    ...(row.source_doc_id != null ? { source_doc_id: row.source_doc_id } : {}),
+    ...(row.ordinal != null ? { ordinal: row.ordinal } : {}),
   };
 }
 

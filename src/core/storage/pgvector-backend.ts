@@ -24,6 +24,7 @@ import type {
   ChunkRecord,
   RetrievedChunk,
   SearchOptions,
+  SourceDocRecord,
   StorageChunkView,
   StorageCounts,
   StorageEntityView,
@@ -31,6 +32,8 @@ import type {
   StoragePage,
   StorageReadPort,
   StorageReadResult,
+  StorageSourceDocSummary,
+  StorageSourceDocView,
   StorageTimelineEvent,
 } from "../types.js";
 import {
@@ -59,6 +62,7 @@ import {
   type PgvectorPoolConfig,
 } from "../../config.js";
 import { GraphragError } from "../errors.js";
+import { SOURCE_DOC_STATUS } from "../types.js";
 import {
   assertPgvectorAnnDimensions,
   upSchemaBootstrap,
@@ -72,17 +76,26 @@ import {
   ENTITY_LIST_SQL,
   ENTITY_LIVE_COUNT_SQL,
   TIMELINE_CHUNKS_SQL,
+  SOURCE_DOC_BY_ID_SQL,
+  SOURCE_DOC_BY_REF_SQL,
+  SOURCE_DOC_COUNT_SQL,
+  SOURCE_DOC_LIST_SQL,
+  SOURCE_DOC_MARK_READY_SQL,
+  SOURCE_DOC_RECORD_FAILURE_SQL,
   isPgInvalidTextRepresentation,
   wrapPgRead,
   lookupReadId,
+  normalizeSourceDocStatus,
   normalizeStorageListOptions,
   paginateItems,
   projectTimelineEvents,
   readSqlCount,
   toChunkView,
   toEntityView,
+  toSourceDocFields,
   type StorageChunkRow,
   type StorageEntityRow,
+  type StorageSourceDocRow,
 } from "./storage-reads.js";
 
 /**
@@ -646,7 +659,7 @@ export class PgvectorBackend
         // upSchemaBootstrap is idempotent (every statement is IF NOT EXISTS) and
         // owns its own BEGIN/COMMIT/ROLLBACK — we MUST NOT wrap it in an
         // outer transaction. The minimal PgClient satisfies upSchemaBootstrap's
-        // `SchemaP0Client` surface structurally. Pass this.dimensions so
+        // `SchemaBootstrapClient` surface structurally. Pass this.dimensions so
         // entities.embedding width matches chunks.embedding width (H1).
         await upSchemaBootstrap(client, this.dimensions, annMaxDimensions);
       } finally {
@@ -690,8 +703,10 @@ export class PgvectorBackend
         await pool.query(
           `INSERT INTO chunks
              (id, content, embedding, valid_from, valid_until,
-              source_ref, metadata, created_at)
-           VALUES ($1, $2, $3::vector, $4, $5, $6, $7::jsonb, $8)
+              source_ref, metadata, created_at,
+              source_doc_id, ordinal)
+           VALUES ($1, $2, $3::vector, $4, $5, $6, $7::jsonb, $8,
+                   $9, $10)
            ON CONFLICT (id) DO UPDATE SET
              content = EXCLUDED.content,
              embedding = EXCLUDED.embedding,
@@ -716,7 +731,9 @@ export class PgvectorBackend
                )
                ELSE EXCLUDED.metadata
              END,
-             created_at = EXCLUDED.created_at`,
+             created_at = EXCLUDED.created_at,
+             source_doc_id = EXCLUDED.source_doc_id,
+             ordinal = EXCLUDED.ordinal`,
           [
             chunk.id,
             chunk.content,
@@ -726,6 +743,8 @@ export class PgvectorBackend
             chunk.source_ref,
             JSON.stringify(chunk.metadata),
             chunk.created_at,
+            chunk.source_doc_id ?? null,
+            chunk.ordinal ?? null,
           ]
         );
         ids.push(chunk.id);
@@ -770,6 +789,19 @@ export class PgvectorBackend
           "INVALID_INPUT"
         );
       }
+
+      // T5: content invalidation targets the 资料 AND its derived chunks.
+      // Close the source_documents window in the SAME transaction so a
+      // committed invalidate always leaves both levels closed (read_source
+      // answers a named-invalid from the 资料 window). The row itself stays
+      // SELECT-able — no physical delete this wave.
+      await client.query(
+        `UPDATE source_documents
+            SET valid_until = $2
+          WHERE source_ref = $1
+            AND (valid_until IS NULL OR valid_until > $2::timestamptz)`,
+        [request.sourceRef, request.invalidatedAt]
+      );
 
       const records: ContentInvalidationRecord[] = [];
       for (const raw of result.rows) {
@@ -858,6 +890,172 @@ export class PgvectorBackend
       records.push(...readContentInvalidations(row.metadata));
     }
     return sortInvalidationRecords(records);
+  }
+
+  /**
+   * Insert-or-update a 资料 row keyed by `source_ref`. The `ON CONFLICT
+   * (source_ref) DO UPDATE` keeps the same id on re-push so chunk back-
+   * pointers remain valid. The T3 contract: re-push of the same locator
+   * must NOT grow the source_documents row count.
+   *
+   * `created_at` is intentionally NOT updated on conflict — first-write
+   * identity timestamp stays stable for the dashboard's "added on" column.
+   *
+   * T5 window rule on conflict: a re-push of the SAME content keeps the
+   * closed 资料 window (invalidation still applies); different content is
+   * a fresh document version and reopens the window (valid_until = NULL).
+   * Mirrors the memory backend and the chunk-level
+   * preserveInvalidationState / ON CONFLICT validity CASE.
+   */
+  async upsertSourceDoc(doc: SourceDocRecord): Promise<SourceDocRecord> {
+    try {
+      const pool = await this.ensureReady();
+      // The status columns are written only when the caller declares a
+      // status, and a declared status carries its failure code with it
+      // (`failure_code: null` on a re-push clears a previous 失败). A
+      // caller that declares neither — `ingest`, the pre-T3 write path —
+      // leaves the stored status untouched rather than silently
+      // downgrading a 就绪 资料. A brand-new row with no declared status
+      // takes 进行中, the state a row is in until a write proves otherwise.
+      // $6 stays the raw declared status: the ON CONFLICT branch reads
+      // `$6 IS NULL` as "the caller declared nothing", which is a different
+      // question from what a brand-new row should hold. $8 answers that one
+      // and is bound rather than inlined, because the vocabulary is owned by
+      // SOURCE_DOC_STATUS and the column's CHECK is derived from it.
+      const declaredStatus = doc.status ?? null;
+      const insertStatus = declaredStatus ?? SOURCE_DOC_STATUS.IN_PROGRESS;
+      const result = await pool.query(
+        `INSERT INTO source_documents
+           (id, source_ref, title, content, created_at, valid_until,
+            status, failure_code)
+           VALUES ($1, $2, $3, $4, $5, NULL,
+                   $8::text, $7::text)
+           ON CONFLICT (source_ref) DO UPDATE SET
+             title = EXCLUDED.title,
+             content = EXCLUDED.content,
+             status = COALESCE($6::text, source_documents.status),
+             failure_code = CASE
+               WHEN $6::text IS NULL THEN source_documents.failure_code
+               ELSE $7::text
+             END,
+             valid_until = CASE
+               WHEN source_documents.content = EXCLUDED.content
+                 THEN source_documents.valid_until
+               ELSE NULL
+             END
+           RETURNING id, source_ref, title, content, created_at, valid_until,
+                     status, failure_code`,
+        [
+          doc.id,
+          doc.source_ref,
+          doc.title,
+          doc.content,
+          doc.created_at,
+          declaredStatus,
+          doc.failure_code ?? null,
+          insertStatus,
+        ]
+      );
+      const row = result.rows[0] as {
+        id: string;
+        source_ref: string;
+        title: string | null;
+        content: string;
+        created_at: Date | string;
+        valid_until: Date | null;
+        status: string | null;
+        failure_code: string | null;
+      };
+      return {
+        id: row.id,
+        source_ref: row.source_ref,
+        title: row.title,
+        content: row.content,
+        created_at:
+          row.created_at instanceof Date
+            ? row.created_at.toISOString()
+            : String(row.created_at),
+        valid_until: row.valid_until?.toISOString() ?? null,
+        ...(row.status === null
+          ? {}
+          : { status: normalizeSourceDocStatus(row.status) }),
+        failure_code: row.failure_code,
+      };
+    } catch (err) {
+      if (err instanceof GraphragError) throw err;
+      throw new GraphragError(
+        `PgvectorBackend.upsertSourceDoc failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+  }
+
+  /**
+   * Drop every chunk row that back-points to `sourceDocId`. T3 rebuild
+   * semantics: same-locator re-push wipes derived chunk rows before
+   * inserting the new set. Legacy chunk rows (source_doc_id IS NULL) are
+   * NOT touched. Returns when the DELETE has committed.
+   *
+   * `excludeChunkIds` lists chunk ids that should NOT be deleted even
+   * though they back-point to `sourceDocId` — T3's ingest handler passes
+   * the ids it just upserted so `preserveInvalidationState` can keep a
+   * closed-row from a prior invalidation. Only orphans (chunks left
+   * over from a previous content-identity version) are dropped.
+   */
+  async deleteChunksForSourceDoc(
+    sourceDocId: string,
+    excludeChunkIds?: Iterable<string>
+  ): Promise<void> {
+    try {
+      const pool = await this.ensureReady();
+      const excluded =
+        excludeChunkIds !== undefined
+          ? Array.from(new Set(excludeChunkIds))
+          : [];
+      if (excluded.length === 0) {
+        await pool.query(`DELETE FROM chunks WHERE source_doc_id = $1`, [
+          sourceDocId,
+        ]);
+      } else {
+        await pool.query(
+          `DELETE FROM chunks WHERE source_doc_id = $1 AND NOT (id = ANY($2::uuid[]))`,
+          [sourceDocId, excluded]
+        );
+      }
+    } catch (err) {
+      if (err instanceof GraphragError) throw err;
+      throw new GraphragError(
+        `PgvectorBackend.deleteChunksForSourceDoc failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+  }
+
+  /**
+   * List every chunk row that back-points to `sourceDocId`, ordered by
+   * ordinal ascending. Used by T4's `read_source` MCP tool and the
+   * dashboard detail.
+   */
+  async listChunksBySourceDoc(
+    sourceDocId: string
+  ): Promise<StorageChunkView[]> {
+    try {
+      const pool = await this.ensureReady();
+      const result = await pool.query(
+        `SELECT id, content, source_ref, valid_from, valid_until, metadata
+           FROM chunks
+          WHERE source_doc_id = $1
+          ORDER BY ordinal ASC`,
+        [sourceDocId]
+      );
+      return (result.rows as StorageChunkRow[]).map(toChunkView);
+    } catch (err) {
+      if (err instanceof GraphragError) throw err;
+      throw new GraphragError(
+        `PgvectorBackend.listChunksBySourceDoc failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
   }
 
   async search(
@@ -1055,6 +1253,119 @@ export class PgvectorBackend
       const result = await pool.query(TIMELINE_CHUNKS_SQL, []);
       const chunks = (result.rows as StorageChunkRow[]).map(toChunkView);
       return paginateItems(projectTimelineEvents(chunks), limit, offset);
+    });
+  }
+
+  async getSourceDoc(
+    sourceRef: string
+  ): Promise<StorageReadResult<StorageSourceDocView>> {
+    if (typeof sourceRef !== "string" || sourceRef.trim() === "") {
+      return { ok: false, code: "INVALID_INPUT" };
+    }
+    return wrapPgRead<StorageReadResult<StorageSourceDocView>>(
+      "getSourceDoc",
+      async () => {
+        const pool = await this.ensureReady();
+        const result = await pool.query(`${SOURCE_DOC_BY_REF_SQL}`, [
+          sourceRef,
+        ]);
+        const row = result.rows[0] as
+          (StorageSourceDocRow & { content: string }) | undefined;
+        if (row === undefined) return { ok: false, code: "NOT_FOUND" };
+        return {
+          ok: true,
+          value: { ...toSourceDocFields(row), content: row.content },
+        };
+      }
+    );
+  }
+
+  async getSourceDocById(
+    id: string
+  ): Promise<StorageReadResult<StorageSourceDocView>> {
+    const lookedUp = lookupReadId(id);
+    if (!lookedUp.ok) return lookedUp;
+    return wrapPgRead<StorageReadResult<StorageSourceDocView>>(
+      "getSourceDocById",
+      async () => {
+        const pool = await this.ensureReady();
+        const result = await pool.query(SOURCE_DOC_BY_ID_SQL, [lookedUp.value]);
+        const row = result.rows[0] as
+          (StorageSourceDocRow & { content: string }) | undefined;
+        if (row === undefined) return { ok: false, code: "NOT_FOUND" };
+        return {
+          ok: true,
+          value: { ...toSourceDocFields(row), content: row.content },
+        };
+      },
+      (err) =>
+        isPgInvalidTextRepresentation(err)
+          ? { ok: false, code: "INVALID_INPUT" }
+          : undefined
+    );
+  }
+
+  /**
+   * 资料 summaries in created_at order. Body column deliberately not
+   * selected — the dashboard list is on-demand (operator-console T6);
+   * open via getSourceDocById.
+   */
+  async listSourceDocs(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageSourceDocSummary>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    return wrapPgRead("listSourceDocs", async () => {
+      const pool = await this.ensureReady();
+      const [countResult, pageResult] = await Promise.all([
+        pool.query(SOURCE_DOC_COUNT_SQL, []),
+        pool.query(SOURCE_DOC_LIST_SQL, [limit, offset]),
+      ]);
+      const rows = pageResult.rows as StorageSourceDocRow[];
+      return {
+        items: rows.map((row) => toSourceDocFields(row)),
+        total: readSqlCount(countResult.rows as Array<Record<string, unknown>>),
+        limit,
+        offset,
+      };
+    });
+  }
+
+  /**
+   * Move a known 资料 to 就绪 (corpus-ready retrieve T3). A targeted UPDATE:
+   * an unknown id is a silent no-op, never an invented row.
+   */
+  async markSourceDocReady(sourceDocId: string): Promise<void> {
+    await wrapPgRead("markSourceDocReady", async () => {
+      const pool = await this.ensureReady();
+      await pool.query(SOURCE_DOC_MARK_READY_SQL, [
+        sourceDocId,
+        SOURCE_DOC_STATUS.READY,
+      ]);
+    });
+  }
+
+  /**
+   * Record a failed push against a known 资料, keyed by source_ref. Matches
+   * zero rows for an unknown locator — the failure is dropped rather than
+   * attached to a 资料 the store never saw.
+   */
+  async recordSourceDocFailure(
+    sourceRef: string,
+    errorCode: string
+  ): Promise<void> {
+    if (typeof sourceRef !== "string" || sourceRef.trim() === "") {
+      throw new GraphragError(
+        "source doc failure: source_ref must be a non-empty string",
+        "INVALID_INPUT"
+      );
+    }
+    await wrapPgRead("recordSourceDocFailure", async () => {
+      const pool = await this.ensureReady();
+      await pool.query(SOURCE_DOC_RECORD_FAILURE_SQL, [
+        sourceRef,
+        errorCode,
+        SOURCE_DOC_STATUS.FAILED,
+      ]);
     });
   }
 

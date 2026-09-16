@@ -454,4 +454,30 @@ describe("MemoryBackend", () => {
       await expect(backend.close()).resolves.toBeUndefined();
     });
   });
+
+  describe("source-doc back-pointers (operator-console T1)", () => {
+    it("accepts chunks carrying source_doc_id + ordinal without changing store behaviour", async () => {
+      const sourceDocId = "11111111-1111-1111-1111-111111111111";
+      await backend.upsert([
+        makeChunk({
+          id: "anchored-0",
+          source_doc_id: sourceDocId,
+          ordinal: 0,
+        }),
+        makeChunk({
+          id: "anchored-1",
+          source_doc_id: sourceDocId,
+          ordinal: 1,
+        }),
+      ]);
+
+      const counts = await backend.counts();
+      expect(counts.chunks).toBe(2);
+
+      // legacy chunk without back-pointers still loads
+      await backend.upsert([makeChunk({ id: "legacy" })]);
+      const after = await backend.counts();
+      expect(after.chunks).toBe(3);
+    });
+  });
 });

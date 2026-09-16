@@ -11,6 +11,7 @@ import type {
   PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
+  SourceDocRecord,
   StorageBackend,
   StorageChunkView,
   StorageCounts,
@@ -19,8 +20,11 @@ import type {
   StoragePage,
   StorageReadPort,
   StorageReadResult,
+  StorageSourceDocSummary,
+  StorageSourceDocView,
   StorageTimelineEvent,
 } from "../types.js";
+import { SOURCE_DOC_COLLECTION_NAME, SOURCE_DOC_STATUS } from "../types.js";
 import {
   appendContentInvalidation,
   CONTENT_INVALIDATIONS_METADATA_KEY,
@@ -102,6 +106,13 @@ export class MemoryBackend
     StorageReadPort
 {
   private readonly store = new Map<string, ChunkRecord>();
+  /**
+   * 资料 SoR rows (operator-console T3). Keyed by `source_ref` so re-push
+   * of the same locator collapses to a single row (the concurrent class).
+   * The Map preserves insertion order for stable list ordering on the
+   * dashboard detail view.
+   */
+  private readonly sourceDocs = new Map<string, SourceDocRecord>();
 
   /**
    * Lexical index, maintained on write rather than rebuilt on read.
@@ -168,6 +179,21 @@ export class MemoryBackend
       );
     }
 
+    // T5: content invalidation targets the 资料 AND its derived chunks.
+    // The chunk windows below close one by one; the 资料 row's window
+    // closes with them so read_source can answer a named-invalid while
+    // the rows stay physically present (no delete this wave).
+    const sourceDoc = this.sourceDocs.get(request.sourceRef);
+    if (sourceDoc !== undefined) {
+      this.sourceDocs.set(request.sourceRef, {
+        ...sourceDoc,
+        valid_until: closeValidityWindow(
+          sourceDoc.valid_until ?? null,
+          request.invalidatedAt
+        ),
+      });
+    }
+
     const records: ContentInvalidationRecord[] = [];
     for (const chunk of matching) {
       const record: ContentInvalidationRecord = {
@@ -187,6 +213,71 @@ export class MemoryBackend
       records.push(record);
     }
     return sortInvalidationRecords(records);
+  }
+
+  /**
+   * Insert-or-update a 资料 row keyed by `source_ref`. Same locator → same id
+   * (caller-derived), so re-push is the concurrent class. Body + title are
+   * replaced on a same-id re-push; `created_at` keeps the first write so the
+   * row's identity timestamp stays stable.
+   */
+  async upsertSourceDoc(doc: SourceDocRecord): Promise<SourceDocRecord> {
+    const existing = this.sourceDocs.get(doc.source_ref);
+    // T5: mirror the chunk-level preserveInvalidationState rule. A
+    // re-push of the same content keeps the closed 资料 window (the
+    // invalidation still applies to what was re-pushed); a different
+    // content version is a fresh document and reopens the window. The
+    // write path always sends `valid_until: null` (a push is never a
+    // close); only invalidation closes.
+    const previousWindow = existing?.valid_until ?? null;
+    const sameContent =
+      existing !== undefined && existing.content === doc.content;
+    const merged: SourceDocRecord = {
+      ...(existing ? { ...doc, created_at: existing.created_at } : doc),
+      ...carryStatus(existing, doc),
+      valid_until:
+        previousWindow !== null && sameContent ? previousWindow : null,
+    };
+    this.sourceDocs.set(doc.source_ref, merged);
+    return merged;
+  }
+
+  /**
+   * Drop every chunk row that back-points to `sourceDocId`. Operator-console
+   * T3 rebuild semantics: a same-locator re-push wipes the derived chunk rows
+   * for that 资料 before inserting the new set. Chunks without a back-pointer
+   * (legacy rows) are NOT touched. Returns the count of dropped chunks.
+   *
+   * `excludeChunkIds` (optional) lists chunk ids that should NOT be deleted
+   * even though they back-point to `sourceDocId`. T3's ingest handler uses
+   * this to keep the just-upserted ids intact after `preserveInvalidationState`
+   * merges their closed-row state — only orphans (chunks left over from a
+   * previous content-identity version) are dropped.
+   */
+  async deleteChunksForSourceDoc(
+    sourceDocId: string,
+    excludeChunkIds?: Iterable<string>
+  ): Promise<void> {
+    const excluded = excludeChunkIds ? new Set(excludeChunkIds) : null;
+    for (const [id, chunk] of this.store) {
+      if (chunk.source_doc_id !== sourceDocId) continue;
+      if (excluded !== null && excluded.has(id)) continue;
+      this.deindex(id);
+      this.store.delete(id);
+    }
+  }
+
+  /**
+   * List every chunk row that back-points to `sourceDocId`, ordered by
+   * ordinal ascending. Used by T4's `read_source` and the dashboard detail.
+   */
+  async listChunksBySourceDoc(
+    sourceDocId: string
+  ): Promise<StorageChunkView[]> {
+    return [...this.store.values()]
+      .filter((chunk) => chunk.source_doc_id === sourceDocId)
+      .sort((a, b) => (a.ordinal ?? 0) - (b.ordinal ?? 0))
+      .map((chunk) => toChunkView(chunk));
   }
 
   async listInvalidations(
@@ -246,6 +337,98 @@ export class MemoryBackend
     const lookedUp = lookupReadId(id);
     if (!lookedUp.ok) return lookedUp;
     return { ok: false, code: "NOT_FOUND" };
+  }
+
+  async getSourceDoc(
+    sourceRef: string
+  ): Promise<StorageReadResult<StorageSourceDocView>> {
+    if (typeof sourceRef !== "string" || sourceRef.trim() === "") {
+      return { ok: false, code: "INVALID_INPUT" };
+    }
+    const doc = this.sourceDocs.get(sourceRef);
+    if (doc === undefined) return { ok: false, code: "NOT_FOUND" };
+    return {
+      ok: true,
+      value: toSourceDocView(doc, this.countChunksOf(doc.id)),
+    };
+  }
+
+  async getSourceDocById(
+    id: string
+  ): Promise<StorageReadResult<StorageSourceDocView>> {
+    if (typeof id !== "string" || id.trim() === "") {
+      return { ok: false, code: "INVALID_INPUT" };
+    }
+    for (const doc of this.sourceDocs.values()) {
+      if (doc.id === id) {
+        return {
+          ok: true,
+          value: toSourceDocView(doc, this.countChunksOf(doc.id)),
+        };
+      }
+    }
+    return { ok: false, code: "NOT_FOUND" };
+  }
+
+  /**
+   * 资料 summaries in creation order (Map preserves insertion order;
+   * a same-locator re-push keeps the original position). Body excluded —
+   * the list is on-demand; open via getSourceDocById.
+   */
+  async listSourceDocs(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageSourceDocSummary>> {
+    const { limit, offset } = normalizeStorageListOptions(opts);
+    const items = [...this.sourceDocs.values()]
+      .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at))
+      .map((doc) => toSourceDocSummary(doc, this.countChunksOf(doc.id)));
+    return paginateItems(items, limit, offset);
+  }
+
+  /** Successful chunk rows for one 资料 — the derived count SSOT. */
+  private countChunksOf(sourceDocId: string): number {
+    let count = 0;
+    for (const chunk of this.store.values()) {
+      if (chunk.source_doc_id === sourceDocId) count += 1;
+    }
+    return count;
+  }
+
+  /** Move a known 资料 to 就绪 (corpus-ready retrieve T3). */
+  async markSourceDocReady(sourceDocId: string): Promise<void> {
+    for (const [sourceRef, doc] of this.sourceDocs) {
+      if (doc.id !== sourceDocId) continue;
+      this.sourceDocs.set(sourceRef, {
+        ...doc,
+        status: SOURCE_DOC_STATUS.READY,
+        failure_code: null,
+      });
+      return;
+    }
+  }
+
+  /**
+   * Record a failed push against a known 资料. Best-effort: an unknown
+   * locator is a no-op (never an invented row) so a push that fails before
+   * the 资料 row exists cannot manufacture one.
+   */
+  async recordSourceDocFailure(
+    sourceRef: string,
+    errorCode: string
+  ): Promise<void> {
+    if (typeof sourceRef !== "string" || sourceRef.trim() === "") {
+      throw new GraphragError(
+        "source doc failure: source_ref must be a non-empty string",
+        "INVALID_INPUT"
+      );
+    }
+    const existing = this.sourceDocs.get(sourceRef);
+    if (existing === undefined) return;
+    this.sourceDocs.set(sourceRef, {
+      ...existing,
+      status: SOURCE_DOC_STATUS.FAILED,
+      failure_code: errorCode,
+    });
   }
 
   async listTimeline(
@@ -632,5 +815,71 @@ function toRetrievedChunk(chunk: ChunkRecord, score: number): RetrievedChunk {
     source_ref: chunk.source_ref,
     valid_window: [chunk.valid_from, chunk.valid_until],
     score,
+  };
+}
+
+/**
+ * Resolve the status fields for an upsert, mirroring the pg upsert's
+ * contract (corpus-ready retrieve T3). A caller that DECLARES a status
+ * overwrites it and carries its `failure_code` with it (`null` on a
+ * re-push clears a previous 失败). A caller that declares neither —
+ * `ingest`, written before T3 — leaves the stored status alone rather
+ * than downgrading a 就绪 资料 to 进行中 on an unrelated write.
+ */
+function carryStatus(
+  existing: SourceDocRecord | undefined,
+  doc: SourceDocRecord
+): Pick<SourceDocRecord, "status" | "failure_code"> {
+  if (doc.status !== undefined) {
+    return { status: doc.status, failure_code: doc.failure_code ?? null };
+  }
+  const carried: Pick<SourceDocRecord, "status" | "failure_code"> = {};
+  if (existing?.status !== undefined) carried.status = existing.status;
+  if (existing?.failure_code !== undefined) {
+    carried.failure_code = existing.failure_code;
+  }
+  return carried;
+}
+
+/**
+ * Project a stored 资料 row into the read port view.
+ *
+ * `chunkCount` is passed in (derived by the caller from the chunk rows)
+ * rather than stored on the record: a persisted counter could drift from
+ * the rows it is supposed to count.
+ */
+function toSourceDocView(
+  doc: SourceDocRecord,
+  chunkCount: number
+): StorageSourceDocView {
+  return {
+    id: doc.id,
+    source_ref: doc.source_ref,
+    title: doc.title,
+    content: doc.content,
+    created_at: doc.created_at,
+    valid_until: doc.valid_until ?? null,
+    collection: SOURCE_DOC_COLLECTION_NAME,
+    status: doc.status ?? SOURCE_DOC_STATUS.IN_PROGRESS,
+    failure_code: doc.failure_code ?? null,
+    chunk_count: chunkCount,
+  };
+}
+
+/** List-row projection: no content body (on-demand list, operator-console T6). */
+function toSourceDocSummary(
+  doc: SourceDocRecord,
+  chunkCount: number
+): StorageSourceDocSummary {
+  return {
+    id: doc.id,
+    source_ref: doc.source_ref,
+    title: doc.title,
+    created_at: doc.created_at,
+    valid_until: doc.valid_until ?? null,
+    collection: SOURCE_DOC_COLLECTION_NAME,
+    status: doc.status ?? SOURCE_DOC_STATUS.IN_PROGRESS,
+    failure_code: doc.failure_code ?? null,
+    chunk_count: chunkCount,
   };
 }

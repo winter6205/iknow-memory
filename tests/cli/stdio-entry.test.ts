@@ -41,6 +41,23 @@ describe("parseStdioEntry", () => {
     const result = parseStdioEntry(["extract"]);
     expect(result.ok).toBe(false);
   });
+
+  it("rejects `config` as a subcommand (operator-console T2)", () => {
+    // The setting CLI lives on its own bin (`iknow-memory-config`).
+    // Operators must NOT be able to invoke it as `iknow-memory config`;
+    // that would either hang the stdio transport (silently treated as
+    // an unknown subcommand) or shadow the real config CLI by mistake.
+    // Acceptance: `iknow-memory` CLI/stdio rejects `config`.
+    const result = parseStdioEntry(["config"]);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toContain("config");
+  });
+
+  it("rejects `iknow-memory-config` as a positional subcommand for the same reason", () => {
+    const result = parseStdioEntry(["iknow-memory-config"]);
+    expect(result.ok).toBe(false);
+  });
 });
 
 describe("iknow-memory bin entry", () => {
@@ -64,5 +81,27 @@ describe("iknow-memory bin entry", () => {
       bin?: Record<string, string>;
     };
     expect(pkg.bin?.["iknow-memory"]).toBe("bin/iknow-memory.js");
+  });
+});
+
+describe("iknow-memory-config bin entry (operator-console T2)", () => {
+  it("bin/iknow-memory-config.js exists at the package root", () => {
+    const binPath = path.join(pkgRoot, "bin", "iknow-memory-config.js");
+    expect(existsSync(binPath)).toBe(true);
+  });
+
+  it("bin/iknow-memory-config.js is a shebang wrapper that resolves dist/cli/config.js", () => {
+    const binPath = path.join(pkgRoot, "bin", "iknow-memory-config.js");
+    const body = readFileSync(binPath, "utf8");
+    expect(body.startsWith("#!/usr/bin/env node")).toBe(true);
+    expect(body).toMatch(/dist\/cli\/config\.js/);
+  });
+
+  it("package.json `bin.iknow-memory-config` matches the bin script path", () => {
+    const pkgPath = path.join(pkgRoot, "package.json");
+    const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+      bin?: Record<string, string>;
+    };
+    expect(pkg.bin?.["iknow-memory-config"]).toBe("bin/iknow-memory-config.js");
   });
 });

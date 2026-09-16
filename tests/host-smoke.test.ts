@@ -33,8 +33,9 @@
  * compiled artifact is what Claude Code launches in production.
  * Exercising it exercises the wire contract end-to-end.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/client";
@@ -88,6 +89,7 @@ function hostSmokeEnv(): Record<string, string> {
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v === "string") env[k] = v;
   }
+  env.HOME = mkdtempSync(path.join(tmpdir(), "iknow-host-smoke-home-"));
   env["GRAPHRAG_MEMORY_STORAGE"] = "memory";
   // GRAPHRAG_MEMORY_EMBED_DIMENSIONS is always required; the smoke suite
   // runs without an embedding credential (keys blanked below), so any
@@ -170,22 +172,24 @@ describe("host-smoke: real stdio MCP client against built server", () => {
   );
 
   test(
-    "tools/list returns ingest, invalidate, push, extract, and retrieve with object inputSchemas",
+    "tools/list returns ingest, invalidate, push, extract, read_source, and retrieve with object inputSchemas",
     { timeout: 30_000 },
     async () => {
       const client = await connectClient();
       clients.push(client);
 
       const { tools } = await client.listTools();
-      // specs/mcp-tool-surface.md Catalog: exactly these write/read tools
-      // over the wire. `echo` is archived; the invalidation tool answers
-      // to `invalidate`; `extract` runs the lifted core pipeline.
+      // specs/mcp-tool-surface.md Catalog + operator-console T4: exactly
+      // these write/read tools over the wire. `echo` is archived; the
+      // invalidation tool answers to `invalidate`; `extract` runs the
+      // lifted core pipeline; `read_source` serves the full 资料 body.
       const names = tools.map((t) => t.name).sort();
       expect(names).toEqual([
         "extract",
         "ingest",
         "invalidate",
         "push",
+        "read_source",
         "retrieve",
       ]);
       expect(names).not.toContain("echo");

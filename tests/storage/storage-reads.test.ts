@@ -22,6 +22,10 @@ function makeChunk(patch: Partial<ChunkRecord> & { id: string }): ChunkRecord {
     valid_from: patch.valid_from ?? "2024-01-01T00:00:00Z",
     valid_until: patch.valid_until ?? null,
     created_at: patch.created_at ?? "2024-01-01T00:00:00Z",
+    ...(patch.source_doc_id !== undefined
+      ? { source_doc_id: patch.source_doc_id }
+      : {}),
+    ...(patch.ordinal !== undefined ? { ordinal: patch.ordinal } : {}),
   };
 }
 
@@ -154,6 +158,93 @@ describe("MemoryBackend storage reads (T1)", () => {
     );
     await expect(backend.listChunks({ offset: -1 })).rejects.toMatchObject({
       code: "INVALID_INPUT",
+    });
+    await expect(backend.listSourceDocs({ limit: 0 })).rejects.toBeInstanceOf(
+      GraphragError
+    );
+    await expect(backend.listSourceDocs({ offset: -1 })).rejects.toMatchObject({
+      code: "INVALID_INPUT",
+    });
+  });
+});
+
+describe("MemoryBackend 资料 list (operator-console T6)", () => {
+  let backend: MemoryBackend;
+
+  beforeEach(() => {
+    backend = new MemoryBackend(TEST_DIM);
+  });
+
+  it("returns an empty page on an empty store", async () => {
+    await expect(backend.listSourceDocs()).resolves.toEqual({
+      items: [],
+      total: 0,
+      limit: 20,
+      offset: 0,
+    });
+  });
+
+  it("lists 资料 summaries in creation order WITHOUT the content body", async () => {
+    await backend.upsertSourceDoc({
+      id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      source_ref: "docs/first.md",
+      title: "第一条",
+      content: "full body one — must not appear in the list",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    await backend.upsertSourceDoc({
+      id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      source_ref: "docs/second.md",
+      title: null,
+      content: "full body two — must not appear in the list",
+      created_at: "2026-01-02T00:00:00.000Z",
+    });
+
+    const page = await backend.listSourceDocs();
+    expect(page.total).toBe(2);
+    expect(page.items.map((item) => item.source_ref)).toEqual([
+      "docs/first.md",
+      "docs/second.md",
+    ]);
+    const first = page.items[0]!;
+    expect(first).toMatchObject({
+      id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      title: "第一条",
+      created_at: "2026-01-01T00:00:00.000Z",
+      valid_until: null,
+    });
+    // On-demand list: summaries only — no full-corpus body fetch.
+    expect(JSON.stringify(page.items)).not.toContain("full body one");
+    expect(JSON.stringify(page.items)).not.toContain("full body two");
+  });
+
+  it("pages and exposes valid_until for invalidated rows", async () => {
+    await backend.upsertSourceDoc({
+      id: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      source_ref: "docs/closed.md",
+      title: "已失效",
+      content: "stale body",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    // invalidateSourceRef requires a matching chunk row; memory-mode T5
+    // semantics close the 资料 window in the same transaction.
+    await backend.upsert([
+      makeChunk({
+        id: "chunk-closed",
+        source_ref: "docs/closed.md",
+      }),
+    ]);
+    await backend.invalidateSourceRef(
+      "docs/closed.md",
+      "2026-06-01T00:00:00.000Z",
+      "t6-test"
+    );
+
+    const page1 = await backend.listSourceDocs({ limit: 1, offset: 0 });
+    expect(page1.total).toBe(1);
+    expect(page1.items[0]).toMatchObject({
+      source_ref: "docs/closed.md",
+      valid_until: "2026-06-01T00:00:00.000Z",
     });
   });
 });

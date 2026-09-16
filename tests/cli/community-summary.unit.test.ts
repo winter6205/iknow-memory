@@ -1,4 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   runCli,
   runCliFromEnv,
@@ -24,6 +27,7 @@ import type {
   RetrieveConfig,
 } from "../../src/core/retrieval/types.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
+import { setSettingHomeForTests } from "../../src/config.js";
 import type {
   ChunkRecord,
   RetrievedChunk,
@@ -106,9 +110,13 @@ async function withMissingNeo4jEnv<T>(fn: () => Promise<T>): Promise<T> {
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"] = "false";
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED"] = "false";
+  const settingHome = mkdtempSync(join(tmpdir(), "iknow-community-setting-"));
+  setSettingHomeForTests(settingHome);
   try {
     return await fn();
   } finally {
+    setSettingHomeForTests(null);
+    rmSync(settingHome, { recursive: true, force: true });
     for (const [key, value] of saved) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;

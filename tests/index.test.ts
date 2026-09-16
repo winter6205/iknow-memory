@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import {
   buildRetrieveDeps,
@@ -8,6 +11,7 @@ import {
 } from "../src/index.ts";
 import { FakeEmbedder } from "../src/core/embedder.ts";
 import { MemoryBackend } from "../src/core/storage/memory-backend.ts";
+import { setSettingHomeForTests } from "../src/config.js";
 
 /**
  * Construct a server with the stage 1 env vars forced to their defaults.
@@ -66,9 +70,13 @@ async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_GRAPH_ENABLED"] = "false";
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED"] = "false";
   process.env["GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED"] = "false";
+  const settingHome = mkdtempSync(join(tmpdir(), "iknow-index-setting-"));
+  setSettingHomeForTests(settingHome);
   try {
     return await createServer();
   } finally {
+    setSettingHomeForTests(null);
+    rmSync(settingHome, { recursive: true, force: true });
     // Faithfully restore the ORIGINAL value: absent stays absent (delete),
     // a real value goes back verbatim. Using `""` here would lie about the
     // pre-test state and could mask a real `.env.local` leak in a later run.
@@ -142,10 +150,11 @@ function textOf(result: { content: unknown }): string {
 }
 
 describe("createServer — registered tool set (T7)", () => {
-  it("tools/list advertises ingest, invalidate, push, extract, and retrieve", async () => {
-    // specs/mcp-tool-surface.md Catalog: the Host-facing tool set is
-    // exactly ingest + invalidate + push + extract + retrieve. `echo` is
-    // archived and the invalidation tool answers to `invalidate`.
+  it("tools/list advertises ingest, invalidate, push, extract, read_source, and retrieve", async () => {
+    // specs/mcp-tool-surface.md Catalog + operator-console T4: the
+    // Host-facing tool set is exactly ingest + invalidate + push +
+    // extract + retrieve + read_source. `echo` is archived and the
+    // invalidation tool answers to `invalidate`.
     const { client, close } = await connectInProcess();
     try {
       const { tools } = await client.listTools();
@@ -155,6 +164,7 @@ describe("createServer — registered tool set (T7)", () => {
         "ingest",
         "invalidate",
         "push",
+        "read_source",
         "retrieve",
       ]);
       // The archived names are gone from the wire, not merely shadowed.

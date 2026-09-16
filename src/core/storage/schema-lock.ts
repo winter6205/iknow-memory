@@ -8,6 +8,30 @@ const INT64_SIGN_BIT = 1n << 63n;
 const UINT64_MODULUS = 1n << 64n;
 const FNV1A_OFFSET_BASIS = 14695981039346656037n;
 const FNV1A_PRIME = 1099511628211n;
+/**
+ * Forward-compat columns whose presence defines a bootstrapped schema. A
+ * deployment that predates an entry has the table but not the column, so
+ * `schemaBootstrapIsReady` must name every one of them: `upSchemaBootstrap`
+ * short-circuits on its answer, and the same `CREATE TABLE IF NOT EXISTS`
+ * that created the table can never add the column afterwards.
+ *
+ * Keep this in lockstep with the forward-compat ALTERs in schema-bootstrap.ts —
+ * a column added there without an entry here is silently skipped on every
+ * existing database (the ALTER only runs when the probe says "not ready").
+ * `tests/storage/bootstrap-columns.test.ts` enforces the lockstep by
+ * deriving the expected set from the ALTER statements the bootstrap emits,
+ * so the next forward-compat column fails a test instead of shipping.
+ */
+const BOOTSTRAP_COLUMNS = [
+  ["triples", "superseded_by"],
+  ["triples", "evidence_span"],
+  ["triples", "extractor"],
+  ["chunks", "source_doc_id"],
+  ["chunks", "ordinal"],
+  ["source_documents", "valid_until"],
+  ["source_documents", "status"],
+  ["source_documents", "failure_code"],
+] as const;
 const BOOTSTRAP_TABLES = [
   "entities",
   "entity_aliases",
@@ -15,6 +39,7 @@ const BOOTSTRAP_TABLES = [
   "extraction_records",
   "community_summaries",
   "projection_outbox",
+  "source_documents",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -33,6 +58,7 @@ const BOOTSTRAP_INDEXES = [
   "projection_outbox_status_created_at_idx",
   "projection_outbox_subject_idx",
   "projection_outbox_pending_subject_idx",
+  "chunks_source_doc_id_ordinal_idx",
 ] as const;
 
 /**
@@ -114,18 +140,27 @@ async function schemaBootstrapIsReady(
                AND c.relkind = 'i'
           )
        )
-       AND EXISTS (
+       AND NOT EXISTS (
          SELECT 1
-           FROM pg_attribute a
-           JOIN pg_class c ON c.oid = a.attrelid
-           JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE n.nspname = current_schema()
-            AND c.relname = 'triples'
-            AND a.attname = 'superseded_by'
-            AND a.attnum > 0
-            AND NOT a.attisdropped
+           FROM unnest($3::text[], $4::text[]) AS required(table_name, column_name)
+          WHERE NOT EXISTS (
+            SELECT 1
+              FROM pg_attribute a
+              JOIN pg_class c ON c.oid = a.attrelid
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = current_schema()
+               AND c.relname = required.table_name
+               AND a.attname = required.column_name
+               AND a.attnum > 0
+               AND NOT a.attisdropped
+          )
        ) AS ready`,
-    [BOOTSTRAP_TABLES, BOOTSTRAP_INDEXES]
+    [
+      BOOTSTRAP_TABLES,
+      BOOTSTRAP_INDEXES,
+      BOOTSTRAP_COLUMNS.map(([table]) => table),
+      BOOTSTRAP_COLUMNS.map(([, column]) => column),
+    ]
   );
   const rows = result.rows as { ready: boolean }[];
   return rows[0]?.ready === true;

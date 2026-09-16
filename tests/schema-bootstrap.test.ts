@@ -22,6 +22,7 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { upSchemaBootstrap } from "../src/core/storage/schema-bootstrap.js";
+import { SOURCE_DOC_STATUS } from "../src/core/types.js";
 import {
   createPgIntegrationHarness,
   redactPgConnectionString,
@@ -47,8 +48,19 @@ const LEDGER_TABLES = [
  */
 const PROJECTION_TABLES = ["projection_outbox"] as const;
 
+/**
+ * operator-console T1: the 资料 prose SoR that the dashboard main list
+ * opens. Rides the same idempotent bootstrap so an empty `iknow_memory`
+ * database boots cleanly.
+ */
+const SOURCE_DOCUMENT_TABLES = ["source_documents"] as const;
+
 /** Every table the bootstrap owns; dropped and re-created by the first test. */
-const BOOTSTRAP_TABLES = [...LEDGER_TABLES, ...PROJECTION_TABLES] as const;
+const BOOTSTRAP_TABLES = [
+  ...LEDGER_TABLES,
+  ...PROJECTION_TABLES,
+  ...SOURCE_DOCUMENT_TABLES,
+] as const;
 
 /**
  * The table names we count via pg_tables: everything the bootstrap owns +
@@ -412,6 +424,13 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
      * Read the five triples indexes from pg_indexes + pg_class/pg_am so the
      * access-method type (btree vs gist) can be asserted without relying on
      * the Postgres-generated index definition text.
+     *
+     * The pg_class join is qualified to the CURRENT schema: an unqualified
+     * `relname = i.indexname` also matches a same-named index that a
+     * parallel integration suite created in its own throwaway schema, which
+     * makes this map collapse two rows into one (false PASS on the access
+     * method) or pick the wrong one (false FAIL). Same reason the
+     * embedding-column probe above pins `nspname`.
      */
     async function readTriplesIndexAm(
       c: pg.Client
@@ -420,8 +439,10 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
         `SELECT i.indexname, am.amname
            FROM pg_indexes i
            JOIN pg_class r ON r.relname = i.indexname
+           JOIN pg_namespace rn ON rn.oid = r.relnamespace
            JOIN pg_am am ON am.oid = r.relam
-          WHERE i.schemaname = $1 AND i.tablename = 'triples'`,
+          WHERE i.schemaname = $1 AND i.tablename = 'triples'
+            AND rn.nspname = $1`,
         [SCHEMA]
       );
       return new Map(res.rows.map((r) => [r.indexname, r.amname]));
@@ -1055,6 +1076,104 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
         [SCHEMA]
       );
       expect(Number(res.rows[0]!.n)).toBe(0);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // operator-console T1: ledger schema adds 资料 (source_documents) and
+  // the chunks back-pointer columns (source_doc_id, ordinal).
+  //
+  // Idempotency has already dropped + recreated the schema above, so
+  // `source_documents` and the back-pointer columns exist when this
+  // describe runs.
+  // -------------------------------------------------------------------
+  describe("source_documents DDL contract", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    async function readColumns(
+      c: pg.Client,
+      tableName: string
+    ): Promise<Set<string>> {
+      const res = await c.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_name = $1 AND table_schema = $2`,
+        [tableName, SCHEMA]
+      );
+      return new Set(res.rows.map((r) => r.column_name));
+    }
+
+    it("source_documents exposes every column pinned in the operator-console ledger contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "source_documents");
+      for (const col of [
+        "id",
+        "source_ref",
+        "title",
+        "content",
+        "created_at",
+      ]) {
+        expect(cols, `source_documents.${col} missing`).toContain(col);
+      }
+    });
+
+    it("source_documents.source_ref is unique so a re-push can locate the row", async () => {
+      const c = requireClient();
+      const res = await c.query<{ indexdef: string }>(
+        `SELECT indexdef FROM pg_indexes
+           WHERE schemaname = $1 AND tablename = 'source_documents'`,
+        [SCHEMA]
+      );
+      const uniqueOnSourceRef = res.rows.some(
+        (row) =>
+          /^CREATE UNIQUE INDEX/i.test(row.indexdef) &&
+          /\(source_ref\)/.test(row.indexdef)
+      );
+      expect(
+        uniqueOnSourceRef,
+        "source_documents must have a UNIQUE (source_ref) index"
+      ).toBe(true);
+    });
+
+    it("chunks has source_doc_id and ordinal back-pointer columns", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "chunks");
+      expect(cols, "chunks.source_doc_id missing").toContain("source_doc_id");
+      expect(cols, "chunks.ordinal missing").toContain("ordinal");
+    });
+
+    it("the status CHECK accepts exactly SOURCE_DOC_STATUS (T3)", async () => {
+      // The CHECK polices the column; SOURCE_DOC_STATUS supplies the values
+      // the writers use. If the two spell the vocabulary independently, a
+      // rename produces rows the CHECK rejects. Asserted against the live
+      // constraint rather than the DDL text so a hand-edited schema fails
+      // here too.
+      const c = requireClient();
+      const accepted: string[] = [];
+      for (const status of Object.values(SOURCE_DOC_STATUS)) {
+        const res = await c.query(
+          `INSERT INTO source_documents (id, source_ref, content, status)
+             VALUES ($1, $2, $3, $4)
+           ON CONFLICT (source_ref) DO UPDATE SET status = EXCLUDED.status
+           RETURNING status`,
+          [crypto.randomUUID(), `status-${status}`, "body", status]
+        );
+        accepted.push((res.rows[0] as { status: string }).status);
+      }
+      expect(accepted).toEqual(Object.values(SOURCE_DOC_STATUS));
+      await expect(
+        c.query(
+          `INSERT INTO source_documents (id, source_ref, content, status)
+             VALUES ($1, $2, $3, $4)`,
+          [crypto.randomUUID(), "status-bogus", "body", "not-a-status"]
+        )
+      ).rejects.toThrow(/source_documents_status_check/);
     });
   });
 });

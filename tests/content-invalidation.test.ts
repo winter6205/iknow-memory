@@ -5,6 +5,7 @@ import { GraphragError } from "../src/core/errors.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import type { StorageBackend } from "../src/core/types.js";
 import { createIngestHandler, IngestInputSchema } from "../src/tools/ingest.js";
+import { createReadSourceHandler } from "../src/tools/read_source.js";
 import {
   createInvalidationHandler,
   InvalidationInputSchema,
@@ -59,6 +60,195 @@ async function queryContent(
   const [embedding] = await deps.embedder.embed([CONTENT]);
   return deps.storage.search(embedding!, { limit: 100, validAt });
 }
+
+/**
+ * Operator-console T5: content invalidation targets the 资料 AND its
+ * derived chunks. Closing the chunk windows alone is not enough — the
+ * source_documents row gets its validity window closed in the same
+ * invalidate call so `read_source` can answer with a named-invalid miss
+ * while every row stays physically present (no delete this wave).
+ */
+describe("T5 invalidate closes the 资料 window, keeps rows", () => {
+  const BODY = "alpha middle omega";
+  const SLICES = [
+    { content: "alpha", index: 0 },
+    { content: "middle", index: 1 },
+    { content: "omega", index: 2 },
+  ];
+
+  async function seedEnvelope(
+    deps: ReturnType<typeof makeDeps>,
+    sourceRef: string,
+    slices: Array<{ content: string; index: number }> = [
+      { content: "content that will be invalidated", index: 0 },
+    ]
+  ): Promise<{ source_doc_id: string; chunk_ids: string[] }> {
+    const result = await createIngestHandler(deps)({
+      source_ref: sourceRef,
+      content: slices.length === 1 ? slices[0]!.content : BODY,
+      chunks: slices,
+    });
+    return JSON.parse(textOf(result)) as {
+      source_doc_id: string;
+      chunk_ids: string[];
+    };
+  }
+
+  it("closes the 资料 window with the chunk windows (one-slice)", async () => {
+    const deps = makeDeps();
+    const seeded = await seedEnvelope(deps, SOURCE_REF);
+
+    const invalidated = invalidationPayload(
+      await createInvalidationHandler(deps)({
+        source_ref: SOURCE_REF,
+        invalidated_at: INVALIDATED_AT,
+        triggered_by: "fin",
+      })
+    );
+    expect(invalidated.invalidated_chunk_ids).toEqual(seeded.chunk_ids);
+
+    // The 资料 row's window is closed at the same instant.
+    const doc = await deps.storage.getSourceDoc(SOURCE_REF);
+    expect(doc.ok).toBe(true);
+    if (!doc.ok) throw new Error("expected source doc");
+    expect(doc.value.valid_until).toBe(INVALIDATED_AT);
+
+    // Retrieve omits the slice after the close.
+    expect(await queryContent(deps, AFTER_INVALIDATION)).toEqual([]);
+  });
+
+  it("closes every derived chunk window (multi-slice)", async () => {
+    const deps = makeDeps();
+    await seedEnvelope(deps, SOURCE_REF, SLICES);
+
+    const invalidated = invalidationPayload(
+      await createInvalidationHandler(deps)({
+        source_ref: SOURCE_REF,
+        invalidated_at: INVALIDATED_AT,
+        triggered_by: "fin",
+      })
+    );
+    expect(invalidated.invalidated_chunk_ids).toHaveLength(SLICES.length);
+
+    const doc = await deps.storage.getSourceDoc(SOURCE_REF);
+    expect(doc.ok).toBe(true);
+    if (!doc.ok) throw new Error("expected source doc");
+    expect(doc.value.valid_until).toBe(INVALIDATED_AT);
+
+    const chunks = await deps.storage.listChunksBySourceDoc(doc.value.id);
+    expect(chunks.map((chunk) => chunk.valid_until)).toEqual(
+      SLICES.map(() => INVALIDATED_AT)
+    );
+    expect(await queryContent(deps, AFTER_INVALIDATION)).toEqual([]);
+  });
+
+  it("read_source answers a named-invalid after invalidate, rows still SELECT-able", async () => {
+    const deps = makeDeps();
+    const seeded = await seedEnvelope(deps, SOURCE_REF);
+    await createInvalidationHandler(deps)({
+      source_ref: SOURCE_REF,
+      invalidated_at: INVALIDATED_AT,
+      triggered_by: "fin",
+    });
+
+    const read = await createReadSourceHandler({ storage: deps.storage })({
+      source_ref: SOURCE_REF,
+    });
+    expect(read.isError).toBe(true);
+    const body = JSON.parse(textOf(read)) as Record<string, unknown>;
+    expect(body.error).toBe("read_source_invalidated");
+    expect(body.source_ref).toBe(SOURCE_REF);
+    expect(body.id).toBe(seeded.source_doc_id);
+    expect(body.valid_until).toBe(INVALIDATED_AT);
+
+    // No physical delete: the 资料 row and its chunk rows are still there.
+    const doc = await deps.storage.getSourceDoc(SOURCE_REF);
+    expect(doc.ok).toBe(true);
+    if (!doc.ok) throw new Error("expected source doc");
+    const chunks = await deps.storage.listChunksBySourceDoc(doc.value.id);
+    expect(chunks).toHaveLength(1);
+  });
+
+  it("read_source by id answers the same named-invalid", async () => {
+    const deps = makeDeps();
+    const seeded = await seedEnvelope(deps, SOURCE_REF);
+    await createInvalidationHandler(deps)({
+      source_ref: SOURCE_REF,
+      invalidated_at: INVALIDATED_AT,
+      triggered_by: "fin",
+    });
+
+    const read = await createReadSourceHandler({ storage: deps.storage })({
+      id: seeded.source_doc_id,
+    });
+    expect(read.isError).toBe(true);
+    const body = JSON.parse(textOf(read)) as Record<string, unknown>;
+    expect(body.error).toBe("read_source_invalidated");
+    expect(body.id).toBe(seeded.source_doc_id);
+    expect(body.source_ref).toBe(SOURCE_REF);
+  });
+
+  it("repeating the same invalidate leaves the 资料 window unchanged", async () => {
+    const deps = makeDeps();
+    await seedEnvelope(deps, SOURCE_REF);
+    const request = {
+      source_ref: SOURCE_REF,
+      invalidated_at: INVALIDATED_AT,
+      triggered_by: "fin",
+    };
+    const invalidate = createInvalidationHandler(deps);
+    const first = invalidationPayload(await invalidate(request));
+    const second = invalidationPayload(await invalidate(request));
+
+    expect(second).toEqual(first);
+    const doc = await deps.storage.getSourceDoc(SOURCE_REF);
+    expect(doc.ok).toBe(true);
+    if (!doc.ok) throw new Error("expected source doc");
+    expect(doc.value.valid_until).toBe(INVALIDATED_AT);
+    await expect(
+      deps.storage.listInvalidations(SOURCE_REF)
+    ).resolves.toHaveLength(1);
+  });
+
+  it("re-pushing the same content keeps the closed 资料 window; different content reopens it", async () => {
+    const deps = makeDeps();
+    const ingest = createIngestHandler(deps);
+    await seedEnvelope(deps, SOURCE_REF);
+    await createInvalidationHandler(deps)({
+      source_ref: SOURCE_REF,
+      invalidated_at: INVALIDATED_AT,
+      triggered_by: "fin",
+    });
+
+    // Same content re-push: the 资料 stays closed (mirrors the chunk-level
+    // preserveInvalidationState rule).
+    await ingest({
+      source_ref: SOURCE_REF,
+      content: "content that will be invalidated",
+      chunks: [{ content: "content that will be invalidated", index: 0 }],
+    });
+    const closedDoc = await deps.storage.getSourceDoc(SOURCE_REF);
+    expect(closedDoc.ok).toBe(true);
+    if (!closedDoc.ok) throw new Error("expected source doc");
+    expect(closedDoc.value.valid_until).toBe(INVALIDATED_AT);
+    expect(await queryContent(deps, AFTER_INVALIDATION)).toEqual([]);
+
+    // Different content: a fresh content version reopens the 资料 window
+    // and the new slices are retrievable again. The re-push stamps
+    // valid_from = now, so the query time must be past that.
+    await ingest({
+      source_ref: SOURCE_REF,
+      content: BODY,
+      chunks: SLICES,
+    });
+    const reopenedDoc = await deps.storage.getSourceDoc(SOURCE_REF);
+    expect(reopenedDoc.ok).toBe(true);
+    if (!reopenedDoc.ok) throw new Error("expected source doc");
+    expect(reopenedDoc.value.valid_until).toBeNull();
+    const hits = await queryContent(deps, "2099-01-01T00:00:00.000Z");
+    expect(hits).toHaveLength(SLICES.length);
+  });
+});
 
 describe("T6 content invalidation", () => {
   it("closes the window at the invalidation instant and leaves a queryable record", async () => {
@@ -148,7 +338,7 @@ describe("T6 content invalidation", () => {
     ).resolves.toHaveLength(1);
   });
 
-  it("invalidates every chunk belonging to the source_ref", async () => {
+  it("invalidates the chunk belonging to the source_ref", async () => {
     const deps = makeDeps();
     const first = createIngestHandler({
       ...deps,
@@ -159,6 +349,9 @@ describe("T6 content invalidation", () => {
       identityVersions: { normalizationRuleVersion: "v2" },
     });
     await first({ content: CONTENT, source_ref: SOURCE_REF });
+    // T3 rebuild: a re-push with a different content identity wipes the
+    // previous chunk for that source_doc — only the new chunk remains,
+    // and invalidation should still find it under the same source_ref.
     await second({ content: CONTENT, source_ref: SOURCE_REF });
 
     const invalidated = invalidationPayload(
@@ -169,11 +362,11 @@ describe("T6 content invalidation", () => {
       })
     );
 
-    expect(invalidated.invalidated_chunk_ids).toHaveLength(2);
+    expect(invalidated.invalidated_chunk_ids).toHaveLength(1);
     expect(await queryContent(deps, AFTER_INVALIDATION)).toEqual([]);
     await expect(
       deps.storage.listInvalidations(SOURCE_REF)
-    ).resolves.toHaveLength(2);
+    ).resolves.toHaveLength(1);
   });
 
   it("returns a typed error for an unknown source_ref", async () => {

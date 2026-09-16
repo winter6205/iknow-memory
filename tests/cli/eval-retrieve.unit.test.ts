@@ -26,6 +26,7 @@ import {
   runCliFromEnv,
   type EvalDeps,
 } from "../../src/cli/eval-retrieve.js";
+import { setSettingHomeForTests } from "../../src/config.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
 import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
@@ -585,7 +586,11 @@ describe("eval CLI — loadEnv switches (SC4, ADR-0006)", () => {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    const settingHome = mkdtempSync(join(tmpdir(), "iknow-eval-setting-"));
+    setSettingHomeForTests(settingHome);
     return fn().finally(() => {
+      setSettingHomeForTests(null);
+      rmSync(settingHome, { recursive: true, force: true });
       for (const [key, value] of saved) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;

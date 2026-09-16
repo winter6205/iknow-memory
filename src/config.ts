@@ -18,6 +18,10 @@ import {
   type RetrievePreset,
 } from "./core/retrieval/types.js";
 import { RRF_K } from "./core/retrieval/rrf.js";
+import {
+  createSettingStore,
+  type SettingStore,
+} from "./config/setting-store.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -284,19 +288,136 @@ function parseEnvFile(path: string): Record<string, string> {
   return out;
 }
 
+/**
+ * Lazily-built, mutable home override for the operator-setting store.
+ *
+ * The setting resolver (`config/setting-resolver.ts`) reads from a
+ * `SettingStore` rooted at `$HOME/.iknow-memory/setting.json`. Production
+ * callers leave this unset; tests in
+ * `tests/config/setting/config-setting-integration.test.ts` inject a tmp
+ * tree via `setSettingHomeForTests` so the real `~/.iknow-memory/` is
+ * never read or written by a test.
+ */
+let settingHomeOverride: string | null = null;
+let cachedSettingStore: SettingStore | null = null;
+let cachedSettingMap: Record<string, string> | undefined | null = undefined;
+
+function getSettingStore(): SettingStore {
+  if (cachedSettingStore === null) {
+    cachedSettingStore = createSettingStore(
+      settingHomeOverride === null ? {} : { home: settingHomeOverride }
+    );
+  }
+  return cachedSettingStore;
+}
+
+/**
+ * Tests-only injection point: route the operator-setting store at a tmp
+ * `home` (typically a `mkdtemp` tree) and reset every cache so the
+ * next `loadEnv` reads from the injected location. `null` clears the
+ * override and the caches, restoring production behavior.
+ *
+ * Exported because the integration test owns the tmp directory and is
+ * the only legitimate caller; production code never touches this.
+ */
+export function setSettingHomeForTests(home: string | null): void {
+  settingHomeOverride = home;
+  cachedSettingStore = null;
+  cachedSettingMap = undefined;
+}
+
 function readEnv(key: string): string | undefined {
-  // A key *present* on process.env (even blank) is an explicit process
-  // value: it must not fall through to `.env.local`. Host-smoke and
-  // Cursor MCP pin secrets to "" so a developer file cannot select
-  // 9router / Neo4j / pgvector. Absent keys still read the file.
+  // Precedence (T2): process.env wins when present and non-blank;
+  // operator setting.json is the next fallback; `.env.local` is the
+  // legacy dev-time fallback. A *present but blank* process.env value
+  // collapses to "absent" — a stray `export FOO=` must not shadow a
+  // real operator setting.
   if (Object.prototype.hasOwnProperty.call(process.env, key)) {
     const fromProcess = process.env[key];
-    if (fromProcess === undefined) return undefined;
-    const trimmed = fromProcess.trim();
-    return trimmed === "" ? undefined : fromProcess;
+    if (fromProcess !== undefined) {
+      const trimmed = fromProcess.trim();
+      if (trimmed !== "") return fromProcess;
+    }
   }
+  const fromSetting = readEnvFromSettingSync(key);
+  if (fromSetting !== undefined) return fromSetting;
   const file = parseEnvFile(join(process.cwd(), ".env.local"));
   return file[key];
+}
+
+/**
+ * Synchronous reader for the operator setting — used by `readEnv` /
+ * `readRawEnv` to keep the existing sync contract. Loads the setting
+ * file at most once per process; subsequent calls reuse the cache.
+ *
+ * Hidden behind a small indirection so tests can call
+ * `setSettingHomeForTests` to swap the file. A malformed file surfaces
+ * as ConfigError (lazy-loaded below) — same shape as the rest of the
+ * config validation, never a silent empty string at the use site.
+ */
+function readEnvFromSettingSync(key: string): string | undefined {
+  // `undefined` is the sentinel for "needs first read"; `null` is the
+  // legacy sentinel from before `setSettingHomeForTests` reset to
+  // `undefined`. Treat both as needing a (re)load.
+  if (cachedSettingMap === null || cachedSettingMap === undefined) {
+    // First read in this process; populate from the store.
+    try {
+      const store = getSettingStore();
+      if (!existsSync(store.path)) {
+        cachedSettingMap = {};
+      } else {
+        const raw = readFileSync(store.path, "utf8");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          throw new ConfigError(
+            `${store.path}: not valid JSON (setting.json must be a JSON object of GRAPHRAG_MEMORY_* keys)`
+          );
+        }
+        if (
+          typeof parsed !== "object" ||
+          parsed === null ||
+          Array.isArray(parsed)
+        ) {
+          throw new ConfigError(
+            `${store.path}: root must be a JSON object of GRAPHRAG_MEMORY_* keys`
+          );
+        }
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(parsed)) {
+          if (k === "") {
+            throw new ConfigError(
+              `${store.path}: setting keys must be non-empty`
+            );
+          }
+          if (typeof v !== "string") {
+            throw new ConfigError(
+              `${store.path}: value for "${k}" must be a string, got ${typeof v}`
+            );
+          }
+          out[k] = v;
+        }
+        cachedSettingMap = out;
+      }
+    } catch (err) {
+      if (err instanceof ConfigError) throw err;
+      // ENOENT race: collapse to empty.
+      if (
+        err instanceof Error &&
+        "code" in err &&
+        (err as NodeJS.ErrnoException).code === "ENOENT"
+      ) {
+        cachedSettingMap = {};
+      } else {
+        throw err;
+      }
+    }
+  }
+  if (cachedSettingMap === undefined || cachedSettingMap === null) {
+    return undefined;
+  }
+  return cachedSettingMap[key];
 }
 
 /**
@@ -309,6 +430,8 @@ function readRawEnv(key: string): string | undefined {
   if (Object.prototype.hasOwnProperty.call(process.env, key)) {
     return process.env[key];
   }
+  const fromSetting = readEnvFromSettingSync(key);
+  if (fromSetting !== undefined) return fromSetting;
   const file = parseEnvFile(join(process.cwd(), ".env.local"));
   return file[key];
 }

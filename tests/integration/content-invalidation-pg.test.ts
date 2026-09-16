@@ -5,6 +5,7 @@ import { FakeEmbedder } from "../../src/core/embedder.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { createIngestHandler } from "../../src/tools/ingest.js";
 import { createInvalidationHandler } from "../../src/tools/invalidation.js";
+import { createReadSourceHandler } from "../../src/tools/read_source.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 32;
@@ -131,5 +132,93 @@ describePg("T6 content invalidation: live PostgreSQL", () => {
     ).rejects.toMatchObject({ code: "INVALID_INPUT" });
     expect("delete" in backend!).toBe(false);
     expect("deleteBySourceRef" in backend!).toBe(false);
+  });
+
+  /**
+   * Operator-console T5: content invalidation targets the 资料 AND its
+   * derived chunks. The source_documents window closes in the same
+   * transaction; read_source answers a named-invalid; rows stay
+   * SELECT-able.
+   */
+  it("T5: closes the 资料 window with the chunk windows; read_source named-invalid; rows SELECT-able", async () => {
+    const embedder = new FakeEmbedder(DIM);
+    const ingest = createIngestHandler({ embedder, storage: backend! });
+    const invalidate = createInvalidationHandler({
+      embedder,
+      storage: backend!,
+    });
+    const body = "alpha middle omega";
+    await ingest({
+      source_ref: SOURCE_REF,
+      content: body,
+      chunks: [
+        { content: "alpha", index: 0 },
+        { content: "middle", index: 1 },
+        { content: "omega", index: 2 },
+      ],
+    });
+
+    const request = {
+      source_ref: SOURCE_REF,
+      invalidated_at: INVALIDATED_AT,
+      triggered_by: "fin",
+    };
+    const first = await invalidate(request);
+    const second = await invalidate(request);
+    expect(textOf(second)).toBe(textOf(first));
+
+    // 资料 window closed in the same transaction.
+    const docRow = await client!.query<{
+      id: string;
+      valid_until: Date | null;
+    }>(`SELECT id, valid_until FROM source_documents WHERE source_ref = $1`, [
+      SOURCE_REF,
+    ]);
+    expect(docRow.rows[0]?.valid_until?.toISOString()).toBe(INVALIDATED_AT);
+    const docRowId = docRow.rows[0]?.id;
+
+    // Rows remain SELECT-able — no physical delete.
+    const docCount = await client!.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM source_documents WHERE source_ref = $1`,
+      [SOURCE_REF]
+    );
+    expect(docCount.rows[0]?.count).toBe("1");
+    const chunkCount = await client!.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM chunks WHERE source_ref = $1`,
+      [SOURCE_REF]
+    );
+    expect(chunkCount.rows[0]?.count).toBe("3");
+
+    // read_source answers a named-invalid (distinct from not-found),
+    // carrying the resolved row identity (doc.id, doc.source_ref) so a
+    // host can map a request back to the underlying 资料.
+    const read = await createReadSourceHandler({ storage: backend! })({
+      source_ref: SOURCE_REF,
+    });
+    expect(read.isError).toBe(true);
+    const readBody = JSON.parse(textOf(read)) as Record<string, unknown>;
+    expect(readBody.error).toBe("read_source_invalidated");
+    expect(readBody.source_ref).toBe(SOURCE_REF);
+    expect(readBody.id).toBe(docRowId);
+    expect(readBody.valid_until).toBe(INVALIDATED_AT);
+
+    // Same-content re-push keeps the closed 资料 window.
+    await ingest({
+      source_ref: SOURCE_REF,
+      content: body,
+      chunks: [
+        { content: "alpha", index: 0 },
+        { content: "middle", index: 1 },
+        { content: "omega", index: 2 },
+      ],
+    });
+    const docAfterRepush = await client!.query<{
+      valid_until: Date | null;
+    }>(`SELECT valid_until FROM source_documents WHERE source_ref = $1`, [
+      SOURCE_REF,
+    ]);
+    expect(docAfterRepush.rows[0]?.valid_until?.toISOString()).toBe(
+      INVALIDATED_AT
+    );
   });
 });

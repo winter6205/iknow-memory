@@ -33,6 +33,7 @@ import { ingestTool } from "./tools/ingest.js";
 import { invalidationTool } from "./tools/invalidation.js";
 import { pushTool } from "./tools/push.js";
 import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
+import { readSourceTool } from "./tools/read_source.js";
 import {
   extractTool,
   type ExtractDeps,
@@ -54,7 +55,7 @@ import {
 } from "./core/graph/neo4j-ppr.js";
 import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
 import { createAnthropicChunkReranker } from "./core/rerank/anthropic-reranker.js";
-import type { StorageBackend } from "./core/types.js";
+import type { StorageBackend, StorageReadPort } from "./core/types.js";
 import type { SearchOptions } from "./core/types.js";
 import type { LexicalStorageBackend } from "./core/storage/backend.js";
 
@@ -84,7 +85,12 @@ const EXIT_CODES = {
 /** Everything the ingest/retrieve handlers need, built once per server. */
 interface ServerDeps {
   embedder: EmbeddingClient;
-  storage: StorageBackend;
+  /**
+   * Both production backends implement StorageReadPort on top of
+   * StorageBackend (operator-console T4 — read_source reads 资料 rows
+   * through the read port).
+   */
+  storage: StorageBackend & StorageReadPort;
   /** Optional Elasticsearch precision layer for derived indexes. */
   precision?: PrecisionIndexer;
   /**
@@ -188,6 +194,30 @@ export function buildRetrieveReranker(
 }
 
 /**
+ * A seam this adapter does not serve. Reaching one means an authoritative
+ * write or read was routed to the derived-index layer, so the refusal is a
+ * typed ConfigError naming where the call belongs rather than a silent
+ * success or a bare Error.
+ *
+ * `Promise<never>` on purpose: it satisfies every async method signature in
+ * `StorageBackend`, so one helper covers seams of differing arity and return
+ * types without a cast.
+ *
+ * The adapter's object literal below stays explicit — every key spelled out —
+ * rather than being generated from a name list: that is what makes the
+ * compiler check each seam against `LexicalStorageBackend`. Only the
+ * message construction is shared.
+ */
+function unimplementedSeam(seam: string, hint: string): () => Promise<never> {
+  return () =>
+    Promise.reject(
+      new ConfigError(
+        `precision-derived lexical backend does not implement ${seam}; ${hint}`
+      )
+    );
+}
+
+/**
  * Adapt a `PrecisionIndexer` to the `LexicalStorageBackend` shape consumed by
  * the BM25 arm.
  *
@@ -205,23 +235,40 @@ function lexicalAdapterFromPrecision(
   precision: PrecisionIndexer
 ): LexicalStorageBackend {
   return {
-    upsert: () =>
-      Promise.reject(
-        new ConfigError(
-          "precision-derived lexical backend does not implement upsert; " +
-            "use storage.upsert for authoritative writes"
-        )
-      ),
-    search: () =>
-      Promise.reject(
-        new ConfigError(
-          "precision-derived lexical backend does not implement vector search; " +
-            "use storage.search for vector recall"
-        )
-      ),
+    upsert: unimplementedSeam(
+      "upsert",
+      "use storage.upsert for authoritative writes"
+    ),
+    search: unimplementedSeam(
+      "vector search",
+      "use storage.search for vector recall"
+    ),
     searchLexical: (query: string, opts: SearchOptions) =>
       precision.searchLexical(query, opts),
     close: () => precision.close(),
+    // Operator-console T3 source-doc seams are not the lexical arm's
+    // concern. A caller reaching them through this adapter has routed
+    // a write/read to the wrong layer; surface a typed refusal.
+    upsertSourceDoc: unimplementedSeam(
+      "upsertSourceDoc",
+      "use storage.upsertSourceDoc for authoritative writes"
+    ),
+    deleteChunksForSourceDoc: unimplementedSeam(
+      "deleteChunksForSourceDoc",
+      "use storage.deleteChunksForSourceDoc for authoritative rebuilds"
+    ),
+    listChunksBySourceDoc: unimplementedSeam(
+      "listChunksBySourceDoc",
+      "use storage.listChunksBySourceDoc for authoritative reads"
+    ),
+    markSourceDocReady: unimplementedSeam(
+      "markSourceDocReady",
+      "use storage.markSourceDocReady for authoritative status writes"
+    ),
+    recordSourceDocFailure: unimplementedSeam(
+      "recordSourceDocFailure",
+      "use storage.recordSourceDocFailure for authoritative status writes"
+    ),
   };
 }
 
@@ -240,7 +287,7 @@ function lexicalAdapterFromPrecision(
  * clear "install pg" hint instead of an opaque module-not-found at startup.
  */
 async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
-  let storage: StorageBackend;
+  let storage: StorageBackend & StorageReadPort;
   if (env.storage === "pgvector") {
     if (env.dbUrl === undefined) {
       // config.loadEnv already enforces this, but defense-in-depth:
@@ -261,6 +308,15 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     // Fail before the stdio transport opens: dimension and ANN-index
     // bootstrap errors are server-startup failures, not tool responses.
     await backend.initialize();
+    const { alignEmbeddingDimensions } =
+      await import("./core/storage/embed-dim-align.js");
+    const { Pool } = await import("pg");
+    const alignPool = new Pool({ connectionString: env.dbUrl });
+    try {
+      await alignEmbeddingDimensions(alignPool, env.embedDimensions);
+    } finally {
+      await alignPool.end();
+    }
     storage = backend;
   } else {
     storage = new MemoryBackend(env.embedDimensions);
@@ -409,6 +465,9 @@ export async function createServer(): Promise<McpServer> {
     // shares it instead of constructing a second ES client from env.
     extractTool(buildExtractDeps(env, logger, deps.precision)),
     retrieveTool(buildRetrieveDeps(deps, debug)),
+    // Operator-console T4: pure read tool over the same deps — the
+    // StorageReadPort is implemented by both production backends.
+    readSourceTool(deps),
   ]);
 
   const server = new McpServer(

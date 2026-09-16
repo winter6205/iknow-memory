@@ -35,6 +35,10 @@ function makeChunk(patch: Partial<ChunkRecord> & { id: string }): ChunkRecord {
     valid_from: patch.valid_from ?? "2024-01-01T00:00:00Z",
     valid_until: patch.valid_until ?? null,
     created_at: patch.created_at ?? "2024-01-01T00:00:00Z",
+    ...(patch.source_doc_id !== undefined
+      ? { source_doc_id: patch.source_doc_id }
+      : {}),
+    ...(patch.ordinal !== undefined ? { ordinal: patch.ordinal } : {}),
   };
 }
 
@@ -59,6 +63,7 @@ describePg("PgvectorBackend storage reads (T1)", () => {
   });
 
   beforeEach(async () => {
+    await client!.query("DELETE FROM triples");
     await client!.query("DELETE FROM entity_aliases");
     await client!.query("DELETE FROM entities");
     await client!.query("DELETE FROM chunks");
@@ -209,5 +214,232 @@ describePg("PgvectorBackend storage reads (T1)", () => {
     await expect(backend!.listTimeline({ offset: -1 })).rejects.toMatchObject({
       code: "INVALID_INPUT",
     });
+    await expect(backend!.listSourceDocs({ limit: 0 })).rejects.toBeInstanceOf(
+      GraphragError
+    );
+    await expect(backend!.listSourceDocs({ offset: -1 })).rejects.toMatchObject(
+      { code: "INVALID_INPUT" }
+    );
+  });
+
+  it("lists 资料 summaries in created order WITHOUT the content body", async () => {
+    const refA = `specs/t6/${randomUUID()}`;
+    const refB = `specs/t6/${randomUUID()}`;
+    await backend!.upsertSourceDoc({
+      id: randomUUID(),
+      source_ref: refA,
+      title: "第一条",
+      content: "full body one — must not appear in the list",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    await backend!.upsertSourceDoc({
+      id: randomUUID(),
+      source_ref: refB,
+      title: null,
+      content: "full body two — must not appear in the list",
+      created_at: "2026-01-02T00:00:00.000Z",
+    });
+
+    const page = await backend!.listSourceDocs({ limit: 100, offset: 0 });
+    const ours = page.items.filter(
+      (item) => item.source_ref === refA || item.source_ref === refB
+    );
+    expect(ours.map((item) => item.source_ref)).toEqual([refA, refB]);
+    expect(ours[0]).toMatchObject({
+      title: "第一条",
+      valid_until: null,
+    });
+    expect(ours[1]!.title).toBeNull();
+    // On-demand list: summaries only — no full-corpus body fetch.
+    const serialized = JSON.stringify(ours);
+    expect(serialized).not.toContain("full body one");
+    expect(serialized).not.toContain("full body two");
+  });
+
+  it("persists 就绪 / 失败 status and derives chunk_count from back-pointers", async () => {
+    // corpus-ready retrieve T3 against the real schema: status is a stored
+    // column (not inferred), the count is a correlated COUNT over
+    // chunks.source_doc_id (not a second mutable counter), and the
+    // collection name is the single process-wide constant.
+    const readyRef = `specs/t3/${randomUUID()}`;
+    const readyId = randomUUID();
+    await backend!.upsertSourceDoc({
+      id: readyId,
+      source_ref: readyRef,
+      title: "就绪资料",
+      content: "ready body",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    await backend!.upsert([
+      makeChunk({
+        id: randomUUID(),
+        source_ref: readyRef,
+        source_doc_id: readyId,
+        ordinal: 0,
+      }),
+      makeChunk({
+        id: randomUUID(),
+        source_ref: readyRef,
+        source_doc_id: readyId,
+        ordinal: 1,
+      }),
+    ]);
+    await backend!.markSourceDocReady(readyId);
+
+    const failedRef = `specs/t3/${randomUUID()}`;
+    const failedId = randomUUID();
+    await backend!.upsertSourceDoc({
+      id: failedId,
+      source_ref: failedRef,
+      title: "失败资料",
+      content: "failed body",
+      created_at: "2026-01-02T00:00:00.000Z",
+    });
+    await backend!.recordSourceDocFailure(failedRef, "CONTENT_TOO_LARGE");
+
+    const page = await backend!.listSourceDocs({ limit: 100, offset: 0 });
+    const ready = page.items.find((item) => item.source_ref === readyRef);
+    const failed = page.items.find((item) => item.source_ref === failedRef);
+    expect(ready).toMatchObject({
+      status: "ready",
+      failure_code: null,
+      chunk_count: 2,
+      collection: "默认资料集合",
+    });
+    expect(failed).toMatchObject({
+      status: "failed",
+      failure_code: "CONTENT_TOO_LARGE",
+      chunk_count: 0,
+    });
+    // A 资料 row written before the status columns existed reads as 进行中.
+    const freshRef = `specs/t3/${randomUUID()}`;
+    await client!.query(
+      `INSERT INTO source_documents (id, source_ref, content)
+         VALUES ($1, $2, $3)`,
+      [randomUUID(), freshRef, "legacy row"]
+    );
+    const freshPage = await backend!.listSourceDocs({ limit: 100, offset: 0 });
+    expect(
+      freshPage.items.find((item) => item.source_ref === freshRef)
+    ).toMatchObject({ status: "in_progress", chunk_count: 0 });
+  });
+
+  it("a plain re-upsert resets a previously 就绪 / 失败 资料 back to 进行中", async () => {
+    // The push write path sends status in_progress on every 资料 upsert and
+    // only calls markSourceDocReady after the chunk rows are durable. If the
+    // upsert ignored that field (the earlier pending-ALTER schema had no
+    // status column to write), a re-push would read 就绪 / 失败 throughout
+    // the rebuild window — a status the store cannot back with rows.
+    const readyRef = `specs/t3/${randomUUID()}`;
+    const readyId = randomUUID();
+    await backend!.upsertSourceDoc({
+      id: readyId,
+      source_ref: readyRef,
+      title: "旧就绪",
+      content: "old body",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    await backend!.markSourceDocReady(readyId);
+
+    await backend!.upsertSourceDoc({
+      id: readyId,
+      source_ref: readyRef,
+      title: "新正文",
+      content: "new body",
+      created_at: "2026-01-02T00:00:00.000Z",
+      status: "in_progress",
+      failure_code: null,
+    });
+    const duringRebuild = await backend!.getSourceDoc(readyRef);
+    if (!duringRebuild.ok) throw new Error("expected source doc");
+    expect(duringRebuild.value.status).toBe("in_progress");
+    expect(duringRebuild.value.failure_code).toBeNull();
+
+    // Same contract for a 失败 资料: a re-push clears the failure code.
+    const failedRef = `specs/t3/${randomUUID()}`;
+    const failedId = randomUUID();
+    await backend!.upsertSourceDoc({
+      id: failedId,
+      source_ref: failedRef,
+      title: "旧失败",
+      content: "blocked body",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    await backend!.recordSourceDocFailure(failedRef, "INVALID_INPUT");
+
+    await backend!.upsertSourceDoc({
+      id: failedId,
+      source_ref: failedRef,
+      title: "重推",
+      content: "retried body",
+      created_at: "2026-01-02T00:00:00.000Z",
+      status: "in_progress",
+      failure_code: null,
+    });
+    const retried = await backend!.getSourceDoc(failedRef);
+    if (!retried.ok) throw new Error("expected source doc");
+    expect(retried.value.status).toBe("in_progress");
+    expect(retried.value.failure_code).toBeNull();
+  });
+
+  it("exposes the four fields on the detail path and never invents a 资料 on failure", async () => {
+    const ref = `specs/t3/${randomUUID()}`;
+    const docId = randomUUID();
+    await backend!.upsertSourceDoc({
+      id: docId,
+      source_ref: ref,
+      title: "详情",
+      content: "detail body",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    await backend!.upsert([
+      makeChunk({ id: randomUUID(), source_ref: ref, source_doc_id: docId }),
+    ]);
+    await backend!.markSourceDocReady(docId);
+
+    const byRef = await backend!.getSourceDoc(ref);
+    const byId = await backend!.getSourceDocById(docId);
+    for (const read of [byRef, byId]) {
+      expect(read.ok).toBe(true);
+      if (!read.ok) throw new Error("expected source doc");
+      expect(read.value).toMatchObject({
+        collection: "默认资料集合",
+        status: "ready",
+        chunk_count: 1,
+        failure_code: null,
+      });
+    }
+
+    // Best-effort failure record: an unknown source_ref matches zero rows
+    // and must NOT invent a row (matches the memory backend contract).
+    const missingRef = `specs/t3/${randomUUID()}`;
+    await backend!.recordSourceDocFailure(missingRef, "INVALID_INPUT");
+    const missing = await backend!.getSourceDoc(missingRef);
+    expect(missing).toEqual({ ok: false, code: "NOT_FOUND" });
+  });
+
+  it("exposes closed valid_until for an invalidated 资料", async () => {
+    const ref = `specs/t6/${randomUUID()}`;
+    const docId = randomUUID();
+    await backend!.upsertSourceDoc({
+      id: docId,
+      source_ref: ref,
+      title: "已失效",
+      content: "stale body",
+      created_at: "2026-01-01T00:00:00.000Z",
+    });
+    // invalidateSourceRef requires a matching chunk row; T5 closes the
+    // 资料 window in the same transaction.
+    await backend!.upsert([makeChunk({ id: randomUUID(), source_ref: ref })]);
+    await backend!.invalidateSourceRef(
+      ref,
+      "2026-06-01T00:00:00.000Z",
+      "t6-pg"
+    );
+
+    const page = await backend!.listSourceDocs({ limit: 100, offset: 0 });
+    const hit = page.items.find((item) => item.source_ref === ref);
+    expect(hit).toBeDefined();
+    expect(hit!.valid_until).toBe("2026-06-01T00:00:00.000Z");
   });
 });

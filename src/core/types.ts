@@ -15,7 +15,78 @@ export interface ChunkRecord {
   valid_from: string; // ISO 8601 datetime
   valid_until: string | null; // null = forever valid
   created_at: string; // ISO 8601 datetime
+  /**
+   * Back-pointer to the 资料 row this chunk was sliced from
+   * (operator-console T1). Optional on the read path so legacy chunk
+   * rows written before T1 still load; new ingest/push writes populate
+   * both fields (T3 enforces required on the envelope write path).
+   */
+  source_doc_id?: string;
+  /** Zero-based ordinal of this chunk within its source document. */
+  ordinal?: number;
 }
+
+/**
+ * A 资料 prose SoR row (operator-console T1 / ADR-0010).
+ *
+ * One row holds the full body text the injector pushed; the dashboard and
+ * `read_source` MCP tool return this body. Chunks back-point to this row
+ * via `chunks.source_doc_id` + `chunks.ordinal` so a derived slice stays
+ * traceable to its source.
+ */
+export interface SourceDocRecord {
+  id: string;
+  source_ref: string;
+  title: string | null;
+  content: string;
+  created_at: string;
+  /**
+   * Close of the 资料 validity window (operator-console T5). `null` =
+   * forever valid — the ingest/push write path always writes `null`
+   * (an opening push is never a close). Set by `invalidateSourceRef`
+   * in the same transaction that closes the derived chunk windows.
+   * Optional on the read path so callers written before T5 still load.
+   */
+  valid_until?: string | null;
+  /**
+   * Persisted 就绪 status (corpus-ready retrieve T3). Optional on the WRITE
+   * path so callers written before T3 still load; a push with no explicit
+   * status records 进行中. The storage layer never derives status from
+   * `valid_until` — a closed window is invalidation, a different concept.
+   */
+  status?: SourceDocStatus;
+  /** Stable code of the last failed push; written with `status: "failed"`. */
+  failure_code?: string | null;
+}
+
+/**
+ * 资料 status vocabulary (corpus-ready retrieve T3).
+ *
+ * PERSISTED, not derived: `in_progress` is written when a push starts and a
+ * failure is written when one fails, so the 资料页 can name 失败 for a
+ * locator whose envelope never produced a chunk row.
+ */
+export const SOURCE_DOC_STATUS = {
+  /** A push for this 资料 is in flight (or landed no chunk yet). */
+  IN_PROGRESS: "in_progress",
+  /** The last push succeeded and ≥1 chunk row exists. */
+  READY: "ready",
+  /** The last push for this 资料 failed; `failure_code` says how. */
+  FAILED: "failed",
+} as const;
+
+export type SourceDocStatus =
+  (typeof SOURCE_DOC_STATUS)[keyof typeof SOURCE_DOC_STATUS];
+
+/**
+ * v1 is a SINGLE process-wide 资料集合 (spec Open Question 2, leading
+ * option): every stored 资料 belongs to the one collection the operator
+ * sees on the existing 资料页. A collections table would be a schema,
+ * routing, and permissions question with no v1 consumer, so the name is a
+ * constant — stable for the wire, the dashboard, and fin's operator copy.
+ * Revisit when a second collection actually has to coexist.
+ */
+export const SOURCE_DOC_COLLECTION_NAME = "默认资料集合";
 
 /** Input to the ingest tool (after Zod validation). */
 export interface IngestInput {
@@ -58,6 +129,50 @@ export interface StorageBackend {
     opts: SearchOptions
   ): Promise<RetrievedChunk[]>;
   close(): Promise<void>;
+  /**
+   * Insert-or-update a 资料 row keyed by `source_ref`. The same locator
+   * always maps to the same `id` (operator-console T3 — re-push is the
+   * concurrent class). Returns the persisted record. Idempotent: a
+   * re-push with the same body returns the existing row unchanged;
+   * a re-push with a different body replaces `title` / `content`.
+   */
+  upsertSourceDoc(doc: SourceDocRecord): Promise<SourceDocRecord>;
+  /**
+   * Drop every chunk row that back-points to `sourceDocId`. Used by
+   * T3's re-push rebuild semantics: a same-locator re-push wipes the
+   * derived chunk rows for that doc before inserting the new set.
+   * Chunks without a back-pointer (legacy rows) are NOT touched.
+   *
+   * `excludeChunkIds` lists chunks that should NOT be deleted even though
+   * they back-point to `sourceDocId` — typically the ones the caller is
+   * about to upsert under the same id (so `preserveInvalidationState`
+   * can keep the closed-row state on a same-content re-push). When
+   * omitted the call behaves as before: drop every back-pointed chunk.
+   */
+  deleteChunksForSourceDoc(
+    sourceDocId: string,
+    excludeChunkIds?: Iterable<string>
+  ): Promise<void>;
+  /**
+   * List every chunk row that back-points to `sourceDocId`, ordered by
+   * ordinal ascending. Used by T4 read_source and the dashboard detail.
+   */
+  listChunksBySourceDoc(sourceDocId: string): Promise<StorageChunkView[]>;
+  /**
+   * Record that the last push for `sourceDocId` produced at least one
+   * successful chunk row (corpus-ready retrieve T3). Ready additionally
+   * requires ≥1 chunk row; the count itself is always derived from the
+   * back-pointers, so this call only moves the status.
+   */
+  markSourceDocReady(sourceDocId: string): Promise<void>;
+  /**
+   * Record a failed push against a 资料 that is ALREADY known, keyed by
+   * `sourceRef` (corpus-ready retrieve T3). Best-effort by contract: an
+   * unknown locator is a no-op, never an invented row — the 资料页 shows
+   * 失败 for a locator the store has seen, and a push that fails before
+   * any 资料 row exists has nothing to attach the failure to.
+   */
+  recordSourceDocFailure(sourceRef: string, errorCode: string): Promise<void>;
 }
 
 /**
@@ -86,6 +201,10 @@ export interface StorageChunkView {
   valid_from: string;
   valid_until: string | null;
   metadata: Record<string, unknown>;
+  /** Back-pointer to the 资料 row this chunk was sliced from (operator-console T3). */
+  source_doc_id?: string;
+  /** Zero-based ordinal of this chunk within its source document. */
+  ordinal?: number;
 }
 
 export interface StorageEntityView {
@@ -94,6 +213,42 @@ export interface StorageEntityView {
   type: string;
   retired: boolean;
   aliases: string[];
+}
+
+/** Read-only view of a 资料 (source_documents) row for operator UI / read_source. */
+export interface StorageSourceDocView {
+  id: string;
+  source_ref: string;
+  title: string | null;
+  content: string;
+  created_at: string;
+  /**
+   * Close of the 资料 validity window (operator-console T5). `null` when
+   * the 资料 is still valid; a timestamp once content invalidation has
+   * closed it. Exposed so the dashboard list can show invalidation state
+   * without a second query.
+   */
+  valid_until: string | null;
+  /**
+   * Process-wide 资料集合 name (corpus-ready retrieve T3). v1 is a single
+   * implicit collection — see `SOURCE_DOC_COLLECTION_NAME`. Present on
+   * every 资料 so the 资料页 can show the field without a collections
+   * table.
+   */
+  collection: string;
+  /** Persisted 就绪 status — see `SOURCE_DOC_STATUS`. */
+  status: SourceDocStatus;
+  /**
+   * Stable code of the last failed push, or `null` when the last outcome
+   * was not a failure. Required only when `status === "failed"`.
+   */
+  failure_code: string | null;
+  /**
+   * Successful chunk count, DERIVED from `chunks.source_doc_id`
+   * back-pointers (never a second mutable counter that could drift from
+   * the rows).
+   */
+  chunk_count: number;
 }
 
 export type StorageTimelineEvent =
@@ -132,6 +287,50 @@ export interface StorageReadPort {
   listTimeline(
     opts?: StorageListOptions
   ): Promise<StoragePage<StorageTimelineEvent>>;
+  /**
+   * Fetch a 资料 (source_documents) row by its source_ref locator. Used by
+   * T4's `read_source` MCP tool and the dashboard detail page.
+   */
+  getSourceDoc(
+    sourceRef: string
+  ): Promise<StorageReadResult<StorageSourceDocView>>;
+  /**
+   * Fetch a 资料 (source_documents) row by its primary-key id. Used by
+   * the dashboard list→detail navigation when only the id is on hand.
+   */
+  getSourceDocById(
+    id: string
+  ): Promise<StorageReadResult<StorageSourceDocView>>;
+  /**
+   * List 资料 (source_documents) summaries in creation order. Summaries
+   * carry NO `content` — the dashboard list is on-demand (operator-console
+   * T6: no full-corpus body fetch when listing); the body is fetched by
+   * `getSourceDocById` when a row is opened.
+   */
+  listSourceDocs(
+    opts?: StorageListOptions
+  ): Promise<StoragePage<StorageSourceDocSummary>>;
+}
+
+/**
+ * List-row projection of a 资料: everything the operator list needs,
+ * without the full body. `title` is nullable — an empty title displays
+ * `source_ref` on the board.
+ */
+export interface StorageSourceDocSummary {
+  id: string;
+  source_ref: string;
+  title: string | null;
+  created_at: string;
+  valid_until: string | null;
+  /** Process-wide 资料集合 name (corpus-ready retrieve T3). */
+  collection: string;
+  /** Persisted 就绪 status — see `SOURCE_DOC_STATUS`. */
+  status: SourceDocStatus;
+  /** Stable code of the last failed push, or `null`. */
+  failure_code: string | null;
+  /** Successful chunk count, derived from the chunk back-pointers. */
+  chunk_count: number;
 }
 
 export interface SearchOptions {

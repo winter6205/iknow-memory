@@ -173,6 +173,35 @@ describe("createRetrieveHandler", () => {
       const body = parseResultBody(result);
       expect(body).toEqual({ chunks: [] });
     });
+
+    it("returns exactly { chunks: [] } with the hybrid config (vector ∥ BM25) enabled", async () => {
+      // T1 gap: the bare empty-store case above runs without a retrieve
+      // config, and hybrid-arms.test.ts never exercises an unseeded
+      // backend. The production config enables the BM25 arm, so pin that
+      // an empty ledger is still a legal empty answer with no `degraded`
+      // flag — zero hits found by an arm that ran is not a degradation
+      // (spec SC4; graph arm off so no unattempted-graph reason applies).
+      const hybridHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage: new MemoryBackend(TEST_DIM),
+        retrieveConfig: {
+          w_vec: 0.7,
+          w_bm25: 0.15,
+          w_graph: 0.15,
+          bm25Enabled: true,
+          graphEnabled: false,
+          rerankEnabled: false,
+          entityLinkTopK: 8,
+          candidateCap: 50,
+          graphArmFloor: 3,
+        },
+      });
+      const result = await hybridHandler({ query: "anything" });
+      const body = parseResultBody(result);
+      expect(body).toEqual({ chunks: [] });
+      expect(body).not.toHaveProperty("degraded");
+      expect(body).not.toHaveProperty("degraded_reasons");
+    });
   });
 
   describe("limit override", () => {

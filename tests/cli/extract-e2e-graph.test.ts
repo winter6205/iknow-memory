@@ -24,7 +24,8 @@
  * SKIPS LOUDLY with the documented Validation block — never silently passes.
  */
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { Client as PgClient, Pool as PgPool } from "pg";
@@ -109,6 +110,7 @@ function runCliSubprocess(
         GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED: "false",
         GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
         ...envOverrides,
+        HOME: mkdtempSync(join(tmpdir(), "iknow-extract-e2e-home-")),
         PATH: process.env.PATH ?? "",
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -158,6 +160,7 @@ async function connectServer(envOverrides: Record<string, string>): Promise<{
       // nonexistent cluster and flip these envelopes to all-arms-failed.
       GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
       ...envOverrides,
+      HOME: mkdtempSync(join(tmpdir(), "iknow-extract-e2e-server-home-")),
       PATH: process.env.PATH ?? "",
     },
     stderr: "pipe",

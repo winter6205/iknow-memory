@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import { ConfigError, loadEnv } from "../src/config.ts";
+import { ConfigError, loadEnv, setSettingHomeForTests } from "../src/config.ts";
 
 /**
  * Config contract — stage 0 is stdio-only.
@@ -244,6 +247,17 @@ function maskDotenvLocal(keys: readonly string[]): void {
   for (const k of keys) process.env[k] = "";
 }
 
+function withSettingIsolated(fn: () => void): void {
+  const settingHome = mkdtempSync(join(tmpdir(), "iknow-config-setting-"));
+  setSettingHomeForTests(settingHome);
+  try {
+    fn();
+  } finally {
+    setSettingHomeForTests(null);
+    rmSync(settingHome, { recursive: true, force: true });
+  }
+}
+
 function withIsolatedEnv(
   keys: readonly string[],
   patch: Record<string, string | undefined>,
@@ -258,9 +272,13 @@ function withIsolatedEnv(
     if (!saved.has(k)) saved.set(k, process.env[k]);
     process.env[k] = v === undefined ? "" : v;
   }
+  const settingHome = mkdtempSync(join(tmpdir(), "iknow-config-setting-"));
+  setSettingHomeForTests(settingHome);
   try {
     fn();
   } finally {
+    setSettingHomeForTests(null);
+    rmSync(settingHome, { recursive: true, force: true });
     for (const [k, v] of saved) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -948,7 +966,7 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
       else process.env[k] = v;
     }
     try {
-      fn();
+      withSettingIsolated(fn);
     } finally {
       for (const [k, v] of saved) {
         if (v === undefined) delete process.env[k];
@@ -1490,7 +1508,7 @@ describe("loadEnv — Neo4j sidecar config", () => {
       else process.env[k] = v;
     }
     try {
-      fn();
+      withSettingIsolated(fn);
     } finally {
       for (const [k, v] of saved) {
         if (v === undefined) delete process.env[k];

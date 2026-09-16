@@ -1,7 +1,22 @@
 /**
  * Ingest tool — writes text content into the memory store.
  *
- * Pipeline: validate → size check → embed → store.
+ * Pipeline (operator-console T3 envelope):
+ *  1. Validate the one envelope: { source_ref, content: <body>, chunks: [{ content, index }] }.
+ *     A one-slice list is allowed (body must equal that slice). Multi-slice
+ *     slices must be contiguous substrings of the body in order with indexes 0..N-1.
+ *  2. Upsert the 资料 SoR row (keyed by source_ref; same id on re-push).
+ *  3. Rebuild the chunk rows: delete the previous chunks back-pointed to that
+ *     资料, then insert the new ordinal chunk rows (one envelope = one rebuild).
+ *  4. Embed slice texts (not the body) and store each chunk with
+ *     source_doc_id + ordinal back-pointers.
+ *
+ * Backward-compat: if the caller sends the legacy single-content or batch
+ * shape WITHOUT a `chunks` field, each item is treated as a one-slice envelope
+ * (body=item content, chunks=[{content: item.content, index: 0}]). fin's old
+ * push_port shape adapts through the same path. The new envelope is the
+ * documented primary shape.
+ *
  * The tool is write-only (specs/mcp-tool-surface.md): content invalidation
  * is a separate `invalidate` tool, never an ingest action.
  */
@@ -14,57 +29,107 @@ import {
 } from "./registry.js";
 import { resolveToolBatchLimit } from "./batch-limit.js";
 import type { EmbeddingClient } from "../core/embedder.js";
-import type { ChunkRecord, StorageBackend } from "../core/types.js";
+import type {
+  ChunkRecord,
+  SourceDocRecord,
+  StorageBackend,
+} from "../core/types.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
 import { GraphragError, MAX_CONTENT_BYTES } from "../core/errors.js";
 import type { Logger } from "../logging.js";
+import {
+  findSliceInvariantViolations,
+  refineSliceInvariants,
+} from "./slice-invariants.js";
 
 /**
- * Zod schema for the ingest input. Mirrors `IngestInput` in core/types.ts
- * but with validation rules attached.
+ * A single slice in the new envelope.
  *
- * - `content` and `source_ref` are required (loose ingest).
- * - `metadata`: optional string-keyed map of unknown values.
- * - `valid_from` / `valid_until`: optional ISO 8601 datetimes. The semantic
- *   check (valid_from < valid_until) lives in the handler, not the schema,
- *   because it depends on cross-field comparison.
- * - Strict object (specs/mcp-tool-surface.md SC2): unknown keys — including
- *   the removed `action` / `invalidated_at` / `triggered_by` invalidate
- *   fields — are validation errors, never silently stripped.
+ * `index` is the zero-based ordinal inside the 资料 body. The handler
+ * validates that the indexes are dense and start at 0 (the schema
+ * enforces it via superRefine).
  */
-const IngestBatchItemSchema = z.object({
+const ChunkSliceSchema = z.object({
+  content: z.string().min(1, "chunk content must be a non-empty string"),
+  index: z.number().int().min(0, "chunk index must be a non-negative integer"),
+});
+
+/**
+ * New envelope shape (operator-console T3):
+ *   { source_ref, content: <body>, chunks: [{ content, index }], title?, ... }
+ *
+ * Strict (z.strictObject) — unknown keys are a typed validation error.
+ *
+ * The `superRefine` below enforces the fin freeze invariant (each chunk
+ * content is a contiguous substring of the body, in order) and the
+ * dense 0..N-1 index rule. Server-side these are not optional — a
+ * non-substring slice or a gap in indexes is a typed INVALID_INPUT.
+ */
+const EnvelopeShapeSchema = z
+  .strictObject({
+    source_ref: z.string().min(1, "source_ref must be a non-empty string"),
+    content: z.string().min(1, "content must be a non-empty string"),
+    chunks: z
+      .array(ChunkSliceSchema)
+      .min(1, "chunks must contain at least one slice"),
+    title: z.string().min(1).optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
+    valid_from: z.string().datetime().optional(),
+    valid_until: z.string().datetime().optional(),
+  })
+  .superRefine(refineSliceInvariants);
+
+/**
+ * Legacy single-content shape:
+ *   { content: <string>, source_ref, metadata?, valid_from?, valid_until? }
+ * The body equals the content; one-slice envelope.
+ */
+const LegacySingleSchema = z.strictObject({
   content: z.string().min(1, "content must be a non-empty string"),
-  source_ref: z
-    .string()
-    .min(1, "source_ref must be a non-empty string")
-    .optional(),
+  source_ref: z.string().min(1, "source_ref must be a non-empty string"),
   metadata: z.record(z.string(), z.unknown()).optional(),
   valid_from: z.string().datetime().optional(),
   valid_until: z.string().datetime().optional(),
 });
 
-const IngestContentSchema = z.union([
+/**
+ * Legacy batch shape:
+ *   { content: [string | { content, source_ref?, ... }, ...], source_ref, ... }
+ *
+ * Bare-string items inherit the top-level `source_ref` and become a
+ * one-slice envelope each (the legacy T7 batch ingest surface). Object
+ * items may carry their own `source_ref` / metadata / window.
+ */
+const LegacyBatchItemSchema = z.union([
   z.string().min(1, "content must be a non-empty string"),
-  z.array(z.union([z.string().min(1), IngestBatchItemSchema])),
-]);
-
-export const IngestInputSchema = z
-  .strictObject({
-    content: IngestContentSchema.optional(),
-    source_ref: z.string().min(1, "source_ref must be a non-empty string"),
+  z.object({
+    content: z.string().min(1, "content must be a non-empty string"),
+    source_ref: z.string().min(1).optional(),
     metadata: z.record(z.string(), z.unknown()).optional(),
     valid_from: z.string().datetime().optional(),
     valid_until: z.string().datetime().optional(),
-  })
-  .superRefine((input, ctx) => {
-    if (input.content === undefined) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["content"],
-        message: "content is required for ingest",
-      });
-    }
-  });
+  }),
+]);
+const LegacyBatchSchema = z.strictObject({
+  content: z
+    .array(LegacyBatchItemSchema)
+    .min(1, "content batch must not be empty"),
+  source_ref: z.string().min(1, "source_ref must be a non-empty string"),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+  valid_from: z.string().datetime().optional(),
+  valid_until: z.string().datetime().optional(),
+});
+
+/**
+ * Discriminated union over the three accepted shapes. The handler picks the
+ * right path based on which keys are present (`chunks` ⇒ new envelope,
+ * `content: string` ⇒ legacy single, `content: array` ⇒ legacy batch).
+ */
+export const IngestInputSchema = z.union([
+  EnvelopeShapeSchema,
+  LegacySingleSchema,
+  LegacyBatchSchema,
+]);
 
 /** Inferred TypeScript type for the parsed ingest input. */
 export type IngestInput = z.infer<typeof IngestInputSchema>;
@@ -132,6 +197,29 @@ export function computeChunkId(
   ].join("-");
 }
 
+/**
+ * Derive a stable 资料 (source_documents) id from the source_ref locator.
+ *
+ * Same locator → same id across re-pushes (the concurrent class in the spec
+ * must collapse to one 资料 row). UUID shape matches the existing
+ * `chunks` row PK so foreign keys stay uniform.
+ */
+export function computeSourceDocId(sourceRef: string): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([sourceRef]), "utf8")
+    .digest();
+  digest[6] = (digest[6]! & 0x0f) | 0x40;
+  digest[8] = (digest[8]! & 0x3f) | 0x80;
+  const hex = digest.subarray(0, 16).toString("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20),
+  ].join("-");
+}
+
 /** Dependencies injected at wiring time (T7). */
 export interface IngestDeps {
   embedder: EmbeddingClient;
@@ -169,69 +257,121 @@ export class BatchLimitExceededError extends GraphragError {
   }
 }
 
-interface NormalizedIngestItem {
-  content: string;
+/**
+ * Normalized envelope that the handler writes per-call.
+ *
+ * One ingest call may carry multiple envelopes when the legacy batch shape
+ * arrives; the new envelope is always exactly one envelope per call.
+ */
+interface NormalizedEnvelope {
   source_ref: string;
+  title: string | null;
+  content: string;
+  slices: Array<{ content: string; ordinal: number }>;
   metadata: Record<string, unknown>;
   valid_from: string | undefined;
   valid_until: string | undefined;
 }
 
-function normalizeIngestItems(input: IngestInput): NormalizedIngestItem[] {
-  const content = input.content;
-  if (content === undefined) {
-    throw new GraphragError(
-      "ingest: content must be provided",
-      "INVALID_INPUT"
-    );
-  }
-  if (typeof content === "string") {
-    if (input.source_ref === undefined) {
-      throw new GraphragError(
-        "ingest: source_ref must be provided",
-        "INVALID_INPUT"
-      );
-    }
+/**
+ * Pick the union branch and normalize it into one or more envelopes.
+ *
+ * - New envelope: one envelope, validate slice contiguous-substring invariant.
+ * - Legacy single: one envelope, one slice equal to the body.
+ * - Legacy batch: N envelopes, one slice each equal to that item's content.
+ */
+function normalizeIngestInput(input: IngestInput): NormalizedEnvelope[] {
+  // The union arms are distinguished by the presence of `chunks` (new)
+  // versus the shape of `content` (legacy single string vs legacy batch array).
+  if ("chunks" in input && input.chunks !== undefined) {
+    const env = input;
+    assertSliceInvariants(env.content, env.chunks);
     return [
       {
-        content,
-        source_ref: input.source_ref,
-        metadata: input.metadata ?? {},
-        valid_from: input.valid_from,
-        valid_until: input.valid_until,
+        source_ref: env.source_ref,
+        title: env.title ?? null,
+        content: env.content,
+        slices: env.chunks.map((slice) => ({
+          content: slice.content,
+          ordinal: slice.index,
+        })),
+        metadata: env.metadata ?? {},
+        valid_from: env.valid_from,
+        valid_until: env.valid_until,
       },
     ];
   }
-  if (!Array.isArray(content)) {
+  // Legacy branch: `content` is either a string (single) or array (batch).
+  const legacy = input as Exclude<IngestInput, { chunks: unknown[] }>;
+  if (typeof legacy.content === "string") {
+    return [
+      {
+        source_ref: legacy.source_ref,
+        title: null,
+        content: legacy.content,
+        slices: [{ content: legacy.content, ordinal: 0 }],
+        metadata: legacy.metadata ?? {},
+        valid_from: legacy.valid_from,
+        valid_until: legacy.valid_until,
+      },
+    ];
+  }
+  // Legacy batch: each item becomes a one-slice envelope. All items share
+  // the top-level source_ref, so they are slices of the same 资料 — the
+  // ordinal is the item's position in the batch, which keeps the
+  // (source_doc_id, ordinal) unique index satisfied and gives the derived
+  // chunks a stable order (the pre-T3 batch surface had no ordinal concept;
+  // array position is the closest faithful mapping).
+  return legacy.content.map((item, position) => {
+    if (typeof item === "string") {
+      return {
+        source_ref: legacy.source_ref,
+        title: null,
+        content: item,
+        slices: [{ content: item, ordinal: position }],
+        metadata: legacy.metadata ?? {},
+        valid_from: legacy.valid_from,
+        valid_until: legacy.valid_until,
+      };
+    }
+    // An object item carrying its own source_ref is its own 资料 — its
+    // one slice is ordinal 0. Only items inheriting the top-level
+    // source_ref are slices of the batch 资料 and take the position.
+    const ownSourceRef = item.source_ref ?? legacy.source_ref;
+    const ordinal =
+      item.source_ref !== undefined && item.source_ref !== legacy.source_ref
+        ? 0
+        : position;
+    return {
+      source_ref: ownSourceRef,
+      title: null,
+      content: item.content,
+      slices: [{ content: item.content, ordinal }],
+      metadata: item.metadata ?? legacy.metadata ?? {},
+      valid_from: item.valid_from ?? legacy.valid_from,
+      valid_until: item.valid_until ?? legacy.valid_until,
+    };
+  });
+}
+
+/**
+ * Handler-side enforcement of the fin freeze invariant, over the shared walk
+ * in slice-invariants.ts. The schema already refines the same list; this is
+ * defense in depth, so a regression that loosens the schema is still caught.
+ * A typed INVALID_INPUT is thrown on the FIRST violation — validation never
+ * raises a bare Error.
+ */
+function assertSliceInvariants(
+  body: string,
+  chunks: ReadonlyArray<{ content: string; index: number }>
+): void {
+  const violations = findSliceInvariantViolations(body, chunks);
+  if (violations.length > 0) {
     throw new GraphragError(
-      "ingest: content must be a string or a batch array",
+      `ingest: ${violations[0]!.message}`,
       "INVALID_INPUT"
     );
   }
-  return content.map((item) => {
-    if (typeof item === "string") {
-      if (input.source_ref === undefined) {
-        throw new GraphragError(
-          "ingest: source_ref must be provided for string batch items",
-          "INVALID_INPUT"
-        );
-      }
-      return {
-        content: item,
-        source_ref: input.source_ref,
-        metadata: input.metadata ?? {},
-        valid_from: input.valid_from,
-        valid_until: input.valid_until,
-      };
-    }
-    return {
-      content: item.content,
-      source_ref: item.source_ref ?? input.source_ref,
-      metadata: item.metadata ?? input.metadata ?? {},
-      valid_from: item.valid_from ?? input.valid_from,
-      valid_until: item.valid_until ?? input.valid_until,
-    };
-  });
 }
 
 /**
@@ -247,28 +387,41 @@ function normalizeIngestItems(input: IngestInput): NormalizedIngestItem[] {
 export { embedWithLog } from "../core/embed-log.js";
 import { embedWithLog } from "../core/embed-log.js";
 
-function validateIngestItem(item: NormalizedIngestItem): void {
-  if (
-    typeof item.content !== "string" ||
-    item.content.length === 0 ||
-    typeof item.source_ref !== "string" ||
-    item.source_ref.length === 0
-  ) {
+/**
+ * Per-envelope preflight: per-chunk size cap (1MB), empty-content reject,
+ * and (when supplied) valid_window ordering. The cap is per chunk — the
+ * body itself may be larger than 1MB because we only embed and store slices.
+ *
+ * Empty content is rejected as INVALID_INPUT. The schema enforces `.min(1)`
+ * on the new envelope and the object form of the legacy batch, but a
+ * bare-string legacy batch item could still be empty when callers go
+ * around the schema. Rejecting here keeps a single source of truth.
+ */
+function validateEnvelopeSizes(env: NormalizedEnvelope): void {
+  if (env.content.length === 0) {
     throw new GraphragError(
-      "ingest: content and source_ref must be non-empty strings",
+      "ingest: content must be a non-empty string",
       "INVALID_INPUT"
     );
   }
-  const byteLength = Buffer.byteLength(item.content, "utf8");
-  if (byteLength > MAX_CONTENT_BYTES) {
-    throw new GraphragError(
-      `ingest: content size ${byteLength} bytes exceeds limit ${MAX_CONTENT_BYTES} (1MB)`,
-      "CONTENT_TOO_LARGE"
-    );
+  for (const slice of env.slices) {
+    if (slice.content.length === 0) {
+      throw new GraphragError(
+        `ingest: chunks[${slice.ordinal}] content must be a non-empty string`,
+        "INVALID_INPUT"
+      );
+    }
+    const byteLength = Buffer.byteLength(slice.content, "utf8");
+    if (byteLength > MAX_CONTENT_BYTES) {
+      throw new GraphragError(
+        `ingest: chunk ${slice.ordinal} content size ${byteLength} bytes exceeds limit ${MAX_CONTENT_BYTES} (1MB)`,
+        "CONTENT_TOO_LARGE"
+      );
+    }
   }
-  if (item.valid_from && item.valid_until) {
-    const fromMs = Date.parse(item.valid_from);
-    const untilMs = Date.parse(item.valid_until);
+  if (env.valid_from && env.valid_until) {
+    const fromMs = Date.parse(env.valid_from);
+    const untilMs = Date.parse(env.valid_until);
     if (Number.isNaN(fromMs) || Number.isNaN(untilMs)) {
       throw new GraphragError(
         "ingest: valid_from / valid_until are not valid ISO 8601 timestamps",
@@ -288,37 +441,49 @@ function validateIngestItem(item: NormalizedIngestItem): void {
  * Build the ingest handler with the given dependencies closed over.
  *
  * Order of checks (and why this order):
- *  1. Schema — already done by Zod before the handler runs.
- *  2. Size — cheap byte-length check, prevents the expensive embed
- *     pipeline from running on a multi-MB payload.
- *  3. Semantic — valid_from < valid_until. Must be explicit (a `>=` window
- *     would be either always-empty or instant-expiry, both bugs).
- *  4. Embed → upsert.
+ *  1. Schema — already done by Zod before the handler runs (union arms).
+ *  2. Normalize to envelopes, validate slice / window invariants.
+ *  3. Size — per-chunk 1MB cap, before the embed pipeline runs.
+ *  4. Embed → upsert 资料 row → rebuild chunk rows (delete + insert).
+ *
+ * Rebuild semantics (operator-console T3):
+ *  - Upsert the source_documents row keyed by source_ref (idempotent on locator).
+ *  - For the (possibly multiple) 资料 rows about to be written, delete every
+ *    chunk row back-pointed to that source_doc_id before inserting the new
+ *    chunks. This is "no re-chunking": the pushed slice text is final.
  */
 export function createIngestHandler(deps: IngestDeps) {
   return async function ingestHandler(input: IngestInput): Promise<ToolResult> {
-    const items = normalizeIngestItems(input);
-    if (items.length === 0) {
+    const envelopes = normalizeIngestInput(input);
+    if (envelopes.length === 0) {
       throw new GraphragError(
-        "ingest: content batch must contain at least one item",
+        "ingest: at least one envelope is required",
         "INVALID_INPUT"
       );
     }
     const batchLimit = resolveToolBatchLimit(deps, "ingest");
-    if (items.length > batchLimit) {
-      throw new BatchLimitExceededError(items.length, batchLimit);
+    if (envelopes.length > batchLimit) {
+      throw new BatchLimitExceededError(envelopes.length, batchLimit);
     }
-    for (const item of items) validateIngestItem(item);
+    for (const env of envelopes) validateEnvelopeSizes(env);
 
+    const totalSlices = envelopes.reduce(
+      (acc, env) => acc + env.slices.length,
+      0
+    );
+    // Embed slice texts in one call (slice text is final — no re-chunking).
+    const sliceTexts = envelopes.flatMap((env) =>
+      env.slices.map((slice) => slice.content)
+    );
     const embeddings = await embedWithLog(
       deps.logger,
       deps.embedder,
-      items.map((item) => item.content),
-      { itemCount: items.length }
+      sliceTexts,
+      { itemCount: totalSlices }
     );
-    if (embeddings.length !== items.length) {
+    if (embeddings.length !== sliceTexts.length) {
       throw new GraphragError(
-        `ingest: embedding count ${embeddings.length} does not match batch count ${items.length}`,
+        `ingest: embedding count ${embeddings.length} does not match slice count ${sliceTexts.length}`,
         "EMBEDDING_FAILED"
       );
     }
@@ -328,24 +493,88 @@ export function createIngestHandler(deps: IngestDeps) {
       ...DEFAULT_CONTENT_IDENTITY_VERSIONS,
       ...deps.identityVersions,
     };
-    const records: ChunkRecord[] = items.map((item, index) => {
-      const contentIdentity = computeContentIdentity(
-        item.content,
-        identityVersions
-      );
-      return {
-        id: computeChunkId(item.source_ref, contentIdentity),
-        content: item.content,
-        embedding: embeddings[index]!,
-        source_ref: item.source_ref,
-        metadata: item.metadata,
-        valid_from: item.valid_from ?? now,
-        valid_until: item.valid_until ?? null,
+    const allChunkIds: string[] = [];
+    const records: ChunkRecord[] = [];
+    let embeddingCursor = 0;
+    const sourceDocIds: string[] = [];
+    /**
+     * New chunk ids grouped by source_doc_id. After upsert, these are
+     * the ids we MUST NOT delete — they're the same-id merges that
+     * preserve T6's closed-row state on a same-content re-push.
+     * Anything else still back-pointed to that 资料 is an orphan from a
+     * previous content-identity version and gets cleaned up.
+     */
+    const keptIdsBySourceDoc = new Map<string, Set<string>>();
+    for (const env of envelopes) {
+      const sourceDocId = computeSourceDocId(env.source_ref);
+      sourceDocIds.push(sourceDocId);
+
+      // Upsert the 资料 SoR row keyed by source_ref (re-push updates body).
+      const sourceDoc: SourceDocRecord = {
+        id: sourceDocId,
+        source_ref: env.source_ref,
+        title: env.title,
+        content: env.content,
         created_at: now,
       };
-    });
+      await deps.storage.upsertSourceDoc(sourceDoc);
 
+      const kept = keptIdsBySourceDoc.get(sourceDocId) ?? new Set<string>();
+      keptIdsBySourceDoc.set(sourceDocId, kept);
+
+      for (const slice of env.slices) {
+        const contentIdentity = computeContentIdentity(
+          slice.content,
+          identityVersions
+        );
+        const record: ChunkRecord = {
+          id: computeChunkId(env.source_ref, contentIdentity),
+          content: slice.content,
+          embedding: embeddings[embeddingCursor]!,
+          source_ref: env.source_ref,
+          metadata: env.metadata,
+          valid_from: env.valid_from ?? now,
+          valid_until: env.valid_until ?? null,
+          created_at: now,
+          source_doc_id: sourceDocId,
+          ordinal: slice.ordinal,
+        };
+        records.push(record);
+        kept.add(record.id);
+        allChunkIds.push(record.id);
+        embeddingCursor += 1;
+      }
+    }
+
+    // Rebuild sweep BEFORE the upsert, excluding the ids this push is
+    // about to write:
+    //  - Same-id re-push (same content identity): the old chunk stays in
+    //    place, so `preserveInvalidationState` (memory) / the ON CONFLICT
+    //    (id) CASE (pg) keeps the closed-row state from a prior
+    //    invalidation (T6).
+    //  - Slot conflicts (same source_doc_id + ordinal, different id) and
+    //    orphans from a previous content identity are cleared BEFORE the
+    //    INSERT, so the (source_doc_id, ordinal) unique index cannot
+    //    reject the new slice rows.
+    for (const [sourceDocId, kept] of keptIdsBySourceDoc) {
+      await deps.storage.deleteChunksForSourceDoc(sourceDocId, kept);
+    }
     const ids = await deps.storage.upsert(records);
+    // 就绪 only AFTER the chunk rows are durable. ingest writes the same
+    // (资料 row, chunk rows) pair push does, so it reaches the same state:
+    // docs/CONTEXT.md 资料集合 defines 就绪 as status ready AND count ≥ 1,
+    // and a 资料 ingested here would otherwise sit at 进行中 with a
+    // non-zero count forever. Best-effort by the same EXIT as push's: a
+    // status write failing must not fail an ingest whose rows are already
+    // authoritative.
+    for (const sourceDocId of sourceDocIds) {
+      try {
+        await deps.storage.markSourceDocReady(sourceDocId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`ingest status write failed: ${message}\n`);
+      }
+    }
     let precisionFailed = false;
     if (deps.precision !== undefined) {
       try {
@@ -361,6 +590,9 @@ export function createIngestHandler(deps: IngestDeps) {
     return textResult(
       JSON.stringify({
         chunk_ids: ids,
+        ...(sourceDocIds.length === 1
+          ? { source_doc_id: sourceDocIds[0] }
+          : { source_doc_ids: sourceDocIds }),
         ...(precisionFailed
           ? {
               degraded: true,
@@ -379,10 +611,11 @@ export function createIngestHandler(deps: IngestDeps) {
 export const ingestTool = (deps: IngestDeps): ToolRegistration => ({
   name: "ingest",
   description:
-    "Loose text ingest: write content into the knowledge memory store. " +
-    "Requires content and source_ref; metadata and a temporal validity " +
-    "window (valid_from / valid_until) are optional. The text is chunked, " +
-    "embedded, and stored.",
+    "Write one or more 资料 (source documents) into the knowledge memory " +
+    "store. Each call takes an envelope with source_ref, the prose body " +
+    "(content), and the slice list (chunks) the injector pre-cut. " +
+    "Re-pushing the same source_ref updates the body and rebuilds its " +
+    "derived chunks without growing the 资料 row count.",
   inputSchema: IngestInputSchema,
   // The registry's handler signature is `(input: unknown) => ...` (the
   // generic is erased at the boundary so the registry stays a single

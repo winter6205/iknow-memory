@@ -119,7 +119,11 @@ describe("T5 ingest idempotency", () => {
     );
 
     expect(secondId).not.toEqual(firstId);
-    expect(await storedCount(deps)).toBe(2);
+    // T3 rebuild semantics: a re-push with a different content identity
+    // produces a fresh chunk id set and wipes the previous chunks that
+    // back-point to the same source_doc_id. The store collapses to the
+    // new set; the legacy "both rows coexist" assertion no longer holds.
+    expect(await storedCount(deps)).toBe(1);
   });
 
   it("keeps concurrent identical pushes on one row with the same id set", async () => {
@@ -157,6 +161,14 @@ describe("T5 ingest idempotency", () => {
       },
       search: async () => [],
       close: async () => {},
+      // T3: 资料 SoR row write is the first storage call in the new
+      // pipeline. A failure there must surface as a typed storage error,
+      // not be swallowed into a false success on the chunk path.
+      upsertSourceDoc: async () => {
+        throw new GraphragError("storage unavailable", "STORAGE_ERROR");
+      },
+      deleteChunksForSourceDoc: async () => {},
+      listChunksBySourceDoc: async () => [],
     };
 
     await expect(

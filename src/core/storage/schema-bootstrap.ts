@@ -18,8 +18,29 @@
  */
 import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
 import { GraphragError } from "../errors.js";
+import { SOURCE_DOC_STATUS, type SourceDocStatus } from "../types.js";
 import { upSchemaProjection } from "./schema-projection.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
+
+/**
+ * Render a status vocabulary as a SQL literal list for a CHECK constraint.
+ *
+ * The values are compile-time constants from SOURCE_DOC_STATUS, so there is
+ * no injection surface; quoting is defensive so a future value containing a
+ * quote cannot silently break the DDL.
+ */
+function sqlTextList(values: readonly string[]): string {
+  return values.map((value) => `'${value.replace(/'/g, "''")}'`).join(", ");
+}
+
+/** A single value as a SQL literal — same escaping as the CHECK's list. */
+function sqlTextLiteral(value: string): string {
+  return sqlTextList([value]);
+}
+
+/** The three-value 资料 status vocabulary, in declaration order. */
+const SOURCE_DOC_STATUS_VALUES: readonly SourceDocStatus[] =
+  Object.values(SOURCE_DOC_STATUS);
 
 /**
  * Minimal client surface the bootstrap consumes: only `query`, with
@@ -225,6 +246,90 @@ async function createCommunitySummaries(
 }
 
 /**
+ * source_documents: the 资料 prose SoR (operator-console T1; ADR-0010).
+ *
+ * One row holds the full body text the injector pushed; the dashboard and
+ * `read_source` MCP tool return this body. Chunks back-point to this row
+ * via `chunks.source_doc_id` + `chunks.ordinal` so a derived slice stays
+ * traceable to its source.
+ *
+ * `source_ref` is UNIQUE so re-pushing the same locator collapses to a
+ * single 资料 row (no duplicate SoR rows). Forward-compatible with an
+ * index lookup for the header typeahead.
+ */
+async function createSourceDocuments(
+  client: SchemaBootstrapClient
+): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS source_documents (
+      id          uuid PRIMARY KEY,
+      source_ref  text NOT NULL UNIQUE,
+      title       text,
+      content     text NOT NULL,
+      created_at  timestamptz NOT NULL DEFAULT now(),
+      valid_until timestamptz NULL
+    )`);
+  // T5 forward-compat ALTER: deployments whose source_documents predates
+  // the 资料 validity window keep working — every existing row reads as
+  // "still valid" through the NULL default. Same pattern as the chunks
+  // back-pointer ALTERs below.
+  await client.query(`
+    ALTER TABLE source_documents
+      ADD COLUMN IF NOT EXISTS valid_until timestamptz NULL`);
+  // T3 (corpus-ready retrieve) forward-compat ALTERs: status is PERSISTED so
+  // a failed push is visible on the 资料页 even though it produced no chunk
+  // row to derive anything from. The default is 就绪's precondition state,
+  // not a claim about the row: a pre-T3 资料 gets its real status the next
+  // time a push touches it, because the push write always declares one.
+  //
+  // The CHECK pins the vocabulary at the storage boundary. Both the values
+  // and the literal come from SOURCE_DOC_STATUS (types.ts) so a rename
+  // cannot leave the constraint rejecting the constant the writers use.
+  await client.query(`
+    ALTER TABLE source_documents
+      ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT ${sqlTextLiteral(SOURCE_DOC_STATUS.IN_PROGRESS)}`);
+  await client.query(`
+    ALTER TABLE source_documents
+      ADD COLUMN IF NOT EXISTS failure_code text NULL`);
+  await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE source_documents
+        ADD CONSTRAINT source_documents_status_check
+        CHECK (status IN (${sqlTextList(SOURCE_DOC_STATUS_VALUES)}));
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
+}
+
+/**
+ * Forward-compat ALTERs for the operator-console ledger.
+ *
+ * `chunks` is stage-1 owned; adding `source_doc_id` + `ordinal` keeps the
+ * SoR/derived pointer explicit on new writes while leaving existing rows
+ * readable (the columns are nullable). Follows the same shape as the
+ * `triples.superseded_by` / `triples.evidence_span` forward-compat
+ * pattern already in this file.
+ */
+async function alterChunksBackPointers(
+  client: SchemaBootstrapClient
+): Promise<void> {
+  await client.query(`
+    ALTER TABLE chunks
+      ADD COLUMN IF NOT EXISTS source_doc_id uuid
+      REFERENCES source_documents(id) ON DELETE SET NULL`);
+  await client.query(`
+    ALTER TABLE chunks
+      ADD COLUMN IF NOT EXISTS ordinal integer`);
+  // (source_doc_id, ordinal) UNIQUE keeps a re-push from leaving two
+  // chunks on the same slice slot. Partial-filtered is not needed —
+  // `ordinal` is per-source and the column is nullable for legacy rows.
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS chunks_source_doc_id_ordinal_idx
+      ON chunks (source_doc_id, ordinal)`);
+}
+
+/**
  * Create all four ledger tables + indexes (plus the projection outbox that rides
  * the same bootstrap — see schema-projection.ts), atomically. Idempotent: safe
  * to call repeatedly (each statement is IF NOT EXISTS). On any failure the
@@ -254,7 +359,12 @@ export async function upSchemaBootstrap(
     await createTriples(client);
     await createExtractionRecords(client);
     await createCommunitySummaries(client, dimensions);
+    await createSourceDocuments(client);
     await upSchemaProjection(client);
+    // ALTER chunks back-pointers must come after `source_documents` exists
+    // (FK target) and after `chunks` itself exists (caller's responsibility —
+    // `PgvectorBackend.ensureTable` creates it before invoking us).
+    await alterChunksBackPointers(client);
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");

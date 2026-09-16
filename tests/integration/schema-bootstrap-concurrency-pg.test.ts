@@ -34,6 +34,7 @@ const BOOTSTRAP_TABLES = [
   "extraction_records",
   "community_summaries",
   "projection_outbox",
+  "source_documents",
 ] as const;
 
 describePg("schema bootstrap concurrency", () => {

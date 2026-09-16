@@ -8,7 +8,7 @@
 
 ### Product identity
 
-**iknow-memory**: the standalone, host-agnostic knowledge memory MCP server. Stores, indexes, and retrieves semantic facts with temporal validity; exposes MCP tools (`ingest`, `push`, `invalidate`, `extract`, `retrieve`) over stdio. Does not assemble context, trigger retrieval, or manage conversation state — those are the host's job.
+**iknow-memory**: the standalone, host-agnostic knowledge memory MCP server. Stores, indexes, and retrieves semantic facts with temporal validity; exposes MCP tools (`ingest`, `push`, `invalidate`, `extract`, `retrieve`, `read_source`) over stdio. Does not assemble context, trigger retrieval, or manage conversation state — those are the host's job.
 _Avoid_: "knowledge base" (implies curated documents, not extracted facts); "memory backend" (too generic)
 
 **MCP tool**: a function exposed via Model Context Protocol (`tools/list` + `tools/call`). iknow-memory defines its own tool protocol — not constrained by any legacy tool contract.
@@ -17,13 +17,25 @@ _Avoid_: "tool" alone (ambiguous with host tools); "API endpoint" (MCP is not RE
 **host**: any MCP client that discovers and calls iknow-memory tools (Claude Code, iknow harness, custom agents). The host owns context engineering (JIT retrieval triggers, cache layout, prompt assembly). iknow-memory never reaches into the host.
 _Avoid_: "client" (too generic); "consumer" (implies passive reading, hosts actively orchestrate)
 
-**iknow-memory dashboard**: the operator HTTP read facade in this repo over the same core as **MCP tool**s — not a **host** and not an MCP client. Graph canvas reads the Neo4j read-only projection; entity / **chunk** / timeline read the **authoritative source**. _Stage: named (wayfinder #188 / #198); not on main._
+**iknow-memory dashboard**: the operator HTTP facade in this repo over the same core as **MCP tool**s — not a **host** and not an MCP client. It lists and opens **资料**; the persistent header typeahead filters **资料** `title` / `source_ref` and does not run **retrieve**. It may trigger the same write runners as MCP/CLI (ingest / extract / invalidate / graph:backfill / graph:drain). Graph canvas reads the Neo4j read-only projection; entity / timeline / **资料** read the **authoritative source**. Interaction follows the operator’s original knowledge-base board (header always present; empty ledger keeps the shell). _Stage: named (wayfinder #188 / #198); not on main._
 _Avoid_: "I know dashboard" / "iknow dashboard" (wrong product); "dashboard-api" (implementation folder, not the term); "WorkBuddyHome" (a local directory name)
 
 ### Memory units
 
-**chunk**: pushed text is final text. fin is the sole chunking authority; iknow-memory stores and recalls the pushed text as-is without re-chunking, truncation, reassembly, or normalization/rewrite. Identified by UUID, carries `embedding`, `source_ref`, `metadata`, `valid_from`, `valid_until`, `created_at`. The atomic unit of vector storage and retrieval in stage 1; returned chunk text is byte-identical to the pushed text.
-_Avoid_: "document" (a chunk is a slice, not a whole document); "passage" (implies semantic completeness); "segment" (ambiguous with context segments)
+**chunk**: a derived index row for one fin-cut slice of a **资料**: slice text, embedding, ordinal, back-pointer. fin is the sole chunking authority; iknow-memory does not re-chunk (ADR-0004). Returned slice text is byte-identical to the pushed slice. Retrieve ranks chunks; it does not return the full **资料** body. _Stage: ADR-0010._
+_Avoid_: "document" (the full body is **资料**); "passage" (implies semantic completeness); "segment" (ambiguous with context segments); treating chunk text as a second prose SoR
+
+**资料**: the prose system of record — one row is the full body the injector pushed. The dashboard and MCP **read_source** return this body. Host `read_file` for ingested locators maps here. _Stage: ADR-0010._
+_Avoid_: wiki page; "document" alone (too generic); assembling the body by concatenating chunks in this repo
+
+**ledger schema**: the authoritative-source table contract: **资料**, chunks, entities, triples, entity_aliases, extraction_records, projection_outbox. Not a phase label.
+_Avoid_: P0 schema
+
+**operator setting**: the home-directory file `~/.iknow-memory/setting.json` that holds identity and everyday secrets (storage mode, dedicated database URL, embedding model and dimensions, Neo4j URI, API keys). Process env overrides a key when set; missing env does not refuse boot if the file has the key. The dashboard and MCP server both read this file. The CLI is a separate bin `iknow-memory-config` — not a subcommand of the `iknow-memory` stdio entry.
+_Avoid_: `config.json`; `iknow-memory config`; copying DSN and keys into host MCP JSON as a second store; requiring exported shell env for keys to work
+
+**资料集合**: the operator-visible set of pushed **资料** (documents) and their successful **chunk** counts on the existing 资料/dashboard page. Ready means status ready and chunk count ≥ 1. Empty store is legal empty **retrieve**, not `degraded`.
+_Avoid_: "knowledge base page in the host"; "dataset" as a second product name; treating memory facts as members of this set
 
 **entity**: a canonical real-world referent extracted from chunks (person, concept, system, event). Identified by UUID, carries `canonical_name`, `type`, `embedding`, `metadata`. Multiple surface forms (aliases) resolve to one entity. _Stage: P0 (implemented)._
 _Avoid_: "node" (graph-generic, use only when discussing Neo4j topology); "concept" (one entity type, not the general term); "mention" (a mention is an occurrence, not the canonical entity)
@@ -48,7 +60,7 @@ _Avoid_: "keyword search" (BM25 is ranked, not boolean); "lexical search" (accep
 **precision layer**: the lexical capability layer that carries CJK segmentation, Okapi BM25 (k1 / b configurable), phrase queries, and field boosting as one unit, delivered by Elasticsearch. Present at both the entity-finding stage (including `canonical_name` / alias graph seeds) and the fallback stage; it complements **vector search** rather than standing by for it, so there is no primary/standby switchover between the two. `GRAPHRAG_MEMORY_ES_URL` is the ES address in global settings, not a switch on Postgres or Neo4j. Default on; missing URL refuses process start (ADR-0007); retrieve-time failure fail-opens + **degraded=true**. A second ledger-only lexical seed path is out. _Stage: `specs/retrieval-stack.md` (定档 B); boot ADR-0007._
 _Avoid_: "BM25 layer" (BM25 is one capability inside it); "keyword arm" (the layer is not a single recall arm); "backup arm" (not a standby for vector search)
 
-**authoritative source**: Postgres, holding the sole authoritative copy of chunk text and its metadata. Retrieval indexes are built from it and never the reverse, so no index rebuild can change authoritative data. _Stage: ADR-0001; extended to retrieval indexes by ADR-0003._
+**authoritative source**: Postgres, holding the sole authoritative copy of **资料** body text and ledger rows (entities, triples, aliases, extraction_records, projection_outbox). **chunk** rows live here as derived index records (ADR-0010). Retrieval indexes are built from it and never the reverse. _Stage: ADR-0001; retrieval indexes ADR-0003; prose SoR ADR-0010._
 _Avoid_: "primary database" (implies a replication topology); "system of record table" (the term covers the whole store, not one table); "master" (replication vocabulary)
 
 **derived index**: a retrieval index — the vector index and the lexical index — built from the **authoritative source**. Deletable and re-builtable from that source; a rebuild leaves authoritative data untouched and must not regress retrieval quality. _Stage: ADR-0003._
@@ -114,20 +126,23 @@ _Avoid_: "cluster" (too generic, used in embedding clustering too); "topic group
 
 ### Pipeline
 
-**ingest**: the write pipeline for final pushed text: validate → size check → embed → store as-is. Pushed text is final text; fin is the sole chunking authority, and iknow-memory does not re-chunk, truncate, reassemble, or normalize/rewrite it. Exposed as MCP tool `ingest` (content + `source_ref`, optional metadata / validity → `{chunk_ids}`). Does not invalidate and does not run **extract_triples**.
-_Avoid_: "index" (implies search-index building, not knowledge extraction); "import" (implies bulk file loading)
+**ingest**: the write pipeline: validate → size check → store **资料** → store derived **chunk**s → embed slices. One envelope only: `source_ref` + 资料 body + `chunks[]` (each slice text + ordinal). A single slice is a one-item list whose text matches the body. Does not invalidate and does not run **extract_triples**. Exposed as MCP tool `ingest`.
+_Avoid_: "index" (implies search-index building, not knowledge extraction); "import" (implies bulk file loading); in-process re-chunking; a second legacy ingest shape
 
-**push**: the strict MCP write tool: every item requires metadata and a validity window; the idempotency key is `(source_ref, content identity)`; a re-push returns the same **chunk** ids without growing rows. Distinct from **ingest** (optional fields). Does not run **extract_triples**.
+**push**: the strict MCP write tool: metadata and a validity window required; the same locator / `source_ref` re-push updates that **资料** and rebuilds its derived **chunk**s without a second SoR. Distinct from **ingest** (optional fields). Does not run **extract_triples**.
 _Avoid_: "upsert" (the guarantee is idempotent push, not the SQL verb); "fin port" (any Host may call it)
 
 **ingest idempotency**: the guarantee that repeated pushes of the same idempotency key — (`source_ref`, content identity, where content identity hashes chunk text plus the normalization / parsing-rule / parameter versions) — produce no second write and return the same **chunk** ids. A failed push is returned by name and is not counted against the idempotency assertion. _Stage: `specs/retrieval-stack.md` (C-9)._
 _Avoid_: "upsert" (idempotency is a result contract, not the SQL mechanism); "dedupe" (implies removing a duplicate after the fact); "at-least-once ingest" (transport property, not the guarantee)
 
-**content invalidation**: the action that closes a **chunk**'s `valid_window` so the content stops matching any query time. Exposed as MCP tool `invalidate`. It never physically deletes the row, is repeatable, and leaves a queryable invalidation record (chunk id, invalidation instant, triggering party). Not an `ingest` action. _Stage: `specs/retrieval-stack.md` (C-9); MCP name `specs/mcp-tool-surface.md`._
-_Avoid_: "delete" (the row stays); "expire" (a scheduled TTL, not a change-triggered close); "tombstone" (no marker row replaces the chunk)
+**content invalidation**: the action that closes a **资料** validity window and the windows of its derived **chunk**s so none match any query time. Exposed as MCP tool `invalidate` (`source_ref` or 资料 `id`). It never physically deletes rows this wave, is repeatable, and leaves a queryable invalidation record. Not an `ingest` action. Physical removal is later work. _Stage: `specs/retrieval-stack.md` (C-9); MCP name `specs/mcp-tool-surface.md`._
+_Avoid_: "delete" (the row stays); "expire" (a scheduled TTL, not a change-triggered close); "tombstone" (no marker row replaces the 资料); per-chunk invalidate as the first-wave path
 
 **retrieve**: the read pipeline: embed query once → entity seeds + Neo4j **PPR** (when configured) mapping to chunks via `source_chunk_id` → non-empty graph hits lead Host `chunks[]`, else (and remainder slots) vector ∥ BM25 → **RRF fusion** → optional entity-embedding seeds / community-summary hits → optional **rerank** (MiniMax LLM on the retrieve hook; optional dedicated HTTP sidecar) → optional **neighbor evidence** → top-K, with default-on graph/rerank/precision-layer missing deps refusing boot (ADR-0006 / ADR-0007) and other gaps or retrieve-time failures surfaced through `degraded` and `degraded_reasons`. Optional drain wait is default off; exposed as MCP tool `retrieve(input: {query, valid_at?, filters?, limit?}) → {chunks[]}`; wire stays `{ chunks[] }` (+ optional `degraded` / `degraded_reasons`). Host `chunks[]` does not carry **evidence span**. _Stage: graph-priority + MiniMax LLM rerank + ADR-0006 / ADR-0007 boot; quality post-steps on main (`specs/retrieve-graph-quality.md`)._
 _Avoid_: "search" (too broad); "three-arm retrieve" (retired ranking); "recall" (one stage, not the whole pipeline)
+
+**read_source**: the MCP tool that returns one stored **资料** full body. Caller passes `source_ref` or `id` (exactly one). Success envelope `{ id, source_ref, title?, content }`. Miss is a named not-found, not an empty string. Not for local files; not a substitute for **retrieve**.
+_Avoid_: get_page; merging this with the host local-file read tool
 
 **extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. Exposed as MCP tool `extract` (`chunk_ids` xor `source_ref`, synchronous, **mark-and-continue**) and as the extract CLI. CLI-only: `--dry-run`, `--list-failed`, `--list-unmapped`, `--backfill-embeddings`. Not folded into **ingest** or **push**. _Stage: CLI on main; MCP `extract` is `specs/mcp-tool-surface.md`._
 _Avoid_: "parse" (implies deterministic grammar, extraction is LLM-based); "NER" (NER is one sub-step, not the whole pipeline)
@@ -177,7 +192,8 @@ _Avoid_: "load test" (implies capacity discovery); "stress test" (we do not push
 
 ## Relationships
 
-- **content → chunker → chunk[]**: fin's chunker produces the final pushed text; pushed text is final text, and iknow-memory stores and recalls each pushed chunk as-is without any ingest-side re-chunking
+- **injector → 资料 + chunk[]**: fin (or a one-item ingest) supplies the **资料** body and already-cut slices; iknow-memory stores the body as SoR and slices as derived chunks without re-chunking
+- **content → chunker → chunk[]**: fin's chunker still owns granularity; pushed slice text is final text for that chunk row
 - **chunk → embedder → embedding**: each chunk gets a dense vector (real API or FakeEmbedder for dev/test)
 - **chunk + LLM → extract_triples → triple[]**: P0 extraction produces (head, relation, tail) from chunk text
 - **triple → entity resolution → canonical entity**: aliases and mentions merge into deduplicated entities
@@ -185,7 +201,7 @@ _Avoid_: "load test" (implies capacity discovery); "stress test" (we do not push
 - **query → hybrid retrieval**: graph-priority ranking, then optional entity-embedding seeds / community hits / **rerank** / **neighbor evidence** (`specs/retrieve-rerank-llm.md`, `specs/retrieve-graph-quality.md`)
 - **valid_window + valid_at → temporal filter**: chunks/triples outside the query's time window are excluded
 - **entity → Neo4j node; triple → Neo4j edge**: read-only projection of Postgres via **projection outbox** + backfill (#69/#70; ADR-0001). Operator path: `npm run graph:backfill` then `npm run graph:drain` — see `docs/runbooks/neo4j-projection.md`
-- **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for entities, triples, aliases, and extraction_records; Neo4j is a derived read-only projection. Sync = projection outbox + full backfill (eventually consistent by default; optional retrieve wait in `specs/retrieve-graph-quality.md`). Do not propose writing to Neo4j outside the projection path. Do not treat a ledger PPR as a production graph engine (ADR-0008).
+- **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for **资料**, entities, triples, aliases, and extraction_records; **chunk** rows are derived index records in the same database (ADR-0010); Neo4j is a derived read-only projection. Sync = projection outbox + full backfill (eventually consistent by default; optional retrieve wait in `specs/retrieve-graph-quality.md`). Do not propose writing to Neo4j outside the projection path, or "just use Postgres for everything" without addressing the native-traversal constraint (PPR / Louvain / later). Do not treat a ledger PPR as a production graph engine (ADR-0008).
 - **community → Louvain → ledger summary → optional retrieve hits**: topic retrieve; Host still generates the answer
 - **core → MCP tools (stdio) ∥ iknow-memory dashboard (HTTP)**: two facades, one capability origin; the dashboard is not a host
 
@@ -193,11 +209,11 @@ _Avoid_: "load test" (implies capacity discovery); "stress test" (we do not push
 
 - **triple vs fact**: in iknow-memory, "triple" is the canonical term for (head, relation, tail). "Fact" is avoided because it is too generic in retrieval literature (bi-temporal claims in some systems, plain extracted assertions in others). If you must say "fact" in iknow-memory context, qualify it: "graph fact" or "temporal fact".
 - **valid_window vs valid_at**: `valid_window` is a property of stored data (when is this true?); `valid_at` is a property of the query (when am I asking about?). The filter is `valid_window @> valid_at`.
-- **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for entities, triples, aliases, and extraction_records; Neo4j is a derived read-only projection synced via **projection outbox** + backfill (#69/#70; ADR-0001). Eventually consistent by default; optional retrieve wait is `specs/retrieve-graph-quality.md` slice 10. Native traversal (PPR first) is why Neo4j exists — SQL JOIN / AGE / ledger PPR do not meet that constraint (ADR-0008). Do not write to Neo4j outside the projection path.
+- **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for **资料**, entities, triples, aliases, and extraction_records; **chunk** rows are derived (ADR-0010); Neo4j is a derived read-only projection synced via **projection outbox** + backfill (#69/#70; ADR-0001). Eventually consistent by default; optional retrieve wait is `specs/retrieve-graph-quality.md` slice 10. Native traversal (PPR first) is why Neo4j exists — SQL JOIN / AGE / ledger PPR do not meet that constraint (ADR-0008). Do not write to Neo4j outside the projection path.
 - **rerank fail-open**: rerank failure returns the pre-rerank Host order unchanged (graph-priority list, or vector+BM25 RRF). A dead reranker must not block retrieval — but the response must still carry `degraded` and name the rerank item in `degraded_reasons`. Do not add retry/fallback logic that changes this contract without explicit decision.
 - **graph-priority vs three-arm RRF**: Host ranking is graph-priority (`specs/retrieve-graph-priority.md`). Do not describe production retrieve as vector+BM25+graph RRF at 0.7/0.15/0.15.
 - **context engineering is NOT our job**: JIT retrieval triggers, cache breakpoint planning, prompt assembly, budget allocation — these belong to the host. iknow-memory returns ranked chunks; what the host does with them is the host's problem.
-- **iknow-memory dashboard is not a host**: it is an in-process HTTP read facade. Do not implement it as an MCP client (`tools/call`) or as the iknow harness UI.
+- **iknow-memory dashboard is not a host**: it is an in-process HTTP facade (open **资料**, header typeahead on **资料** names, thin write runners). Do not implement it as an MCP client (`tools/call`) or as the iknow harness UI.
 - **zero external runtime dependency on any reference implementation**: design decisions (RRF k=60, cosine re-score 0.7/0.3, rerank fail-open, PPR) are first-class product choices documented in CONTEXT.md and PRDs; rationale is independent of any particular reference codebase. Any locally tracked upstream reference directory is read-only and not linked at runtime (zero import/link/symlink/dynamic load). We implement from first principles, not by copying.
 
 ## Bootstrap mode

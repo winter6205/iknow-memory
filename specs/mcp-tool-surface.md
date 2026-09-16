@@ -39,15 +39,35 @@ Terms this contract tightens are on the 待写入 list. Until flush, **extract**
 
 ## Catalog
 
-| Name           | Action                                                                                                                                               |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `retrieve`     | Keep. Envelope unchanged. Description: ranked chunk search with temporal filter.                                                                     |
-| `ingest`       | Keep write path. Remove `action: "invalidate"` and related fields. Description: loose ingest (content + `source_ref`, optional metadata / validity). |
-| `push`         | Keep. Strict batch, idempotent `(source_ref, content_identity)`, required metadata and validity window. Description must not say “fin port”.         |
-| `invalidate`   | Rename from `invalidation`. Same close-window semantics, no physical delete.                                                                         |
-| `extract`      | Add. Selector `chunk_ids` xor `source_ref`; reuse existing pipeline; return counts and per-chunk failures.                                           |
-| `echo`         | Archive: absent from registry / `tools/list`.                                                                                                        |
-| `invalidation` | Archive the **name**: absent from `tools/list`.                                                                                                      |
+| Name           | Action                                                                                                                                                                                                                                                                                                                                                                                                    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `retrieve`     | Keep. Envelope unchanged. Description: ranked chunk search with temporal filter.                                                                                                                                                                                                                                                                                                                          |
+| `read_source`  | Add (operator-console T4). Selector `source_ref` xor `id`; returns the full 资料 body `{ id, source_ref, title?, content }`. Miss is a named `read_source_not_found` error result, never a `""` success. An **invalidated** 资料 (T5: window closed) is a distinct named `read_source_invalidated` error result carrying `valid_until`. Pure read: no embedder, no batch limit.                           |
+| `ingest`       | Keep write path. Remove `action: "invalidate"` and related fields. One write envelope (T3): `source_ref` + `content` body + `chunks[]` `{ content, index }`; one-slice list allowed (body equals that slice). Legacy single-content / batch shapes accepted during the migration window.                                                                                                                  |
+| `push`         | Keep. Same one envelope (T3), stricter: required non-empty metadata, `valid_from` / `valid_until`, idempotent `(source_ref, content_identity)`. Description must not say “fin port”.                                                                                                                                                                                                                      |
+| `invalidate`   | Rename from `invalidation`. Same close-window semantics, no physical delete. Operator-console T5: closes the **资料** window (`source_documents.valid_until`) in the same transaction as the derived chunk windows — `read_source` then answers `read_source_invalidated` while every row stays SELECT-able. A same-content re-push keeps the closed 资料 window; a different content version reopens it. |
+| `extract`      | Add. Selector `chunk_ids` xor `source_ref`; reuse existing pipeline; return counts and per-chunk failures.                                                                                                                                                                                                                                                                                                |
+| `echo`         | Archive: absent from registry / `tools/list`.                                                                                                                                                                                                                                                                                                                                                             |
+| `invalidation` | Archive the **name**: absent from `tools/list`.                                                                                                                                                                                                                                                                                                                                                           |
+
+### Write envelope contract (operator-console T3)
+
+Both `ingest` and `push` accept one envelope:
+
+```json
+{
+  "source_ref": "…",
+  "content": "<资料 body>",
+  "chunks": [{ "content": "…", "index": 0 }]
+}
+```
+
+- `source_ref` is required — an ingest/push without it is a typed validation error.
+- `chunks` are the pre-cut slices (no re-chunking, ADR-0004). Indexes must be dense `0..N-1`; every slice is a contiguous substring of the body in order; a one-slice list must equal the body verbatim.
+- Per-chunk content over 1MB → typed `CONTENT_TOO_LARGE` refuse (overflow).
+- **资料 SoR row** (`source_documents`) is upserted keyed by `source_ref` — a re-push of the same locator is the concurrent class: same 资料 id, body updated, derived chunks rebuilt (chunks back-point via `source_doc_id` + `ordinal`), 资料 row never physically deleted.
+- Response: `chunk_ids` plus `source_doc_id` (or `source_doc_ids` for legacy batch), optional `degraded` / `degraded_reasons` when the derived precision index failed.
+- Backward compat: the legacy shapes (`content` as a single string / array of items for `ingest`; `items[]` for `push`) still parse during the migration window and are normalized to one-slice envelopes. Unknown top-level keys are rejected (strict).
 
 ## Extract tool contract
 
@@ -63,6 +83,16 @@ Both set, neither set, empty `chunk_ids`, or over-limit `chunk_ids` → input er
 **Auth:** same as CLI real extract: missing LLM or embedding credentials that the persist path needs → typed config/tool error, not `FakeLLMClient` / fake vectors.
 
 **Not in this tool:** `--dry-run`, `--list-failed`, `--list-unmapped`, `--backfill-embeddings`, `--only-failed`, `--since` as Host API. Those stay CLI.
+
+## Read source tool contract (operator-console T4)
+
+**Input (exactly one selector):** `source_ref` (non-empty string) **xor** `id` (UUID). Both set or neither set → input error. Unknown keys are rejected (strict).
+
+**Output (JSON text like other tools):** the full 资料 row as stored by the write envelope (T3, `source_documents`): `{ id, source_ref, title?, content }`. `title` is omitted when the row has none. `content` is byte-identical to the pushed body — a read tool: no embedding, no ranking, no batch limit.
+
+**Miss:** a missing key is a **named** not-found — `isError: true` with JSON body `{"error": "read_source_not_found", ...}` carrying back the requested key. It is never a `""` success content block, so a Host can distinguish "no such 资料" from an empty body.
+
+**Invalidated (operator-console T5):** a 资料 whose validity window was closed by `invalidate` answers a distinct **named-invalid** — `isError: true` with JSON body `{"error": "read_source_invalidated", "valid_until": <close instant>, ...}` carrying back the requested key. The row still exists (SELECT-able); the body is just not handed back as if still authoritative.
 
 ## Boundaries
 

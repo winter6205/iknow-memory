@@ -114,6 +114,7 @@ describePg("extract-outbox-pg: outbox emit rides the chunk transaction", () => {
         id uuid PRIMARY KEY,
         content text NOT NULL,
         embedding vector(${DIM}) NOT NULL,
+        source_ref text NOT NULL DEFAULT '',
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);

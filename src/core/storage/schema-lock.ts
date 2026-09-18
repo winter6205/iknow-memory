@@ -40,6 +40,7 @@ const BOOTSTRAP_TABLES = [
   "claims",
   "extraction_records",
   "community_summaries",
+  "community_index_state",
   "projection_outbox",
   "source_documents",
 ] as const;

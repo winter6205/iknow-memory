@@ -2,17 +2,26 @@ import { describe, expect, it, vi } from "vitest";
 import type { PoolClient } from "pg";
 import { ConfigError } from "../../src/config.js";
 import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
-import { SOURCE_DOC_STATUS } from "../../src/core/types.js";
+import {
+  SOURCE_DOC_STATUS,
+  COMMUNITY_INDEX_STATUS,
+} from "../../src/core/types.js";
 
-function recordingClient(): { client: PoolClient; queries: string[] } {
+function recordingClient(): {
+  client: PoolClient;
+  queries: string[];
+  records: { sql: string; values?: unknown[] }[];
+} {
   const queries: string[] = [];
+  const records: { sql: string; values?: unknown[] }[] = [];
   const client = {
-    query: vi.fn(async (sql: string) => {
+    query: vi.fn(async (sql: string, values?: unknown[]) => {
       queries.push(sql);
+      records.push({ sql, values });
       return { rows: [] };
     }),
   } as unknown as PoolClient;
-  return { client, queries };
+  return { client, queries, records };
 }
 
 describe("upSchemaBootstrap community summary index", () => {
@@ -151,5 +160,54 @@ describe("upSchemaBootstrap source_documents ledger (operator-console T1)", () =
     expect(addColumn).toContain(`DEFAULT 'in_progress'`);
     expect(check).toContain(`'in_progress'`);
     expect(addColumn).not.toMatch(/DEFAULT\s+''\s/);
+  });
+});
+
+// graph-index-standard-fast T5: the persisted C-ready (就绪) state the
+// community-summary CLI maintains beside the ledger swap. The table carries
+// EXACTLY ONE row (id = 1) — a corpus-level fact, not a per-community one.
+describe("upSchemaBootstrap community_index_state (T5 C-ready ledger)", () => {
+  it("creates the singleton state table with a constant-derived status CHECK", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+
+    const create = queries.find((query) =>
+      /CREATE TABLE IF NOT EXISTS community_index_state/i.test(query)
+    );
+    expect(create, "community_index_state CREATE TABLE not emitted").toBeDefined();
+    expect(create).toMatch(/CHECK \(id = 1\)/);
+    expect(create).toMatch(/failure_code text NULL/);
+    for (const value of Object.values(COMMUNITY_INDEX_STATUS)) {
+      expect(create, `CHECK misses '${value}'`).toContain(`'${value}'`);
+    }
+  });
+
+  it("the readiness probe names community_index_state so deployed DBs get it", async () => {
+    // The probe short-circuits the whole DDL when every BOOTSTRAP_TABLES
+    // entry exists; a table missing from that list would never be added to
+    // a deployed database (same lockstep doctrine as bootstrap-columns).
+    // The mock must answer `current_schema()` with a row, or
+    // acquireSchemaBootstrapLock returns "not ready" BEFORE emitting the
+    // probe (schema-lock.ts:98-101) and the probe is never observable.
+    const records: { sql: string; values?: unknown[] }[] = [];
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        records.push({ sql, values });
+        if (/AS ready/.test(sql)) return { rows: [{ ready: true }] };
+        if (/current_schema\(\)/.test(sql)) {
+          return { rows: [{ schema_name: "public" }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as PoolClient;
+    await upSchemaBootstrap(client, 1536, 2000);
+
+    const probe = records.find(({ sql }) => /AS ready/.test(sql));
+    expect(probe, "readiness probe not emitted").toBeDefined();
+    expect(probe!.values?.[0]).toContain("community_index_state");
+    // ready: true must also short-circuit the DDL (probe ordering pin).
+    expect(
+      records.some(({ sql }) => /CREATE TABLE IF NOT EXISTS entities/.test(sql))
+    ).toBe(false);
   });
 });

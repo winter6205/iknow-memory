@@ -1,16 +1,27 @@
 /**
  * Index-time community summary CLI.
  *
- * The flow is GDS Louvain → load live entity names from Postgres → summarize
- * with the configured LLM → embed the summary → upsert the Postgres ledger
- * row. Neo4j is read-only here. A failed detector or failed individual
- * summary fails the job; individual summary failures do not abort the batch.
+ * The flow is hierarchical GDS Leiden (T2) → load live entity names from
+ * Postgres → summarize EVERY community with the configured LLM into an
+ * in-memory generation FIRST → swap the whole generation into the Postgres
+ * ledger in ONE transaction. Neo4j is read-only here.
+ *
+ * All-or-nothing (graph-index-standard-fast T5, spec assumption 10): any
+ * community that errors or yields an empty summary fails the job with a
+ * typed error BEFORE any ledger write, and moves the corpus-level C-ready
+ * row (`community_index_state`) to `failed` / `community_summary_index_failure`
+ * so the previous report set is never served as current C. A re-run that
+ * succeeds replaces the previous generation atomically: readers see either
+ * the old set or the complete new set plus its `ready` state — never a mix.
+ * A community whose entities are ALL retired is deterministically omitted
+ * from the new generation; nothing exists to summarize, so it is not a
+ * failure.
  *
  * Exit-code map:
  *   0 successful summary run
  *   1 configuration / fatal error, including a typed job failure
  *   2 usage error
- *   3 documented skip — no Neo4j URI, so Louvain is not attempted
+ *   3 documented skip — no Neo4j URI, so Leiden is not attempted
  */
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
@@ -33,6 +44,11 @@ import {
   type CommunitySummaryClient,
 } from "../core/graph/community-summary-llm.js";
 import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
+import {
+  COMMUNITY_INDEX_STATUS,
+  COMMUNITY_SUMMARY_INDEX_FAILURE,
+  type CommunityIndexStatus,
+} from "../core/types.js";
 
 export type {
   Community,
@@ -71,12 +87,21 @@ export class CommunitySummarySkipError extends Error {
   readonly exitCode = COMMUNITY_SUMMARY_SKIP_EXIT;
 
   constructor() {
-    super(`${NEO4J_URI_VAR} is not configured; Louvain was not attempted`);
+    super(`${NEO4J_URI_VAR} is not configured; Leiden was not attempted`);
     this.name = "CommunitySummarySkipError";
   }
 }
 
-export type CommunitySummaryJobFailurePhase = "detection" | "summary";
+/**
+ * Failure phases of the summary job. `detection` covers a broken or
+ * unavailable Leiden run (including malformed output), `summary` covers
+ * generation (names lookup, LLM, embedder), `persist` covers the ledger
+ * swap transaction itself.
+ */
+export type CommunitySummaryJobFailurePhase =
+  | "detection"
+  | "summary"
+  | "persist";
 
 export class CommunitySummaryJobError extends Error {
   readonly code = "COMMUNITY_SUMMARY_JOB_FAILED" as const;
@@ -117,71 +142,23 @@ export async function runCli(
   }
   const client = await deps.pool.connect();
   try {
-    if (!parsed.flags.dryRun) {
-      await upSchemaBootstrap(client, deps.dimensions);
+    return await runSummaryJob(client, deps, parsed.flags.dryRun);
+  } catch (err) {
+    // EXIT: a typed job failure moves C off `ready` before the process
+    // exits non-zero; the state write is best-effort so it never masks the
+    // primary error. Dry-run reports only — it must not move C state.
+    if (
+      !parsed.flags.dryRun &&
+      err instanceof CommunitySummaryJobError
+    ) {
+      await markStateBestEffort(
+        client,
+        deps.logger,
+        COMMUNITY_INDEX_STATUS.FAILED,
+        COMMUNITY_SUMMARY_INDEX_FAILURE
+      );
     }
-    let communities: Community[];
-    try {
-      communities = await deps.detector.detect();
-    } catch (err) {
-      deps.logger.warn("community-detection-failed", {
-        error: errorMessage(err),
-      });
-      throw new CommunitySummaryJobError("detection", errorMessage(err), err);
-    }
-    if (parsed.flags.dryRun) {
-      deps.logger.info("community-summary-plan", {
-        communities: communities.length,
-      });
-      return 0;
-    }
-
-    if (communities.length === 0) {
-      await clearCommunitySummaries(client);
-      deps.logger.info("community-summaries-cleared", {
-        reason: "community-detection-returned-empty",
-      });
-      return 0;
-    }
-
-    let stored = 0;
-    let failed = 0;
-    let firstFailure: CommunitySummaryJobError | undefined;
-    for (const community of communities) {
-      try {
-        const names = await loadEntityNames(client, community.entityIds);
-        if (names.length === 0) continue;
-        const summary = (await deps.summarizer.summarize(names)).trim();
-        if (summary === "")
-          throw new Error("summary client returned empty text");
-        const [embedding] = await deps.embedder.embed([summary]);
-        if (embedding === undefined || embedding.length === 0) {
-          throw new Error("summary embedder returned no vector");
-        }
-        await upsertSummary(client, community, summary, embedding);
-        stored += 1;
-      } catch (err) {
-        // EXIT: 单个 community 失败仅记录并继续批处理，不阻断其他摘要。
-        failed += 1;
-        firstFailure ??= new CommunitySummaryJobError(
-          "summary",
-          errorMessage(err),
-          err,
-          community.id
-        );
-        deps.logger.warn("community-summary-failed", {
-          communityId: community.id,
-          error: errorMessage(err),
-        });
-      }
-    }
-    deps.logger.info("community-summary-complete", {
-      communities: communities.length,
-      stored,
-      failed,
-    });
-    if (firstFailure !== undefined) throw firstFailure;
-    return 0;
+    throw err;
   } finally {
     client.release();
     try {
@@ -194,10 +171,206 @@ export async function runCli(
   }
 }
 
-async function clearCommunitySummaries(
-  client: CommunitySummaryDbClient
+async function runSummaryJob(
+  client: CommunitySummaryDbClient,
+  deps: CommunitySummaryDeps,
+  dryRun: boolean
+): Promise<number> {
+  if (!dryRun) {
+    await upSchemaBootstrap(client, deps.dimensions);
+    // Rebuild-in-progress is C-not-ready: a job that dies before its swap
+    // leaves `in_progress`, so the previous set is not served until a
+    // successful rerun publishes the new generation.
+    await markStateBestEffort(
+      client,
+      deps.logger,
+      COMMUNITY_INDEX_STATUS.IN_PROGRESS,
+      null
+    );
+  }
+  let communities: Community[];
+  try {
+    communities = await deps.detector.detect();
+  } catch (err) {
+    deps.logger.warn("community-detection-failed", {
+      error: errorMessage(err),
+    });
+    throw new CommunitySummaryJobError("detection", errorMessage(err), err);
+  }
+  if (dryRun) {
+    deps.logger.info("community-summary-plan", {
+      communities: communities.length,
+    });
+    return 0;
+  }
+  assertUniqueCommunityIds(communities);
+  // Generation first, writes last: nothing touches the ledger until every
+  // summary exists, which is what makes the job all-or-nothing. An empty
+  // detection result is a complete (empty) generation and clears the ledger.
+  const pending = await generatePendingSummaries(client, communities, deps);
+  try {
+    await swapCommunitySummaries(client, pending);
+  } catch (err) {
+    throw new CommunitySummaryJobError("persist", errorMessage(err), err);
+  }
+  deps.logger.info("community-summary-complete", {
+    communities: communities.length,
+    stored: pending.length,
+    skipped: communities.length - pending.length,
+  });
+  return 0;
+}
+
+/**
+ * Leiden's hierarchy numbers communities globally, and the ledger UNIQUEs
+ * `community_id`; a duplicate is malformed detector output and must fail as
+ * a typed detection error, never as a mid-swap constraint violation.
+ */
+function assertUniqueCommunityIds(communities: readonly Community[]): void {
+  const seen = new Set<string>();
+  for (const community of communities) {
+    if (seen.has(community.id)) {
+      throw new CommunitySummaryJobError(
+        "detection",
+        `duplicate community id "${community.id}" in detector output`,
+        undefined,
+        community.id
+      );
+    }
+    seen.add(community.id);
+  }
+}
+
+interface PendingSummary {
+  communityId: string;
+  entityIds: string[];
+  summary: string;
+  embedding: number[];
+}
+
+async function generatePendingSummaries(
+  client: CommunitySummaryDbClient,
+  communities: readonly Community[],
+  deps: CommunitySummaryDeps
+): Promise<PendingSummary[]> {
+  const pending: PendingSummary[] = [];
+  for (const community of communities) {
+    try {
+      const names = await loadEntityNames(client, community.entityIds);
+      if (names.length === 0) {
+        // EXIT: fully retired community — nothing to summarize; the row is
+        // deterministically absent from the new generation, not a failure.
+        deps.logger.warn("community-summary-skipped-retired", {
+          communityId: community.id,
+        });
+        continue;
+      }
+      const summary = (await deps.summarizer.summarize(names)).trim();
+      if (summary === "")
+        throw new Error("summary client returned empty text");
+      const [embedding] = await deps.embedder.embed([summary]);
+      if (embedding === undefined || embedding.length === 0) {
+        throw new Error("summary embedder returned no vector");
+      }
+      pending.push({
+        communityId: community.id,
+        entityIds: [...community.entityIds],
+        summary,
+        embedding,
+      });
+    } catch (err) {
+      // EXIT: all-or-nothing — the first empty/error aborts the job before
+      // any ledger write; the previous generation stays intact but C moves
+      // to not-ready (runCli's typed-failure path).
+      throw new CommunitySummaryJobError(
+        "summary",
+        errorMessage(err),
+        err,
+        community.id
+      );
+    }
+  }
+  return pending;
+}
+
+/**
+ * Atomically replace the whole report generation: DELETE + INSERTs + the
+ * `ready` state write share one transaction, so concurrent readers observe
+ * either the previous set (with its previous state) or the complete new set
+ * marked ready — never a half-old/half-new mix. A plain INSERT (no upsert)
+ * is deliberate: after the in-transaction DELETE any conflict is a real
+ * error that rolls the whole swap back.
+ */
+async function swapCommunitySummaries(
+  client: CommunitySummaryDbClient,
+  pending: readonly PendingSummary[]
 ): Promise<void> {
-  await client.query("DELETE FROM community_summaries", []);
+  await client.query("BEGIN");
+  try {
+    await client.query("DELETE FROM community_summaries", []);
+    for (const row of pending) {
+      await client.query(
+        `INSERT INTO community_summaries
+           (id, community_id, summary, entity_ids, embedding)
+         VALUES ($1, $2, $3, $4, $5::vector)`,
+        [
+          randomUUID(),
+          row.communityId,
+          row.summary,
+          row.entityIds,
+          toVectorLiteral(row.embedding),
+        ]
+      );
+    }
+    await markCommunityIndexState(
+      client,
+      COMMUNITY_INDEX_STATUS.READY,
+      null
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  }
+}
+
+/**
+ * The singleton C-ready row (see `COMMUNITY_INDEX_STATUS` in core/types).
+ * Called inside the swap transaction for `ready`, and outside it (via
+ * `markStateBestEffort`) for the in-progress / failed transitions.
+ */
+async function markCommunityIndexState(
+  client: CommunitySummaryDbClient,
+  status: CommunityIndexStatus,
+  failureCode: string | null
+): Promise<void> {
+  await client.query(
+    `INSERT INTO community_index_state (id, status, failure_code, updated_at)
+     VALUES (1, $1, $2, now())
+     ON CONFLICT (id) DO UPDATE SET
+       status = EXCLUDED.status,
+       failure_code = EXCLUDED.failure_code,
+       updated_at = now()`,
+    [status, failureCode]
+  );
+}
+
+async function markStateBestEffort(
+  client: CommunitySummaryDbClient,
+  logger: Logger,
+  status: CommunityIndexStatus,
+  failureCode: string | null
+): Promise<void> {
+  try {
+    await markCommunityIndexState(client, status, failureCode);
+  } catch (err) {
+    // EXIT: observability metadata must not replace the primary failure;
+    // mirrors push.ts's secondary status-write posture.
+    logger.warn("community-index-state-write-failed", {
+      status,
+      error: errorMessage(err),
+    });
+  }
 }
 
 async function loadEntityNames(
@@ -214,31 +387,6 @@ async function loadEntityNames(
   return result.rows
     .map((row) => row.canonical_name)
     .filter((name): name is string => typeof name === "string" && name !== "");
-}
-
-async function upsertSummary(
-  client: CommunitySummaryDbClient,
-  community: Community,
-  summary: string,
-  embedding: number[]
-): Promise<void> {
-  await client.query(
-    `INSERT INTO community_summaries
-       (id, community_id, summary, entity_ids, embedding)
-     VALUES ($1, $2, $3, $4, $5::vector)
-     ON CONFLICT (community_id) DO UPDATE SET
-       summary = EXCLUDED.summary,
-       entity_ids = EXCLUDED.entity_ids,
-       embedding = EXCLUDED.embedding,
-       updated_at = now()`,
-    [
-      randomUUID(),
-      community.id,
-      summary,
-      [...community.entityIds],
-      toVectorLiteral(embedding),
-    ]
-  );
 }
 
 function toVectorLiteral(embedding: number[]): string {

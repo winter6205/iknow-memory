@@ -485,8 +485,8 @@ async function processChunk(
     await projectEntitiesToPrecisionLayer(deps, client, counts);
     // SC10 success leg: the counts are only final after persistOutputs, so
     // this event fires post-commit with the whitelisted field set. The T3
-    // enrichment counts ride the same whitelist (numbers only — never the
-    // summary text or claim text).
+    // enrichment counts and the T6 description-embed counts ride the same
+    // whitelist (numbers only — never the summary text or claim text).
     deps.logger.info("chunk-extracted", {
       ...chunkLogFields(deps, chunk.id, latencyStart),
       outcome: "ok",
@@ -495,6 +495,8 @@ async function processChunk(
       ungrounded: counts.ungrounded,
       described: enrich.described,
       describeSkipped: enrich.describeSkipped,
+      embedded: enrich.embedded,
+      embedSkipped: enrich.embedSkipped,
       claims: enrich.claimsWritten,
       claimsSkipped: enrich.claimsSkipped,
     });

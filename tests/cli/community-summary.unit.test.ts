@@ -47,6 +47,7 @@ import type {
 } from "../../src/core/retrieval/types.js";
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../../src/core/types.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
+import { GraphragError } from "../../src/core/errors.js";
 import { setSettingHomeForTests } from "../../src/config.js";
 import type {
   ChunkRecord,
@@ -833,5 +834,65 @@ describe("community summary index CLI", () => {
       false
     );
     expect(h.client.readState()).toBeNull();
+  });
+
+  // ─── T6: the community-summary embedding class ────────────────────────
+  //
+  // ADR 0058 class 3: the summary TEXT is embedded at index time inside the
+  // rebuild, one vector per community, and the swap INSERT carries exactly
+  // that vector — never a re-embed at query time (retrieve only compares the
+  // QUERY vector against the stored one). Failure posture is the T5
+  // all-or-nothing one: an embedder error is a typed summary-phase job fail
+  // with C not-ready, NOT the sealed per-node skip the entity-description
+  // class (T6/enrich) takes.
+
+  it("embeds each community's trimmed summary exactly once and stores that vector", async () => {
+    const calls: string[][] = [];
+    const recording: EmbeddingClient = {
+      async embed(texts: string[]) {
+        calls.push([...texts]);
+        return texts.map(() => [0.5]);
+      },
+    };
+    const h = deps({
+      embedder: recording,
+      summarizer: {
+        async summarize() {
+          return "  padded community summary  ";
+        },
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    // Exact input composition: the TRIMMED summary text alone, one batched
+    // call per community — two communities would be two such calls, and the
+    // swap never embeds again (no double-embedding elsewhere).
+    expect(calls).toEqual([["padded community summary"]]);
+    expect(h.client.readSummaryRows()[0]!.embedding).toBe("[0.5]");
+  });
+
+  it("an embedder failure is a typed summary-phase fail with the previous generation intact", async () => {
+    const client = new FakeClient(oldGeneration());
+    const failing: EmbeddingClient = {
+      async embed() {
+        throw new GraphragError(
+          "embedding request failed: boom",
+          "EMBEDDING_FAILED"
+        );
+      },
+    };
+    const h = deps({ client, embedder: failing });
+
+    await expect(runCli([], h.deps)).rejects.toMatchObject({
+      code: "COMMUNITY_SUMMARY_JOB_FAILED",
+      phase: "summary",
+    });
+    // All-or-nothing: nothing was swapped, the stale rows stay, and C moves
+    // off ready with the fin-pinned failure token.
+    expect(client.readSummaryRows()).toEqual(oldGeneration());
+    expect(client.readState()).toEqual({
+      status: "failed",
+      failure_code: COMMUNITY_SUMMARY_INDEX_FAILURE,
+    });
   });
 });

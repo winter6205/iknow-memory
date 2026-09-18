@@ -34,6 +34,7 @@ import {
 } from "../config.js";
 import { createLogger, type Logger, writeStderr } from "../logging.js";
 import { NineRouterEmbedder, type EmbeddingClient } from "../core/embedder.js";
+import { embedWithLog } from "../core/embed-log.js";
 import {
   createNeo4jCommunityDetector,
   type Community,
@@ -268,7 +269,14 @@ async function generatePendingSummaries(
       const summary = (await deps.summarizer.summarize(names)).trim();
       if (summary === "")
         throw new Error("summary client returned empty text");
-      const [embedding] = await deps.embedder.embed([summary]);
+      // T6 class 3 through the shared SC10 embed-log contract
+      // (embed-log.ts is the one home for every embedder.embed call site).
+      const [embedding] = await embedWithLog(
+        deps.logger,
+        deps.embedder,
+        [summary],
+        { eventName: "community-summary-embed", itemCount: 1 }
+      );
       if (embedding === undefined || embedding.length === 0) {
         throw new Error("summary embedder returned no vector");
       }

@@ -15,7 +15,11 @@
  * warn event, and NEVER throws at the orchestrator. DB write errors are
  * deliberately NOT caught here: they roll the whole chunk transaction
  * back through the pipeline's catch, which is the established "no partial
- * ledger" discipline.
+ * ledger" discipline. The T6 description-vector embed rides the same
+ * sealed posture: an embedder failure skips the vectors (the summarized
+ * descriptions stay durable), matching the joint spec's "one entity-summary
+ * miss skips that node's vector" — explicitly NOT the all-or-nothing
+ * failure class the community-summary embedding takes (T5).
  *
  * Capability-gated: both legs run only when the LLM client carries the
  * optional methods (`describeEntities` / `extractClaims`). A client
@@ -32,9 +36,14 @@ import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../../logging.js";
 import { normalizeAlias } from "../entities/merge.js";
+import { computeEntityEmbeddingText } from "../entities/embedding.js";
+import { embedWithLog } from "../embed-log.js";
+import { GraphragError } from "../errors.js";
+import type { EmbeddingClient } from "../embedder.js";
 import type { ChunkInput } from "./extract.js";
 import { LLM_EXCEPTION_CODE } from "./extract.js";
 import type { LLMClient } from "./llm-client.js";
+import { toVectorLiteral } from "./persist.js";
 import type { Queryable } from "./records.js";
 import type {
   ClaimsResponse,
@@ -55,25 +64,39 @@ export const LLM_EXCEPTION_ENRICH_CODE = LLM_EXCEPTION_CODE;
 export interface EnrichCounts {
   described: number;
   describeSkipped: number;
+  /** T6: survivors whose new description vector was written. */
+  embedded: number;
+  /** T6: survivors whose vector write was sealed-skipped (embedder failure). */
+  embedSkipped: number;
   claimsWritten: number;
   claimsSkipped: number;
   /** Sealed failure code of the last failed/throwing describe call. */
   lastDescribeErrorCode?: string;
   /** Sealed failure code of the last failed/throwing claims call. */
   lastClaimsErrorCode?: string;
+  /** Sealed failure code of the last throwing description-embed call. */
+  lastEmbedErrorCode?: string;
 }
 
 /** The zero outcome — enrichment did not run (fast method / no survivors). */
 export const ZERO_ENRICH: EnrichCounts = {
   described: 0,
   describeSkipped: 0,
+  embedded: 0,
+  embedSkipped: 0,
   claimsWritten: 0,
   claimsSkipped: 0,
 };
 
-/** Minimal deps: the LLM seam and the logger. Widely satisfied. */
+/** Minimal deps: the LLM seam, the embedder (T6 description class), the logger. */
 export interface EnrichDeps {
   llm: LLMClient;
+  /**
+   * The SAME embedder the persist half uses: one model, one dimension for
+   * all three index embedding classes (ADR 0058 / spec Open Question 3,
+   * answered "reuse the existing embedder").
+   */
+  embedder: EmbeddingClient;
   logger: Logger;
 }
 
@@ -178,6 +201,9 @@ async function sealClaims(
  * summary of all PAST chunks) into this run's new descriptions, dial ONE
  * batched call, and UPDATE only the entities the response covers. A
  * missing draft is that entity's miss — skipped, counted, never fatal.
+ * Every written draft then feeds the T6 description-embedding class
+ * (ADR 0058): one batched embed of the survivor set, vectors UPDATEd onto
+ * `entities.embedding` inside the same chunk transaction.
  */
 async function runDescribeLeg(
   deps: EnrichDeps,
@@ -217,12 +243,12 @@ async function runDescribeLeg(
   const drafts = new Map(
     response.descriptions.map((d) => [d.canonicalName, d.description])
   );
+  const written: DescribedDraft[] = [];
   for (const group of groups) {
     const draft = drafts.get(group.canonicalName)?.trim();
     if (!draft) {
       // One description miss skips THIS entity (ADR 0069) — the run and
-      // the chunk continue. The entity vector is NOT re-embedded here:
-      // the description-embedding class is T6's index job.
+      // the chunk continue, and with no draft there is nothing to embed.
       counts.describeSkipped += 1;
       continue;
     }
@@ -238,6 +264,73 @@ async function runDescribeLeg(
       [group.entityId, draft]
     );
     counts.described += 1;
+    written.push({ entityId: group.entityId, canonicalName: group.canonicalName, draft });
+  }
+  await reembedDescriptions(deps, client, chunkId, written, counts);
+}
+
+/** One survivor whose new description just landed — the re-embed input. */
+interface DescribedDraft {
+  entityId: string;
+  canonicalName: string;
+  draft: string;
+}
+
+/**
+ * T6 description-embedding class: embed `canonical_name | draft` (the same
+ * `computeEntityEmbeddingText` SSOT the insert path uses, so one entity
+ * always carries its latest description vector) with ONE batched call,
+ * then UPDATE each survivor's `entities.embedding`.
+ *
+ * Failure posture (joint spec assumption 9): sealed skip. A throwing or
+ * short embedder response leaves the committed description text with its
+ * previous vector and records the count + code — it never fails the chunk
+ * or the C job, unlike the all-or-nothing community-summary class (T5).
+ */
+async function reembedDescriptions(
+  deps: EnrichDeps,
+  client: Queryable,
+  chunkId: string,
+  entries: DescribedDraft[],
+  counts: EnrichCounts
+): Promise<void> {
+  if (entries.length === 0) return;
+  const texts = entries.map((e) =>
+    computeEntityEmbeddingText(e.canonicalName, e.draft)
+  );
+  let vectors: number[][];
+  try {
+    vectors = await embedWithLog(deps.logger, deps.embedder, texts, {
+      eventName: "entity-description-embed",
+      itemCount: texts.length,
+    });
+  } catch (err) {
+    // EXIT: sealed per-leg skip — the embed log already fired inside
+    // embedWithLog; the description writes above stay committed with the
+    // chunk.
+    const code = err instanceof GraphragError ? err.code : "EMBEDDING_FAILED";
+    counts.embedSkipped += entries.length;
+    counts.lastEmbedErrorCode = code;
+    deps.logger.warn("standard-enrichment-embed-failed", {
+      chunkId,
+      code,
+      skipped: entries.length,
+    });
+    return;
+  }
+  for (let i = 0; i < entries.length; i += 1) {
+    const vector = vectors[i];
+    if (!vector || vector.length === 0) {
+      // Row-level mark-and-continue: a short response skips THIS node's
+      // vector, the described siblings still land theirs.
+      counts.embedSkipped += 1;
+      continue;
+    }
+    await client.query(
+      `UPDATE entities SET embedding = $2::vector WHERE id = $1`,
+      [entries[i]!.entityId, toVectorLiteral(vector)]
+    );
+    counts.embedded += 1;
   }
 }
 

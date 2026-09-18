@@ -1,5 +1,5 @@
 /**
- * Schema bootstrap: the four entity/triple ledger tables + their indexes.
+ * Schema bootstrap: the entity/triple/claim ledger tables + their indexes.
  *
  * Decomposed by table (one small helper per table) so each function stays
  * well under 40 lines and the public `upSchemaBootstrap` is a thin orchestrator
@@ -160,6 +160,45 @@ async function createTriples(client: SchemaBootstrapClient): Promise<void> {
   await client.query(`
     CREATE INDEX IF NOT EXISTS triples_relation_norm_idx
       ON triples (relation_norm)`);
+}
+
+/**
+ * claims: time-bounded assertions the STANDARD extract job writes after
+ * canonical merge (graph-index-standard-fast T3; ADR 0071).
+ *
+ * Postgres SoR like the rest of the ledger — claims are NOT graph subjects,
+ * so no projection intent is ever emitted for this table (ADR-0001 keeps
+ * the Neo4j side an entity/triple projection). One row = one claim hanging
+ * on one survivor entity (`entity_id` CASCADE: retiring the entity retires
+ * its claims) with the producing chunk as provenance (`SET NULL`: knowledge
+ * outlives its source, same posture as `triples.source_chunk_id`). The
+ * extract pipeline RESTATES a chunk's rows (DELETE by `source_chunk_id` →
+ * INSERT) inside the chunk transaction, which is what makes repeat
+ * extraction idempotent; `claims_source_chunk_id_idx` serves that replace.
+ * Column vocabulary mirrors `triples` (valid_window '[)' semantics,
+ * confidence CHECK, extractor provenance tag).
+ */
+async function createClaims(client: SchemaBootstrapClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claims (
+      id              uuid PRIMARY KEY,
+      entity_id       uuid NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      source_chunk_id uuid REFERENCES chunks(id) ON DELETE SET NULL,
+      claim_text      text NOT NULL,
+      valid_window    tstzrange NOT NULL,
+      confidence      real NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+      evidence_span   text,
+      extractor       text NOT NULL DEFAULT 'llm',
+      created_at      timestamptz NOT NULL DEFAULT now()
+    )`);
+  // Community-report / claim-read joins hang claims on their entity.
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS claims_entity_id_idx
+      ON claims (entity_id)`);
+  // Per-chunk restatement (DELETE WHERE source_chunk_id = $1).
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS claims_source_chunk_id_idx
+      ON claims (source_chunk_id)`);
 }
 
 /** extraction_records: chunk-level extraction outcomes, batch_id aggregate. */
@@ -379,6 +418,7 @@ export async function upSchemaBootstrap(
     await createEntities(client, dimensions);
     await createEntityAliases(client);
     await createTriples(client);
+    await createClaims(client);
     await createExtractionRecords(client);
     await createCommunitySummaries(client, dimensions);
     await createSourceDocuments(client);

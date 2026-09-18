@@ -55,11 +55,19 @@ const PROJECTION_TABLES = ["projection_outbox"] as const;
  */
 const SOURCE_DOCUMENT_TABLES = ["source_documents"] as const;
 
+/**
+ * graph-index-standard-fast T3: the claims ledger table the standard
+ * extract job writes after canonical merge (ADR 0071). Rides the same
+ * idempotent bootstrap.
+ */
+const CLAIMS_TABLES = ["claims"] as const;
+
 /** Every table the bootstrap owns; dropped and re-created by the first test. */
 const BOOTSTRAP_TABLES = [
   ...LEDGER_TABLES,
   ...PROJECTION_TABLES,
   ...SOURCE_DOCUMENT_TABLES,
+  ...CLAIMS_TABLES,
 ] as const;
 
 /**
@@ -1174,6 +1182,145 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
           [crypto.randomUUID(), "status-bogus", "body", "not-a-status"]
         )
       ).rejects.toThrow(/source_documents_status_check/);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // graph-index-standard-fast T3: DDL contract lock for `claims`
+  // (ADR 0069 / 0071 — standard extract writes time-bounded claims after
+  // canonical merge; Postgres SoR, never projected to Neo4j).
+  // -------------------------------------------------------------------
+  describe("claims DDL contract", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    async function readColumns(
+      c: pg.Client,
+      tableName: string
+    ): Promise<Set<string>> {
+      const res = await c.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_name = $1 AND table_schema = $2`,
+        [tableName, SCHEMA]
+      );
+      return new Set(res.rows.map((r) => r.column_name));
+    }
+
+    /** Insert one claim row against a fresh entity; returns the row id. */
+    async function insertClaim(
+      c: pg.Client,
+      over: { chunkId?: string; confidence?: number } = {}
+    ): Promise<string> {
+      const entityId = crypto.randomUUID();
+      await c.query(
+        `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'concept')`,
+        [entityId, `claims-${entityId}`]
+      );
+      const id = crypto.randomUUID();
+      await c.query(
+        `INSERT INTO claims
+           (id, entity_id, source_chunk_id, claim_text, valid_window, confidence)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          id,
+          entityId,
+          over.chunkId ?? null,
+          "Alice joined Acme in 2024.",
+          "[2026-01-01,)",
+          over.confidence ?? 0.8,
+        ]
+      );
+      return id;
+    }
+
+    it("claims exposes every column pinned in the ledger contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "claims");
+      for (const col of [
+        "id",
+        "entity_id",
+        "source_chunk_id",
+        "claim_text",
+        "valid_window",
+        "confidence",
+        "evidence_span",
+        "extractor",
+        "created_at",
+      ]) {
+        expect(cols, `claims.${col} missing`).toContain(col);
+      }
+    });
+
+    it("claims has the entity-lookup and per-chunk-replace btree indexes", async () => {
+      const c = requireClient();
+      const res = await c.query<{ indexname: string; indexdef: string }>(
+        `SELECT indexname, indexdef FROM pg_indexes
+           WHERE schemaname = $1 AND tablename = 'claims'`,
+        [SCHEMA]
+      );
+      const byName = new Map(res.rows.map((r) => [r.indexname, r.indexdef]));
+      const entityIdx = byName.get("claims_entity_id_idx");
+      expect(entityIdx, "claims_entity_id_idx missing").toBeDefined();
+      expect(entityIdx).toMatch(/USING btree/i);
+      expect(entityIdx).toMatch(/\(entity_id\)/);
+      const chunkIdx = byName.get("claims_source_chunk_id_idx");
+      expect(chunkIdx, "claims_source_chunk_id_idx missing").toBeDefined();
+      expect(chunkIdx).toMatch(/\(source_chunk_id\)/);
+    });
+
+    it("CHECK rejects confidence outside [0,1]", async () => {
+      const c = requireClient();
+      await expect(insertClaim(c, { confidence: -0.5 })).rejects.toThrow();
+      await expect(insertClaim(c, { confidence: 1.5 })).rejects.toThrow();
+    });
+
+    it("extractor defaults to 'llm' (the standard extract writer)", async () => {
+      const c = requireClient();
+      const id = await insertClaim(c);
+      const res = await c.query<{ extractor: string }>(
+        `SELECT extractor FROM claims WHERE id = $1`,
+        [id]
+      );
+      expect(res.rows[0]!.extractor).toBe("llm");
+    });
+
+    it("FK ON DELETE CASCADE: deleting the entity removes its claims", async () => {
+      const c = requireClient();
+      const id = await insertClaim(c);
+      const row = await c.query<{ entity_id: string }>(
+        `SELECT entity_id FROM claims WHERE id = $1`,
+        [id]
+      );
+      await c.query(`DELETE FROM entities WHERE id = $1`, [
+        row.rows[0]!.entity_id,
+      ]);
+      const after = await c.query(
+        `SELECT 1 FROM claims WHERE id = $1`,
+        [id]
+      );
+      expect(after.rowCount).toBe(0);
+    });
+
+    it("FK ON DELETE SET NULL: deleting the chunk keeps the claim, nulls the provenance", async () => {
+      const c = requireClient();
+      const chunkId = crypto.randomUUID();
+      await insertFkProbeChunk(c, chunkId, "claim-provenance-chunk");
+      const id = await insertClaim(c, { chunkId });
+
+      await c.query(`DELETE FROM chunks WHERE id = $1`, [chunkId]);
+
+      const after = await c.query<{ source_chunk_id: string | null }>(
+        `SELECT source_chunk_id FROM claims WHERE id = $1`,
+        [id]
+      );
+      expect(after.rowCount).toBe(1);
+      expect(after.rows[0]!.source_chunk_id).toBeNull();
     });
   });
 });

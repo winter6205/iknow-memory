@@ -21,7 +21,7 @@ import { randomUUID } from "node:crypto";
 
 import type { Logger } from "../../logging.js";
 import type { ProjectionSubject } from "../storage/projection-outbox.js";
-import type { ExtractionOutput } from "./types.js";
+import type { ExtractionOutput, SurvivorRef } from "./types.js";
 import { upsertTriple } from "./dedup.js";
 import { isGrounded } from "../extraction-eval/filter.js";
 import { normalizeRelation, DEFAULT_THRESHOLD, UNMAPPED } from "./normalize.js";
@@ -99,6 +99,14 @@ export interface PersistCounts {
    */
   mergedLoserIds: string[];
   /**
+   * T3 standard-enrichment input: one entry per resolved endpoint of every
+   * output that reached entity resolution, keyed by the SURVIVOR id the
+   * merge settled on (never a loser). `enrichStandardChunk` groups these
+   * into per-entity description lists after the merge, inside the same
+   * chunk transaction.
+   */
+  survivors: SurvivorRef[];
+  /**
    * SC5: every output in this chunk was rejected as a self-loop. The chunk
    * produced zero graph edges and zero entities; the orchestrator marks it
    * `failed` with the SELF_LOOP_REJECTED sentinel so --list-failed /
@@ -123,6 +131,7 @@ export async function persistOutputs(
   const projected: ProjectionSubject[] = [];
   const entityIds = new Set<string>();
   const mergedLoserIds = new Set<string>();
+  const survivors: SurvivorRef[] = [];
   for (const out of outputs) {
     if (
       normalizeAlias(out.head) === normalizeAlias(out.tail) &&
@@ -134,7 +143,9 @@ export async function persistOutputs(
     }
     const {
       headId,
+      headName,
       tailId,
+      tailName,
       mergedLoserIds: losers,
     } = await resolveEndpoints(deps, client, out);
     // Both endpoints are projectable nodes even when the triple below is
@@ -142,6 +153,11 @@ export async function persistOutputs(
     // seed on.
     projected.push({ kind: "entity", id: headId });
     entityIds.add(headId);
+    survivors.push({
+      entityId: headId,
+      canonicalName: headName,
+      description: out.description,
+    });
     for (const loser of losers) mergedLoserIds.add(loser);
     if (headId === tailId) {
       logSelfLoopRejection(deps, chunkId, out, headId);
@@ -150,6 +166,11 @@ export async function persistOutputs(
     }
     projected.push({ kind: "entity", id: tailId });
     entityIds.add(tailId);
+    survivors.push({
+      entityId: tailId,
+      canonicalName: tailName,
+      description: out.description,
+    });
     // Persist gate for the evidence span (SC7, assumption 10): the span must
     // be a non-empty substring of the chunk text, or the triple is a
     // hallucination and never lands. Per-triple mark-and-continue — the
@@ -190,6 +211,7 @@ export async function persistOutputs(
     projected,
     entities: [...entityIds],
     mergedLoserIds: [...mergedLoserIds],
+    survivors,
     allSelfLoop,
   };
 }
@@ -212,7 +234,9 @@ async function resolveEndpoints(
   out: ExtractionOutput
 ): Promise<{
   headId: string;
+  headName: string;
   tailId: string;
+  tailName: string;
   mergedLoserIds: string[];
 }> {
   // Normalize LLM types to the closed P0 set up front (CR High #2) so the
@@ -234,7 +258,9 @@ async function resolveEndpoints(
   );
   return {
     headId: head.id,
+    headName: head.canonicalName,
     tailId: tail.id,
+    tailName: tail.canonicalName,
     mergedLoserIds: [...head.mergedLoserIds, ...tail.mergedLoserIds],
   };
 }
@@ -370,7 +396,9 @@ async function vetRelationNorm(
  * head/tail exclusion. The filter is applied to the loaded `CandidateEntity[]`
  * before the gates see it, so the merge module keeps its locked signature.
  *
- * Returns the resolved id and any loser ids this call wrote. Loser ids are
+ * Returns the resolved id, the SURVIVOR's canonical name (the T3 enrichment
+ * describe/claims input is keyed by ledger name, never by the LLM's surface
+ * form), and any loser ids this call wrote. Loser ids are
  * the rows materialized as `merged_into` survivors — the precision layer
  * must remove them from its entity index so a lexical seed lookup can
  * never resolve to a row the ledger no longer answers for.
@@ -380,7 +408,11 @@ async function resolveEntity(
   client: Queryable,
   incoming: IncomingEntity,
   opts: { excludeIds?: string[] } = {}
-): Promise<{ id: string; mergedLoserIds: string[] }> {
+): Promise<{
+  id: string;
+  canonicalName: string;
+  mergedLoserIds: string[];
+}> {
   const excluded = new Set(opts.excludeIds ?? []);
   const live = (await loadEntities(client)).filter((c) => !excluded.has(c.id));
   const { canonicalId, decision } = await mergeEntitiesWithGating(
@@ -411,12 +443,18 @@ async function resolveEntity(
     if (survivor && survivor.canonicalName !== incoming.canonicalName) {
       await insertAlias(client, survivorId, incoming.canonicalName, "variant");
     }
-    return { id: survivorId, mergedLoserIds };
+    return {
+      id: survivorId,
+      // The survivor row's name; a resolveCanonicalId hop that left the
+      // live set falls back to the incoming form the merge matched on.
+      canonicalName: survivor?.canonicalName ?? incoming.canonicalName,
+      mergedLoserIds,
+    };
   }
   const id = randomUUID();
   await insertEntity(client, id, incoming, await embedEntity(deps, incoming));
   await insertAlias(client, id, incoming.canonicalName, "name");
-  return { id, mergedLoserIds: [] };
+  return { id, canonicalName: incoming.canonicalName, mergedLoserIds: [] };
 }
 
 /**

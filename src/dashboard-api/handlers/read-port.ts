@@ -94,13 +94,35 @@ export function readListHandler(
   };
 }
 
+/**
+ * Closed pattern for every detail-route id. All ids are `randomUUID()`
+ * products stored in PG `uuid` columns, so anything outside 8-4-4-4-12
+ * hex is not a lookup miss — it is a malformed (possibly traversal-shaped,
+ * CWE-22) request, because the router decodeURIComponent()s `:id` before
+ * dispatch and `%2F` therefore arrives as a real `/`. Case is allowed:
+ * PG uuid text is case-insensitive.
+ */
+const DETAIL_ID_PATTERN =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+export function isDetailId(id: string): boolean {
+  return DETAIL_ID_PATTERN.test(id);
+}
+
 export function readDetailHandler<T>(
   get: (id: string) => Promise<StorageReadResult<T>>,
   missing: string
 ): RouteHandler {
   return async (req) => {
+    const id = req.params["id"] ?? "";
+    // Validate at the boundary BEFORE touching the read port; the reply is
+    // the same envelope the storage INVALID_INPUT path already produced,
+    // so the wire stays byte-compatible.
+    if (!isDetailId(id)) {
+      return detailFromRead({ ok: false, code: "INVALID_INPUT" }, missing);
+    }
     try {
-      const result = await get(req.params["id"] ?? "");
+      const result = await get(id);
       return detailFromRead(result, missing);
     } catch (err) {
       return { status: 503, body: errorEnvelope("STORAGE_ERROR", err) };

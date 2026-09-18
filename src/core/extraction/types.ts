@@ -35,6 +35,13 @@ export interface ExtractionOutput {
   evidenceSpan: string;
   /** Confidence in [0,1]. */
   confidence: number;
+  /**
+   * Producer provenance written to `triples.extractor`. The LLM path leaves
+   * it absent (persist defaults to 'llm'); the fast NLP path (T4) tags its
+   * co-occurrence edges 'fast' so the ledger records which method produced
+   * the row.
+   */
+  extractor?: string;
 }
 
 /**

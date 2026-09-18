@@ -1,19 +1,20 @@
 /**
- * T1 (graph-index-standard-fast): extract CLI `--method` / `--source-ref`.
+ * T1 + T4 (graph-index-standard-fast): extract CLI `--method` / `--source-ref`.
  *
  * Pins the version-spine surface of the CLI:
  *   - `--method standard|fast` and `--source-ref REF` parse; anything else is
  *     a usage error (exit 2), consistent with the file's flag-conflict doctrine.
  *   - `--source-ref` swaps the pending scan for the per-source selector.
  *   - the requested method reaches the shared pipeline seam: standard routes
- *     to the LLM, the sealed fast leg fails per chunk (mark-and-continue, so
- *     exit stays 0) without ever dialing the LLM.
+ *     to the LLM, fast routes to the pure NLP co-occurrence extractor (T4)
+ *     that dials no LLM at all — including no LLM-credential requirement.
  *
  * Same no-live-DB posture as extract.unit.test.ts: a recording FakeClient.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
+  isRealExtraction,
   parseArgs,
   runCli,
   type CliClient,
@@ -22,7 +23,7 @@ import {
 } from "../../src/cli/extract.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
-import { FAST_EXTRACT_UNIMPLEMENTED_CODE } from "../../src/core/extraction/method.js";
+import { FAST_EMPTY_GRAPH_CODE } from "../../src/core/extraction/fast.js";
 
 const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
 const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
@@ -183,12 +184,14 @@ describe("runCli --source-ref selector", () => {
   });
 });
 
-describe("runCli --method fast (sealed)", () => {
-  it("fails each chunk with FAST_EXTRACT_UNIMPLEMENTED without an LLM call; exit stays 0 (mark-and-continue)", async () => {
+describe("runCli --method fast (T4 NLP leg)", () => {
+  it("persists fast-tagged triples through the shared merge path with no LLM; exit 0", async () => {
     const client = new FakeClient();
     client.rowsOverride = (text) =>
       /FROM chunks c/.test(text) ? [CHUNK_ROW] : [];
-    // Empty queue: any LLM call throws "queue exhausted".
+    // Empty queue: any LLM call throws "queue exhausted" and would roll the
+    // chunk into a write-failure (exit 2). Exit 0 therefore also proves the
+    // fast leg dialed no LLM.
     const llm = new FakeLLMClient({ queue: [] });
 
     const code = await runCli(
@@ -197,34 +200,108 @@ describe("runCli --method fast (sealed)", () => {
     );
 
     expect(code).toBe(0);
+    const tripleWrites = client.queries.filter((q) =>
+      q.includes("INSERT INTO triples")
+    );
+    // alice/works/acme/corp → 4 terms → 6 co-occurrence edges, all written
+    // via the canonical persist path.
+    expect(tripleWrites).toHaveLength(6);
+    const firstTriple = client.valuesList[
+      client.queries.findIndex((q) => q.includes("INSERT INTO triples"))
+    ]!;
+    expect(firstTriple).toContain("co_occurs_with");
+    expect(firstTriple).toContain("fast");
+    // The success leg claims the version for fast (T1 spine).
+    const recordIdx = client.queries.findIndex((q) =>
+      q.includes("UPDATE source_documents")
+    );
+    expect(client.valuesList[recordIdx]).toEqual([CHUNK_ROW.id, "fast"]);
+  });
+
+  it("a Chinese chunk with no edges records the typed FAST_EMPTY_GRAPH failure", async () => {
+    const client = new FakeClient();
+    client.rowsOverride = (text) =>
+      /FROM chunks c/.test(text)
+        ? [{ id: "00000000-0000-4000-8000-000000000002", content: "的了 于 与 之" }]
+        : [];
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const code = await runCli(
+      ["--method", "fast", "--batch-size", "1"],
+      makeDeps(client, llm)
+    );
+
+    // Mark-and-continue: the chunk fails per-chunk, the batch exits 0.
+    expect(code).toBe(0);
     const failedIdx = client.queries.findIndex((q) =>
       q.includes("SET status = 'failed'")
     );
     expect(failedIdx).toBeGreaterThanOrEqual(0);
-    expect(client.valuesList[failedIdx]).toContain(
-      FAST_EXTRACT_UNIMPLEMENTED_CODE
-    );
-    // The sealed leg never records a method onto the version.
+    expect(client.valuesList[failedIdx]).toContain(FAST_EMPTY_GRAPH_CODE);
+    // A failed fast chunk records no method onto the version.
     expect(
       client.queries.find((q) => q.includes("UPDATE source_documents"))
     ).toBeUndefined();
   });
 
-  it("--method fast --dry-run reports the would-fail leg, dials no LLM, writes nothing", async () => {
+  it("--method fast --dry-run reports the would-write leg, dials no LLM, writes nothing", async () => {
     const client = new FakeClient();
     client.rowsOverride = (text) =>
       /FROM chunks c/.test(text) ? [CHUNK_ROW] : [];
     const llm = new FakeLLMClient({ queue: [] });
+    const events: Array<[string, unknown]> = [];
+    const deps: CliDeps = {
+      ...makeDeps(client, llm),
+      logger: {
+        level: "error",
+        debug: () => {},
+        info: (event, data) => {
+          events.push([event, data]);
+        },
+        warn: () => {},
+        error: () => {},
+      },
+    };
 
     const code = await runCli(
       ["--method", "fast", "--dry-run", "--batch-size", "1"],
-      makeDeps(client, llm)
+      deps
     );
 
     expect(code).toBe(0);
+    // The unsealed leg previews REAL fast output, not a sealed failure.
+    expect(events).toContainEqual([
+      "dry-run-chunk-would-write",
+      expect.objectContaining({ chunkId: CHUNK_ROW.id, triples: 6 }),
+    ]);
     const writes = client.queries.filter((q) =>
       /^\s*(INSERT|UPDATE|DELETE)\s/i.test(q)
     );
     expect(writes).toEqual([]);
+  });
+});
+
+describe("isRealExtraction (LLM-credential guard, T4)", () => {
+  const flagsOf = (argv: string[]) => {
+    const parsed = parseArgs(argv);
+    if (!parsed.ok) throw new Error(`unexpected parse failure: ${parsed.error}`);
+    return parsed.flags;
+  };
+
+  it("a fast run needs no LLM credentials: the NLP leg dials nothing", () => {
+    expect(isRealExtraction(flagsOf(["--method", "fast"]))).toBe(false);
+  });
+
+  it("standard and default runs are real LLM extractions (credential guard stays on)", () => {
+    expect(isRealExtraction(flagsOf([]))).toBe(true);
+    expect(isRealExtraction(flagsOf(["--method", "standard"]))).toBe(true);
+  });
+
+  it("report/dry-run modes are never real extractions, either method", () => {
+    expect(isRealExtraction(flagsOf(["--dry-run"]))).toBe(false);
+    expect(isRealExtraction(flagsOf(["--method", "fast", "--dry-run"]))).toBe(
+      false
+    );
+    expect(isRealExtraction(flagsOf(["--list-failed"]))).toBe(false);
   });
 });

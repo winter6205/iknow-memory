@@ -1,16 +1,17 @@
 /**
- * T1 (graph-index-standard-fast): the extract-method dispatch seam.
+ * T1 + T4 (graph-index-standard-fast): the extract-method dispatch seam.
  *
  * `runExtractMethod` is the single routing point between the batch
  * orchestrator and a per-version extract method:
  *   - "standard" delegates to the existing `extractChunk` path unchanged,
- *   - "fast" is SEALED until T4: a typed failed outcome bearing
- *     FAST_EXTRACT_UNIMPLEMENTED, never an LLM call.
+ *   - "fast" (unsealed by T4) delegates to the pure NLP co-occurrence
+ *     extractor in fast.ts — it never receives the LLM client at all, so a
+ *     fast run cannot dial a model.
  *
- * Boundary classes covered here (test.md): normal (standard routes),
- * failure (fast sealed; no LLM), invalid input (unknown method value),
- * empty input (empty chunk still reaches the standard validation), plus the
- * version-spine SQL helpers (`findChunkMethodConflict`,
+ * Boundary classes covered here (test.md): normal (both methods route),
+ * failure (fast typed failures; no LLM), invalid input (unknown method
+ * value), empty input (empty chunk reaches each leg's pre-flight
+ * validation), plus the version-spine SQL helpers (`findChunkMethodConflict`,
  * `recordChunkExtractMethod`) which pin the conflict-read / record-write
  * statements the pipeline runs per chunk.
  */
@@ -19,7 +20,6 @@ import { describe, it, expect } from "vitest";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import {
   EXTRACT_METHOD_CONFLICT_CODE,
-  FAST_EXTRACT_UNIMPLEMENTED_CODE,
   InvalidExtractMethodError,
   findChunkMethodConflict,
   isExtractMethod,
@@ -27,6 +27,7 @@ import {
   recordChunkExtractMethod,
   runExtractMethod,
 } from "../../src/core/extraction/method.js";
+import { FAST_EMPTY_GRAPH_CODE } from "../../src/core/extraction/fast.js";
 import { EMPTY_CHUNK_CODE } from "../../src/core/extraction/extract.js";
 import type { ExtractionOutput } from "../../src/core/extraction/types.js";
 import type { Queryable } from "../../src/core/extraction/records.js";
@@ -117,20 +118,10 @@ describe("runExtractMethod — standard leg", () => {
   });
 });
 
-describe("runExtractMethod — sealed fast leg", () => {
-  it("fails with the FAST_EXTRACT_UNIMPLEMENTED code and never touches the LLM", async () => {
-    // Empty queue: if the fast leg dialed the LLM it would throw
-    // "queue exhausted" instead of returning the sealed failure.
-    const llm = new FakeLLMClient({ queue: [] });
-    const result = await runExtractMethod("fast", chunk, { llm });
-    expect(result).toEqual({
-      kind: "failed",
-      errorCode: FAST_EXTRACT_UNIMPLEMENTED_CODE,
-      errorMsg: expect.any(String),
-    });
-  });
-
-  it("does not call a scripted LLM at all (exception-proof witness)", async () => {
+describe("runExtractMethod — fast leg (T4, pure NLP)", () => {
+  it("routes to the co-occurrence extractor and never touches the LLM", async () => {
+    // Poison witness: ANY extract call is counted. The fast leg must not
+    // increment it — the seam does not even forward the client downstream.
     let calls = 0;
     const llm = new FakeLLMClient({
       scripted: async () => {
@@ -138,8 +129,48 @@ describe("runExtractMethod — sealed fast leg", () => {
         return { kind: "ok", outputs: [OUTPUT] };
       },
     });
-    await runExtractMethod("fast", chunk, { llm });
+    const result = await runExtractMethod(
+      "fast",
+      { id: "chunk-1", content: "the a Alice Bob" },
+      { llm }
+    );
+    expect(result.kind).toBe("ok");
+    if (result.kind !== "ok") throw new Error("narrow");
+    // stopword-filtered terms alice/bob form exactly one fast edge.
+    expect(result.outputs).toHaveLength(1);
+    expect(result.outputs[0]).toMatchObject({
+      head: "alice",
+      tail: "bob",
+      relationRaw: "co_occurs_with",
+      extractor: "fast",
+    });
     expect(calls).toBe(0);
+  });
+
+  it("inherits the empty-chunk pre-flight (EMPTY_CHUNK) with no LLM", async () => {
+    const llm = new FakeLLMClient({ queue: [] });
+    const result = await runExtractMethod(
+      "fast",
+      { id: "chunk-1", content: "   " },
+      { llm }
+    );
+    expect(result).toMatchObject({
+      kind: "failed",
+      errorCode: EMPTY_CHUNK_CODE,
+    });
+  });
+
+  it("an empty Chinese graph is the typed FAST_EMPTY_GRAPH failure, not a silent zero", async () => {
+    const llm = new FakeLLMClient({ queue: [] });
+    const result = await runExtractMethod(
+      "fast",
+      { id: "chunk-1", content: "的了 于 与 之" },
+      { llm }
+    );
+    expect(result).toMatchObject({
+      kind: "failed",
+      errorCode: FAST_EMPTY_GRAPH_CODE,
+    });
   });
 });
 
@@ -216,8 +247,8 @@ describe("recordChunkExtractMethod", () => {
 });
 
 describe("typed codes", () => {
-  it("name the sealed method and the version conflict", () => {
-    expect(FAST_EXTRACT_UNIMPLEMENTED_CODE).toBe("FAST_EXTRACT_UNIMPLEMENTED");
+  it("names the version conflict and the empty-fast failure", () => {
     expect(EXTRACT_METHOD_CONFLICT_CODE).toBe("EXTRACT_METHOD_CONFLICT");
+    expect(FAST_EMPTY_GRAPH_CODE).toBe("FAST_EMPTY_GRAPH");
   });
 });

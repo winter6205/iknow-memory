@@ -162,14 +162,27 @@ export function createNeo4jCommunityDetector(
 /**
  * Group `gds.leiden.stream` rows by (level, communityId), drop members
  * outside the largest component, then split oversized communities into
- * deterministic sorted chunks. Chunk ids: the first chunk keeps the Leiden
- * community id; later chunks append `-2`, `-3`, … .
+ * deterministic sorted chunks.
  */
 function toHierarchicalCommunities(
   rows: Array<Record<string, unknown>>,
   lccMembers: Set<string> | undefined,
   maxClusterSize: number
 ): Community[] {
+  return splitIntoOrderedChunks(
+    groupCommunitiesByLevel(rows, lccMembers),
+    maxClusterSize
+  );
+}
+
+/**
+ * Collect members per (level, leiden communityId), skipping rows outside the
+ * largest component and rows whose level key is not a positive integer.
+ */
+function groupCommunitiesByLevel(
+  rows: Array<Record<string, unknown>>,
+  lccMembers: Set<string> | undefined
+): Map<number, Map<string, string[]>> {
   const groups = new Map<number, Map<string, string[]>>();
   for (const row of rows) {
     const entityId = String(row["entityId"]);
@@ -179,46 +192,54 @@ function toHierarchicalCommunities(
     for (const [rawLevel, rawCommunityId] of Object.entries(levels)) {
       const level = Number(rawLevel);
       if (!Number.isInteger(level) || level < 1) continue;
-      const communityId = String(rawCommunityId);
-      let members = groups.get(level)?.get(communityId);
-      if (members === undefined) {
-        members = [];
-        let byId = groups.get(level);
-        if (byId === undefined) {
-          byId = new Map();
-          groups.set(level, byId);
-        }
-        byId.set(communityId, members);
-      }
-      members.push(entityId);
+      addMember(groups, level, String(rawCommunityId), entityId);
     }
   }
+  return groups;
+}
 
-  const entries: Array<{
-    level: number;
-    communityId: string;
-    chunkIndex: number;
-    community: Community;
-  }> = [];
+/** Insert one member, creating the (level, communityId) buckets on demand. */
+function addMember(
+  groups: Map<number, Map<string, string[]>>,
+  level: number,
+  communityId: string,
+  entityId: string
+): void {
+  const byId = groups.get(level) ?? new Map<string, string[]>();
+  const members = byId.get(communityId) ?? [];
+  members.push(entityId);
+  byId.set(communityId, members);
+  groups.set(level, byId);
+}
+
+/**
+ * Split oversized communities into deterministic sorted chunks. Chunk ids:
+ * the first chunk keeps the Leiden community id; later chunks append `-2`,
+ * `-3`, … . Output is globally ordered by (level, numeric communityId,
+ * chunk index).
+ */
+function splitIntoOrderedChunks(
+  groups: Map<number, Map<string, string[]>>,
+  maxClusterSize: number
+): Community[] {
+  const entries: CommunityEntry[] = [];
   for (const [level, byId] of groups) {
     for (const [communityId, members] of byId) {
       members.sort(compareEntityIds);
-      const chunks: string[][] = [];
+      let chunkIndex = 0;
       for (let start = 0; start < members.length; start += maxClusterSize) {
-        chunks.push(members.slice(start, start + maxClusterSize));
-      }
-      chunks.forEach((chunk, index) => {
         entries.push({
           level,
           communityId,
-          chunkIndex: index,
+          chunkIndex,
           community: {
-            id: index === 0 ? communityId : `${communityId}-${index + 1}`,
-            entityIds: chunk,
+            id: chunkIndex === 0 ? communityId : `${communityId}-${chunkIndex + 1}`,
+            entityIds: members.slice(start, start + maxClusterSize),
             level,
           },
         });
-      });
+        chunkIndex += 1;
+      }
     }
   }
   entries.sort(compareEntries);
@@ -229,6 +250,7 @@ interface CommunityEntry {
   level: number;
   communityId: string;
   chunkIndex: number;
+  community: Community;
 }
 
 /** Sort by level, then numeric Leiden id, then chunk index (never "X-10" vs "X-2"). */

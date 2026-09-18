@@ -231,9 +231,9 @@ export interface ProcessBatchOptions {
   /**
    * T1 version spine: the extract method for this run, routed through the
    * `runExtractMethod` seam. Default "standard" — the spec's default job
-   * (assumption 3); Fast never runs without the recorded switch. The
-   * method's only production entry today is this option (the extract CLI's
-   * --method flag); the MCP tool keeps the default until T4.
+   * (assumption 3); Fast never runs unasked. The production entry today is
+   * this option (the extract CLI's --method flag); the MCP tool keeps the
+   * standard default (a Fast switch there is a later surface).
    */
   method?: ExtractMethod;
 }

@@ -454,8 +454,8 @@ async function dryRunPlan(
   deps.logger.info("dry-run-plan", { chunks: chunks.length });
   for (const chunk of chunks) {
     // Same dispatch seam as the real batch: a dry run must show the outcome
-    // the requested method would produce (incl. the sealed fast leg), not a
-    // standard-only preview that could promise a run the seam would refuse.
+    // the requested method would produce (incl. the pure NLP fast leg), not
+    // a standard-only preview that could promise a run the seam would refuse.
     const outcome = await runExtractMethod(method ?? "standard", chunk, {
       llm: deps.llm,
     });
@@ -481,9 +481,14 @@ async function dryRunPlan(
  * True when the invocation runs the LLM extraction write path. Anything else
  * (`--dry-run`, `--list-unmapped`, `--list-failed`, `--backfill-embeddings`)
  * makes no use of LLM output, so keyless operation may fall back to the
- * scripted fake (`buildLlmClient`'s guard).
+ * scripted fake (`buildLlmClient`'s guard). Nor does a `--method fast` run
+ * (T4): the fast leg is pure NLP and dials no LLM at all, so it must not
+ * require LLM credentials either.
+ *
+ * Exported for tests — it is the credential-guard predicate.
  */
-function isRealExtraction(flags: CliFlags): boolean {
+export function isRealExtraction(flags: CliFlags): boolean {
+  if (flags.method === "fast") return false;
   return !(
     flags.dryRun ||
     flags.listUnmapped ||

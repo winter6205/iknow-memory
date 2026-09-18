@@ -312,9 +312,10 @@ function logUngroundedRejection(
  * confidence just moved, so the edge still needs re-projecting (the caller
  * pushes it onto `projected` either way).
  *
- * `extractor` is set explicitly to `'llm'` here — every triple this module
- * produces comes from the LLM extraction path; a rule-based or human writer
- * has its own call site and sets its own tag.
+ * `extractor` follows the output's provenance tag: the LLM path leaves it
+ * absent and the row defaults to `'llm'`; the fast NLP path (T4) tags its
+ * co-occurrence outputs `'fast'` so the ledger records which method
+ * produced the edge. A rule-based or human writer sets its own tag.
  *
  * T4: the write-time supersede switch from `deps.writeTimeSupersede` is
  * forwarded to `upsertTriple` as `options.writeTimeSupersede`. The
@@ -348,7 +349,7 @@ async function resolveAndUpsertTriple(
       sourceChunkId: chunkId,
       evidenceSpan: out.evidenceSpan,
       validWindow: { start: startedAt, end: null },
-      extractor: "llm",
+      extractor: out.extractor ?? "llm",
     },
     {
       ...(deps.writeTimeSupersede === true

@@ -82,8 +82,8 @@ export type SourceDocStatus =
  * Extract-method vocabulary (graph-index-standard-fast T1; spec assumption 3).
  *
  * One 资料 version carries EXACTLY ONE method: `standard` (LLM extraction,
- * the default job) or `fast` (NLP co-occurrence, sealed until T4). Persisted
- * on `source_documents.extract_method`; the CHECK constraint in
+ * the default job) or `fast` (pure NLP co-occurrence, T4). Persisted on
+ * `source_documents.extract_method`; the CHECK constraint in
  * schema-bootstrap.ts derives its literal list from this constant, mirroring
  * the `SOURCE_DOC_STATUS` pattern.
  */

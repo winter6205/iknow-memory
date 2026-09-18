@@ -30,10 +30,8 @@ import {
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { SELF_LOOP_REJECTED_CODE } from "../../src/core/extraction/records.js";
-import {
-  EXTRACT_METHOD_CONFLICT_CODE,
-  FAST_EXTRACT_UNIMPLEMENTED_CODE,
-} from "../../src/core/extraction/method.js";
+import { EXTRACT_METHOD_CONFLICT_CODE } from "../../src/core/extraction/method.js";
+import { FAST_EMPTY_GRAPH_CODE } from "../../src/core/extraction/fast.js";
 import type { Logger } from "../../src/logging.js";
 
 /** Recording fake Queryable; rows are chosen per SQL text (and binds). */
@@ -356,26 +354,49 @@ describe("processBatch extract-method routing (T1 seam)", () => {
     expect(recordIdx).toBeLessThan(commitIdx);
   });
 
-  it("method 'fast' fails every chunk with FAST_EXTRACT_UNIMPLEMENTED and never calls the LLM", async () => {
+  it("method 'fast' runs the pure NLP extractor, persists fast-tagged triples, and never calls the LLM", async () => {
     const client = new FakeQueryable();
-    // Empty queue: any LLM call would throw "queue exhausted".
+    // Empty queue: any LLM call would throw "queue exhausted" and the chunk
+    // would land as a write-failure, not a success.
     const llm = new FakeLLMClient({ queue: [] });
 
     const summary = await processBatch(
       makeDeps(llm),
       client,
-      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      [{ id: "chunk-1", content: "the a Alice Bob" }],
+      { batchSize: 1, method: "fast" }
+    );
+
+    // "alice"/"bob" survive stopword filtering → one co-occurrence edge →
+    // the SAME canonical merge/persist path the standard leg uses.
+    expect(summary.succeeded).toBe(1);
+    expect(summary.failed).toBe(0);
+    const tripleIdx = client.indexOf("INSERT INTO triples");
+    expect(tripleIdx).toBeGreaterThanOrEqual(0);
+    expect(client.valuesList[tripleIdx]).toContain("co_occurs_with");
+    // Provenance: the fast triples carry the 'fast' extractor tag, not 'llm'.
+    expect(client.valuesList[tripleIdx]).toContain("fast");
+    // The success leg claims the version for fast (T1 spine unchanged).
+    const recordIdx = client.indexOf("UPDATE source_documents");
+    expect(client.valuesList[recordIdx]).toEqual(["chunk-1", "fast"]);
+  });
+
+  it("method 'fast' on a Chinese chunk with no edges is a typed FAST_EMPTY_GRAPH chunk fail", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "的了 于 与 之" }],
       { batchSize: 1, method: "fast" }
     );
 
     expect(summary.failed).toBe(1);
-    expect(summary.succeeded).toBe(0);
     const failedIdx = client.indexOf("SET status = 'failed'");
     expect(failedIdx).toBeGreaterThanOrEqual(0);
-    expect(client.valuesList[failedIdx]).toContain(
-      FAST_EXTRACT_UNIMPLEMENTED_CODE
-    );
-    // The sealed leg writes no ledger rows and never records a method.
+    expect(client.valuesList[failedIdx]).toContain(FAST_EMPTY_GRAPH_CODE);
+    // The failed leg writes no ledger rows and records no method.
     expect(client.indexOf("INSERT INTO triples")).toBe(-1);
     expect(client.indexOf("UPDATE source_documents")).toBe(-1);
   });
@@ -536,21 +557,32 @@ describe("processBatch standard post-merge enrichment (T3)", () => {
 
   it("the fast method never dials describe/claims and never writes them", async () => {
     const client = new FakeQueryable();
+    let describeCalls = 0;
+    let claimCalls = 0;
     const llm = makeEnrichLLM([], {
-      scriptedDescribe: describeDrafts,
-      scriptedClaims: claimsOk,
+      scriptedDescribe: async (input: any) => {
+        describeCalls += 1;
+        return describeDrafts(input);
+      },
+      scriptedClaims: async () => {
+        claimCalls += 1;
+        return claimsOk();
+      },
     });
 
     const summary = await processBatch(
       makeDeps(llm),
       client,
-      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      [{ id: "chunk-1", content: "the a Alice Bob" }],
       { batchSize: 1, method: "fast" }
     );
 
-    // Fast stays sealed (T1/T4): the chunk fails before any persist, and
-    // the enrichment legs never run — no description UPDATE, no claim rows.
-    expect(summary.failed).toBe(1);
+    // Fast persists its co-occurrence edges (T4) but enrichment stays
+    // standard-only (spec: Fast has no descriptions, no claims): the chunk
+    // succeeds without a single describe/claims touch or write.
+    expect(summary.succeeded).toBe(1);
+    expect(describeCalls).toBe(0);
+    expect(claimCalls).toBe(0);
     expect(client.indexOf("jsonb_set")).toBe(-1);
     expect(client.indexOf("DELETE FROM claims")).toBe(-1);
     expect(client.indexOf("INSERT INTO claims")).toBe(-1);

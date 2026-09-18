@@ -1,12 +1,13 @@
 /**
- * Extract-method dispatch — the version spine of T1
+ * Extract-method dispatch — the version spine of T1, fast leg opened by T4
  * (plans/graph-index-standard-fast.md).
  *
  * One 资料 version carries EXACTLY ONE extract method (spec assumption 3):
- * `standard` (LLM extraction) or `fast` (NLP co-occurrence, implemented by
- * T4). `runExtractMethod` is the single dispatch seam: `standard` delegates
- * to the existing `extractChunk` path; `fast` is SEALED until T4 and fails
- * with the typed FAST_EXTRACT_UNIMPLEMENTED code instead of dialing the LLM.
+ * `standard` (LLM extraction) or `fast` (pure NLP co-occurrence).
+ * `runExtractMethod` is the single dispatch seam: `standard` delegates to
+ * the existing `extractChunk` path; `fast` delegates to `extractFastChunk`
+ * (fast.ts) — a pure function over the chunk text that never even receives
+ * the LLM client, so a fast run cannot dial a model.
  *
  * The version columns ride the `source_documents` ledger (SoR):
  * `findChunkMethodConflict` is the pre-flight guard — it runs BEFORE any LLM
@@ -17,6 +18,7 @@
  */
 import { GraphragError } from "../errors.js";
 import { EXTRACT_METHODS, type ExtractMethod } from "../types.js";
+import { extractFastChunk } from "./fast.js";
 import type { Queryable } from "./records.js";
 import {
   extractChunk,
@@ -25,8 +27,6 @@ import {
   type ExtractionOutcome,
 } from "./extract.js";
 
-/** Error code for the sealed fast method (typed, never bare). */
-export const FAST_EXTRACT_UNIMPLEMENTED_CODE = "FAST_EXTRACT_UNIMPLEMENTED";
 /** Error code for a method that conflicts with the version's recorded method. */
 export const EXTRACT_METHOD_CONFLICT_CODE = "EXTRACT_METHOD_CONFLICT";
 
@@ -60,9 +60,10 @@ export function parseExtractMethod(raw: string): ExtractMethod {
 /**
  * Dispatch one chunk through its version's extract method.
  *
- * `fast` is a sealed FAILED outcome (mark-and-continue stays the caller's
- * contract, and the code lands in extraction_records for operators) — it
- * returns before `ctx` is ever touched, so the LLM cannot be dialed.
+ * `fast` runs the pure NLP extractor (T4): the `ctx` — whose only member is
+ * the LLM client — is dropped at the branch, so the leg cannot bill a call;
+ * its failures stay sealed outcomes (mark-and-continue stays the caller's
+ * contract, and the code lands in extraction_records for operators).
  * A value outside the vocabulary is a caller-contract violation, not a
  * chunk outcome: it throws `InvalidExtractMethodError`.
  */
@@ -75,13 +76,7 @@ export async function runExtractMethod(
     throw new InvalidExtractMethodError(String(method));
   }
   if (method === "standard") return extractChunk(chunk, ctx);
-  return {
-    kind: "failed",
-    errorCode: FAST_EXTRACT_UNIMPLEMENTED_CODE,
-    errorMsg:
-      "fast extraction is sealed until plan ticket T4 (NLP co-occurrence); " +
-      "the standard method is the only runnable extract method",
-  };
+  return extractFastChunk(chunk);
 }
 
 /** A 资料 row whose recorded method differs from the requested one. */

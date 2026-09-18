@@ -466,3 +466,156 @@ describe("processBatch extract-method routing (T1 seam)", () => {
     );
   });
 });
+
+// ─── T3 (graph-index-standard-fast): standard describe + claims ──────────
+
+/**
+ * A FakeLLMClient carrying the OPTIONAL enrichment methods, so the
+ * pipeline's standard leg actually runs describe + claims.
+ */
+function makeEnrichLLM(extractQueue: any[], overrides: any) {
+  return new FakeLLMClient({ queue: extractQueue, ...overrides });
+}
+
+const describeDrafts = async (input: any) => ({
+  kind: "ok",
+  descriptions: input.entities.map((e: any) => ({
+    canonicalName: e.canonicalName,
+    description: `${e.canonicalName} summary`,
+  })),
+});
+
+const claimsOk = async () => ({
+  kind: "ok",
+  claims: [
+    {
+      entity: "Alice",
+      claim: "Alice works at Acme Corp.",
+      validFrom: null,
+      validTo: null,
+      confidence: 0.8,
+      evidenceSpan: "",
+    },
+  ],
+});
+
+describe("processBatch standard post-merge enrichment (T3)", () => {
+  it("runs describe + claims after the merge writes and inside the chunk transaction", async () => {
+    const client = new FakeQueryable();
+    const llm = makeEnrichLLM(
+      [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+      { scriptedDescribe: describeDrafts, scriptedClaims: claimsOk }
+    );
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "standard" }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    // Ordering inside the one transaction: merge/persist writes → the
+    // survivor description UPDATE + the claims replace → outbox intents →
+    // COMMIT. Enrichment rides the SAME transaction (a rolled-back chunk
+    // leaves no descriptions or claims behind), and it runs AFTER the
+    // canonical merge wrote the survivor rows.
+    const tripleInsert = client.indexOf("INSERT INTO triples");
+    const describeUpdate = client.indexOf("jsonb_set");
+    const claimsDelete = client.indexOf("DELETE FROM claims");
+    const claimsInsert = client.indexOf("INSERT INTO claims");
+    const outbox = client.indexOf("INSERT INTO projection_outbox");
+    const commit = client.indexOf("COMMIT");
+    expect(tripleInsert).toBeGreaterThanOrEqual(0);
+    expect(describeUpdate).toBeGreaterThan(tripleInsert);
+    expect(claimsDelete).toBeGreaterThan(tripleInsert);
+    expect(claimsInsert).toBeGreaterThan(claimsDelete);
+    expect(outbox).toBeGreaterThan(claimsInsert);
+    expect(commit).toBeGreaterThan(outbox);
+  });
+
+  it("the fast method never dials describe/claims and never writes them", async () => {
+    const client = new FakeQueryable();
+    const llm = makeEnrichLLM([], {
+      scriptedDescribe: describeDrafts,
+      scriptedClaims: claimsOk,
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "fast" }
+    );
+
+    // Fast stays sealed (T1/T4): the chunk fails before any persist, and
+    // the enrichment legs never run — no description UPDATE, no claim rows.
+    expect(summary.failed).toBe(1);
+    expect(client.indexOf("jsonb_set")).toBe(-1);
+    expect(client.indexOf("DELETE FROM claims")).toBe(-1);
+    expect(client.indexOf("INSERT INTO claims")).toBe(-1);
+  });
+
+  it("an enrichment miss (failed describe + failed claims) keeps the chunk successful", async () => {
+    const client = new FakeQueryable();
+    const llm = makeEnrichLLM(
+      [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+      {
+        scriptedDescribe: async () => ({
+          kind: "failed",
+          errorCode: "5xx",
+          errorMsg: "provider down",
+        }),
+        scriptedClaims: async () => ({
+          kind: "failed",
+          errorCode: "format",
+          errorMsg: "bad json",
+        }),
+      }
+    );
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "standard" }
+    );
+
+    // ADR 0069 / 0071: misses skip their leg; the C job is not failed.
+    expect(summary.succeeded).toBe(1);
+    expect(summary.failed).toBe(0);
+    expect(summary.writeFailures).toBe(0);
+    expect(client.indexOf("jsonb_set")).toBe(-1);
+    expect(client.indexOf("INSERT INTO claims")).toBe(-1);
+    expect(client.indexOf("SET status = 'succeeded'")).toBeGreaterThanOrEqual(
+      0
+    );
+    expect(client.indexOf("COMMIT")).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a throwing enrichment client is sealed per leg and never rolls the chunk back", async () => {
+    const client = new FakeQueryable();
+    const llm = makeEnrichLLM(
+      [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+      {
+        scriptedDescribe: async () => {
+          throw new Error("socket reset");
+        },
+        scriptedClaims: async () => {
+          throw new Error("socket reset");
+        },
+      }
+    );
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "standard" }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    expect(summary.writeFailures).toBe(0);
+    expect(client.indexOf("ROLLBACK")).toBe(-1);
+  });
+});

@@ -15,9 +15,11 @@
  * the CLI maps `writeFailures > 0` to exit 2).
  *
  * Transaction shape per chunk (SC3): BEGIN → insertRecord(pending) →
- * method-conflict check (T1) → runExtractMethod → persistOutputs →
- * emitProjectionIntents (same transaction as the ledger rows it describes) →
- * recordChunkExtractMethod (T1 version claim) → markSucceeded → COMMIT. The
+ * method-conflict check (T1) → runExtractMethod → persistOutputs (canonical
+ * merge) → enrichStandardChunk (T3, standard only: survivor descriptions +
+ * claims) → emitProjectionIntents (same transaction as the ledger rows it
+ * describes) → recordChunkExtractMethod (T1 version claim) → markSucceeded →
+ * COMMIT. The
  * ES precision layer mirrors AFTER commit, fail-open, never aborting the
  * chunk.
  */
@@ -26,6 +28,11 @@ import type { PrecisionIndexer } from "../storage/elasticsearch-precision.js";
 import { emitProjectionIntents } from "../storage/projection-outbox.js";
 import { fetchEntityProjection } from "../storage/entity-projection.js";
 import { type ChunkInput } from "./extract.js";
+import {
+  enrichStandardChunk,
+  ZERO_ENRICH,
+  type EnrichCounts,
+} from "./enrich.js";
 import type { LLMClient } from "./llm-client.js";
 import {
   EXTRACT_METHOD_CONFLICT_CODE,
@@ -435,6 +442,24 @@ async function processChunk(
         errorMsg: "all outputs were self-loops",
       };
     }
+    // T3 standard-only post-merge enrichment (ADR 0069 / 0071): summarize
+    // each merge survivor's description list and re-state this chunk's
+    // claims AFTER the canonical merge settled survivors, inside the SAME
+    // transaction — a rolled-back chunk keeps no summaries and no claims.
+    // Every LLM-level miss is a sealed skip inside the leg (ticket: one
+    // description miss does not fail the whole C job); a DB write error
+    // still rolls the chunk back through the catch below. Fast never runs
+    // this (spec: Fast has no descriptions, no claims).
+    const enrich: EnrichCounts =
+      method === "standard"
+        ? await enrichStandardChunk(
+            deps,
+            client,
+            chunk,
+            counts.survivors,
+            startedAt
+          )
+        : { ...ZERO_ENRICH };
     // Same transaction as the ledger rows it describes (SC3): a projection
     // intent that outlived a rolled-back chunk would tell the projector to
     // sync a row Postgres never kept, and a chunk that committed without one
@@ -459,13 +484,19 @@ async function processChunk(
     // through `keyword_bm25:attempted-and-failed` on stderr.
     await projectEntitiesToPrecisionLayer(deps, client, counts);
     // SC10 success leg: the counts are only final after persistOutputs, so
-    // this event fires post-commit with the whitelisted field set.
+    // this event fires post-commit with the whitelisted field set. The T3
+    // enrichment counts ride the same whitelist (numbers only — never the
+    // summary text or claim text).
     deps.logger.info("chunk-extracted", {
       ...chunkLogFields(deps, chunk.id, latencyStart),
       outcome: "ok",
       triples: counts.triples,
       unmapped: counts.unmapped,
       ungrounded: counts.ungrounded,
+      described: enrich.described,
+      describeSkipped: enrich.describeSkipped,
+      claims: enrich.claimsWritten,
+      claimsSkipped: enrich.claimsSkipped,
     });
     return { kind: "ok", ungrounded: counts.ungrounded };
   } catch (err) {

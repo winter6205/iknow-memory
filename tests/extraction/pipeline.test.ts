@@ -30,18 +30,22 @@ import {
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { SELF_LOOP_REJECTED_CODE } from "../../src/core/extraction/records.js";
+import {
+  EXTRACT_METHOD_CONFLICT_CODE,
+  FAST_EXTRACT_UNIMPLEMENTED_CODE,
+} from "../../src/core/extraction/method.js";
 import type { Logger } from "../../src/logging.js";
 
-/** Recording fake Queryable; rows are chosen per SQL text. */
+/** Recording fake Queryable; rows are chosen per SQL text (and binds). */
 class FakeQueryable implements Queryable {
   queries: string[] = [];
   valuesList: unknown[][] = [];
-  rowsFor: (text: string) => any[] = () => [];
+  rowsFor: (text: string, values: unknown[]) => any[] = () => [];
 
   async query(text: string, values: unknown[] = []) {
     this.queries.push(text);
     this.valuesList.push(values);
-    return { rows: this.rowsFor(text) };
+    return { rows: this.rowsFor(text, values) };
   }
 
   /** Index of the first query containing `fragment`, or -1. */
@@ -320,5 +324,145 @@ describe("processBatch (core batch orchestration, no CLI argv)", () => {
     const failedIdx = client.indexOf("SET status = 'failed'");
     expect(failedIdx).toBeGreaterThanOrEqual(0);
     expect(client.valuesList[failedIdx]).toContain(SELF_LOOP_REJECTED_CODE);
+  });
+});
+
+// ─── T1 (graph-index-standard-fast): extract-method version spine ────────
+
+/** SQL fragment that identifies the per-chunk conflict SELECT. */
+const CONFLICT_SELECT = "SELECT sd.source_ref, sd.extract_method";
+
+describe("processBatch extract-method routing (T1 seam)", () => {
+  it("default method is standard: LLM runs and the success leg records the method", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    const recordIdx = client.indexOf("UPDATE source_documents");
+    expect(recordIdx).toBeGreaterThanOrEqual(0);
+    expect(client.valuesList[recordIdx]).toEqual(["chunk-1", "standard"]);
+    // Recording rides the chunk transaction BEFORE it commits (the version
+    // metadata must not survive a rolled-back chunk).
+    const commitIdx = client.indexOf("COMMIT");
+    expect(recordIdx).toBeLessThan(commitIdx);
+  });
+
+  it("method 'fast' fails every chunk with FAST_EXTRACT_UNIMPLEMENTED and never calls the LLM", async () => {
+    const client = new FakeQueryable();
+    // Empty queue: any LLM call would throw "queue exhausted".
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "fast" }
+    );
+
+    expect(summary.failed).toBe(1);
+    expect(summary.succeeded).toBe(0);
+    const failedIdx = client.indexOf("SET status = 'failed'");
+    expect(failedIdx).toBeGreaterThanOrEqual(0);
+    expect(client.valuesList[failedIdx]).toContain(
+      FAST_EXTRACT_UNIMPLEMENTED_CODE
+    );
+    // The sealed leg writes no ledger rows and never records a method.
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(client.indexOf("UPDATE source_documents")).toBe(-1);
+  });
+
+  it("a recorded method that differs fails the chunk with EXTRACT_METHOD_CONFLICT, no LLM call", async () => {
+    const client = new FakeQueryable();
+    // Simulate the SQL's `<> $2` filter: the stored row only surfaces when
+    // it differs from the requested method.
+    client.rowsFor = (text, values) =>
+      text.includes(CONFLICT_SELECT) && values[1] !== "fast"
+        ? [{ source_ref: "doc-1", extract_method: "fast" }]
+        : [];
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const outcomes: string[] = [];
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      {
+        batchSize: 1,
+        method: "standard",
+        onChunkOutcome: (o) => outcomes.push(o.kind),
+      }
+    );
+
+    expect(summary.failed).toBe(1);
+    const failedIdx = client.indexOf("SET status = 'failed'");
+    expect(client.valuesList[failedIdx]).toContain(
+      EXTRACT_METHOD_CONFLICT_CODE
+    );
+    // The message names the conflicting 资料 locator for the operator.
+    expect(
+      client.valuesList[failedIdx]!.some(
+        (v) => typeof v === "string" && v.includes("doc-1")
+      )
+    ).toBe(true);
+    // Conflict is checked BEFORE extraction: no ledger writes, no method
+    // overwrite — the recorded version keeps its original method.
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(client.indexOf("UPDATE source_documents")).toBe(-1);
+    expect(outcomes).toEqual(["failed"]);
+  });
+
+  it("re-extracting with the SAME recorded method is not a conflict (idempotent repeat)", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = (text, values) =>
+      text.includes(CONFLICT_SELECT) && values[1] !== "standard"
+        ? [{ source_ref: "doc-1", extract_method: "standard" }]
+        : [];
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "standard" }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    expect(summary.failed).toBe(0);
+    // The record write stays idempotent: same method re-recorded verbatim.
+    expect(
+      client.valuesList[client.indexOf("UPDATE source_documents")]
+    ).toEqual(["chunk-1", "standard"]);
+  });
+
+  it("chunks whose 资料 row has no recorded method proceed and claim the version", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "standard" }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    // Conflict SELECT ran before the record insert marked the chunk pending-
+    // extraction, proving the guard is pre-flight, not post-hoc.
+    expect(client.indexOf(CONFLICT_SELECT)).toBeLessThan(
+      client.indexOf("SET status = 'succeeded'")
+    );
   });
 });

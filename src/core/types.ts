@@ -79,6 +79,19 @@ export type SourceDocStatus =
   (typeof SOURCE_DOC_STATUS)[keyof typeof SOURCE_DOC_STATUS];
 
 /**
+ * Extract-method vocabulary (graph-index-standard-fast T1; spec assumption 3).
+ *
+ * One 资料 version carries EXACTLY ONE method: `standard` (LLM extraction,
+ * the default job) or `fast` (NLP co-occurrence, sealed until T4). Persisted
+ * on `source_documents.extract_method`; the CHECK constraint in
+ * schema-bootstrap.ts derives its literal list from this constant, mirroring
+ * the `SOURCE_DOC_STATUS` pattern.
+ */
+export const EXTRACT_METHODS = ["standard", "fast"] as const;
+
+export type ExtractMethod = (typeof EXTRACT_METHODS)[number];
+
+/**
  * v1 is a SINGLE process-wide 资料集合 (spec Open Question 2, leading
  * option): every stored 资料 belongs to the one collection the operator
  * sees on the existing 资料页. A collections table would be a schema,

@@ -1,6 +1,6 @@
 # Spec: Retrieve community summaries
 
-> **Status:** draft — ACR in this file after spec-axis + ACR review (2026-08-30); not implemented.
+> **Status:** draft — **community algorithm superseded by ADR-0011** (hierarchical Leiden) and `specs/graph-index-standard-fast.md`. Ledger summary + retrieve-read clauses remain until that spec ships.
 > **Source:** operator 2026-08-30 — coarse contract for CONTEXT **community** (English GraphRAG term). Parent stack remains `specs/retrieve-graph-quality.md` slice 8 / plan T9.
 > **Predecessors:** ADR-0001; `specs/neo4j-graph-arm.md` (projection + GDS); `specs/retrieve-graph-priority.md` (Host `chunks[]` order); `specs/retrieve-graph-quality.md` (mode bundle, fail-open, envelope).
 > **Tracker:** local markdown only. Do not use GitHub issues.

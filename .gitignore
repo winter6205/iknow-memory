@@ -44,3 +44,4 @@ docs/visualizations/
 
 # Playwright CLI page snapshots / console logs (local debugging scratch)
 .playwright-cli/
+.qoder

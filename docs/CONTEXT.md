@@ -118,11 +118,11 @@ _Avoid_: "causal link" (rule-based linkers do not produce typed edges); "reason 
 
 ### Graph storage
 
-**Neo4j sidecar**: the only production graph engine (ADR-0008); native multi-hop traversal (PPR first; Louvain / node-level embedding later); a read-only projection of Postgres-authoritative entities/triples, never a system of record (ADR-0001 / issue #3 D1). Sync mechanism locked as transactional **projection outbox** + full backfill (#69; #7 Q3b). SQL JOIN, Apache AGE, and ledger-side PPR do not satisfy the graph capability. When **RetrieveConfig** `graphEnabled` is on (the default), missing Neo4j URI or credentials refuse process start (`ConfigError`, ADR-0006); explicit off allows start without a sidecar (test/escape hatch). Ingest does not require Neo4j. _Stage: morphology locked (#69); on main via #77 (Neo4j CE + GDS over Bolt)._
+**Neo4j sidecar**: the only production graph engine (ADR-0008); native multi-hop traversal (PPR first; **Leiden** community clustering at index — ADR-0011; node-level embedding later); a read-only projection of Postgres-authoritative entities/triples, never a system of record (ADR-0001 / issue #3 D1). Sync mechanism locked as transactional **projection outbox** + full backfill (#69; #7 Q3b). SQL JOIN, Apache AGE, and ledger-side PPR do not satisfy the graph capability. When **RetrieveConfig** `graphEnabled` is on (the default), missing Neo4j URI or credentials refuse process start (`ConfigError`, ADR-0006); explicit off allows start without a sidecar (test/escape hatch). Ingest does not require Neo4j. _Stage: morphology locked (#69); on main via #77 (Neo4j CE + GDS over Bolt)._
 _Avoid_: "graph database" (too generic); "Neo4j CE" (edition detail, not architectural term); "graph backend" (acceptable alias)
 
-**community**: a cluster of densely-connected entities detected by Louvain (Neo4j GDS). Each community gets a ledger-stored summary; retrieve may return those summaries as Host `chunks[]` when the **mode bundle** enables topic retrieve. Map-reduce of a final answer stays on the **host**. _Stage: locked in `specs/retrieve-graph-quality.md`; not yet implemented._
-_Avoid_: "cluster" (too generic, used in embedding clustering too); "topic group" (implies manual curation)
+**community**: Entity-graph clusters from **hierarchical Leiden** at index time (ADR-0011), each with a ledger-stored summary. Retrieve may return those summaries as Host `chunks[]` when topic / **检索档** C is enabled; map-reduce of a final answer stays on the **host**. _Stage: algorithm locked 2026-09-17; not yet implemented._
+_Avoid_: "cluster" (too generic, used in embedding clustering too); "topic group" (implies manual curation); Louvain as the product community algorithm
 
 ### Pipeline
 
@@ -201,8 +201,8 @@ _Avoid_: "load test" (implies capacity discovery); "stress test" (we do not push
 - **query → hybrid retrieval**: graph-priority ranking, then optional entity-embedding seeds / community hits / **rerank** / **neighbor evidence** (`specs/retrieve-rerank-llm.md`, `specs/retrieve-graph-quality.md`)
 - **valid_window + valid_at → temporal filter**: chunks/triples outside the query's time window are excluded
 - **entity → Neo4j node; triple → Neo4j edge**: read-only projection of Postgres via **projection outbox** + backfill (#69/#70; ADR-0001). Operator path: `npm run graph:backfill` then `npm run graph:drain` — see `docs/runbooks/neo4j-projection.md`
-- **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for **资料**, entities, triples, aliases, and extraction_records; **chunk** rows are derived index records in the same database (ADR-0010); Neo4j is a derived read-only projection. Sync = projection outbox + full backfill (eventually consistent by default; optional retrieve wait in `specs/retrieve-graph-quality.md`). Do not propose writing to Neo4j outside the projection path, or "just use Postgres for everything" without addressing the native-traversal constraint (PPR / Louvain / later). Do not treat a ledger PPR as a production graph engine (ADR-0008).
-- **community → Louvain → ledger summary → optional retrieve hits**: topic retrieve; Host still generates the answer
+- **Postgres authoritative, Neo4j read-only projection**: Postgres is the sole system of record for **资料**, entities, triples, aliases, and extraction_records; **chunk** rows are derived index records in the same database (ADR-0010); Neo4j is a derived read-only projection. Sync = projection outbox + full backfill (eventually consistent by default; optional retrieve wait in `specs/retrieve-graph-quality.md`). Do not propose writing to Neo4j outside the projection path, or "just use Postgres for everything" without addressing the native-traversal constraint (PPR / Leiden / later). Do not treat a ledger PPR as a production graph engine (ADR-0008).
+- **community → Leiden → ledger summary → optional retrieve hits**: topic / C retrieve; Host still generates the answer
 - **core → MCP tools (stdio) ∥ iknow-memory dashboard (HTTP)**: two facades, one capability origin; the dashboard is not a host
 
 ## Flagged ambiguities

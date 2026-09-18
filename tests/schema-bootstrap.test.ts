@@ -22,7 +22,7 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { upSchemaBootstrap } from "../src/core/storage/schema-bootstrap.js";
-import { SOURCE_DOC_STATUS } from "../src/core/types.js";
+import { SOURCE_DOC_STATUS, COMMUNITY_INDEX_STATUS } from "../src/core/types.js";
 import {
   createPgIntegrationHarness,
   redactPgConnectionString,
@@ -1321,6 +1321,50 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
       );
       expect(after.rowCount).toBe(1);
       expect(after.rows[0]!.source_chunk_id).toBeNull();
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // graph-index-standard-fast T5: DDL contract lock for
+  // `community_index_state` — the singleton C-ready (就绪) row the
+  // community-summary CLI swaps atomically with the report generation.
+  // -------------------------------------------------------------------
+  describe("community_index_state DDL contract", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    it("accepts exactly the COMMUNITY_INDEX_STATUS vocabulary", async () => {
+      const c = requireClient();
+      for (const status of Object.values(COMMUNITY_INDEX_STATUS)) {
+        await c.query(
+          `INSERT INTO community_index_state (id, status, failure_code)
+             VALUES (1, $1, NULL)
+             ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status`,
+          [status]
+        );
+      }
+      await expect(
+        c.query(`UPDATE community_index_state SET status = 'bogus' WHERE id = 1`)
+      ).rejects.toThrow(/community_index_state_status_check/);
+    });
+
+    it("holds at most one row: the state is corpus-level, not per-community", async () => {
+      const c = requireClient();
+      await c.query(
+        `INSERT INTO community_index_state (id, status) VALUES (1, 'ready')
+           ON CONFLICT (id) DO NOTHING`
+      );
+      await expect(
+        c.query(
+          `INSERT INTO community_index_state (id, status) VALUES (2, 'ready')`
+        )
+      ).rejects.toThrow();
     });
   });
 });

@@ -21,6 +21,7 @@ import { GraphragError } from "../errors.js";
 import {
   SOURCE_DOC_STATUS,
   EXTRACT_METHODS,
+  COMMUNITY_INDEX_STATUS,
   type SourceDocStatus,
 } from "../types.js";
 import { upSchemaProjection } from "./schema-projection.js";
@@ -289,6 +290,32 @@ async function createCommunitySummaries(
 }
 
 /**
+ * community_index_state: the corpus-level C-ready (就绪) singleton written
+ * by the community-summary CLI (graph-index-standard-fast T5).
+ *
+ * One row (CHECK id = 1) describes the WHOLE report generation, because the
+ * CLI swaps `community_summaries` atomically — a partial generation is by
+ * definition not ready, so a per-community flag would only restate the row
+ * set. `failure_code` mirrors the `source_documents` status pattern and
+ * carries the fin-pinned `community_summary_index_failure` token so the
+ * search-mode retrieve ticket can forward it verbatim. The CHECK's literal
+ * list derives from COMMUNITY_INDEX_STATUS (types.ts), same constant-side
+ * doctrine as `source_documents_status_check`.
+ */
+async function createCommunityIndexState(
+  client: SchemaBootstrapClient
+): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS community_index_state (
+      id           integer PRIMARY KEY CHECK (id = 1),
+      status       text NOT NULL
+                     CHECK (status IN (${sqlTextList(Object.values(COMMUNITY_INDEX_STATUS))})),
+      failure_code text NULL,
+      updated_at   timestamptz NOT NULL DEFAULT now()
+    )`);
+}
+
+/**
  * source_documents: the 资料 prose SoR (operator-console T1; ADR-0010).
  *
  * One row holds the full body text the injector pushed; the dashboard and
@@ -421,6 +448,7 @@ export async function upSchemaBootstrap(
     await createClaims(client);
     await createExtractionRecords(client);
     await createCommunitySummaries(client, dimensions);
+    await createCommunityIndexState(client);
     await createSourceDocuments(client);
     await upSchemaProjection(client);
     // ALTER chunks back-pointers must come after `source_documents` exists

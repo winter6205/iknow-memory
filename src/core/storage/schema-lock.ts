@@ -31,6 +31,7 @@ const BOOTSTRAP_COLUMNS = [
   ["source_documents", "valid_until"],
   ["source_documents", "status"],
   ["source_documents", "failure_code"],
+  ["source_documents", "extract_method"],
 ] as const;
 const BOOTSTRAP_TABLES = [
   "entities",

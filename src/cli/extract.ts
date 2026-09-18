@@ -37,9 +37,11 @@ import { createLogger, writeStderr, type Logger } from "../logging.js";
 import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
 import { listFailed } from "../core/extraction/records.js";
-import { extractChunk, type ChunkInput } from "../core/extraction/extract.js";
+import type { ChunkInput } from "../core/extraction/extract.js";
+import { runExtractMethod } from "../core/extraction/method.js";
 import {
   selectPendingChunks,
+  selectPendingChunksBySourceRef,
   processBatch,
 } from "../core/extraction/pipeline.js";
 import { embedEntity, toVectorLiteral } from "../core/extraction/persist.js";
@@ -49,6 +51,7 @@ import {
 } from "../core/extraction/clients.js";
 import type { LLMClient } from "../core/extraction/llm-client.js";
 import type { EmbeddingClient } from "../core/embedder.js";
+import { EXTRACT_METHODS, type ExtractMethod } from "../core/types.js";
 
 export interface CliFlags {
   batchSize: number;
@@ -59,6 +62,14 @@ export interface CliFlags {
   listFailed: boolean;
   /** `--list-failed` batch filter; null means "every batch". */
   batchId: string | null;
+  /**
+   * T1 version spine: `--method standard|fast`. null = flag absent, which
+   * the pipeline reads as its "standard" default (spec SC3: the default job
+   * is standard; Fast never runs unasked).
+   */
+  method: ExtractMethod | null;
+  /** `--source-ref REF`: extract that 资料's pending chunks instead of the global scan. */
+  sourceRef: string | null;
   /** A9 repair mode; never set by a normal extraction run. */
   backfillEmbeddings: boolean;
 }
@@ -71,10 +82,12 @@ const DEFAULT_FLAGS: CliFlags = {
   listUnmapped: false,
   listFailed: false,
   batchId: null,
+  method: null,
+  sourceRef: null,
   backfillEmbeddings: false,
 };
 
-const USAGE = `usage: extract [--batch-size N] [--dry-run] [--since ISO8601] [--only-failed] [--list-unmapped] [--list-failed [--batch-id UUID]] [--backfill-embeddings]`;
+const USAGE = `usage: extract [--batch-size N] [--dry-run] [--since ISO8601] [--only-failed] [--method standard|fast] [--source-ref REF] [--list-unmapped] [--list-failed [--batch-id UUID]] [--backfill-embeddings]`;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -157,6 +170,28 @@ export function parseArgs(argv: string[]): ParsedArgs {
       }
       flags.since = raw;
       i += 1;
+    } else if (arg === "--method") {
+      // Validated against the shared vocabulary here so a typo is a usage
+      // error (exit 2), not a fatal at the dispatch seam.
+      const raw = argv[i + 1];
+      if (
+        raw === undefined ||
+        !(EXTRACT_METHODS as readonly string[]).includes(raw)
+      ) {
+        return {
+          ok: false,
+          error: `--method requires ${EXTRACT_METHODS.join(" or ")}`,
+        };
+      }
+      flags.method = raw as ExtractMethod;
+      i += 1;
+    } else if (arg === "--source-ref") {
+      const raw = argv[i + 1];
+      if (raw === undefined || raw.length === 0) {
+        return { ok: false, error: `--source-ref requires a non-empty value` };
+      }
+      flags.sourceRef = raw;
+      i += 1;
     } else {
       return { ok: false, error: `unknown flag: "${arg}"` };
     }
@@ -194,6 +229,23 @@ function flagConflict(flags: CliFlags): string | null {
   // other path would silently ignore it instead of naming the mistake.
   if (flags.batchId !== null && !flags.listFailed) {
     return `--batch-id is only valid with --list-failed`;
+  }
+  // T1: `--method` and `--source-ref` steer the extraction run only; on a
+  // report/repair mode both would be silently dropped, so name the mistake
+  // (same doctrine as --batch-id above).
+  if (selected.length === 1) {
+    if (flags.method !== null)
+      return `--method is only valid for extraction runs, not with ${selected[0]}`;
+    if (flags.sourceRef !== null)
+      return `--source-ref is only valid for extraction runs, not with ${selected[0]}`;
+  }
+  // The source_ref selector has its own scan; --since/--only-failed filter
+  // the global pending scan and would be silently ignored if combined.
+  if (flags.sourceRef !== null && flags.since !== null) {
+    return `--source-ref and --since are mutually exclusive`;
+  }
+  if (flags.sourceRef !== null && flags.onlyFailed) {
+    return `--source-ref and --only-failed are mutually exclusive`;
   }
   return null;
 }
@@ -234,19 +286,31 @@ function reportFatal(logger: Logger, err: unknown): void {
  */
 async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
   const client = await deps.pool.connect();
+  // null method = --method absent = the pipeline's standard default (SC3).
+  const method = flags.method;
   try {
     await upSchemaBootstrap(client, deps.dims);
-    const chunks = await selectPendingChunks(client, {
-      batchSize: flags.batchSize,
-      since: flags.since,
-      onlyFailed: flags.onlyFailed,
-    });
+    const chunks =
+      flags.sourceRef !== null
+        ? (
+            await selectPendingChunksBySourceRef(
+              client,
+              flags.sourceRef,
+              flags.batchSize
+            )
+          ).chunks
+        : await selectPendingChunks(client, {
+            batchSize: flags.batchSize,
+            since: flags.since,
+            onlyFailed: flags.onlyFailed,
+          });
     if (flags.dryRun) {
-      await dryRunPlan(deps, chunks);
+      await dryRunPlan(deps, chunks, method);
       return 0;
     }
     const summary = await processBatch(deps, client, chunks, {
       batchSize: flags.batchSize,
+      ...(method !== null ? { method } : {}),
     });
     return summary.writeFailures > 0 ? 2 : 0;
   } finally {
@@ -382,10 +446,19 @@ async function backfillOne(
 }
 
 /** Dry-run: simulate extraction, print what would happen, write no rows. */
-async function dryRunPlan(deps: CliDeps, chunks: ChunkInput[]): Promise<void> {
+async function dryRunPlan(
+  deps: CliDeps,
+  chunks: ChunkInput[],
+  method: ExtractMethod | null
+): Promise<void> {
   deps.logger.info("dry-run-plan", { chunks: chunks.length });
   for (const chunk of chunks) {
-    const outcome = await extractChunk(chunk, { llm: deps.llm });
+    // Same dispatch seam as the real batch: a dry run must show the outcome
+    // the requested method would produce (incl. the sealed fast leg), not a
+    // standard-only preview that could promise a run the seam would refuse.
+    const outcome = await runExtractMethod(method ?? "standard", chunk, {
+      llm: deps.llm,
+    });
     if (outcome.kind === "failed") {
       deps.logger.info("dry-run-chunk-would-fail", {
         chunkId: chunk.id,

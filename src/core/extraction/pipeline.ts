@@ -15,16 +15,25 @@
  * the CLI maps `writeFailures > 0` to exit 2).
  *
  * Transaction shape per chunk (SC3): BEGIN → insertRecord(pending) →
- * extractChunk → persistOutputs → emitProjectionIntents (same transaction as
- * the ledger rows it describes) → markSucceeded → COMMIT. The ES precision
- * layer mirrors AFTER commit, fail-open, never aborting the chunk.
+ * method-conflict check (T1) → runExtractMethod → persistOutputs →
+ * emitProjectionIntents (same transaction as the ledger rows it describes) →
+ * recordChunkExtractMethod (T1 version claim) → markSucceeded → COMMIT. The
+ * ES precision layer mirrors AFTER commit, fail-open, never aborting the
+ * chunk.
  */
 import { writeStderr } from "../../logging.js";
 import type { PrecisionIndexer } from "../storage/elasticsearch-precision.js";
 import { emitProjectionIntents } from "../storage/projection-outbox.js";
 import { fetchEntityProjection } from "../storage/entity-projection.js";
-import { extractChunk, type ChunkInput } from "./extract.js";
+import { type ChunkInput } from "./extract.js";
 import type { LLMClient } from "./llm-client.js";
+import {
+  EXTRACT_METHOD_CONFLICT_CODE,
+  findChunkMethodConflict,
+  recordChunkExtractMethod,
+  runExtractMethod,
+} from "./method.js";
+import type { ExtractMethod } from "../types.js";
 import {
   insertRecord,
   markSucceeded,
@@ -212,6 +221,14 @@ export interface ProcessBatchOptions {
    * transaction back, so no failed row exists to select for those chunks.
    */
   onChunkOutcome?: (outcome: ChunkOutcomeReport) => void;
+  /**
+   * T1 version spine: the extract method for this run, routed through the
+   * `runExtractMethod` seam. Default "standard" — the spec's default job
+   * (assumption 3); Fast never runs without the recorded switch. The
+   * method's only production entry today is this option (the extract CLI's
+   * --method flag); the MCP tool keeps the default until T4.
+   */
+  method?: ExtractMethod;
 }
 
 /**
@@ -238,13 +255,21 @@ export async function processBatch(
   opts: ProcessBatchOptions = {}
 ): Promise<BatchSummary> {
   const batchId = newRecordId();
+  const method: ExtractMethod = opts.method ?? "standard";
   const startedAt = depsNow(deps);
   let writeFailures = 0;
   let succeeded = 0;
   let failed = 0;
   let ungrounded = 0;
   for (const chunk of chunks) {
-    const out = await processChunk(deps, client, chunk, batchId, startedAt);
+    const out = await processChunk(
+      deps,
+      client,
+      chunk,
+      batchId,
+      startedAt,
+      method
+    );
     if (out.kind === "write-failure") writeFailures += 1;
     else if (out.kind === "ok") succeeded += 1;
     else failed += 1;
@@ -321,7 +346,8 @@ async function processChunk(
   client: Queryable,
   chunk: ChunkInput,
   batchId: string,
-  startedAt: string
+  startedAt: string,
+  method: ExtractMethod
 ): Promise<ChunkOutcome> {
   const recordId = newRecordId();
   // Latency covers the whole chunk (LLM call + persist) so the per-chunk
@@ -335,7 +361,30 @@ async function processChunk(
       chunkId: chunk.id,
       startedAt,
     });
-    const outcome = await extractChunk(chunk, { llm: deps.llm });
+    // T1 conflict gate: a 资料 version that already recorded ANOTHER method
+    // refuses this run before any extraction work — typed failed leg, never
+    // a silent overwrite of the recorded method.
+    const conflict = await findChunkMethodConflict(client, chunk.id, method);
+    if (conflict) {
+      const msg = `source ${conflict.sourceRef} already extracted with method "${conflict.recorded}"; refusing "${method}" on the same version`;
+      await markFailed(client, recordId, {
+        code: EXTRACT_METHOD_CONFLICT_CODE,
+        msg,
+      });
+      await client.query("COMMIT", []);
+      deps.logger.info("chunk-failed", {
+        ...chunkLogFields(deps, chunk.id, latencyStart),
+        code: EXTRACT_METHOD_CONFLICT_CODE,
+        outcome: "failed",
+      });
+      return {
+        kind: "failed",
+        ungrounded: 0,
+        errorCode: EXTRACT_METHOD_CONFLICT_CODE,
+        errorMsg: msg,
+      };
+    }
+    const outcome = await runExtractMethod(method, chunk, { llm: deps.llm });
     if (outcome.kind === "failed") {
       await markFailed(client, recordId, {
         code: outcome.errorCode,
@@ -392,6 +441,11 @@ async function processChunk(
     // would leave Neo4j permanently behind. A throw here lands in the catch
     // below, which rolls the whole chunk back.
     await emitProjectionIntents(client, counts.projected);
+    // T1 version spine: the method that produced these rows is recorded on
+    // the chunk's 资料 row inside the SAME transaction — a rolled-back chunk
+    // never leaves a version claim behind, and the overwrite guard keeps a
+    // conflicting method from being replaced (SC2).
+    await recordChunkExtractMethod(client, chunk.id, method);
     await markSucceeded(client, recordId, {
       triplesCount: counts.triples,
       unmappedCount: counts.unmapped,

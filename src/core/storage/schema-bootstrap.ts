@@ -18,7 +18,11 @@
  */
 import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
 import { GraphragError } from "../errors.js";
-import { SOURCE_DOC_STATUS, type SourceDocStatus } from "../types.js";
+import {
+  SOURCE_DOC_STATUS,
+  EXTRACT_METHODS,
+  type SourceDocStatus,
+} from "../types.js";
 import { upSchemaProjection } from "./schema-projection.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 
@@ -297,6 +301,24 @@ async function createSourceDocuments(
       ALTER TABLE source_documents
         ADD CONSTRAINT source_documents_status_check
         CHECK (status IN (${sqlTextList(SOURCE_DOC_STATUS_VALUES)}));
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
+  // T1 (graph-index-standard-fast) version spine: which extract method
+  // produced this 资料 version. NULL = never extracted; once set, the method
+  // is frozen for the version — the pipeline refuses a conflicting re-
+  // extract (EXTRACT_METHOD_CONFLICT) and its record UPDATE is overwrite-
+  // guarded, so the column can never silently change hands. Same
+  // constant-derived CHECK as status above.
+  await client.query(`
+    ALTER TABLE source_documents
+      ADD COLUMN IF NOT EXISTS extract_method text NULL`);
+  await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE source_documents
+        ADD CONSTRAINT source_documents_extract_method_check
+        CHECK (extract_method IN (${sqlTextList(EXTRACT_METHODS)}));
     EXCEPTION
       WHEN duplicate_object THEN NULL;
     END $$`);

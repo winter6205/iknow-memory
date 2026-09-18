@@ -20,6 +20,14 @@
  *   - capability absence: an LLM client without the optional enrichment
  *     methods runs the standard chunk with zero enrichment writes (fast T4
  *     and the existing no-enrichment tests share this leg)
+ *
+ * T6 adds the entity-DESCRIPTION embedding class (ADR 0058 / spec
+ * assumption 11): every summarized description is re-embedded inside the
+ * same leg and lands on `entities.embedding`. Its failure posture is the
+ * fin spec's "one entity-summary miss skips that node's vector" — a sealed
+ * skip, never a chunk- or job-fail (unlike the community-summary class,
+ * which is all-or-nothing in T5). See the
+ * "entity description embedding (T6)" block below.
  */
 import { describe, it, expect, vi } from "vitest";
 
@@ -30,6 +38,12 @@ import {
   type SurvivorRef,
 } from "../../src/core/extraction/enrich.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
+import {
+  FakeEmbedder,
+  UnavailableEmbedder,
+  type EmbeddingClient,
+} from "../../src/core/embedder.js";
+import { GraphragError } from "../../src/core/errors.js";
 import type { Logger } from "../../src/logging.js";
 
 /** Recording fake Queryable; rows are chosen per SQL text (and binds). */
@@ -67,6 +81,41 @@ const SILENT_LOGGER: Logger = {
   error: () => {},
 };
 
+/** Logger capturing warn events so the sealed-embed legs are assertable. */
+function makeCaptureLogger(): {
+  logger: Logger;
+  warns: Array<{ msg: string; fields: Record<string, unknown> }>;
+} {
+  const warns: Array<{ msg: string; fields: Record<string, unknown> }> = [];
+  return {
+    warns,
+    logger: {
+      level: "error",
+      debug: () => {},
+      info: () => {},
+      warn: (msg, fields) => {
+        warns.push({ msg, fields: fields ?? {} });
+      },
+      error: () => {},
+    },
+  };
+}
+
+/**
+ * Embedder recording every batch it was handed; one deterministic vector
+ * per text so the stored literal is assertable (`[0.5]`).
+ */
+class RecordingEmbedder implements EmbeddingClient {
+  readonly available = true;
+  /** One entry per embed() call — the batch composition is the contract. */
+  calls: string[][] = [];
+
+  async embed(texts: string[]): Promise<number[][]> {
+    this.calls.push([...texts]);
+    return texts.map(() => [0.5]);
+  }
+}
+
 const CHUNK = { id: "chunk-1", content: "Alice works at Acme since 2024." };
 
 const SURVIVORS: SurvivorRef[] = [
@@ -75,8 +124,11 @@ const SURVIVORS: SurvivorRef[] = [
   { entityId: "e2", canonicalName: "Acme", description: "Acme employs Alice." },
 ];
 
-function makeDeps(llm: FakeLLMClient) {
-  return { llm, logger: SILENT_LOGGER };
+function makeDeps(llm: FakeLLMClient, embedder?: EmbeddingClient) {
+  // The T6 description-embedding class makes the embedder a required dep of
+  // the enrichment leg; tests that never describe pass no embedder and share
+  // a plain FakeEmbedder (deterministic, dim 4).
+  return { llm, logger: SILENT_LOGGER, embedder: embedder ?? new FakeEmbedder(4) };
 }
 
 /** FakeLLMClient that carries the enrichment methods the pipeline sees. */
@@ -130,8 +182,10 @@ describe("enrichStandardChunk — entity description (ADR 0069)", () => {
 
     expect(counts.described).toBe(2);
     expect(counts.describeSkipped).toBe(0);
-    // One UPDATE per survivor id — never a per-description UPDATE.
-    const updates = client.indexesOf("UPDATE entities");
+    // One description UPDATE per survivor id — never a per-description
+    // UPDATE. T6 adds a SECOND `UPDATE entities` family (SET embedding);
+    // this assertion stays scoped to the metadata leg on purpose.
+    const updates = client.indexesOf("SET metadata = jsonb_set");
     expect(updates).toHaveLength(2);
     expect(client.valuesList[updates[0]!]![1]).toBe("summary of Acme");
     expect(client.valuesList[updates[1]!]![1]).toBe("summary of Alice");
@@ -189,7 +243,7 @@ describe("enrichStandardChunk — entity description (ADR 0069)", () => {
 
     expect(counts.described).toBe(1);
     expect(counts.describeSkipped).toBe(1);
-    const updates = client.indexesOf("UPDATE entities");
+    const updates = client.indexesOf("SET metadata = jsonb_set");
     expect(updates).toHaveLength(1);
     expect(client.valuesList[updates[0]!]).toEqual([
       "e1",
@@ -530,5 +584,190 @@ describe("enrichStandardChunk — empty / capability legs", () => {
     expect(counts.claimsWritten).toBe(0);
     expect(client.indexOf("UPDATE entities")).toBe(-1);
     expect(client.indexOf("INSERT INTO claims")).toBe(-1);
+  });
+});
+
+describe("enrichStandardChunk — entity description embedding (T6)", () => {
+  /** Scripted describe that summarizes every entity it is handed. */
+  const describeAll = async (input: any) => ({
+    kind: "ok",
+    descriptions: input.entities.map((e: any) => ({
+      canonicalName: e.canonicalName,
+      description: `summary of ${e.canonicalName}`,
+    })),
+  });
+
+  it("embeds each summarized description ONCE, batched, and writes the vector to entities.embedding", async () => {
+    const client = new FakeQueryable();
+    const embedder = new RecordingEmbedder();
+    const llm = makeEnrichLLM({ scriptedDescribe: describeAll });
+
+    const counts = await enrichStandardChunk(
+      makeDeps(llm, embedder),
+      client,
+      CHUNK,
+      SURVIVORS,
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    // SSOT input shape (computeEntityEmbeddingText): canonical name + " | "
+    // + the NEW summarized description — never the raw per-chunk list.
+    // One batched call, groups in canonical-name order (Acme before Alice).
+    expect(embedder.calls).toEqual([
+      ["Acme | summary of Acme", "Alice | summary of Alice"],
+    ]);
+    // The vector lands on entities.embedding, one UPDATE per survivor.
+    const vectorUpdates = client.indexesOf("SET embedding");
+    expect(vectorUpdates).toHaveLength(2);
+    expect(client.valuesList[vectorUpdates[0]!]).toEqual(["e2", "[0.5]"]);
+    expect(client.valuesList[vectorUpdates[1]!]).toEqual(["e1", "[0.5]"]);
+    // The description UPDATE still happens (the vector never replaces it).
+    expect(client.indexesOf("SET metadata = jsonb_set")).toHaveLength(2);
+    expect(counts.embedded).toBe(2);
+    expect(counts.embedSkipped).toBe(0);
+    expect(counts.described).toBe(2);
+  });
+
+  it("a describe miss skips that entity's vector too (only described drafts embed)", async () => {
+    const client = new FakeQueryable();
+    const embedder = new RecordingEmbedder();
+    // The response carries only Alice — Acme's summary is missing.
+    const llm = makeEnrichLLM({
+      describeQueue: [
+        {
+          kind: "ok",
+          descriptions: [
+            { canonicalName: "Alice", description: "Alice is an Acme engineer." },
+          ],
+        },
+      ],
+    });
+
+    const counts = await enrichStandardChunk(
+      makeDeps(llm, embedder),
+      client,
+      CHUNK,
+      SURVIVORS,
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    expect(embedder.calls).toEqual([["Alice | Alice is an Acme engineer."]]);
+    expect(client.indexesOf("SET embedding")).toHaveLength(1);
+    expect(counts.embedded).toBe(1);
+    expect(counts.embedSkipped).toBe(0);
+    expect(counts.describeSkipped).toBe(1);
+  });
+
+  it("an embedder that THROWS is sealed: descriptions stay, vectors skip, the leg never rethrows", async () => {
+    const client = new FakeQueryable();
+    const { logger, warns } = makeCaptureLogger();
+    const llm = makeEnrichLLM({ scriptedDescribe: describeAll });
+    const throwing: EmbeddingClient = {
+      async embed() {
+        throw new GraphragError("embedding request failed: boom", "EMBEDDING_FAILED");
+      },
+    };
+
+    const counts = await enrichStandardChunk(
+      { llm, logger, embedder: throwing },
+      client,
+      CHUNK,
+      SURVIVORS,
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    // fin spec assumption 9: one entity-summary miss skips that node's
+    // vector; it does NOT fail the chunk or the C job (contrast T5's
+    // all-or-nothing community-summary class).
+    expect(counts.described).toBe(2);
+    expect(counts.embedded).toBe(0);
+    expect(counts.embedSkipped).toBe(2);
+    expect(counts.lastEmbedErrorCode).toBe("EMBEDDING_FAILED");
+    expect(client.indexesOf("SET metadata = jsonb_set")).toHaveLength(2);
+    expect(client.indexOf("SET embedding")).toBe(-1);
+    expect(warns.map((w) => w.msg)).toContain("standard-enrichment-embed-failed");
+  });
+
+  it("an UNAVAILABLE embedder (no credentials) is the same typed skip, not a job fail", async () => {
+    const client = new FakeQueryable();
+    const llm = makeEnrichLLM({ scriptedDescribe: describeAll });
+
+    const counts = await enrichStandardChunk(
+      makeDeps(llm, new UnavailableEmbedder()),
+      client,
+      CHUNK,
+      SURVIVORS,
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    expect(counts.described).toBe(2);
+    expect(counts.embedded).toBe(0);
+    expect(counts.embedSkipped).toBe(2);
+    expect(counts.lastEmbedErrorCode).toBe("EMBEDDING_FAILED");
+    expect(client.indexOf("SET embedding")).toBe(-1);
+  });
+
+  it("a short embed response skips only the entities left without a vector", async () => {
+    const client = new FakeQueryable();
+    const llm = makeEnrichLLM({ scriptedDescribe: describeAll });
+    const short: EmbeddingClient = {
+      async embed(texts: string[]) {
+        // Two texts in, one vector back: Acme embeds, Alice skips.
+        return texts.slice(0, 1).map(() => [0.25]);
+      },
+    };
+
+    const counts = await enrichStandardChunk(
+      makeDeps(llm, short),
+      client,
+      CHUNK,
+      SURVIVORS,
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    const vectorUpdates = client.indexesOf("SET embedding");
+    expect(vectorUpdates).toHaveLength(1);
+    expect(client.valuesList[vectorUpdates[0]!]).toEqual(["e2", "[0.25]"]);
+    expect(counts.embedded).toBe(1);
+    expect(counts.embedSkipped).toBe(1);
+  });
+
+  it("a failed describe response dials the embedder zero times", async () => {
+    const client = new FakeQueryable();
+    const embedder = new RecordingEmbedder();
+    const llm = makeEnrichLLM({
+      describeQueue: [{ kind: "failed", errorCode: "5xx", errorMsg: "boom" }],
+    });
+
+    const counts = await enrichStandardChunk(
+      makeDeps(llm, embedder),
+      client,
+      CHUNK,
+      SURVIVORS,
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    expect(embedder.calls).toHaveLength(0);
+    expect(counts.embedded).toBe(0);
+    expect(counts.embedSkipped).toBe(0);
+    expect(client.indexOf("SET embedding")).toBe(-1);
+  });
+
+  it("zero survivors embed nothing (empty-input class)", async () => {
+    const client = new FakeQueryable();
+    const embedder = new RecordingEmbedder();
+    const llm = makeEnrichLLM({ scriptedDescribe: describeAll });
+
+    const counts = await enrichStandardChunk(
+      makeDeps(llm, embedder),
+      client,
+      CHUNK,
+      [],
+      "2026-01-01T00:00:00.000Z"
+    );
+
+    expect(embedder.calls).toHaveLength(0);
+    expect(counts.embedded).toBe(0);
+    expect(counts.embedSkipped).toBe(0);
   });
 });

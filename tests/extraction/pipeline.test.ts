@@ -651,3 +651,76 @@ describe("processBatch standard post-merge enrichment (T3)", () => {
     expect(client.indexOf("ROLLBACK")).toBe(-1);
   });
 });
+
+// ─── T6 (graph-index-standard-fast): entity-description re-embedding ─────
+
+/** Embedder recording every batch, delegating vectors to FakeEmbedder. */
+class RecordingEmbedder {
+  readonly available = true;
+  calls: string[][] = [];
+  private readonly fake = new FakeEmbedder(8);
+
+  async embed(texts: string[]): Promise<number[][]> {
+    this.calls.push([...texts]);
+    return this.fake.embed(texts);
+  }
+}
+
+describe("processBatch entity-description embedding class (T6)", () => {
+  it("standard re-embeds each summarized description inside the chunk transaction", async () => {
+    const client = new FakeQueryable();
+    const embedder = new RecordingEmbedder();
+    const llm = makeEnrichLLM(
+      [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+      { scriptedDescribe: describeDrafts, scriptedClaims: claimsOk }
+    );
+
+    const summary = await processBatch(
+      { ...makeDeps(llm), embedder },
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, method: "standard" }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    // The description-embedding SSOT text (name | summarized description)
+    // is dialed at INDEX time — the query never embeds this class first.
+    const batch = embedder.calls.find((texts) => texts.length === 2);
+    expect(batch).toEqual([
+      "Acme Corp | Acme Corp summary",
+      "Alice | Alice summary",
+    ]);
+    // The vector UPDATE rides the same transaction: after the description
+    // UPDATE, before COMMIT.
+    const describeUpdate = client.indexOf("jsonb_set");
+    const vectorUpdate = client.indexOf("SET embedding");
+    const commit = client.indexOf("COMMIT");
+    expect(vectorUpdate).toBeGreaterThan(describeUpdate);
+    expect(commit).toBeGreaterThan(vectorUpdate);
+  });
+
+  it("the fast method never produces the description-vector class", async () => {
+    const client = new FakeQueryable();
+    const embedder = new RecordingEmbedder();
+    const llm = makeEnrichLLM([], {
+      scriptedDescribe: describeDrafts,
+      scriptedClaims: claimsOk,
+    });
+
+    const summary = await processBatch(
+      { ...makeDeps(llm), embedder },
+      client,
+      [{ id: "chunk-1", content: "the a Alice Bob" }],
+      { batchSize: 1, method: "fast" }
+    );
+
+    // Fast DOES embed its insert-time entity vectors (persist path) but has
+    // no description class: no re-embed UPDATE, no describe batch.
+    expect(summary.succeeded).toBe(1);
+    expect(client.indexOf("SET embedding")).toBe(-1);
+    expect(client.indexOf("jsonb_set")).toBe(-1);
+    expect(embedder.calls.every((texts) => !texts.some((t) => t.includes("summary")))).toBe(
+      true
+    );
+  });
+});

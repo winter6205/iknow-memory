@@ -3,6 +3,7 @@ import { createRetrieveHandler, retrieveTool } from "../src/tools/retrieve.js";
 import { FakeEmbedder } from "../src/core/embedder.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import { GraphragError } from "../src/core/errors.js";
+import { REAL_DB_NOT_WIRED_REASON } from "../src/core/retrieval/search-mode.js";
 import {
   COMMUNITY_INDEX_STATUS,
   COMMUNITY_SUMMARY_INDEX_FAILURE,
@@ -208,8 +209,8 @@ describe("createRetrieveHandler", () => {
   // B; outside the closed set → typed INVALID_INPUT carrying a stable
   // host-mappable reason token (never a healthy empty `chunks` with no
   // reason). T2 opened A as the lexical child-hit → parent-body arm
-  // (ADR-0060); T3 opened C report-first; D stays provisional until T4
-  // replaces its row with the typed `real_db_not_wired` refusal.
+  // (ADR-0060); T3 opened C report-first; T4 replaced D's provisional row
+  // with the typed `real_db_not_wired` refusal.
   describe("filters.search_mode (T1)", () => {
     const HYBRID_CONFIG = {
       w_vec: 0.7,
@@ -273,8 +274,21 @@ describe("createRetrieveHandler", () => {
       }
     });
 
-    it("valid A/C/D parse; C types not-ready, A runs its own, D stays provisional", async () => {
+    it("valid A/C/D parse; C types not-ready, D types unwired, A runs its own", async () => {
       const baseline = await handler({ query: "anything" });
+      // T4 opened D's row: the closed 档 whose SQL path does not exist yet
+      // is the typed `real_db_not_wired` refusal — never a provisional B
+      // answer over chunks (spec SC5: not fake SQL over document chunks).
+      let thrownD: unknown;
+      try {
+        await handler({ query: "anything", filters: { search_mode: "D" } });
+      } catch (err) {
+        thrownD = err;
+      }
+      expect(thrownD).toBeInstanceOf(GraphragError);
+      expect((thrownD as GraphragError).message).toContain(
+        REAL_DB_NOT_WIRED_REASON
+      );
       // T3 opened C: a backend without a READY `community_index_state`
       // row is the typed `community_summary_index_failure` exit — it
       // neither answers like B nor degrades into a healthy empty.
@@ -292,26 +306,22 @@ describe("createRetrieveHandler", () => {
       // back-pointers, and the query terms match no chunk content, so the
       // lexical-first A finds nothing: a healthy empty answer, visibly NOT
       // the B arm's vector result of [x, y].
-      const aBody = parseResultBody(
-        await handler({ query: "anything", filters: { search_mode: "A" } })
-      );
+      const aResult = await handler({
+        query: "anything",
+        filters: { search_mode: "A" },
+      });
+      const aBody = parseResultBody(aResult);
       expect(aBody.chunks).toEqual([]);
       expect(aBody).not.toHaveProperty("degraded");
-      // D is still the provisional graph-priority arm until T4 lands its
-      // typed refusal.
-      const dResult = await handler({
-        query: "anything",
-        filters: { search_mode: "D" },
-      });
-      expect(parseResultBody(dResult)).toEqual(parseResultBody(baseline));
       expect(parseResultBody(baseline).chunks).toHaveLength(2);
     });
 
     it("search_mode never reaches the lexical arm's exact-match filters", async () => {
       // Regression guard for the ES precision layer, which turns every
       // filter key into a term clause: a leaked `search_mode` would match
-      // no indexed field and silently zero the BM25 arm. D is the probe —
-      // still provisional B, so it runs the B pipeline end to end.
+      // no indexed field and silently zero the BM25 arm. Explicit B is the
+      // probe — it runs the B pipeline end to end. (T4 made D type out
+      // before any arm reads filters, so it can no longer serve as one.)
       const lexical = new RecordingLexicalBackend(TEST_DIM);
       const hybridHandler = createRetrieveHandler({
         embedder: new FakeEmbedder(TEST_DIM),
@@ -321,18 +331,17 @@ describe("createRetrieveHandler", () => {
       });
       const result = await hybridHandler({
         query: "anything",
-        filters: { source_ref: "docs/x.md", search_mode: "D" },
+        filters: { source_ref: "docs/x.md", search_mode: "B" },
       });
       expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
       for (const filters of lexical.lexicalFilterCalls) {
         expect(filters).not.toHaveProperty("search_mode");
         expect(filters?.source_ref).toBe("docs/x.md");
       }
-      // D answers through the hybrid pipeline, un-degraded, like B.
+      // B answers through the hybrid pipeline, un-degraded.
       expect(parseResultBody(result).chunks.map((c) => c.id)).toEqual(["x"]);
     });
   });
-
 
   // plans/search-mode-retrieve.md T3 (fin ADR-0070): 档 C report-first over
   // the community summaries. Handler-level acceptance on the fake fixture:
@@ -459,7 +468,6 @@ describe("createRetrieveHandler", () => {
       }
     });
   });
-
 
   // Review repair I2: `c_drop_windows` is 档 C's ROUTING switch, not chunk
   // metadata — in A/B/D it must be stripped by the dispatcher like

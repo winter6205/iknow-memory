@@ -7,6 +7,12 @@
  * fused with the graph arm via RRF. The wire envelope contains `chunks` plus
  * only the optional `degraded` and `degraded_reasons` fields; internal debug
  * diagnostics are not serialized.
+ *
+ * `filters.search_mode` (检索档 A|B|C|D, specs/search-mode-retrieve.md) is
+ * resolved and dispatched in this handler before the arms run: missing →
+ * B, invalid → typed INVALID_INPUT, A/C/D → the provisional graph-priority
+ * arm until plans T2/T3/T4 open their rows (see
+ * src/core/retrieval/search-mode.ts).
  */
 import { z } from "zod";
 import {
@@ -33,7 +39,12 @@ import {
   RetrieveConfigError,
   isRetrievePreset,
 } from "../core/retrieval/types.js";
-import { assembleRetrievalResult } from "../core/retrieval/index.js";
+import {
+  SEARCH_MODE_ARMS,
+  invalidSearchModeMessage,
+  parseSearchMode,
+  stripSearchModeFilter,
+} from "../core/retrieval/search-mode.js";
 import { GraphragError } from "../core/errors.js";
 
 const DEFAULT_LIMIT = 10;
@@ -128,6 +139,18 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     input: RetrieveInput
   ): Promise<ToolResult> {
     validateRetrieveQuery(input, deps.inputValidationFailureCounter);
+    // Resolve the 档 before anything else so an invalid value is a typed
+    // refusal, never a degraded or empty answer (plans/search-mode-retrieve
+    // .md T1 acceptance). `search_mode` is routing, not matching: strip it
+    // from the exact-match filters so arms and backends never see it.
+    const searchMode = parseSearchMode(input.filters);
+    if (searchMode.kind === "invalid") {
+      throw new GraphragError(
+        invalidSearchModeMessage(searchMode.value),
+        "INVALID_INPUT"
+      );
+    }
+    const matchFilters = stripSearchModeFilter(input.filters);
     const retrieveConfig = applyPreset(
       deps.retrieveConfig,
       input.preset,
@@ -139,10 +162,10 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     const opts: SearchOptions = {
       limit: input.limit ?? DEFAULT_LIMIT,
       validAt: input.valid_at ?? new Date().toISOString(),
-      ...(input.filters !== undefined ? { filters: input.filters } : {}),
+      ...(matchFilters !== undefined ? { filters: matchFilters } : {}),
     };
 
-    const envelope = await assembleRetrievalResult(
+    const envelope = await SEARCH_MODE_ARMS[searchMode.mode](
       {
         query: input.query,
         validAt: opts.validAt,
@@ -264,7 +287,8 @@ export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
   name: "retrieve",
   description:
     "Ranked chunk search over the knowledge memory store, filtered by " +
-    "temporal validity.",
+    "temporal validity. filters.search_mode (A | B | C | D) selects the " +
+    "retrieval tier; missing defaults to B.",
   inputSchema:
     deps.inputValidationFailureCounter === undefined
       ? RetrieveInputSchema

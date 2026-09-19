@@ -24,6 +24,10 @@ import type {
   StorageSourceDocView,
   StorageTimelineEvent,
 } from "../types.js";
+import type {
+  ParentWindowRow,
+  ParentWindowStorage,
+} from "../retrieval/types.js";
 import { SOURCE_DOC_COLLECTION_NAME, SOURCE_DOC_STATUS } from "../types.js";
 import {
   appendContentInvalidation,
@@ -103,6 +107,7 @@ export class MemoryBackend
     StorageBackend,
     LexicalStorageBackend,
     ContentInvalidationStorage,
+    ParentWindowStorage,
     StorageReadPort
 {
   private readonly store = new Map<string, ChunkRecord>();
@@ -268,6 +273,31 @@ export class MemoryBackend
   }
 
   /**
+   * 档 A child→parent window lookup (plans/search-mode-retrieve.md T2):
+   * resolves each child chunk's back-pointer to its 资料 row. A child
+   * without `source_doc_id` (legacy row) or whose 资料 row is gone yields
+   * NO row — the caller must degrade rather than cite the child alone.
+   */
+  async parentWindowsByChunkIds(
+    chunkIds: readonly string[]
+  ): Promise<ParentWindowRow[]> {
+    const rows: ParentWindowRow[] = [];
+    for (const chunkId of chunkIds) {
+      const chunk = this.store.get(chunkId);
+      if (chunk === undefined || chunk.source_doc_id === undefined) continue;
+      const doc = this.findSourceDocById(chunk.source_doc_id);
+      if (doc === undefined) continue;
+      rows.push({
+        chunk_id: chunk.id,
+        source_doc_id: doc.id,
+        ordinal: chunk.ordinal ?? null,
+        content: doc.content,
+      });
+    }
+    return rows;
+  }
+
+  /**
    * List every chunk row that back-points to `sourceDocId`, ordered by
    * ordinal ascending. Used by T4's `read_source` and the dashboard detail.
    */
@@ -359,15 +389,17 @@ export class MemoryBackend
     if (typeof id !== "string" || id.trim() === "") {
       return { ok: false, code: "INVALID_INPUT" };
     }
+    const doc = this.findSourceDocById(id);
+    if (doc === undefined) return { ok: false, code: "NOT_FOUND" };
+    return { ok: true, value: toSourceDocView(doc, this.countChunksOf(doc.id)) };
+  }
+
+  /** 资料 row by primary-key id (the Map is keyed by source_ref). */
+  private findSourceDocById(id: string): SourceDocRecord | undefined {
     for (const doc of this.sourceDocs.values()) {
-      if (doc.id === id) {
-        return {
-          ok: true,
-          value: toSourceDocView(doc, this.countChunksOf(doc.id)),
-        };
-      }
+      if (doc.id === id) return doc;
     }
-    return { ok: false, code: "NOT_FOUND" };
+    return undefined;
   }
 
   /**

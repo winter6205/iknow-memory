@@ -8,9 +8,9 @@
  *      filters reach exact-match backends (the ES precision layer turns every
  *      filter key into a term clause, so an unstripped key would silently
  *      zero the lexical arm);
- *   3. the dispatch table exists for all four modes: B implemented, A/C/D
- *      still on the provisional graph-priority alias until plans T2/T3/T4
- *      open their rows.
+ *   3. the dispatch table exists for all four modes: B implemented, A
+ *      opened by T2 on its own lexical child→parent arm, C and D still on
+ *      the provisional graph-priority alias until plans T3 and T4.
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -22,6 +22,7 @@ import {
   invalidSearchModeMessage,
 } from "../../src/core/retrieval/search-mode.js";
 import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
+import { modeAParentWindowArm } from "../../src/core/retrieval/mode-a-arm.js";
 
 describe("parseSearchMode", () => {
   it("resolves to B when filters are absent", () => {
@@ -96,16 +97,21 @@ describe("invalidSearchModeMessage", () => {
 });
 
 describe("SEARCH_MODE_ARMS dispatch table", () => {
-  it("routes all four modes through the assembler while A/C/D are provisional (T1)", () => {
-    // T1 opens the table only: A/C/D alias the provisional graph-priority
-    // arm, which IS the B assembler — byte-for-byte today's behavior.
-    // T2 moves A's row, T3 moves C's row, T4 replaces D's row.
-    for (const mode of SEARCH_MODES) {
-      expect(SEARCH_MODE_ARMS[mode]).toBe(assembleRetrievalResult);
-    }
+  it("routes A to the mode-A arm opened by plans T2 (child lexical → parent body)", () => {
+    // The T2 swap: exactly this row moved off the provisional alias.
+    expect(SEARCH_MODE_ARMS.A).toBe(modeAParentWindowArm);
+    expect(SEARCH_MODE_ARMS.A).not.toBe(assembleRetrievalResult);
   });
 
   it("keeps B on the graph-priority assembler", () => {
     expect(SEARCH_MODE_ARMS.B).toBe(assembleRetrievalResult);
+  });
+
+  it("keeps C and D on the provisional alias until plans T3 and T4", () => {
+    // T3 moves C's row to the report-first arm; T4 replaces D's row with
+    // the typed refusal. Until then both ARE the B assembler, byte-for-byte
+    // today's behavior.
+    expect(SEARCH_MODE_ARMS.C).toBe(assembleRetrievalResult);
+    expect(SEARCH_MODE_ARMS.D).toBe(assembleRetrievalResult);
   });
 });

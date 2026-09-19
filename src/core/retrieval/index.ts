@@ -91,8 +91,10 @@ import { GraphragError } from "../errors.js";
  *
  * The mode bundle's `candidateCap` controls this pool when a configured arm
  * is active; this fallback keeps legacy callers at the balanced width.
+ * Exported so the 档 A arm (mode-a-arm.ts) fetches children at the same
+ * depth instead of duplicating the constant.
  */
-const ARM_CANDIDATE_POOL = 50;
+export const ARM_CANDIDATE_POOL = 50;
 const DEFAULT_WAIT_FOR_DRAIN_TIMEOUT_MS = 5_000;
 
 /** Inputs — what the orchestrator needs from the retrieve tool. */
@@ -583,7 +585,13 @@ function observationsFromOptional(
   ]);
 }
 
-function observation(
+/**
+ * The one observation shape, built in one place. Exported for the 档 arms
+ * (review I3): they own their capabilities' states but must not own a
+ * second factory each — same precedent as `buildEnvelope` and
+ * `ARM_CANDIDATE_POOL`.
+ */
+export function observation(
   capability: DegradedCapability,
   state: CapabilityObservation["state"]
 ): CapabilityObservation {
@@ -799,9 +807,10 @@ function prependCommunityPriority(
 /**
  * Build the output envelope from all observations in one place. This is the
  * sole decision point for the four degraded rules and the only place that
- * attaches the optional wire fields.
+ * attaches the optional wire fields. Exported for the 档 A arm, which owns
+ * a different ranking path but must not own a second envelope builder.
  */
-function buildEnvelope(
+export function buildEnvelope(
   fused: FusedHit[],
   observations: readonly CapabilityObservation[],
   debug: Record<string, unknown> | undefined

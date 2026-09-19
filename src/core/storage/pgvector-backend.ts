@@ -53,6 +53,8 @@ import type {
   NeighborChunkStorage,
   Neo4jArmStorage,
   CommunitySummaryRow,
+  ParentWindowRow,
+  ParentWindowStorage,
   ProjectionDrainWaiter,
 } from "../retrieval/types.js";
 import {
@@ -245,6 +247,25 @@ SELECT DISTINCT n.id, n.content, n.source_ref, n.valid_from,
                        AND t.position + $3::bigint
  ORDER BY n.source_ref, n.created_at, n.id`;
 
+/**
+ * 档 A child→parent window rows (plans/search-mode-retrieve.md T2,
+ * ADR-0060). One round trip over the child ids the lexical arm ranked.
+ *
+ * The INNER JOIN is the whole contract: a legacy chunk with a NULL
+ * `source_doc_id`, or a chunk whose 资料 row is gone, yields no row and the
+ * arm must degrade — it never cites the child slice as if it were the
+ * parent window. No temporal predicate here on purpose: the lexical arm
+ * already admitted the child by `valid_from`/`valid_until`, and a parent
+ * closed by invalidation closes its children in the same transaction
+ * (operator-console T5), so a re-filter could only hide rows behind a
+ * second clock read.
+ */
+const PARENT_WINDOWS_SQL = `
+SELECT c.id AS chunk_id, c.source_doc_id, c.ordinal, d.content
+  FROM chunks c
+  JOIN source_documents d ON d.id = c.source_doc_id
+ WHERE c.id = ANY($1::uuid[])`;
+
 export const CHUNK_VECTOR_INDEX_NAME = "chunks_embedding_idx";
 
 /** Cast for the row shape we expect from our SELECT/UPSERT queries. */
@@ -411,6 +432,7 @@ export class PgvectorBackend
     GraphRagStorageBackend,
     ContentInvalidationStorage,
     NeighborChunkStorage,
+    ParentWindowStorage,
     ProjectionDrainWaiter,
     StorageReadPort
 {
@@ -1129,6 +1151,40 @@ export class PgvectorBackend
     } catch (err) {
       throw new GraphragError(
         `PgvectorBackend.chunksByChunkIds failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+  }
+
+  /**
+   * Resolve child chunks to their parent 资料 window rows (档 A, T2).
+   * Children with no back-pointer or no 资料 row are absent from the
+   * result; the calling arm turns that absence into a named degradation.
+   */
+  async parentWindowsByChunkIds(
+    chunkIds: readonly string[]
+  ): Promise<ParentWindowRow[]> {
+    if (chunkIds.length === 0) return [];
+    try {
+      const pool = await this.ensureReady();
+      const result = await pool.query(PARENT_WINDOWS_SQL, [[...chunkIds]]);
+      return result.rows.map((r) => {
+        const row = r as {
+          chunk_id: string;
+          source_doc_id: string;
+          ordinal: number | null;
+          content: string;
+        };
+        return {
+          chunk_id: row.chunk_id,
+          source_doc_id: row.source_doc_id,
+          ordinal: row.ordinal,
+          content: row.content,
+        };
+      });
+    } catch (err) {
+      throw new GraphragError(
+        `PgvectorBackend.parentWindowsByChunkIds failed: ${(err as Error).message}`,
         "STORAGE_ERROR"
       );
     }

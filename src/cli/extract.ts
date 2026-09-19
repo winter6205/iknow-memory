@@ -139,6 +139,119 @@ export interface CliDeps {
 type ParsedArgs = { ok: true; flags: CliFlags } | { ok: false; error: string };
 
 /**
+ * One flag's handler in the `parseArgs` dispatch table.
+ *
+ * `boolean` flags take no value; `value` flags consume the next argv element
+ * (`raw` is `undefined` at the end of argv) and either mutate `flags` or
+ * return the exact usage-error string. Returning `null` means "accepted".
+ */
+type FlagSpec =
+  | { kind: "boolean"; set: (flags: CliFlags) => void }
+  | { kind: "value"; parse: (flags: CliFlags, raw: string | undefined) => string | null };
+
+/**
+ * Declarative flag → handler mapping: the table is the single list of
+ * recognised flags, so `parseArgs` only needs the loop's advance semantics
+ * (value flags step over their operand) and the `unknown flag` fallback.
+ * A Map (not a plain object) so an argv word like `constructor` still hits
+ * the unknown-flag branch instead of an `Object.prototype` member.
+ * Each handler's message is part of the usage-error contract (exit 2) and is
+ * asserted verbatim by the CLI tests — never reword one here.
+ */
+const FLAG_SPECS: ReadonlyMap<string, FlagSpec> = new Map([
+  ["--dry-run", { kind: "boolean", set: (f) => void (f.dryRun = true) }],
+  [
+    "--only-failed",
+    { kind: "boolean", set: (f) => void (f.onlyFailed = true) },
+  ],
+  [
+    "--list-unmapped",
+    { kind: "boolean", set: (f) => void (f.listUnmapped = true) },
+  ],
+  [
+    "--list-failed",
+    { kind: "boolean", set: (f) => void (f.listFailed = true) },
+  ],
+  [
+    "--backfill-embeddings",
+    { kind: "boolean", set: (f) => void (f.backfillEmbeddings = true) },
+  ],
+  [
+    "--batch-id",
+    {
+      // Validated here so a malformed value is a usage error (exit 2) rather
+      // than a Postgres `invalid input syntax for type uuid` fatal (exit 1).
+      kind: "value",
+      parse: (f, raw) => {
+        if (raw === undefined || !UUID_RE.test(raw)) {
+          return `--batch-id requires a UUID`;
+        }
+        f.batchId = raw;
+        return null;
+      },
+    },
+  ],
+  [
+    "--batch-size",
+    {
+      kind: "value",
+      parse: (f, raw) => {
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n <= 0) {
+          return `--batch-size requires a positive integer`;
+        }
+        f.batchSize = n;
+        return null;
+      },
+    },
+  ],
+  [
+    "--since",
+    {
+      kind: "value",
+      parse: (f, raw) => {
+        if (raw === undefined || Number.isNaN(Date.parse(raw))) {
+          return `--since requires an ISO8601 timestamp`;
+        }
+        f.since = raw;
+        return null;
+      },
+    },
+  ],
+  [
+    "--method",
+    {
+      // Validated against the shared vocabulary here so a typo is a usage
+      // error (exit 2), not a fatal at the dispatch seam.
+      kind: "value",
+      parse: (f, raw) => {
+        if (
+          raw === undefined ||
+          !(EXTRACT_METHODS as readonly string[]).includes(raw)
+        ) {
+          return `--method requires ${EXTRACT_METHODS.join(" or ")}`;
+        }
+        f.method = raw as ExtractMethod;
+        return null;
+      },
+    },
+  ],
+  [
+    "--source-ref",
+    {
+      kind: "value",
+      parse: (f, raw) => {
+        if (raw === undefined || raw.length === 0) {
+          return `--source-ref requires a non-empty value`;
+        }
+        f.sourceRef = raw;
+        return null;
+      },
+    },
+  ],
+]);
+
+/**
  * Parse CLI flags manually (no new dep). Value flags fail fast on a missing /
  * non-parseable value; unknown flags surface a usage error (exit 2).
  */
@@ -147,58 +260,16 @@ export function parseArgs(argv: string[]): ParsedArgs {
   let i = 0;
   while (i < argv.length) {
     const arg = argv[i]!;
-    if (arg === "--dry-run") flags.dryRun = true;
-    else if (arg === "--only-failed") flags.onlyFailed = true;
-    else if (arg === "--list-unmapped") flags.listUnmapped = true;
-    else if (arg === "--list-failed") flags.listFailed = true;
-    else if (arg === "--backfill-embeddings") flags.backfillEmbeddings = true;
-    else if (arg === "--batch-id") {
-      // Validated here so a malformed value is a usage error (exit 2) rather
-      // than a Postgres `invalid input syntax for type uuid` fatal (exit 1).
-      const raw = argv[i + 1];
-      if (raw === undefined || !UUID_RE.test(raw)) {
-        return { ok: false, error: `--batch-id requires a UUID` };
-      }
-      flags.batchId = raw;
-      i += 1;
-    } else if (arg === "--batch-size") {
-      const n = Number(argv[i + 1]);
-      if (!Number.isInteger(n) || n <= 0) {
-        return { ok: false, error: `--batch-size requires a positive integer` };
-      }
-      flags.batchSize = n;
-      i += 1;
-    } else if (arg === "--since") {
-      const raw = argv[i + 1];
-      if (raw === undefined || Number.isNaN(Date.parse(raw))) {
-        return { ok: false, error: `--since requires an ISO8601 timestamp` };
-      }
-      flags.since = raw;
-      i += 1;
-    } else if (arg === "--method") {
-      // Validated against the shared vocabulary here so a typo is a usage
-      // error (exit 2), not a fatal at the dispatch seam.
-      const raw = argv[i + 1];
-      if (
-        raw === undefined ||
-        !(EXTRACT_METHODS as readonly string[]).includes(raw)
-      ) {
-        return {
-          ok: false,
-          error: `--method requires ${EXTRACT_METHODS.join(" or ")}`,
-        };
-      }
-      flags.method = raw as ExtractMethod;
-      i += 1;
-    } else if (arg === "--source-ref") {
-      const raw = argv[i + 1];
-      if (raw === undefined || raw.length === 0) {
-        return { ok: false, error: `--source-ref requires a non-empty value` };
-      }
-      flags.sourceRef = raw;
-      i += 1;
-    } else {
+    const spec = FLAG_SPECS.get(arg);
+    if (spec === undefined) {
       return { ok: false, error: `unknown flag: "${arg}"` };
+    }
+    if (spec.kind === "value") {
+      const error = spec.parse(flags, argv[i + 1]);
+      if (error !== null) return { ok: false, error };
+      i += 1; // the value flag consumed its operand
+    } else {
+      spec.set(flags);
     }
     i += 1;
   }

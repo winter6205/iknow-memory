@@ -105,13 +105,17 @@ const ZH_CHUNK_CONTENT =
 const EN_CHUNK_CONTENT =
   "Okapi BM25 ranks documents by term frequency and document length.";
 
-function makeChunk(content: string, sourceRef: string): ChunkRecord {
+function makeChunk(
+  content: string,
+  sourceRef: string,
+  metadata: Record<string, unknown> = {}
+): ChunkRecord {
   return {
     id: randomUUID(),
     content,
     embedding: [0.1, 0.2, 0.3],
     source_ref: sourceRef,
-    metadata: {},
+    metadata,
     valid_from: NOW,
     valid_until: null,
     created_at: NOW,
@@ -271,5 +275,24 @@ describeEs("es-precision: Elasticsearch precision layer", () => {
     expect(scoreOf(phraseOn, phraseTarget.id)).toBeGreaterThan(
       scoreOf(phraseOff, phraseTarget.id)!
     );
+  });
+
+  it("retrieves a chunk whose metadata carries dynamically-mapped numeric fields", async () => {
+    // Reproduces the numeric-metadata 400 that lenient:true fixes;
+    // rationale at buildPrecisionChunkQuery.
+    await layer!.deleteChunkIndex();
+    const target = makeChunk(
+      "quantumenclave marks the numeric metadata regression case",
+      "es/numeric-metadata/target",
+      { density: 1, locator: { unit: 7 } }
+    );
+    await layer!.indexChunks([target]);
+
+    const hits = await layer!.searchLexical("quantumenclave", {
+      limit: 5,
+      validAt: NOW,
+    });
+
+    expect(hits.map((h) => h.id)).toContain(target.id);
   });
 });

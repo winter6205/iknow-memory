@@ -29,7 +29,21 @@ import {
   type AssembleDeps,
 } from "./index.js";
 import { modeAParentWindowArm } from "./mode-a-arm.js";
+import { modeCReportFirstArm } from "./mode-c-arm.js";
+import { SEARCH_MODE_FILTER_KEY } from "./wire-filters.js";
 import type { RetrieveOutputEnvelope } from "./types.js";
+
+// Re-exported so wire-side callers (src/tools/retrieve.ts, tests) keep one
+// import point; the constants live in the leaf module for the cyclic-TDZ
+// reason documented there.
+export {
+  SEARCH_MODE_FILTER_KEY,
+  C_DROP_WINDOWS_FILTER_KEY,
+  C_DROP_WINDOWS_OFF,
+  cDropWindowsEnabled,
+  stripSearchModeFilter,
+  stripCDropWindowsFilter,
+} from "./wire-filters.js";
 
 /** The closed set from specs/search-mode-retrieve.md; never widen it silently. */
 export const SEARCH_MODES = ["A", "B", "C", "D"] as const;
@@ -41,9 +55,6 @@ export const DEFAULT_SEARCH_MODE: SearchMode = "B";
 
 /** Stable host-mappable reason token, aligned with fin `named_failures` style. */
 export const INVALID_SEARCH_MODE_REASON = "invalid_search_mode";
-
-/** The `filters` key carrying the 档; single source of truth. */
-export const SEARCH_MODE_FILTER_KEY = "search_mode";
 
 export type SearchModeResolution =
   | { kind: "resolved"; mode: SearchMode }
@@ -61,22 +72,6 @@ export function parseSearchMode(
   return { kind: "invalid", value };
 }
 
-/**
- * Remove the 档 routing key from the exact-match filters handed to the
- * arms. Returns `undefined` when nothing else remains, so the call shape
- * stays identical to a request that never carried filters at all.
- */
-export function stripSearchModeFilter(
-  filters: Record<string, string> | undefined
-): Record<string, string> | undefined {
-  if (filters === undefined || !(SEARCH_MODE_FILTER_KEY in filters)) {
-    return filters;
-  }
-  const rest: Record<string, string> = { ...filters };
-  delete rest[SEARCH_MODE_FILTER_KEY];
-  return Object.keys(rest).length > 0 ? rest : undefined;
-}
-
 /** Build the thrown-error message; keeps the reason token out of magic strings. */
 export function invalidSearchModeMessage(value: string): string {
   return (
@@ -87,30 +82,54 @@ export function invalidSearchModeMessage(value: string): string {
 }
 
 /**
+ * Routing controls the dispatcher resolves from `filters` before any arm
+ * runs, so an arm never re-reads a control key out of the exact-match map
+ * it hands to backends (review I2: the dispatcher is the single strip
+ * point for EVERY 档, C included).
+ */
+export interface SearchModeControl {
+  /**
+   * Resolved `filters.c_drop_windows` switch for 档 C: default on, off
+   * only on the exact "0" (see wire-filters.ts).
+   */
+  cDropWindows: boolean;
+}
+
+/**
  * One assembled answer per retrieve call — the same (args, deps) contract
- * the B pipeline already honors.
+ * the B pipeline already honors. `control` is supplied by the dispatcher;
+ * direct arm callers (tests, internal reuse) may omit it, in which case an
+ * arm that owns a routing key falls back to parsing it from `args.filters`
+ * itself — the key is a control only on the wire path, where the
+ * dispatcher strips it.
  */
 export type SearchModeArm = (
   args: AssembleArgs,
-  deps: AssembleDeps
+  deps: AssembleDeps,
+  control?: SearchModeControl
 ) => Promise<RetrieveOutputEnvelope>;
 
 /**
- * T1 stand-in until the remaining per-档 arms land: plans T3 opens C and
- * T4 replaces D with its typed refusal. Each ticket swaps exactly ONE row
- * of the table below — the handler parsing, stripping and envelope stay as
- * they are. T2 opened A's row on the parent-window arm (below); the
- * remaining provisional rows answer through the existing graph-priority
- * assembler, byte-for-byte the current B behavior.
+ * T1 stand-in until the last 档 row opens: plans T4 replaces D with its
+ * typed refusal. Each ticket swaps exactly ONE row of the dispatch table —
+ * the handler parsing, stripping and envelope stay as they are. Until then
+ * D answers through the existing graph-priority assembler, byte-for-byte
+ * the current B behavior.
  */
 const provisionalGraphPriorityArm: SearchModeArm = assembleRetrievalResult;
 
+/**
+ * specs/search-mode-retrieve.md confirms each 档 gets its own arm: T2 opened
+ * A (mode-a-arm.ts, ADR-0060), T3 opened C (mode-c-arm.ts, ADR-0070), each
+ * replacing exactly ONE row of this table. T4 replaces D's provisional row
+ * with the typed unwired refusal.
+ */
 export const SEARCH_MODE_ARMS: Readonly<Record<SearchMode, SearchModeArm>> = {
   // T2: child lexical hits cite the parent 抽图窗 body (ADR-0060).
   A: modeAParentWindowArm,
   B: assembleRetrievalResult,
-  // Still provisional until plans T3 opens the report-first arm.
-  C: provisionalGraphPriorityArm,
-  // Still provisional until plans T4 lands the typed refusal.
+  // T3: report-first community summaries, ES ∥ report vectors (ADR-0070).
+  C: modeCReportFirstArm,
+  // Provisional until plans T4 lands the typed `real_db_not_wired` refusal.
   D: provisionalGraphPriorityArm,
 };

@@ -42,7 +42,9 @@ export type DegradedCapability =
   | "community_summary"
   | "neighbor_evidence"
   | "projection_drain"
-  | "parent_window";
+  | "parent_window"
+  | "community_report"
+  | "window_fill";
 
 export type CapabilityState =
   "disabled" | "unattempted" | "attempted-and-failed" | "succeeded";
@@ -84,6 +86,10 @@ export const DEGRADED_REASON_CODES = [
   "projection_drain:attempted-and-failed",
   "parent_window:unattempted",
   "parent_window:attempted-and-failed",
+  "community_report:unattempted",
+  "community_report:attempted-and-failed",
+  "window_fill:unattempted",
+  "window_fill:attempted-and-failed",
 ] as const;
 
 export type DegradedReason = (typeof DEGRADED_REASON_CODES)[number];
@@ -167,6 +173,25 @@ export const CAPABILITY_REGISTRY = {
     defaultOn: true,
     unattempted: "parent_window:unattempted",
     attemptedAndFailed: "parent_window:attempted-and-failed",
+  },
+  // 档 C (fin ADR-0070): the two report arms (ES ∥ report vectors).
+  // default-on because reports ARE the 档 — a C that could run neither arm
+  // has nothing to cite and must not look like a healthy miss. Only named
+  // `unattempted` when NEITHER arm could run; one surviving arm answering
+  // is a healthy partial, so single-arm seam absence stays silent.
+  community_report: {
+    defaultOn: true,
+    unattempted: "community_report:unattempted",
+    attemptedAndFailed: "community_report:attempted-and-failed",
+  },
+  // 档 C drop: the optional window fill after a report hit. An
+  // off-by-filter drop emits no observation at all, so `unattempted`
+  // never fires on the C path; default-off keeps the pair honest if a
+  // future caller names a skipped fill.
+  window_fill: {
+    defaultOn: false,
+    unattempted: "window_fill:unattempted",
+    attemptedAndFailed: "window_fill:attempted-and-failed",
   },
 } as const satisfies Record<DegradedCapability, CapabilityDefinition>;
 
@@ -375,6 +400,36 @@ export interface RetrieveConfig {
   waitForDrainTimeoutMs?: number;
 }
 
+/**
+ * The levers NO preset bundle owns, with their startup default values.
+ * Single source (review I1): the retrieve tool's preset fallback and the
+ * 档 C fusion fallback each rebuilt this same literal, three copies in
+ * all — this constant replaces all three without changing any value.
+ * Lives in this leaf module so tools and arms can share it without an
+ * ESM cycle (the same reason wire-filters.ts is a leaf).
+ */
+const RETRIEVE_BASE_LEVERS: Omit<RetrieveConfig, keyof RetrievePresetBundle> = {
+  preset: DEFAULT_RETRIEVE_PRESET,
+  w_graph: 0.15,
+  bm25Enabled: true,
+  graphEnabled: true,
+  rerankEnabled: false,
+  graphArmFloor: 3,
+};
+
+/** A preset bundle's levers over the single-source base defaults. */
+export function retrieveConfigForPreset(preset: RetrievePreset): RetrieveConfig {
+  return { ...RETRIEVE_PRESET_BUNDLES[preset], ...RETRIEVE_BASE_LEVERS };
+}
+
+/**
+ * The fusion config used when no operator config arrived: the default
+ * preset's bundle over the base levers.
+ */
+export const DEFAULT_RETRIEVE_CONFIG: RetrieveConfig = retrieveConfigForPreset(
+  DEFAULT_RETRIEVE_PRESET
+);
+
 /** One entity ranked by the graph engine, with the engine's own score. */
 export interface RankedEntity {
   /** Ledger entity id — the same uuid Postgres and Neo4j both key on. */
@@ -551,6 +606,49 @@ export interface CommunitySummaryStorage {
   ): Promise<CommunitySummaryRow | undefined>;
   searchCommunitySummaries(
     embedding: number[],
+    limit: number
+  ): Promise<CommunitySummaryRow[]>;
+}
+
+/**
+ * One row of the corpus-level C-ready singleton `community_index_state`
+ * (schema-bootstrap; written by the community-summary CLI, demoted by the
+ * extract pipeline). The status/failure spellings are the core types
+ * `COMMUNITY_INDEX_STATUS` / `COMMUNITY_SUMMARY_INDEX_FAILURE` constants —
+ * kept as plain strings here because this file is a type leaf.
+ */
+export interface CommunityIndexStateRow {
+  status: string;
+  failure_code: string | null;
+}
+
+/**
+ * Read seam for the C-ready state (plans/search-mode-retrieve.md T3).
+ *
+ * Retrieve forwards the readiness verdict verbatim: absent row, non-ready
+ * status, or a carried failure_code all mean 档 C is NOT ready and the arm
+ * must type `community_summary_index_failure` — readiness is never
+ * inferred from the summary table having rows.
+ */
+export interface CommunityIndexStateStorage {
+  getCommunityIndexState(): Promise<CommunityIndexStateRow | undefined>;
+}
+
+/**
+ * Lexical search over community REPORT text — the ES half of 档 C's two
+ * parallel arms (fin ADR-0070). Separate from `CommunitySummaryStorage`
+ * because it is the derived precision-index read (query text in, ranked
+ * rows out) while that seam is the ledger's vector read.
+ *
+ * Deliberately NOT part of `PrecisionIndexer` in this ticket: the live
+ * summary-index write side belongs to the graph-index plan T5 wave, and
+ * an uncallable index method would be dead code. The C arm discovers this
+ * port structurally on whatever object is wired as `deps.lexical`, so the
+ * later ES-side ticket only has to add the method.
+ */
+export interface CommunityReportLexicalStorage {
+  searchCommunitySummariesLexical(
+    query: string,
     limit: number
   ): Promise<CommunitySummaryRow[]>;
 }

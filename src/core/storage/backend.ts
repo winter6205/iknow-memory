@@ -15,6 +15,9 @@ export type {
   NeighborChunkStorage,
   Neo4jArmStorage,
   CommunitySummaryStorage,
+  CommunityIndexStateRow,
+  CommunityIndexStateStorage,
+  CommunityReportLexicalStorage,
   ProjectionDrainWaiter,
   ParentWindowStorage,
   ParentWindowRow,
@@ -31,6 +34,8 @@ import type {
   NeighborChunkStorage,
   Neo4jArmStorage,
   CommunitySummaryStorage,
+  CommunityIndexStateStorage,
+  CommunityReportLexicalStorage,
   ProjectionDrainWaiter,
   ParentWindowStorage,
 } from "../retrieval/types.js";
@@ -163,6 +168,35 @@ export function supportsParentWindows(
   return (
     typeof (storage as Partial<ParentWindowStorage>).parentWindowsByChunkIds ===
     "function"
+  );
+}
+
+/**
+ * Runtime narrowing for 档 C's community_index_state readiness seam
+ * (plans/search-mode-retrieve.md T3). The C arm FAILS CLOSED without it:
+ * missing evidence of readiness is not readiness.
+ */
+export function supportsCommunityIndexState(
+  storage: StorageBackend
+): storage is StorageBackend & CommunityIndexStateStorage {
+  return (
+    typeof (storage as Partial<CommunityIndexStateStorage>)
+      .getCommunityIndexState === "function"
+  );
+}
+
+/**
+ * Runtime narrowing for 档 C's report-text lexical seam (the ES half of
+ * ADR-0070's parallel arms). Takes `unknown` because the C arm probes both
+ * `deps.lexical` and `deps.storage` structurally — whichever object the
+ * precision layer is wired into gains the arm by implementing the method.
+ */
+export function supportsCommunityReportLexical(
+  candidate: unknown
+): candidate is CommunityReportLexicalStorage {
+  return (
+    typeof (candidate as Partial<CommunityReportLexicalStorage> | null | undefined)
+      ?.searchCommunitySummariesLexical === "function"
   );
 }
 

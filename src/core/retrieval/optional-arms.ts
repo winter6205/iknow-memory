@@ -17,6 +17,7 @@ import type {
   ArmName,
   ArmResult,
   CapabilityObservation,
+  CommunitySummaryRow,
   CommunitySummaryStorage,
   EntityLexicalStorage,
   GraphArmStorage,
@@ -247,6 +248,32 @@ function getCommunitySummaries(
   return deps.storage.communitySummaries;
 }
 
+/**
+ * Project one ledger summary row into an arm hit. Shared by B's optional
+ * community arm and 档 C's report arms (plans T3) so the summary-row wire
+ * shape — `community/<id>` source ref, epoch validity, community-summary
+ * metadata — has exactly one definition.
+ */
+export function communitySummaryArmHit(
+  row: CommunitySummaryRow,
+  arm: ArmName,
+  rank: number
+): ArmHit {
+  return {
+    id: row.id,
+    arm,
+    rank,
+    score: row.score ?? 1 / rank,
+    content: row.summary,
+    source_ref: `community/${row.communityId}`,
+    valid_window: ["1970-01-01T00:00:00.000Z", null],
+    metadata: {
+      kind: "community-summary",
+      communityId: row.communityId,
+    },
+  };
+}
+
 async function runCommunitySummarySafe(
   queryEmbedding: number[],
   storage: CommunitySummaryStorage,
@@ -256,19 +283,9 @@ async function runCommunitySummarySafe(
     const rows = await storage.searchCommunitySummaries(queryEmbedding, limit);
     return {
       arm: "community-summary",
-      hits: rows.map((row, i) => ({
-        id: row.id,
-        arm: "community-summary",
-        rank: i + 1,
-        score: row.score ?? 1 / (i + 1),
-        content: row.summary,
-        source_ref: `community/${row.communityId}`,
-        valid_window: ["1970-01-01T00:00:00.000Z", null],
-        metadata: {
-          kind: "community-summary",
-          communityId: row.communityId,
-        },
-      })),
+      hits: rows.map((row, i) =>
+        communitySummaryArmHit(row, "community-summary", i + 1)
+      ),
       belowFloor: false,
     };
   } catch (err) {

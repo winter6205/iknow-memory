@@ -80,6 +80,19 @@ Joint terms **抽图窗**, **Fast 抽图**, **实体描述**, **claim**, **具�
 
 **Note (2026-09-19):** assumption 9's **tunable** prune thresholds are satisfied programmatically — `FastPruneOptions` (`src/core/extraction/fast.ts`) takes `weakPercentile` (default 40th percentile) and `minDegree` (default 1) as index-job config. An operator CLI/env surface stays deferred until a real tuning need appears (YAGNI).
 
+## Decisions (post-gate)
+
+- The C-ready flag is implemented as a **corpus-level singleton** row
+  (`community_index_state`, `CHECK id = 1`), superseding the "for that corpus
+  version" wording in Boundaries / SC11: hierarchical Leiden clusters the ONE
+  projected whole-graph, so every version shares a single report generation
+  and a per-version flag would name a granularity the graph does not have.
+  Statuses `in_progress / ready / stale / failed`; a graph-changing extract
+  commit demotes `ready → stale` inside the same chunk transaction, and the
+  community-summary swap returns it to `ready` atomically with the new set
+  (SC11's rebuild-before-ready stays the recovery path). Retrieve-side
+  consumption of the flag stays with `specs/search-mode-retrieve.md`.
+
 ## Inherits / Changes
 
 **Inherits:** ADR-0001 / ADR-0008 / ADR-0004; P0 extract + L0–L3 merge; projection outbox + drain; `specs/p0-extraction.md`; `specs/neo4j-graph-arm.md`; community **summary on ledger** from `specs/retrieve-community.md`.

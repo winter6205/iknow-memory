@@ -102,12 +102,18 @@ export type ExtractMethod = (typeof EXTRACT_METHODS)[number];
  * in-flight rebuild never lets the previous report set be served as
  * current C. `in_progress` exists so a crashed rebuild stays 未就绪 until an
  * operator reruns the job, instead of silently re-validating the old set.
+ * `stale` is the producer-side demotion (T5 review gap): an extract chunk
+ * that persisted new graph rows moves READY there inside the SAME chunk
+ * transaction, so the summary generation is openly outdated until the next
+ * community-summary rebuild swaps back to READY.
  */
 export const COMMUNITY_INDEX_STATUS = {
   /** A detect + summarize rebuild is running (or died mid-flight). */
   IN_PROGRESS: "in_progress",
   /** The ledger holds the complete summary generation for the current graph. */
   READY: "ready",
+  /** Graph rows landed after the last swap; the summaries are outdated. */
+  STALE: "stale",
   /** The last community-summary job failed; `failure_code` says how. */
   FAILED: "failed",
 } as const;

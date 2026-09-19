@@ -10,17 +10,21 @@
  *      zero the lexical arm);
  *   3. the dispatch table exists for all four modes: B implemented, A
  *      opened by T2 on its own lexical child→parent arm, C opened by T3 on
- *      its report-first arm, D still on the provisional graph-priority
- *      alias until plans T4 replaces its row with the typed refusal.
+ *      its report-first arm, D opened by T4 as the typed unwired refusal
+ *      (the closed 档 whose product fact is `real_db_not_wired`, never a
+ *      provisional B answer).
  */
 import { describe, it, expect } from "vitest";
 import {
   INVALID_SEARCH_MODE_REASON,
+  REAL_DB_NOT_WIRED_REASON,
   SEARCH_MODES,
   SEARCH_MODE_ARMS,
+  SEARCH_MODE_FILTER_KEY,
   parseSearchMode,
   stripSearchModeFilter,
   invalidSearchModeMessage,
+  realDbNotWiredMessage,
   C_DROP_WINDOWS_FILTER_KEY,
   cDropWindowsEnabled,
   stripCDropWindowsFilter,
@@ -114,14 +118,24 @@ describe("SEARCH_MODE_ARMS dispatch table", () => {
     expect(SEARCH_MODE_ARMS.C).not.toBe(assembleRetrievalResult);
   });
 
+  it("routes D to the typed unwired refusal opened by plans T4 (not a provisional B answer)", () => {
+    // The T4 swap: exactly this row moved off the provisional alias. D is
+    // a closed 档 whose product fact is 真库未接 — answering it through B
+    // would pretend the SQL path exists.
+    expect(SEARCH_MODE_ARMS.D).not.toBe(assembleRetrievalResult);
+  });
+
   it("keeps B on the graph-priority assembler", () => {
     expect(SEARCH_MODE_ARMS.B).toBe(assembleRetrievalResult);
   });
+});
 
-  it("keeps D on the provisional alias until plans T4", () => {
-    // T4 replaces D's row with the typed `real_db_not_wired` refusal.
-    // Until then D IS the B assembler, byte-for-byte today's behavior.
-    expect(SEARCH_MODE_ARMS.D).toBe(assembleRetrievalResult);
+describe("realDbNotWiredMessage", () => {
+  it("carries the stable token, the routing key and the 档 letter", () => {
+    const message = realDbNotWiredMessage();
+    expect(message).toContain(REAL_DB_NOT_WIRED_REASON);
+    expect(message).toContain(SEARCH_MODE_FILTER_KEY);
+    expect(message).toContain("D");
   });
 });
 

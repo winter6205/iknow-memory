@@ -32,6 +32,7 @@ import { modeAParentWindowArm } from "./mode-a-arm.js";
 import { modeCReportFirstArm } from "./mode-c-arm.js";
 import { SEARCH_MODE_FILTER_KEY } from "./wire-filters.js";
 import type { RetrieveOutputEnvelope } from "./types.js";
+import { GraphragError } from "../errors.js";
 
 // Re-exported so wire-side callers (src/tools/retrieve.ts, tests) keep one
 // import point; the constants live in the leaf module for the cyclic-TDZ
@@ -56,6 +57,17 @@ export const DEFAULT_SEARCH_MODE: SearchMode = "B";
 /** Stable host-mappable reason token, aligned with fin `named_failures` style. */
 export const INVALID_SEARCH_MODE_REASON = "invalid_search_mode";
 
+/**
+ * Stable host-mappable token for 档 D, aligned with fin
+ * `named_failures.REAL_DB_NOT_WIRED` (specs/search-mode-retrieve.md Open
+ * Question: codes shared with fin `named_failures`). It lives HERE, beside
+ * the other wire-side reason token, not beside `COMMUNITY_SUMMARY_INDEX_
+ * FAILURE` in core types: that constant is a persisted `failure_code`
+ * column value written by the community-summary job, while this one is a
+ * routing-time refusal that never touches storage.
+ */
+export const REAL_DB_NOT_WIRED_REASON = "real_db_not_wired";
+
 export type SearchModeResolution =
   | { kind: "resolved"; mode: SearchMode }
   | { kind: "invalid"; value: string };
@@ -78,6 +90,15 @@ export function invalidSearchModeMessage(value: string): string {
     `retrieve ${SEARCH_MODE_FILTER_KEY} must be one of ` +
     `${SEARCH_MODES.join(" | ")}, got "${value}" ` +
     `(${INVALID_SEARCH_MODE_REASON})`
+  );
+}
+
+/** Same constant pattern as `invalidSearchModeMessage`, for 档 D's refusal. */
+export function realDbNotWiredMessage(): string {
+  return (
+    `retrieve ${SEARCH_MODE_FILTER_KEY}=D is not wired: ` +
+    `${REAL_DB_NOT_WIRED_REASON} (document tables stay on 档 B until a ` +
+    `business SQL path exists)`
   );
 }
 
@@ -110,19 +131,26 @@ export type SearchModeArm = (
 ) => Promise<RetrieveOutputEnvelope>;
 
 /**
- * T1 stand-in until the last 档 row opens: plans T4 replaces D with its
- * typed refusal. Each ticket swaps exactly ONE row of the dispatch table —
- * the handler parsing, stripping and envelope stay as they are. Until then
- * D answers through the existing graph-priority assembler, byte-for-byte
- * the current B behavior.
+ * 档 D (plans/search-mode-retrieve.md T4, spec assumption 5 + SC5): the
+ * business-SQL path is a plan slot, not implemented, so the honest answer
+ * is a typed refusal — reading `args`/`deps` at all would mean running SQL
+ * (fake or real) over chunks, exactly what the spec forbids; document
+ * tables stay on B. Same exit chain as T1's invalid mode and T3's not-ready
+ * gate: throw a `GraphragError` whose message carries the stable fin-pinned
+ * token, because the MCP adapter serializes only thrown Error messages
+ * into the `isError` result. Code `INVALID_INPUT` mirrors fin's
+ * routing-time 400 for `real_db_not_wired` (the run never starts — no
+ * storage was touched, so it is not a `STORAGE_ERROR`).
  */
-const provisionalGraphPriorityArm: SearchModeArm = assembleRetrievalResult;
+async function modeDNotWiredArm(): Promise<RetrieveOutputEnvelope> {
+  throw new GraphragError(realDbNotWiredMessage(), "INVALID_INPUT");
+}
 
 /**
  * specs/search-mode-retrieve.md confirms each 档 gets its own arm: T2 opened
  * A (mode-a-arm.ts, ADR-0060), T3 opened C (mode-c-arm.ts, ADR-0070), each
- * replacing exactly ONE row of this table. T4 replaces D's provisional row
- * with the typed unwired refusal.
+ * replacing exactly ONE row of this table — the handler parsing, stripping
+ * and envelope stay as they are. T4 opened D's row below.
  */
 export const SEARCH_MODE_ARMS: Readonly<Record<SearchMode, SearchModeArm>> = {
   // T2: child lexical hits cite the parent 抽图窗 body (ADR-0060).
@@ -130,6 +158,6 @@ export const SEARCH_MODE_ARMS: Readonly<Record<SearchMode, SearchModeArm>> = {
   B: assembleRetrievalResult,
   // T3: report-first community summaries, ES ∥ report vectors (ADR-0070).
   C: modeCReportFirstArm,
-  // Provisional until plans T4 lands the typed `real_db_not_wired` refusal.
-  D: provisionalGraphPriorityArm,
+  // T4: typed 真库未接 refusal, never a provisional B answer over chunks.
+  D: modeDNotWiredArm,
 };

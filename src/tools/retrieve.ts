@@ -12,8 +12,8 @@
  * resolved and dispatched in this handler before the arms run: missing →
  * B, invalid → typed INVALID_INPUT, A → the lexical child-hit/parent-body
  * arm (plans T2), C → the report-first community-summary arm (plans T3),
- * D → the provisional graph-priority arm until plans T4 lands the typed
- * `real_db_not_wired` refusal (see src/core/retrieval/search-mode.ts).
+ * D → the typed `real_db_not_wired` refusal (plans T4; see
+ * src/core/retrieval/search-mode.ts).
  */
 import { z } from "zod";
 import {

@@ -79,6 +79,54 @@ export type SourceDocStatus =
   (typeof SOURCE_DOC_STATUS)[keyof typeof SOURCE_DOC_STATUS];
 
 /**
+ * Extract-method vocabulary (graph-index-standard-fast T1; spec assumption 3).
+ *
+ * One 资料 version carries EXACTLY ONE method: `standard` (LLM extraction,
+ * the default job) or `fast` (pure NLP co-occurrence, T4). Persisted on
+ * `source_documents.extract_method`; the CHECK constraint in
+ * schema-bootstrap.ts derives its literal list from this constant, mirroring
+ * the `SOURCE_DOC_STATUS` pattern.
+ */
+export const EXTRACT_METHODS = ["standard", "fast"] as const;
+
+export type ExtractMethod = (typeof EXTRACT_METHODS)[number];
+
+/**
+ * C-ready vocabulary for the corpus-level community index (graph-index-
+ * standard-fast T5; spec assumption 10 / success criterion 11).
+ *
+ * Persisted on the single row of `community_index_state`, following the
+ * `SOURCE_DOC_STATUS` convention (constant-derived CHECK, `failure_code`
+ * beside `status`). Not-ready is the safe default: only a completed atomic
+ * swap of the whole summary generation writes READY, so a failed or
+ * in-flight rebuild never lets the previous report set be served as
+ * current C. `in_progress` exists so a crashed rebuild stays 未就绪 until an
+ * operator reruns the job, instead of silently re-validating the old set.
+ */
+export const COMMUNITY_INDEX_STATUS = {
+  /** A detect + summarize rebuild is running (or died mid-flight). */
+  IN_PROGRESS: "in_progress",
+  /** The ledger holds the complete summary generation for the current graph. */
+  READY: "ready",
+  /** The last community-summary job failed; `failure_code` says how. */
+  FAILED: "failed",
+} as const;
+
+export type CommunityIndexStatus =
+  (typeof COMMUNITY_INDEX_STATUS)[keyof typeof COMMUNITY_INDEX_STATUS];
+
+/**
+ * Stable failure code stored in `community_index_state.failure_code` when a
+ * community-summary job fails. Spec 待写入 keeps public spellings as an
+ * Open Question; this string is the fin `具名失败` token already pinned by
+ * `specs/search-mode-retrieve.md` (`community_summary_index_failure`), so
+ * the retrieve-side ticket can forward it verbatim. The process-level typed
+ * error stays `COMMUNITY_SUMMARY_JOB_FAILED` on the CLI.
+ */
+export const COMMUNITY_SUMMARY_INDEX_FAILURE =
+  "community_summary_index_failure" as const;
+
+/**
  * v1 is a SINGLE process-wide 资料集合 (spec Open Question 2, leading
  * option): every stored 资料 belongs to the one collection the operator
  * sees on the existing 资料页. A collections table would be a schema,

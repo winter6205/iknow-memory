@@ -76,3 +76,78 @@ export function buildExtractionPrompt(chunkText: string): string {
     chunkText,
   ].join("\n");
 }
+
+// ─── T3 (graph-index-standard-fast): standard post-merge enrichment ──────
+
+/**
+ * Build the describe prompt for ONE batched call covering every merge
+ * survivor of a chunk (ADR 0069). Each entity arrives with its merged
+ * description list; the model returns one consolidated description per
+ * entity. Entities the model cannot summarize are omitted from the response
+ * — a miss skips that description, it never fails the run.
+ */
+export function buildDescribePrompt(
+  entities: readonly { canonicalName: string; descriptions: readonly string[] }[]
+): string {
+  const blocks = entities.map(
+    (e) =>
+      `Entity: ${e.canonicalName}\n` +
+      e.descriptions.map((d) => `  - ${d}`).join("\n")
+  );
+  return [
+    "You consolidate extracted knowledge descriptions into one entity description.",
+    "For each entity below, merge its description list into ONE concise",
+    "description (1-2 sentences) that preserves every distinct fact. Use the",
+    "same language as the descriptions.",
+    "",
+    "Entities:",
+    ...(blocks.length > 0 ? blocks : ["(none)"]),
+    "",
+    "Output schema (return this exact JSON shape, nothing else):",
+    "{",
+    '  "descriptions": [ { "entity": string, "description": string } ]',
+    "}",
+    'The "entity" value must repeat the entity name exactly as listed.',
+    "Omit an entity you cannot summarize — never invent facts the",
+    "descriptions do not carry.",
+    "",
+    "Return raw JSON only. Do not wrap in markdown fences.",
+  ].join("\n");
+}
+
+/**
+ * Build the claims prompt for one chunk (ADR 0071): time-bounded factual
+ * assertions about the given survivor entities, grounded in the chunk text.
+ * `validFrom` / `validTo` carry ISO-8601 dates when the text states a
+ * bound, otherwise null (open-ended window).
+ */
+export function buildClaimsPrompt(
+  chunkText: string,
+  entityNames: readonly string[]
+): string {
+  return [
+    "You extract time-bounded claims about the listed entities from the chunk.",
+    "A claim is one atomic assertion that could later be contradicted or",
+    "retired; not a triple relation, not an opinion.",
+    "",
+    "Entities (a claim must be about exactly one of them, by this name):",
+    ...(entityNames.length > 0
+      ? entityNames.map((n) => `- ${n}`)
+      : ["(none — return an empty list)"]),
+    "",
+    "Output schema (return this exact JSON shape, nothing else):",
+    "{",
+    '  "claims": [ { "entity": string, "claim": string,',
+    '    "validFrom": string|null, "validTo": string|null,',
+    '    "confidence": number, "evidenceSpan": string } ]',
+    "}",
+    "validFrom / validTo: ISO-8601 dates when the chunk states a bound,",
+    "otherwise null. confidence in [0, 1]. evidenceSpan: a short verbatim",
+    "substring of the chunk backing the claim (empty string when none).",
+    "",
+    "Return raw JSON only. Do not wrap in markdown fences.",
+    "",
+    "Chunk:",
+    chunkText,
+  ].join("\n");
+}

@@ -1,5 +1,5 @@
 /**
- * Schema bootstrap: the four entity/triple ledger tables + their indexes.
+ * Schema bootstrap: the entity/triple/claim ledger tables + their indexes.
  *
  * Decomposed by table (one small helper per table) so each function stays
  * well under 40 lines and the public `upSchemaBootstrap` is a thin orchestrator
@@ -18,7 +18,12 @@
  */
 import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
 import { GraphragError } from "../errors.js";
-import { SOURCE_DOC_STATUS, type SourceDocStatus } from "../types.js";
+import {
+  SOURCE_DOC_STATUS,
+  EXTRACT_METHODS,
+  COMMUNITY_INDEX_STATUS,
+  type SourceDocStatus,
+} from "../types.js";
 import { upSchemaProjection } from "./schema-projection.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 
@@ -158,6 +163,45 @@ async function createTriples(client: SchemaBootstrapClient): Promise<void> {
       ON triples (relation_norm)`);
 }
 
+/**
+ * claims: time-bounded assertions the STANDARD extract job writes after
+ * canonical merge (graph-index-standard-fast T3; ADR 0071).
+ *
+ * Postgres SoR like the rest of the ledger — claims are NOT graph subjects,
+ * so no projection intent is ever emitted for this table (ADR-0001 keeps
+ * the Neo4j side an entity/triple projection). One row = one claim hanging
+ * on one survivor entity (`entity_id` CASCADE: retiring the entity retires
+ * its claims) with the producing chunk as provenance (`SET NULL`: knowledge
+ * outlives its source, same posture as `triples.source_chunk_id`). The
+ * extract pipeline RESTATES a chunk's rows (DELETE by `source_chunk_id` →
+ * INSERT) inside the chunk transaction, which is what makes repeat
+ * extraction idempotent; `claims_source_chunk_id_idx` serves that replace.
+ * Column vocabulary mirrors `triples` (valid_window '[)' semantics,
+ * confidence CHECK, extractor provenance tag).
+ */
+async function createClaims(client: SchemaBootstrapClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS claims (
+      id              uuid PRIMARY KEY,
+      entity_id       uuid NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      source_chunk_id uuid REFERENCES chunks(id) ON DELETE SET NULL,
+      claim_text      text NOT NULL,
+      valid_window    tstzrange NOT NULL,
+      confidence      real NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+      evidence_span   text,
+      extractor       text NOT NULL DEFAULT 'llm',
+      created_at      timestamptz NOT NULL DEFAULT now()
+    )`);
+  // Community-report / claim-read joins hang claims on their entity.
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS claims_entity_id_idx
+      ON claims (entity_id)`);
+  // Per-chunk restatement (DELETE WHERE source_chunk_id = $1).
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS claims_source_chunk_id_idx
+      ON claims (source_chunk_id)`);
+}
+
 /** extraction_records: chunk-level extraction outcomes, batch_id aggregate. */
 async function createExtractionRecords(
   client: SchemaBootstrapClient
@@ -246,6 +290,32 @@ async function createCommunitySummaries(
 }
 
 /**
+ * community_index_state: the corpus-level C-ready (就绪) singleton written
+ * by the community-summary CLI (graph-index-standard-fast T5).
+ *
+ * One row (CHECK id = 1) describes the WHOLE report generation, because the
+ * CLI swaps `community_summaries` atomically — a partial generation is by
+ * definition not ready, so a per-community flag would only restate the row
+ * set. `failure_code` mirrors the `source_documents` status pattern and
+ * carries the fin-pinned `community_summary_index_failure` token so the
+ * search-mode retrieve ticket can forward it verbatim. The CHECK's literal
+ * list derives from COMMUNITY_INDEX_STATUS (types.ts), same constant-side
+ * doctrine as `source_documents_status_check`.
+ */
+async function createCommunityIndexState(
+  client: SchemaBootstrapClient
+): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS community_index_state (
+      id           integer PRIMARY KEY CHECK (id = 1),
+      status       text NOT NULL
+                     CHECK (status IN (${sqlTextList(Object.values(COMMUNITY_INDEX_STATUS))})),
+      failure_code text NULL,
+      updated_at   timestamptz NOT NULL DEFAULT now()
+    )`);
+}
+
+/**
  * source_documents: the 资料 prose SoR (operator-console T1; ADR-0010).
  *
  * One row holds the full body text the injector pushed; the dashboard and
@@ -297,6 +367,24 @@ async function createSourceDocuments(
       ALTER TABLE source_documents
         ADD CONSTRAINT source_documents_status_check
         CHECK (status IN (${sqlTextList(SOURCE_DOC_STATUS_VALUES)}));
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
+  // T1 (graph-index-standard-fast) version spine: which extract method
+  // produced this 资料 version. NULL = never extracted; once set, the method
+  // is frozen for the version — the pipeline refuses a conflicting re-
+  // extract (EXTRACT_METHOD_CONFLICT) and its record UPDATE is overwrite-
+  // guarded, so the column can never silently change hands. Same
+  // constant-derived CHECK as status above.
+  await client.query(`
+    ALTER TABLE source_documents
+      ADD COLUMN IF NOT EXISTS extract_method text NULL`);
+  await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE source_documents
+        ADD CONSTRAINT source_documents_extract_method_check
+        CHECK (extract_method IN (${sqlTextList(EXTRACT_METHODS)}));
     EXCEPTION
       WHEN duplicate_object THEN NULL;
     END $$`);
@@ -357,8 +445,10 @@ export async function upSchemaBootstrap(
     await createEntities(client, dimensions);
     await createEntityAliases(client);
     await createTriples(client);
+    await createClaims(client);
     await createExtractionRecords(client);
     await createCommunitySummaries(client, dimensions);
+    await createCommunityIndexState(client);
     await createSourceDocuments(client);
     await upSchemaProjection(client);
     // ALTER chunks back-pointers must come after `source_documents` exists

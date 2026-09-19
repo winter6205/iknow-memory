@@ -3,7 +3,11 @@ import { createRetrieveHandler, retrieveTool } from "../src/tools/retrieve.js";
 import { FakeEmbedder } from "../src/core/embedder.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import { GraphragError } from "../src/core/errors.js";
-import type { ChunkRecord } from "../src/core/types.js";
+import type {
+  ChunkRecord,
+  RetrievedChunk,
+  SearchOptions,
+} from "../src/core/types.js";
 import type { ToolResult } from "../src/tools/registry.js";
 
 /** Test dimension — injected into FakeEmbedder and MemoryBackend. */
@@ -50,6 +54,19 @@ function makeChunk(patch: Partial<ChunkRecord> & { id: string }): ChunkRecord {
     valid_until: patch.valid_until ?? null,
     created_at: patch.created_at ?? "2024-01-01T00:00:00Z",
   };
+}
+
+/** Lexical backend that records the exact-match filters it receives. */
+class RecordingLexicalBackend extends MemoryBackend {
+  lexicalFilterCalls: Array<SearchOptions["filters"]> = [];
+
+  async searchLexical(
+    _query: string,
+    opts: SearchOptions
+  ): Promise<RetrievedChunk[]> {
+    this.lexicalFilterCalls.push(opts.filters);
+    return [];
+  }
 }
 
 describe("createRetrieveHandler", () => {
@@ -164,6 +181,116 @@ describe("createRetrieveHandler", () => {
       });
       const body = parseResultBody(result);
       expect(body.chunks.map((c) => c.id).sort()).toEqual(["a", "c"]);
+    });
+  });
+
+  // plans/search-mode-retrieve.md T1: `filters.search_mode` is a routing
+  // control, not a chunk-matching filter. Missing → today's graph-priority
+  // B; outside the closed set → typed INVALID_INPUT carrying a stable
+  // host-mappable reason token (never a healthy empty `chunks` with no
+  // reason). A/C/D still answer through the provisional graph-priority arm
+  // until T2 opens A, T3 opens C and T4 replaces D's row.
+  describe("filters.search_mode (T1)", () => {
+    const HYBRID_CONFIG = {
+      w_vec: 0.7,
+      w_bm25: 0.15,
+      w_graph: 0.15,
+      bm25Enabled: true,
+      graphEnabled: false,
+      rerankEnabled: false,
+      entityLinkTopK: 8,
+      candidateCap: 50,
+      graphArmFloor: 3,
+    };
+
+    beforeEach(async () => {
+      await backend.upsert([
+        makeChunk({ id: "x", source_ref: "docs/x.md" }),
+        makeChunk({ id: "y", source_ref: "docs/y.md" }),
+      ]);
+    });
+
+    it("missing key keeps the exact B behavior of an explicit B", async () => {
+      const withoutMode = await handler({
+        query: "anything",
+        filters: { source_ref: "docs/x.md" },
+      });
+      const withMode = await handler({
+        query: "anything",
+        filters: { source_ref: "docs/x.md", search_mode: "B" },
+      });
+      expect(parseResultBody(withMode)).toEqual(parseResultBody(withoutMode));
+      expect(parseResultBody(withoutMode).chunks.map((c) => c.id)).toEqual([
+        "x",
+      ]);
+    });
+
+    it("invalid value throws GraphragError INVALID_INPUT with the stable reason token", async () => {
+      await expect(
+        handler({ query: "anything", filters: { search_mode: "E" } })
+      ).rejects.toBeInstanceOf(GraphragError);
+      let thrown: unknown;
+      try {
+        await handler({ query: "anything", filters: { search_mode: "E" } });
+      } catch (err) {
+        thrown = err;
+      }
+      const error = thrown as GraphragError;
+      expect(error.code).toBe("INVALID_INPUT");
+      // The message is the wire surface (the MCP adapter serializes it into
+      // an isError result), so the host maps on this stable token.
+      expect(error.message).toContain("invalid_search_mode");
+      expect(error.message).toContain("A | B | C | D");
+    });
+
+    it("a rejected mode does not fall through to a healthy empty envelope", async () => {
+      // The negative path must not be reachable as a `{ chunks: [] }`
+      // success either way of spelling the invalid value.
+      for (const bad of ["", "b", "graph"]) {
+        await expect(
+          handler({ query: "anything", filters: { search_mode: bad } })
+        ).rejects.toBeInstanceOf(GraphragError);
+      }
+    });
+
+    it("valid A/C/D parse and run the provisional B arm", async () => {
+      const baseline = await handler({ query: "anything" });
+      // T1 opens the dispatch table only: A/C/D alias the provisional
+      // graph-priority arm, so each answers byte-for-byte like B. T2
+      // splits A out; T3/T4 will move C's and D's rows.
+      for (const mode of ["A", "C", "D"] as const) {
+        const result = await handler({
+          query: "anything",
+          filters: { search_mode: mode },
+        });
+        expect(parseResultBody(result)).toEqual(parseResultBody(baseline));
+      }
+      expect(parseResultBody(baseline).chunks).toHaveLength(2);
+    });
+
+    it("search_mode never reaches the lexical arm's exact-match filters", async () => {
+      // Regression guard for the ES precision layer, which turns every
+      // filter key into a term clause: a leaked `search_mode` would match
+      // no indexed field and silently zero the BM25 arm. C is the probe —
+      // while it is provisional B it runs the B pipeline end to end.
+      const lexical = new RecordingLexicalBackend(TEST_DIM);
+      const hybridHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage: backend,
+        lexical,
+        retrieveConfig: HYBRID_CONFIG,
+      });
+      const result = await hybridHandler({
+        query: "anything",
+        filters: { source_ref: "docs/x.md", search_mode: "C" },
+      });
+      expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
+      for (const filters of lexical.lexicalFilterCalls) {
+        expect(filters).not.toHaveProperty("search_mode");
+        expect(filters?.source_ref).toBe("docs/x.md");
+      }
+      // C answers through the hybrid pipeline, un-degraded, like B.
+      expect(parseResultBody(result).chunks.map((c) => c.id)).toEqual(["x"]);
     });
   });
 

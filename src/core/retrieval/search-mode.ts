@@ -28,6 +28,7 @@ import {
   type AssembleArgs,
   type AssembleDeps,
 } from "./index.js";
+import { modeAParentWindowArm } from "./mode-a-arm.js";
 import type { RetrieveOutputEnvelope } from "./types.js";
 
 /** The closed set from specs/search-mode-retrieve.md; never widen it silently. */
@@ -95,17 +96,21 @@ export type SearchModeArm = (
 ) => Promise<RetrieveOutputEnvelope>;
 
 /**
- * T1 stand-in until the per-档 arms land: plans T2 opens A, T3 opens C,
+ * T1 stand-in until the remaining per-档 arms land: plans T3 opens C and
  * T4 replaces D with its typed refusal. Each ticket swaps exactly ONE row
  * of the table below — the handler parsing, stripping and envelope stay as
- * they are. Until then every 档 answers through the existing graph-priority
- * assembler, which is byte-for-byte the current B behavior.
+ * they are. T2 opened A's row on the parent-window arm (below); the
+ * remaining provisional rows answer through the existing graph-priority
+ * assembler, byte-for-byte the current B behavior.
  */
 const provisionalGraphPriorityArm: SearchModeArm = assembleRetrievalResult;
 
 export const SEARCH_MODE_ARMS: Readonly<Record<SearchMode, SearchModeArm>> = {
-  A: provisionalGraphPriorityArm,
+  // T2: child lexical hits cite the parent 抽图窗 body (ADR-0060).
+  A: modeAParentWindowArm,
   B: assembleRetrievalResult,
+  // Still provisional until plans T3 opens the report-first arm.
   C: provisionalGraphPriorityArm,
+  // Still provisional until plans T4 lands the typed refusal.
   D: provisionalGraphPriorityArm,
 };

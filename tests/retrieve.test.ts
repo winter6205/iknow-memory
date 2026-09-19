@@ -33,6 +33,15 @@ function parseResultBody(result: ToolResult): {
     source_ref: string;
     valid_window: [string, string | null];
     score: number;
+    metadata?: {
+      kind: string;
+      sourceDocId?: string;
+      children?: Array<{
+        chunkId: string;
+        ordinal: number | null;
+        score: number;
+      }>;
+    };
   }>;
 } {
   const text = result.content[0]?.text;
@@ -53,6 +62,12 @@ function makeChunk(patch: Partial<ChunkRecord> & { id: string }): ChunkRecord {
     valid_from: patch.valid_from ?? "2024-01-01T00:00:00Z",
     valid_until: patch.valid_until ?? null,
     created_at: patch.created_at ?? "2024-01-01T00:00:00Z",
+    // Parent back-pointers stay absent unless the caller sets them — a
+    // legacy child without them is exactly what 档 A must degrade on.
+    ...(patch.source_doc_id !== undefined
+      ? { source_doc_id: patch.source_doc_id }
+      : {}),
+    ...(patch.ordinal !== undefined ? { ordinal: patch.ordinal } : {}),
   };
 }
 
@@ -188,8 +203,8 @@ describe("createRetrieveHandler", () => {
   // control, not a chunk-matching filter. Missing → today's graph-priority
   // B; outside the closed set → typed INVALID_INPUT carrying a stable
   // host-mappable reason token (never a healthy empty `chunks` with no
-  // reason). A/C/D still answer through the provisional graph-priority arm
-  // until T2 opens A, T3 opens C and T4 replaces D's row.
+  // reason). T2 opened A as the lexical child-hit → parent-body arm
+  // (ADR-0060); C stays provisional until T3, D until T4.
   describe("filters.search_mode (T1)", () => {
     const HYBRID_CONFIG = {
       w_vec: 0.7,
@@ -253,12 +268,20 @@ describe("createRetrieveHandler", () => {
       }
     });
 
-    it("valid A/C/D parse and run the provisional B arm", async () => {
+    it("valid A/C/D parse; A runs its own arm, C/D stay provisional", async () => {
       const baseline = await handler({ query: "anything" });
-      // T1 opens the dispatch table only: A/C/D alias the provisional
-      // graph-priority arm, so each answers byte-for-byte like B. T2
-      // splits A out; T3/T4 will move C's and D's rows.
-      for (const mode of ["A", "C", "D"] as const) {
+      // T2 moved A's row off the provisional alias. The fixture's chunks
+      // carry no parent back-pointers, and the query terms match no chunk
+      // content, so the lexical-first A finds nothing: a healthy empty
+      // answer, visibly NOT the B arm's vector result of [x, y].
+      const aBody = parseResultBody(
+        await handler({ query: "anything", filters: { search_mode: "A" } })
+      );
+      expect(aBody.chunks).toEqual([]);
+      expect(aBody).not.toHaveProperty("degraded");
+      // C and D still alias the provisional graph-priority arm: T3 opens
+      // C, T4 replaces D.
+      for (const mode of ["C", "D"] as const) {
         const result = await handler({
           query: "anything",
           filters: { search_mode: mode },
@@ -291,6 +314,86 @@ describe("createRetrieveHandler", () => {
       }
       // C answers through the hybrid pipeline, un-degraded, like B.
       expect(parseResultBody(result).chunks.map((c) => c.id)).toEqual(["x"]);
+    });
+  });
+
+  // plans/search-mode-retrieve.md T2 (ADR-0060): 档 A ranks in-window
+  // children lexically and cites the PARENT 抽图窗 body. Acceptance fixture
+  // below: an A query that hits the child returns the parent text.
+  describe("search_mode=A child hit returns parent text (T2)", () => {
+    const PARENT_BODY =
+      "the whole extract window body about quantum tunneling with extra context";
+
+    beforeEach(async () => {
+      await backend.upsertSourceDoc({
+        id: "doc-parent",
+        source_ref: "docs/parent.md",
+        title: null,
+        content: PARENT_BODY,
+        created_at: "2024-01-01T00:00:00Z",
+      });
+      // The pushed chunk rows ARE the children (fast.ts): slices of the
+      // body, back-pointing to the 资料 row.
+      await backend.upsert([
+        makeChunk({
+          id: "child-1",
+          content: "a child slice about quantum tunneling",
+          source_ref: "docs/parent.md",
+          source_doc_id: "doc-parent",
+          ordinal: 0,
+        }),
+      ]);
+    });
+
+    it("A query hitting the child puts the parent body in chunks[] text", async () => {
+      const result = await handler({
+        query: "quantum tunneling",
+        filters: { search_mode: "A" },
+      });
+      const body = parseResultBody(result);
+      expect(body.chunks).toHaveLength(1);
+      const hit = body.chunks[0]!;
+      expect(hit.content).toBe(PARENT_BODY);
+      expect(hit.id).toBe("doc-parent");
+      expect(hit.source_ref).toBe("docs/parent.md");
+      expect(hit.metadata?.kind).toBe("parent-window");
+      expect(hit.metadata?.sourceDocId).toBe("doc-parent");
+      expect(hit.metadata?.children).toEqual([
+        { chunkId: "child-1", ordinal: 0, score: hit.score },
+      ]);
+      expect(body).not.toHaveProperty("degraded");
+    });
+
+    it("A never routes through the B vector arm for the same query", async () => {
+      // A graph-priority-B-shaped answer would cite the child id with the
+      // child slice text; assert the A envelope is categorically different.
+      const aBody = parseResultBody(
+        await handler({
+          query: "quantum tunneling",
+          filters: { search_mode: "A" },
+        })
+      );
+      expect(aBody.chunks.map((c) => c.id)).toEqual(["doc-parent"]);
+    });
+
+    it("A strips search_mode before the lexical seam sees the filters", async () => {
+      // Same leak guard the C test gives the provisional row, now pinned
+      // for the arm that actually consumes the lexical seam directly.
+      const lexical = new RecordingLexicalBackend(TEST_DIM);
+      const aHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage: backend,
+        lexical,
+      });
+      await aHandler({
+        query: "quantum tunneling",
+        filters: { source_ref: "docs/parent.md", search_mode: "A" },
+      });
+      expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
+      for (const filters of lexical.lexicalFilterCalls) {
+        expect(filters).not.toHaveProperty("search_mode");
+        expect(filters?.source_ref).toBe("docs/parent.md");
+      }
     });
   });
 

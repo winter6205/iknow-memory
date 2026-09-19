@@ -16,6 +16,8 @@ export type {
   Neo4jArmStorage,
   CommunitySummaryStorage,
   ProjectionDrainWaiter,
+  ParentWindowStorage,
+  ParentWindowRow,
 } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type {
@@ -30,6 +32,7 @@ import type {
   Neo4jArmStorage,
   CommunitySummaryStorage,
   ProjectionDrainWaiter,
+  ParentWindowStorage,
 } from "../retrieval/types.js";
 
 /**
@@ -149,6 +152,16 @@ export function supportsNeighborChunks(
 ): storage is StorageBackend & NeighborChunkStorage {
   return (
     typeof (storage as Partial<NeighborChunkStorage>).chunksByChunkIds ===
+    "function"
+  );
+}
+
+/** Runtime narrowing for 档 A's optional child→parent window seam. */
+export function supportsParentWindows(
+  storage: StorageBackend
+): storage is StorageBackend & ParentWindowStorage {
+  return (
+    typeof (storage as Partial<ParentWindowStorage>).parentWindowsByChunkIds ===
     "function"
   );
 }

@@ -41,7 +41,8 @@ export type DegradedCapability =
   | "node_embedding"
   | "community_summary"
   | "neighbor_evidence"
-  | "projection_drain";
+  | "projection_drain"
+  | "parent_window";
 
 export type CapabilityState =
   "disabled" | "unattempted" | "attempted-and-failed" | "succeeded";
@@ -81,6 +82,8 @@ export const DEGRADED_REASON_CODES = [
   "neighbor_evidence:attempted-and-failed",
   "projection_drain:unattempted",
   "projection_drain:attempted-and-failed",
+  "parent_window:unattempted",
+  "parent_window:attempted-and-failed",
 ] as const;
 
 export type DegradedReason = (typeof DEGRADED_REASON_CODES)[number];
@@ -157,6 +160,14 @@ export const CAPABILITY_REGISTRY = {
     unattempted: "projection_drain:unattempted",
     attemptedAndFailed: "projection_drain:attempted-and-failed",
   },
+  // 档 A (ADR-0060): the child→parent window lookup. default-on because an
+  // A retrieve without it could only ever cite child text, which ADR-0060
+  // forbids; B never observes this capability, so its envelope is unchanged.
+  parent_window: {
+    defaultOn: true,
+    unattempted: "parent_window:unattempted",
+    attemptedAndFailed: "parent_window:attempted-and-failed",
+  },
 } as const satisfies Record<DegradedCapability, CapabilityDefinition>;
 
 /** Named retrieval mode bundles exposed by the retrieve tool. */
@@ -214,6 +225,34 @@ export function isRetrievePreset(value: string): value is RetrievePreset {
   return (RETRIEVE_PRESETS as readonly string[]).includes(value);
 }
 
+/**
+ * Wire-safe metadata a hit may carry. A union member per citable-body
+ * provenance kind; single source so ArmHit, FusedHit and the envelope
+ * cannot drift apart when a 档 adds one.
+ *
+ * `parent-window` (档 A, ADR-0060): the hit's text is the parent 抽图窗
+ * body; the lexical children that produced the hit are recorded here as
+ * span metadata only — they are never a second citable body or ranker.
+ */
+export type RetrieveHitMetadata =
+  | {
+      kind: "community-summary";
+      communityId: string;
+    }
+  | {
+      kind: "parent-window";
+      /** The 资料 (parent window) row id the text came from. */
+      sourceDocId: string;
+      /** Contributing children in best-rank-first order. */
+      children: Array<{
+        chunkId: string;
+        /** Zero-based child ordinal in the parent; null = legacy row. */
+        ordinal: number | null;
+        /** The child's lexical score. */
+        score: number;
+      }>;
+    };
+
 /** A single hit produced by one retrieval arm. */
 export interface ArmHit {
   /** Chunk id (UUID string); the RRF fuse key. */
@@ -234,10 +273,7 @@ export interface ArmHit {
   source_ref: string;
   /** Temporal validity window for filtering. */
   valid_window: [string, string | null];
-  metadata?: {
-    kind: "community-summary";
-    communityId: string;
-  };
+  metadata?: RetrieveHitMetadata;
 }
 
 /** Result of one retrieval arm. */
@@ -271,10 +307,7 @@ export interface FusedHit {
   rrfScore: number;
   /** Which arm(s) contributed to this hit. */
   arms: ArmName[];
-  metadata?: {
-    kind: "community-summary";
-    communityId: string;
-  };
+  metadata?: RetrieveHitMetadata;
 }
 
 /** Configuration for the retrieval pipeline (loaded from env, see src/config.ts). */
@@ -438,6 +471,38 @@ export interface NeighborChunkStorage {
 }
 
 /**
+ * One child→parent resolution row for 档 A (plans/search-mode-retrieve.md
+ * T2, ADR-0060). The parent body is the citable text; the child id and
+ * ordinal locate the hit span inside it. A chunk whose back-pointer or
+ * 资料 row is missing yields NO row — the arm must then degrade, never
+ * cite the child alone.
+ */
+export interface ParentWindowRow {
+  /** The child chunk id this row was requested for. */
+  chunk_id: string;
+  /** The parent 资料 (抽图窗) row id — the citation key. */
+  source_doc_id: string;
+  /** Zero-based child ordinal; null = legacy row without one. */
+  ordinal: number | null;
+  /** Parent body text — the 抽图窗 content from `source_documents`. */
+  content: string;
+}
+
+/**
+ * Postgres chunk-ledger seam for 档 A's child→parent window lookup.
+ *
+ * Deliberately keyed on chunk ids, not source refs: the lexical arm (ES or
+ * in-memory BM25) already returns chunk ids, and the (source_doc_id,
+ * ordinal) back-pointers (operator-console T1) are the only parent pointer
+ * with a single SoR — the ES chunk docs stay parent-blind by design.
+ */
+export interface ParentWindowStorage {
+  parentWindowsByChunkIds(
+    chunkIds: readonly string[]
+  ): Promise<ParentWindowRow[]>;
+}
+
+/**
  * Postgres entity-embedding read path: entity seeds in, their chunks out.
  *
  * The optional score is the cosine similarity calculated by Postgres. A
@@ -527,10 +592,7 @@ export interface RetrieveOutputEnvelope {
     source_ref: string;
     valid_window: [string, string | null];
     score: number;
-    metadata?: {
-      kind: "community-summary";
-      communityId: string;
-    };
+    metadata?: RetrieveHitMetadata;
   }>;
   /** Optional: true only when the central capability decision finds reasons. */
   degraded?: boolean;

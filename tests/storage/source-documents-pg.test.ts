@@ -226,6 +226,57 @@ describePg("source_documents ledger (operator-console T1)", () => {
     }
   });
 
+  it("parentWindowsByChunkIds resolves 档 A child rows and omits parentless children", async () => {
+    // plans/search-mode-retrieve.md T2 (ADR-0060): the arm's child→parent
+    // seam. Back-pointing children yield the 资料 body; a legacy child
+    // without `source_doc_id` yields NO row — the INNER JOIN is what makes
+    // "missing parent" a visible degradation instead of a child-only cite.
+    const sourceDocId = randomUUID();
+    const sourceRef = `parent-window-${randomUUID()}`;
+    await admin!.query(
+      `INSERT INTO source_documents (id, source_ref, content)
+         VALUES ($1, $2, $3)`,
+      [sourceDocId, sourceRef, "the parent window body"]
+    );
+    const makeChild = (ordinal: number): ChunkRecord => ({
+      id: randomUUID(),
+      content: `child slice ${ordinal}`,
+      embedding: new Array(DIM)
+        .fill(0)
+        .map((_, axis) => (axis === ordinal ? 1 : 0)),
+      source_ref: sourceRef,
+      metadata: {},
+      valid_from: "2024-01-01T00:00:00Z",
+      valid_until: null,
+      created_at: "2024-01-01T00:00:00Z",
+      source_doc_id: sourceDocId,
+      ordinal,
+    });
+    const children = [makeChild(0), makeChild(1)];
+    const legacyChild: ChunkRecord = {
+      ...makeChild(2),
+      source_doc_id: undefined,
+      ordinal: undefined,
+    };
+    await backend!.upsert([...children, legacyChild]);
+
+    const rows = await backend!.parentWindowsByChunkIds([
+      ...children.map((chunk) => chunk.id),
+      legacyChild.id,
+      randomUUID(), // unknown id: simply no row
+    ]);
+    expect(rows).toHaveLength(2);
+    const byChild = new Map(rows.map((row) => [row.chunk_id, row]));
+    for (const [ordinal, chunk] of children.entries()) {
+      const row = byChild.get(chunk.id);
+      expect(row, `no parent row for child ordinal ${ordinal}`).toBeDefined();
+      expect(row!.source_doc_id).toBe(sourceDocId);
+      expect(row!.ordinal).toBe(ordinal);
+      expect(row!.content).toBe("the parent window body");
+    }
+    expect(byChild.has(legacyChild.id)).toBe(false);
+  });
+
   it("upsert without back-pointers stays valid (legacy chunk rows load)", async () => {
     // Old writes / replay paths still pass through; the new columns are
     // nullable so an old chunk row remains SELECT-able.

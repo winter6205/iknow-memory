@@ -48,7 +48,9 @@ jobs:
             --exclude tests/cli/extract-e2e-graph.test.ts \
             --exclude tests/cli/consolidate-pg.test.ts \
             --exclude tests/schema-bootstrap.test.ts \
+            --exclude tests/storage/bootstrap-columns.test.ts \
             --exclude tests/storage/pgvector-startup.test.ts \
+            --exclude tests/storage/source-documents-pg.test.ts \
             --exclude tests/storage/storage-reads-pg.test.ts
 
   test-es:

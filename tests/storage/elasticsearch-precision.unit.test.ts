@@ -193,6 +193,43 @@ describe("ElasticsearchPrecisionLayer", () => {
     expect(query).toContain("multi_match");
   });
 
+  it("searches metadata fields leniently against numeric mappings", async () => {
+    const client = fakeClient();
+    const layer = new ElasticsearchPrecisionLayer(
+      {
+        node: "http://localhost:9200",
+        chunkIndex: "chunks",
+        entityIndex: "entities",
+      },
+      { client }
+    );
+
+    await layer.searchLexical("中文 分词", { limit: 5, validAt: NOW });
+
+    // Pins the fix in buildPrecisionChunkQuery: lenient must sit on the
+    // chunk multi_match, not on any other clause of the request.
+    const request = client.search.mock.calls[0]?.[0] as {
+      query: {
+        bool: {
+          must: Array<{ bool: { should: Array<Record<string, unknown>> } }>;
+        };
+      };
+    };
+    const should = request.query.bool.must[0]!.bool.should;
+    const multiMatch = should[0]!.multi_match as {
+      lenient?: boolean;
+      fields?: unknown;
+    };
+    expect(multiMatch.fields).toEqual(
+      expect.arrayContaining(["metadata.*"])
+    );
+    expect(multiMatch.lenient).toBe(true);
+    const matchPhrase = (should[1]!.match_phrase as {
+      content: { lenient?: boolean };
+    }).content;
+    expect(matchPhrase.lenient).toBeUndefined();
+  });
+
   it("ignores query-time k1/b entirely (index-time-only semantics)", async () => {
     const client = fakeClient();
     const layer = new ElasticsearchPrecisionLayer(

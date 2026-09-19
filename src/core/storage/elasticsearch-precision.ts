@@ -111,6 +111,9 @@ export function buildPrecisionChunkQuery(
         type: "best_fields",
         operator: "or",
         analyzer: cjk ? IK_QUERY_ANALYZER : "standard",
+        // metadata is dynamic:true, so pushed numeric fields map as long;
+        // without lenient ES parses non-numeric tokens against them -> 400.
+        lenient: true,
       },
     },
   ];

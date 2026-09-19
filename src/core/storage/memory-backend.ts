@@ -25,6 +25,8 @@ import type {
   StorageTimelineEvent,
 } from "../types.js";
 import type {
+  CommunityIndexStateRow,
+  CommunityIndexStateStorage,
   ParentWindowRow,
   ParentWindowStorage,
 } from "../retrieval/types.js";
@@ -108,9 +110,17 @@ export class MemoryBackend
     LexicalStorageBackend,
     ContentInvalidationStorage,
     ParentWindowStorage,
+    CommunityIndexStateStorage,
     StorageReadPort
 {
   private readonly store = new Map<string, ChunkRecord>();
+  /**
+   * Corpus-level C-ready singleton (the in-memory twin of
+   * `community_index_state`). `null` = the row does not exist = the
+   * community job never ran, which 档 C must read as not-ready, never as
+   * empty.
+   */
+  private communityIndexState: CommunityIndexStateRow | null = null;
   /**
    * 资料 SoR rows (operator-console T3). Keyed by `source_ref` so re-push
    * of the same locator collapses to a single row (the concurrent class).
@@ -295,6 +305,22 @@ export class MemoryBackend
       });
     }
     return rows;
+  }
+
+  /**
+   * 档 C readiness singleton write (plans/search-mode-retrieve.md T3).
+   * Mirrors the CLI's swap: `null` clears the row (no job ever ran).
+   */
+  async setCommunityIndexState(
+    row: CommunityIndexStateRow | null
+  ): Promise<void> {
+    this.communityIndexState = row === null ? null : { ...row };
+  }
+
+  async getCommunityIndexState(): Promise<CommunityIndexStateRow | undefined> {
+    return this.communityIndexState === null
+      ? undefined
+      : { ...this.communityIndexState };
   }
 
   /**

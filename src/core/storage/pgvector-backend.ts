@@ -53,6 +53,8 @@ import type {
   NeighborChunkStorage,
   Neo4jArmStorage,
   CommunitySummaryRow,
+  CommunityIndexStateRow,
+  CommunityIndexStateStorage,
   ParentWindowRow,
   ParentWindowStorage,
   ProjectionDrainWaiter,
@@ -214,6 +216,15 @@ const COMMUNITY_SUMMARIES_SQL = `SELECT id, community_id, summary,
 const COMMUNITY_SUMMARY_BY_ID_SQL = `SELECT id, community_id, summary
   FROM community_summaries
  WHERE community_id = $1`;
+
+/**
+ * The 档 C readiness singleton (schema-bootstrap `community_index_state`,
+ * CHECK id = 1). Retrieve reads it to decide ready-vs-typed-not-ready;
+ * only the community-summary CLI and the extract demotion ever write it.
+ */
+const COMMUNITY_INDEX_STATE_SQL = `SELECT status, failure_code
+  FROM community_index_state
+ WHERE id = 1`;
 
 /**
  * Same-source neighboring chunks around already-ranked anchors.
@@ -433,6 +444,7 @@ export class PgvectorBackend
     ContentInvalidationStorage,
     NeighborChunkStorage,
     ParentWindowStorage,
+    CommunityIndexStateStorage,
     ProjectionDrainWaiter,
     StorageReadPort
 {
@@ -1185,6 +1197,33 @@ export class PgvectorBackend
     } catch (err) {
       throw new GraphragError(
         `PgvectorBackend.parentWindowsByChunkIds failed: ${(err as Error).message}`,
+        "STORAGE_ERROR"
+      );
+    }
+  }
+
+  /**
+   * Read the 档 C readiness singleton (plans/search-mode-retrieve.md T3).
+   * `undefined` = no row = the community job never ran; the C arm turns
+   * that and every non-ready spelling into the typed
+   * `community_summary_index_failure` exit. A read failure throws — it
+   * must not read as "no row", because the arm fails closed either way
+   * and the operator needs the storage error named in logs.
+   */
+  async getCommunityIndexState(): Promise<
+    CommunityIndexStateRow | undefined
+  > {
+    try {
+      const pool = await this.ensureReady();
+      const result = await pool.query(COMMUNITY_INDEX_STATE_SQL, []);
+      const row = result.rows[0] as
+        | { status: string; failure_code: string | null }
+        | undefined;
+      if (row === undefined) return undefined;
+      return { status: row.status, failure_code: row.failure_code };
+    } catch (err) {
+      throw new GraphragError(
+        `PgvectorBackend.getCommunityIndexState failed: ${(err as Error).message}`,
         "STORAGE_ERROR"
       );
     }

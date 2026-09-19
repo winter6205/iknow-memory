@@ -10,9 +10,10 @@
  *
  * `filters.search_mode` (检索档 A|B|C|D, specs/search-mode-retrieve.md) is
  * resolved and dispatched in this handler before the arms run: missing →
- * B, invalid → typed INVALID_INPUT, A/C/D → the provisional graph-priority
- * arm until plans T2/T3/T4 open their rows (see
- * src/core/retrieval/search-mode.ts).
+ * B, invalid → typed INVALID_INPUT, A → the lexical child-hit/parent-body
+ * arm (plans T2), C → the report-first community-summary arm (plans T3),
+ * D → the provisional graph-priority arm until plans T4 lands the typed
+ * `real_db_not_wired` refusal (see src/core/retrieval/search-mode.ts).
  */
 import { z } from "zod";
 import {
@@ -33,17 +34,21 @@ import type {
   RetrieveConfig,
 } from "../core/retrieval/types.js";
 import {
-  DEFAULT_RETRIEVE_PRESET,
+  DEFAULT_RETRIEVE_CONFIG,
   RETRIEVE_PRESETS,
   RETRIEVE_PRESET_BUNDLES,
   RetrieveConfigError,
   isRetrievePreset,
+  retrieveConfigForPreset,
 } from "../core/retrieval/types.js";
 import {
   SEARCH_MODE_ARMS,
+  cDropWindowsEnabled,
   invalidSearchModeMessage,
   parseSearchMode,
+  stripCDropWindowsFilter,
   stripSearchModeFilter,
+  type SearchModeControl,
 } from "../core/retrieval/search-mode.js";
 import { GraphragError } from "../core/errors.js";
 
@@ -150,7 +155,17 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         "INVALID_INPUT"
       );
     }
-    const matchFilters = stripSearchModeFilter(input.filters);
+    // Routing keys are resolved and stripped HERE, once, for every 档
+    // (review I2): each backend applies `filters` as exact-match term
+    // clauses, so a left-over control key silently zeros the arm that
+    // consumes it — `c_drop_windows` included. 档 C still sees its switch:
+    // as the typed control value below, never as a filter key.
+    const control: SearchModeControl = {
+      cDropWindows: cDropWindowsEnabled(input.filters),
+    };
+    const matchFilters = stripCDropWindowsFilter(
+      stripSearchModeFilter(input.filters)
+    );
     const retrieveConfig = applyPreset(
       deps.retrieveConfig,
       input.preset,
@@ -186,7 +201,8 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         debug: deps.debug,
         capabilityObservations: deps.capabilityObservations,
         projectionDrain: deps.projectionDrain,
-      }
+      },
+      control
     );
 
     return textResult(JSON.stringify(envelope));
@@ -235,15 +251,7 @@ function applyPreset(
   }
 
   const bundle = RETRIEVE_PRESET_BUNDLES[requested];
-  const base: RetrieveConfig = configured ?? {
-    ...bundle,
-    preset: DEFAULT_RETRIEVE_PRESET,
-    w_graph: 0.15,
-    bm25Enabled: true,
-    graphEnabled: true,
-    rerankEnabled: false,
-    graphArmFloor: 3,
-  };
+  const base: RetrieveConfig = configured ?? retrieveConfigForPreset(requested);
   return applyWaitOverrides(
     {
       ...base,
@@ -263,17 +271,7 @@ function applyWaitOverrides(
   if (waitForDrain === undefined && waitForDrainTimeoutMs === undefined) {
     return configured;
   }
-  const bundle =
-    RETRIEVE_PRESET_BUNDLES[configured?.preset ?? DEFAULT_RETRIEVE_PRESET];
-  const base: RetrieveConfig = configured ?? {
-    ...bundle,
-    preset: DEFAULT_RETRIEVE_PRESET,
-    w_graph: 0.15,
-    bm25Enabled: true,
-    graphEnabled: true,
-    rerankEnabled: false,
-    graphArmFloor: 3,
-  };
+  const base: RetrieveConfig = configured ?? DEFAULT_RETRIEVE_CONFIG;
   return {
     ...base,
     ...(waitForDrain !== undefined

@@ -3,6 +3,10 @@ import { createRetrieveHandler, retrieveTool } from "../src/tools/retrieve.js";
 import { FakeEmbedder } from "../src/core/embedder.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import { GraphragError } from "../src/core/errors.js";
+import {
+  COMMUNITY_INDEX_STATUS,
+  COMMUNITY_SUMMARY_INDEX_FAILURE,
+} from "../src/core/types.js";
 import type {
   ChunkRecord,
   RetrievedChunk,
@@ -204,7 +208,8 @@ describe("createRetrieveHandler", () => {
   // B; outside the closed set → typed INVALID_INPUT carrying a stable
   // host-mappable reason token (never a healthy empty `chunks` with no
   // reason). T2 opened A as the lexical child-hit → parent-body arm
-  // (ADR-0060); C stays provisional until T3, D until T4.
+  // (ADR-0060); T3 opened C report-first; D stays provisional until T4
+  // replaces its row with the typed `real_db_not_wired` refusal.
   describe("filters.search_mode (T1)", () => {
     const HYBRID_CONFIG = {
       w_vec: 0.7,
@@ -268,34 +273,45 @@ describe("createRetrieveHandler", () => {
       }
     });
 
-    it("valid A/C/D parse; A runs its own arm, C/D stay provisional", async () => {
+    it("valid A/C/D parse; C types not-ready, A runs its own, D stays provisional", async () => {
       const baseline = await handler({ query: "anything" });
-      // T2 moved A's row off the provisional alias. The fixture's chunks
-      // carry no parent back-pointers, and the query terms match no chunk
-      // content, so the lexical-first A finds nothing: a healthy empty
-      // answer, visibly NOT the B arm's vector result of [x, y].
+      // T3 opened C: a backend without a READY `community_index_state`
+      // row is the typed `community_summary_index_failure` exit — it
+      // neither answers like B nor degrades into a healthy empty.
+      let thrownC: unknown;
+      try {
+        await handler({ query: "anything", filters: { search_mode: "C" } });
+      } catch (err) {
+        thrownC = err;
+      }
+      expect(thrownC).toBeInstanceOf(GraphragError);
+      expect((thrownC as GraphragError).message).toContain(
+        COMMUNITY_SUMMARY_INDEX_FAILURE
+      );
+      // T2: A is no longer the B arm. The fixture's chunks carry no parent
+      // back-pointers, and the query terms match no chunk content, so the
+      // lexical-first A finds nothing: a healthy empty answer, visibly NOT
+      // the B arm's vector result of [x, y].
       const aBody = parseResultBody(
         await handler({ query: "anything", filters: { search_mode: "A" } })
       );
       expect(aBody.chunks).toEqual([]);
       expect(aBody).not.toHaveProperty("degraded");
-      // C and D still alias the provisional graph-priority arm: T3 opens
-      // C, T4 replaces D.
-      for (const mode of ["C", "D"] as const) {
-        const result = await handler({
-          query: "anything",
-          filters: { search_mode: mode },
-        });
-        expect(parseResultBody(result)).toEqual(parseResultBody(baseline));
-      }
+      // D is still the provisional graph-priority arm until T4 lands its
+      // typed refusal.
+      const dResult = await handler({
+        query: "anything",
+        filters: { search_mode: "D" },
+      });
+      expect(parseResultBody(dResult)).toEqual(parseResultBody(baseline));
       expect(parseResultBody(baseline).chunks).toHaveLength(2);
     });
 
     it("search_mode never reaches the lexical arm's exact-match filters", async () => {
       // Regression guard for the ES precision layer, which turns every
       // filter key into a term clause: a leaked `search_mode` would match
-      // no indexed field and silently zero the BM25 arm. C is the probe —
-      // while it is provisional B it runs the B pipeline end to end.
+      // no indexed field and silently zero the BM25 arm. D is the probe —
+      // still provisional B, so it runs the B pipeline end to end.
       const lexical = new RecordingLexicalBackend(TEST_DIM);
       const hybridHandler = createRetrieveHandler({
         embedder: new FakeEmbedder(TEST_DIM),
@@ -305,15 +321,62 @@ describe("createRetrieveHandler", () => {
       });
       const result = await hybridHandler({
         query: "anything",
-        filters: { source_ref: "docs/x.md", search_mode: "C" },
+        filters: { source_ref: "docs/x.md", search_mode: "D" },
       });
       expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
       for (const filters of lexical.lexicalFilterCalls) {
         expect(filters).not.toHaveProperty("search_mode");
         expect(filters?.source_ref).toBe("docs/x.md");
       }
-      // C answers through the hybrid pipeline, un-degraded, like B.
+      // D answers through the hybrid pipeline, un-degraded, like B.
       expect(parseResultBody(result).chunks.map((c) => c.id)).toEqual(["x"]);
+    });
+  });
+
+
+  // plans/search-mode-retrieve.md T3 (fin ADR-0070): 档 C report-first over
+  // the community summaries. Handler-level acceptance on the fake fixture:
+  // a C-ready ledger answers with summary rows on the wire, and the
+  // `c_drop_windows` routing key never becomes an exact-match filter.
+  describe("search_mode=C report-first (T3)", () => {
+    it("answers summary-row hits through the wire when C is ready", async () => {
+      const ready = new MemoryBackend(TEST_DIM);
+      await ready.setCommunityIndexState({
+        status: COMMUNITY_INDEX_STATUS.READY,
+        failure_code: null,
+      });
+      const storage = Object.create(ready, {
+        communitySummaries: {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: {
+            getCommunitySummaryByCommunityId: async () => undefined,
+            searchCommunitySummaries: async () => [
+              {
+                id: "sum-1",
+                communityId: "com-1",
+                summary: "the one report row",
+                score: 0.9,
+              },
+            ],
+          },
+        },
+      }) as MemoryBackend;
+      const cHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage,
+      });
+      const result = await cHandler({
+        query: "anything",
+        filters: { search_mode: "C", c_drop_windows: "0" },
+      });
+      const body = parseResultBody(result);
+      expect(body.chunks).toHaveLength(1);
+      expect(body.chunks[0]!.id).toBe("sum-1");
+      expect(body.chunks[0]!.content).toBe("the one report row");
+      expect(body.chunks[0]!.metadata?.kind).toBe("community-summary");
+      expect(body).not.toHaveProperty("degraded");
     });
   });
 
@@ -394,6 +457,191 @@ describe("createRetrieveHandler", () => {
         expect(filters).not.toHaveProperty("search_mode");
         expect(filters?.source_ref).toBe("docs/parent.md");
       }
+    });
+  });
+
+
+  // Review repair I2: `c_drop_windows` is 档 C's ROUTING switch, not chunk
+  // metadata — in A/B/D it must be stripped by the dispatcher like
+  // `search_mode`, because the ES precision layer turns every key in the
+  // exact-match filters into a term clause and silently zeros the arm
+  // (the failure mode wire-filters.ts exists to prevent).
+  describe("c_drop_windows routing strip (I2)", () => {
+    /**
+     * Lexical double with the ES precision layer's exact-match contract:
+     * EVERY filter key becomes a term clause, so one unknown control key
+     * zeroes the whole arm — unlike MemoryBackend, which ignores unknown
+     * top-level keys. This is what makes a leaked routing key observable
+     * as a behavior change, not just a shape change.
+     */
+    class EsStyleLexicalBackend extends MemoryBackend {
+      lexicalFilterCalls: Array<SearchOptions["filters"]> = [];
+
+      async searchLexical(
+        query: string,
+        opts: SearchOptions
+      ): Promise<RetrievedChunk[]> {
+        this.lexicalFilterCalls.push(opts.filters);
+        for (const key of Object.keys(opts.filters ?? {})) {
+          if (key !== "source_ref" && !key.startsWith("metadata.")) {
+            return [];
+          }
+        }
+        return super.searchLexical(query, opts);
+      }
+    }
+
+    it("档 A: the switch never reaches the lexical arm and never zeroes it", async () => {
+      await backend.upsertSourceDoc({
+        id: "doc-parent",
+        source_ref: "docs/parent.md",
+        title: null,
+        content: "the whole extract window body about quantum tunneling",
+        created_at: "2024-01-01T00:00:00Z",
+      });
+      await backend.upsert([
+        makeChunk({
+          id: "child-1",
+          content: "a child slice about quantum tunneling",
+          source_ref: "docs/parent.md",
+          source_doc_id: "doc-parent",
+          ordinal: 0,
+        }),
+      ]);
+      const lexical = new EsStyleLexicalBackend(TEST_DIM);
+      // The double must index the same children the ledger does — the
+      // parent-window resolution stays on `backend`, ranking on the double.
+      await lexical.upsert([
+        makeChunk({
+          id: "child-1",
+          content: "a child slice about quantum tunneling",
+          source_ref: "docs/parent.md",
+          source_doc_id: "doc-parent",
+          ordinal: 0,
+        }),
+      ]);
+      const aHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage: backend,
+        lexical,
+      });
+      const body = parseResultBody(
+        await aHandler({
+          query: "quantum tunneling",
+          filters: {
+            source_ref: "docs/parent.md",
+            search_mode: "A",
+            c_drop_windows: "0",
+          },
+        })
+      );
+      for (const filters of lexical.lexicalFilterCalls) {
+        expect(filters).not.toHaveProperty("c_drop_windows");
+      }
+      // Behavior identical to the same request without the switch: the
+      // parent body answers, not a silently zeroed lexical arm.
+      expect(body.chunks.map((c) => c.id)).toEqual(["doc-parent"]);
+    });
+
+    it("档 B: the hybrid lexical arm never sees the routing key", async () => {
+      await backend.upsert([
+        makeChunk({ id: "x", source_ref: "docs/x.md" }),
+        makeChunk({ id: "y", source_ref: "docs/y.md" }),
+      ]);
+      const lexical = new EsStyleLexicalBackend(TEST_DIM);
+      // Same corpus in the lexical index, so the BM25 arm genuinely
+      // contributes and a leaked key would show up in the fused scores.
+      await lexical.upsert([
+        makeChunk({ id: "x", source_ref: "docs/x.md" }),
+        makeChunk({ id: "y", source_ref: "docs/y.md" }),
+      ]);
+      const bHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage: backend,
+        lexical,
+        retrieveConfig: {
+          preset: "balanced",
+          w_vec: 0.7,
+          w_bm25: 0.15,
+          w_graph: 0.15,
+          bm25Enabled: true,
+          graphEnabled: false,
+          rerankEnabled: false,
+          entityLinkTopK: 8,
+          candidateCap: 50,
+          neighborWidth: 1,
+          graphArmFloor: 3,
+        },
+      });
+      const baseline = parseResultBody(
+        await bHandler({
+          query: "anything",
+          filters: { source_ref: "docs/x.md", search_mode: "B" },
+        })
+      );
+      lexical.lexicalFilterCalls.length = 0;
+      const withSwitch = parseResultBody(
+        await bHandler({
+          query: "anything",
+          filters: {
+            source_ref: "docs/x.md",
+            search_mode: "B",
+            c_drop_windows: "0",
+          },
+        })
+      );
+      expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
+      for (const filters of lexical.lexicalFilterCalls) {
+        expect(filters).not.toHaveProperty("c_drop_windows");
+        expect(filters?.source_ref).toBe("docs/x.md");
+      }
+      expect(withSwitch).toEqual(baseline);
+    });
+
+    it("档 C wire: the dispatcher strip keeps c_drop_windows=0 switching the drop off", async () => {
+      // Regression guard for the C path across the dispatcher-side strip:
+      // the switch is resolved from the raw filters, so the off-value
+      // still reaches the arm as a typed control, and a request without
+      // it still fills windows.
+      const ready = new MemoryBackend(TEST_DIM);
+      await ready.setCommunityIndexState({
+        status: COMMUNITY_INDEX_STATUS.READY,
+        failure_code: null,
+      });
+      await ready.upsert([makeChunk({ id: "win-1", source_ref: "docs/win.md" })]);
+      const storage = Object.create(ready, {
+        communitySummaries: {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: {
+            getCommunitySummaryByCommunityId: async () => undefined,
+            searchCommunitySummaries: async () => [
+              {
+                id: "sum-1",
+                communityId: "com-1",
+                summary: "the one report row",
+                score: 0.9,
+              },
+            ],
+          },
+        },
+      }) as MemoryBackend;
+      const cHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage,
+      });
+      const off = parseResultBody(
+        await cHandler({
+          query: "anything",
+          filters: { search_mode: "C", c_drop_windows: "0" },
+        })
+      );
+      expect(off.chunks.map((c) => c.id)).toEqual(["sum-1"]);
+      const on = parseResultBody(
+        await cHandler({ query: "anything", filters: { search_mode: "C" } })
+      );
+      expect(on.chunks.map((c) => c.id)).toEqual(["sum-1", "win-1"]);
     });
   });
 

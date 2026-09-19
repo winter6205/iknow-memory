@@ -51,15 +51,18 @@ function fakeSession(opts: FakeSessionOptions = {}): {
   return { session, calls };
 }
 
+/**
+ * One `gds.leiden.stream` row as GDS 2.13 really emits it:
+ * `intermediateCommunityIds` is an ARRAY of integer community ids ordered
+ * finest → coarsest (level k = array index k − 1, last element =
+ * communityId). Ids restart per level, so the same id can reappear at a
+ * different level — see the live-probe evidence in the integration smoke.
+ */
 function leidenRow(
   entityId: string,
-  levels: Record<number, number>
+  communityIdsByLevelAscending: number[]
 ): Record<string, unknown> {
-  const intermediateCommunities: Record<string, number> = {};
-  for (const [level, communityId] of Object.entries(levels)) {
-    intermediateCommunities[level] = communityId;
-  }
-  return { entityId, intermediateCommunities };
+  return { entityId, intermediateCommunityIds: communityIdsByLevelAscending };
 }
 
 function communitiesOfLevel(
@@ -79,9 +82,9 @@ describe("Neo4j GDS hierarchical Leiden community detector", () => {
         },
       ],
       leidenRows: [
-        leidenRow("entity-a", { 1: 101, 2: 201 }),
-        leidenRow("entity-b", { 1: 101, 2: 201 }),
-        leidenRow("entity-c", { 1: 102, 2: 201 }),
+        leidenRow("entity-a", [101, 201]),
+        leidenRow("entity-b", [101, 201]),
+        leidenRow("entity-c", [102, 201]),
       ],
     });
 
@@ -104,10 +107,10 @@ describe("Neo4j GDS hierarchical Leiden community detector", () => {
     const { session } = fakeSession({
       lccRows: [{ componentId: 1, entityIds: all }],
       leidenRows: [
-        leidenRow("entity-a", { 1: 11, 2: 21, 3: 31 }),
-        leidenRow("entity-b", { 1: 11, 2: 21, 3: 31 }),
-        leidenRow("entity-c", { 1: 12, 2: 22, 3: 31 }),
-        leidenRow("entity-d", { 1: 12, 2: 22, 3: 31 }),
+        leidenRow("entity-a", [11, 21, 31]),
+        leidenRow("entity-b", [11, 21, 31]),
+        leidenRow("entity-c", [12, 22, 31]),
+        leidenRow("entity-d", [12, 22, 31]),
       ],
     });
 
@@ -129,13 +132,51 @@ describe("Neo4j GDS hierarchical Leiden community detector", () => {
     ]);
   });
 
+  it("keeps per-level numbering apart when the same community id appears at two levels", async () => {
+    // Real GDS output (live-probed, 2.13.2): ids restart each level, so a
+    // node's row can legitimately read [2, 9, 2] — community 2 at level 1
+    // and community 2 again at level 3. They must not merge.
+    const all = ["entity-a", "entity-b", "entity-c"];
+    const { session } = fakeSession({
+      lccRows: [{ componentId: 1, entityIds: all }],
+      leidenRows: [
+        leidenRow("entity-a", [2, 9, 2]),
+        leidenRow("entity-b", [2, 9, 2]),
+        leidenRow("entity-c", [11, 9, 2]),
+      ],
+    });
+
+    const communities = await createCommunityDetector(session).detect();
+    expect(communities).toEqual([
+      { id: "2", entityIds: ["entity-a", "entity-b"], level: 1 },
+      { id: "11", entityIds: ["entity-c"], level: 1 },
+      { id: "9", entityIds: all, level: 2 },
+      { id: "2", entityIds: all, level: 3 },
+    ]);
+  });
+
+  it("skips a Leiden row whose intermediate ids are not an array", async () => {
+    const { session } = fakeSession({
+      lccRows: [{ componentId: 1, entityIds: ["entity-a", "entity-b"] }],
+      leidenRows: [
+        leidenRow("entity-a", [101]),
+        { entityId: "entity-b", intermediateCommunityIds: null },
+      ],
+    });
+
+    const communities = await createCommunityDetector(session).detect();
+    expect(communities).toEqual([
+      { id: "101", entityIds: ["entity-a"], level: 1 },
+    ]);
+  });
+
   it("excludes entities outside the largest connected component when lcc is on", async () => {
     const { session } = fakeSession({
       lccRows: [{ componentId: 4, entityIds: ["entity-a", "entity-b"] }],
       leidenRows: [
-        leidenRow("entity-a", { 1: 101 }),
-        leidenRow("entity-b", { 1: 101 }),
-        leidenRow("entity-speck", { 1: 102 }),
+        leidenRow("entity-a", [101]),
+        leidenRow("entity-b", [101]),
+        leidenRow("entity-speck", [102]),
       ],
     });
 
@@ -148,7 +189,7 @@ describe("Neo4j GDS hierarchical Leiden community detector", () => {
   it("keeps every entity when wcc reports a single component", async () => {
     const { session } = fakeSession({
       lccRows: [{ componentId: 1, entityIds: ["entity-a", "entity-b"] }],
-      leidenRows: [leidenRow("entity-a", { 1: 101 }), leidenRow("entity-b", { 1: 101 })],
+      leidenRows: [leidenRow("entity-a", [101]), leidenRow("entity-b", [101])],
     });
 
     const communities = await createCommunityDetector(session).detect();
@@ -159,7 +200,7 @@ describe("Neo4j GDS hierarchical Leiden community detector", () => {
 
   it("skips the wcc query entirely when use_lcc is disabled", async () => {
     const { session, calls } = fakeSession({
-      leidenRows: [leidenRow("entity-a", { 1: 101 })],
+      leidenRows: [leidenRow("entity-a", [101])],
     });
 
     const communities = await createCommunityDetector(session, {
@@ -196,7 +237,7 @@ describe("Neo4j GDS hierarchical Leiden community detector", () => {
     const members = ["e5", "e1", "e2", "e3", "e4"];
     const { session } = fakeSession({
       lccRows: [{ componentId: 1, entityIds: members }],
-      leidenRows: members.map((entityId) => leidenRow(entityId, { 1: 500 })),
+      leidenRows: members.map((entityId) => leidenRow(entityId, [500])),
     });
 
     const communities = await createCommunityDetector(session, {
@@ -216,7 +257,7 @@ describe("Neo4j GDS hierarchical Leiden community detector", () => {
     );
     const { session } = fakeSession({
       lccRows: [{ componentId: 1, entityIds: members }],
-      leidenRows: members.map((entityId) => leidenRow(entityId, { 1: 900 })),
+      leidenRows: members.map((entityId) => leidenRow(entityId, [900])),
     });
 
     const communities = await createCommunityDetector(session).detect();

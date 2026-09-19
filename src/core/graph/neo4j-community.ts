@@ -6,12 +6,15 @@
  * Each call uses a throwaway projection so it cannot become stale relative
  * to the projection outbox.
  *
- * Detection shape (ADR-0011): project → optional largest-connected-component
- * filter via `gds.wcc` → `gds.leiden.stream` with
- * `includeIntermediateCommunities` (hierarchical levels) → drop projection.
- * GDS Leiden has no native cluster-size cap, so oversized communities are
- * split by deterministic sorted chunking. A fixed integer seed keeps the
- * same graph + seed reproducible to the same partition.
+ * Detection shape (ADR-0011): project undirected → optional
+ * largest-connected-component filter via `gds.wcc` → `gds.leiden.stream`
+ * with `includeIntermediateCommunities` → drop projection. The live-probed
+ * GDS 2.13 output column is `intermediateCommunityIds`: an array of
+ * community ids ordered finest → coarsest (level k = index k − 1; its last
+ * element is the final `communityId`). GDS Leiden has no native
+ * cluster-size cap, so oversized communities are split by deterministic
+ * sorted chunking. A fixed integer seed keeps the same graph + seed
+ * reproducible to the same partition.
  */
 import { randomUUID } from "node:crypto";
 import neo4j, { type Driver } from "neo4j-driver";
@@ -53,11 +56,12 @@ export const LEIDEN_DEFAULT_RANDOM_SEED = 42;
 export const LEIDEN_DEFAULT_MAX_CLUSTER_SIZE = 10;
 
 export const COMMUNITY_PROJECT_CYPHER = `MATCH (source:Entity)
-  OPTIONAL MATCH (source)-[:RELATION]->(target:Entity)
-  WITH gds.graph.project($graphName, source, target, {},
-                         {undirectedRelationshipTypes: ['*']}) AS g
-  RETURN g.graphName AS graphName, g.nodeCount AS nodeCount,
-         g.relationshipCount AS relationshipCount`;
+  WITH count(source) AS entityCount
+  WHERE entityCount > 0
+  CALL gds.graph.project($graphName, 'Entity',
+                         {RELATION: {orientation: 'UNDIRECTED'}})
+  YIELD graphName, nodeCount, relationshipCount
+  RETURN graphName, nodeCount, relationshipCount`;
 
 /** Largest connected component: one row, member ids, tie-broken by componentId. */
 export const COMMUNITY_LCC_CYPHER = `CALL gds.wcc.stream($graphName)
@@ -69,8 +73,8 @@ export const COMMUNITY_LCC_CYPHER = `CALL gds.wcc.stream($graphName)
 
 export const COMMUNITY_LEIDEN_CYPHER = `CALL gds.leiden.stream($graphName,
     {includeIntermediateCommunities: true, randomSeed: $randomSeed})
-  YIELD nodeId, intermediateCommunities
-  RETURN gds.util.asNode(nodeId).id AS entityId, intermediateCommunities
+  YIELD nodeId, intermediateCommunityIds
+  RETURN gds.util.asNode(nodeId).id AS entityId, intermediateCommunityIds
   ORDER BY entityId`;
 
 export const COMMUNITY_DROP_CYPHER = `CALL gds.graph.drop($graphName, false)
@@ -143,7 +147,7 @@ export function createNeo4jCommunityDetector(
       driver ??= openDriver(config);
       const current = driver.session();
       try {
-        const result = await current.run(cypher, params);
+        const result = await current.run(cypher, toDriverParameters(params));
         return result.records.map((record) => record.toObject());
       } catch (err) {
         throw new GraphUnavailableError(config.uri, err);
@@ -157,6 +161,25 @@ export function createNeo4jCommunityDetector(
     },
   };
   return createCommunityDetector(session, options);
+}
+
+/**
+ * The JS driver serializes a plain integer as a Cypher Float, and GDS
+ * rejects a Float `randomSeed` ("must be of type Long"). Integer params
+ * therefore become driver Integers at this boundary; the CypherSession seam
+ * (and the fake unit tests) keep seeing plain numbers.
+ */
+function toDriverParameters(
+  params: Record<string, unknown>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(params)) {
+    out[key] =
+      typeof value === "number" && Number.isInteger(value)
+        ? neo4j.int(value)
+        : value;
+  }
+  return out;
 }
 
 /**
@@ -177,7 +200,11 @@ function toHierarchicalCommunities(
 
 /**
  * Collect members per (level, leiden communityId), skipping rows outside the
- * largest component and rows whose level key is not a positive integer.
+ * largest component. `intermediateCommunityIds` is consumed by ARRAY INDEX —
+ * level k = index k − 1 (finest first, live-probed against GDS 2.13). Never
+ * iterate it with Object.entries: that would present the indices as string
+ * keys and silently mis-number (or drop) the finest level. Ids are numbered
+ * per level, so the same id at two levels stays two distinct communities.
  */
 function groupCommunitiesByLevel(
   rows: Array<Record<string, unknown>>,
@@ -187,12 +214,10 @@ function groupCommunitiesByLevel(
   for (const row of rows) {
     const entityId = String(row["entityId"]);
     if (lccMembers !== undefined && !lccMembers.has(entityId)) continue;
-    const levels = row["intermediateCommunities"];
-    if (typeof levels !== "object" || levels === null) continue;
-    for (const [rawLevel, rawCommunityId] of Object.entries(levels)) {
-      const level = Number(rawLevel);
-      if (!Number.isInteger(level) || level < 1) continue;
-      addMember(groups, level, String(rawCommunityId), entityId);
+    const levels = row["intermediateCommunityIds"];
+    if (!Array.isArray(levels)) continue;
+    for (let index = 0; index < levels.length; index += 1) {
+      addMember(groups, index + 1, String(levels[index]), entityId);
     }
   }
   return groups;

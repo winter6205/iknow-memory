@@ -241,6 +241,9 @@ describe("processBatch (core batch orchestration, no CLI argv)", () => {
     expect(summary.failed).toBe(1);
     expect(summary.writeFailures).toBe(0);
     expect(summary.ungrounded).toBe(0);
+    // The sealed failure leg's code travels to the caller (job-level
+    // decisions must not re-query extraction_records).
+    expect(summary.failureCodes).toEqual(["5xx"]);
     expect(summary.batchId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
     );
@@ -393,6 +396,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
     );
 
     expect(summary.failed).toBe(1);
+    expect(summary.failureCodes).toEqual([FAST_EMPTY_GRAPH_CODE]);
     const failedIdx = client.indexOf("SET status = 'failed'");
     expect(failedIdx).toBeGreaterThanOrEqual(0);
     expect(client.valuesList[failedIdx]).toContain(FAST_EMPTY_GRAPH_CODE);

@@ -44,9 +44,14 @@ class FakeClient implements CliClient {
   queries: string[] = [];
   valuesList: unknown[][] = [];
   rowsOverride?: (text: string) => unknown[];
+  /** When set, queries matching it throw — simulates a mid-transaction write error. */
+  failOn?: RegExp;
   async query(text: string, values?: unknown[]) {
     this.queries.push(text);
     this.valuesList.push(values ?? []);
+    if (this.failOn !== undefined && this.failOn.test(text)) {
+      throw new Error("simulated write failure");
+    }
     const rows = this.rowsOverride ? this.rowsOverride(text) : [];
     return { rows };
   }
@@ -79,6 +84,12 @@ function makeDeps(client: FakeClient, llm: FakeLLMClient): CliDeps {
 const CHUNK_ROW = {
   id: "00000000-0000-4000-8000-000000000001",
   content: "Alice works at Acme Corp.",
+};
+
+/** Chinese stop-word-only content: the fast leg prunes it to an empty graph. */
+const EMPTY_GRAPH_CHUNK_ROW = {
+  id: "00000000-0000-4000-8000-000000000002",
+  content: "的了 于 与 之",
 };
 
 const GROUNDED_OUTPUT = {
@@ -221,9 +232,7 @@ describe("runCli --method fast (T4 NLP leg)", () => {
   it("a Chinese chunk with no edges records the typed FAST_EMPTY_GRAPH failure", async () => {
     const client = new FakeClient();
     client.rowsOverride = (text) =>
-      /FROM chunks c/.test(text)
-        ? [{ id: "00000000-0000-4000-8000-000000000002", content: "的了 于 与 之" }]
-        : [];
+      /FROM chunks c/.test(text) ? [EMPTY_GRAPH_CHUNK_ROW] : [];
     const llm = new FakeLLMClient({ queue: [] });
 
     const code = await runCli(
@@ -231,8 +240,9 @@ describe("runCli --method fast (T4 NLP leg)", () => {
       makeDeps(client, llm)
     );
 
-    // Mark-and-continue: the chunk fails per-chunk, the batch exits 0.
-    expect(code).toBe(0);
+    // T4 acceptance (job level): a fast run whose only chunk died with
+    // FAST_EMPTY_GRAPH is a JOB fail — exit 1, not the mark-and-continue 0.
+    expect(code).toBe(1);
     const failedIdx = client.queries.findIndex((q) =>
       q.includes("SET status = 'failed'")
     );
@@ -278,6 +288,106 @@ describe("runCli --method fast (T4 NLP leg)", () => {
       /^\s*(INSERT|UPDATE|DELETE)\s/i.test(q)
     );
     expect(writes).toEqual([]);
+  });
+});
+
+describe("runCli job exit codes for an empty fast graph (T4 acceptance)", () => {
+  it("an all-FAST_EMPTY_GRAPH fast batch is a job fail (exit 1)", async () => {
+    const client = new FakeClient();
+    client.rowsOverride = (text) =>
+      /FROM chunks c/.test(text)
+        ? [
+            EMPTY_GRAPH_CHUNK_ROW,
+            { ...EMPTY_GRAPH_CHUNK_ROW, id: "00000000-0000-4000-8000-000000000003" },
+          ]
+        : [];
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const code = await runCli(
+      ["--method", "fast", "--batch-size", "2"],
+      makeDeps(client, llm)
+    );
+
+    expect(code).toBe(1);
+  });
+
+  it("a fast batch with one success plus FAST_EMPTY_GRAPH siblings keeps mark-and-continue (exit 0)", async () => {
+    const client = new FakeClient();
+    client.rowsOverride = (text) =>
+      /FROM chunks c/.test(text) ? [CHUNK_ROW, EMPTY_GRAPH_CHUNK_ROW] : [];
+    // Empty queue: the run only passes if no LLM is dialed AND the one
+    // succeeding fast chunk keeps the batch at 0 despite its failed sibling.
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const code = await runCli(
+      ["--method", "fast", "--batch-size", "2"],
+      makeDeps(client, llm)
+    );
+
+    expect(code).toBe(0);
+    // Both legs ran: the English chunk persisted, the Chinese one failed.
+    expect(
+      client.queries.find((q) => q.includes("INSERT INTO triples"))
+    ).toBeDefined();
+    expect(
+      client.queries.find((q) => q.includes("SET status = 'failed'"))
+    ).toBeDefined();
+  });
+
+  it("a write failure outranks an all-empty fast batch (exit 2 wins)", async () => {
+    const client = new FakeClient();
+    client.rowsOverride = (text) =>
+      /FROM chunks c/.test(text) ? [CHUNK_ROW, EMPTY_GRAPH_CHUNK_ROW] : [];
+    // The English chunk's persist throws mid-transaction (write failure),
+    // so succeeded === 0 while the Chinese chunk carries FAST_EMPTY_GRAPH —
+    // the writeFailures → 2 rule must fire before the job-fail → 1 rule.
+    client.failOn = /INSERT INTO entities/;
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const code = await runCli(
+      ["--method", "fast", "--batch-size", "2"],
+      makeDeps(client, llm)
+    );
+
+    expect(code).toBe(2);
+    expect(client.queries).toContain("ROLLBACK");
+  });
+
+  it("an all-failed STANDARD batch is unchanged mark-and-continue (exit 0)", async () => {
+    const client = new FakeClient();
+    client.rowsOverride = (text) =>
+      /FROM chunks c/.test(text)
+        ? [
+            CHUNK_ROW,
+            { ...CHUNK_ROW, id: "00000000-0000-4000-8000-000000000003" },
+          ]
+        : [];
+    const llm = new FakeLLMClient({
+      queue: [
+        { kind: "5xx", message: "provider down" },
+        { kind: "5xx", message: "provider down" },
+      ],
+    });
+
+    const code = await runCli(["--batch-size", "2"], makeDeps(client, llm));
+
+    expect(code).toBe(0);
+    expect(
+      client.queries.filter((q) => q.includes("SET status = 'failed'"))
+    ).toHaveLength(2);
+  });
+
+  it("a fast zero-chunk no-op scan stays exit 0 (nothing was requested to fail)", async () => {
+    const client = new FakeClient();
+    client.rowsOverride = () => [];
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const code = await runCli(
+      ["--method", "fast", "--batch-size", "1"],
+      makeDeps(client, llm)
+    );
+
+    expect(code).toBe(0);
   });
 });
 

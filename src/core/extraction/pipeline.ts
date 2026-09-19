@@ -212,6 +212,15 @@ export interface BatchSummary {
   failed: number;
   writeFailures: number;
   ungrounded: number;
+  /**
+   * Error codes of the sealed `failed` legs, one entry per failed chunk
+   * (LLM retry class, SELF_LOOP_REJECTED, FAST_EMPTY_GRAPH, …) — the
+   * counts alone cannot tell a job-level policy WHICH failures happened,
+   * and a write-failure leg rolls its record back so re-querying
+   * extraction_records is not equivalent. The pipeline only reports;
+   * callers decide (the CLI maps an all-empty fast graph to exit 1).
+   */
+  failureCodes: string[];
 }
 
 export interface ProcessBatchOptions {
@@ -268,6 +277,7 @@ export async function processBatch(
   let succeeded = 0;
   let failed = 0;
   let ungrounded = 0;
+  const failureCodes: string[] = [];
   for (const chunk of chunks) {
     const out = await processChunk(
       deps,
@@ -279,7 +289,10 @@ export async function processBatch(
     );
     if (out.kind === "write-failure") writeFailures += 1;
     else if (out.kind === "ok") succeeded += 1;
-    else failed += 1;
+    else {
+      failed += 1;
+      failureCodes.push(out.errorCode);
+    }
     // Every leg defines `ungrounded` (failed legs are 0), so no guard needed.
     ungrounded += out.ungrounded;
     opts.onChunkOutcome?.({
@@ -308,6 +321,7 @@ export async function processBatch(
     failed,
     writeFailures,
     ungrounded,
+    failureCodes,
   };
 }
 

@@ -35,6 +35,13 @@ export interface ExtractionOutput {
   evidenceSpan: string;
   /** Confidence in [0,1]. */
   confidence: number;
+  /**
+   * Producer provenance written to `triples.extractor`. The LLM path leaves
+   * it absent (persist defaults to 'llm'); the fast NLP path (T4) tags its
+   * co-occurrence edges 'fast' so the ledger records which method produced
+   * the row.
+   */
+  extractor?: string;
 }
 
 /**
@@ -46,6 +53,73 @@ export interface ExtractionOutput {
 export type ExtractionResponse =
   | { kind: "ok"; outputs: ExtractionOutput[] }
   | { kind: RetryClass; message: string };
+
+// ─── T3 (graph-index-standard-fast): standard post-merge enrichment ──────
+
+/**
+ * One merge survivor's per-output description as produced by an
+ * `ExtractionOutput` endpoint — the input unit of the post-merge describe
+ * step (ADR 0069) and the entity anchor of a claim (ADR 0071). Produced by
+ * `persistOutputs` AFTER the canonical merge, so `entityId` is always the
+ * survivor row's id, never a merged-away loser.
+ */
+export interface SurvivorRef {
+  entityId: string;
+  canonicalName: string;
+  description: string;
+}
+
+/** One entity whose merged description list is summarized into one string. */
+export interface EntityDescribeTarget {
+  canonicalName: string;
+  /** The survivor's stored summary first (when present), then this run's new descriptions. */
+  descriptions: string[];
+}
+
+/** Input to the per-chunk batched describe call. */
+export interface DescribeInput {
+  entities: EntityDescribeTarget[];
+}
+
+/** One summarized description returned for one entity. */
+export interface EntityDescriptionDraft {
+  canonicalName: string;
+  description: string;
+}
+
+/**
+ * Sealed outcome of one describe call (ADR 0069): a failure skips the leg —
+ * it never throws and never fails the chunk or the C job. `errorCode` is a
+ * transport `RetryClass` ("5xx" / "4xx" / "format") or `LLM_EXCEPTION_CODE`
+ * when the client itself threw.
+ */
+export type DescribeResponse =
+  | { kind: "ok"; descriptions: EntityDescriptionDraft[] }
+  | { kind: "failed"; errorCode: string; errorMsg: string };
+
+/** Input to the per-chunk claim-extract call (ADR 0071). */
+export interface ClaimsInput {
+  chunkText: string;
+  /** Canonical names of this chunk's merge survivors — a claim must anchor on one. */
+  entities: string[];
+}
+
+/** One time-bounded assertion as emitted by the LLM. */
+export interface ClaimOutput {
+  /** Entity surface form; matched to a survivor name by the pipeline. */
+  entity: string;
+  claim: string;
+  /** ISO-8601 date string or null; unparseable values collapse to null. */
+  validFrom: string | null;
+  validTo: string | null;
+  confidence: number;
+  evidenceSpan: string;
+}
+
+/** Sealed outcome of one claims call — same failure posture as describe. */
+export type ClaimsResponse =
+  | { kind: "ok"; claims: ClaimOutput[] }
+  | { kind: "failed"; errorCode: string; errorMsg: string };
 
 /**
  * Chunk content is empty or whitespace-only. Raised before any LLM call —

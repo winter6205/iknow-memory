@@ -31,13 +31,16 @@ const BOOTSTRAP_COLUMNS = [
   ["source_documents", "valid_until"],
   ["source_documents", "status"],
   ["source_documents", "failure_code"],
+  ["source_documents", "extract_method"],
 ] as const;
 const BOOTSTRAP_TABLES = [
   "entities",
   "entity_aliases",
   "triples",
+  "claims",
   "extraction_records",
   "community_summaries",
+  "community_index_state",
   "projection_outbox",
   "source_documents",
 ] as const;
@@ -50,6 +53,8 @@ const BOOTSTRAP_INDEXES = [
   "triples_tail_id_idx",
   "triples_source_chunk_id_idx",
   "triples_relation_norm_idx",
+  "claims_entity_id_idx",
+  "claims_source_chunk_id_idx",
   "extraction_records_chunk_id_idx",
   "extraction_records_batch_id_idx",
   "extraction_records_status_idx",

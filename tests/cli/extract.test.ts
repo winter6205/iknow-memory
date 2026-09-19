@@ -191,6 +191,7 @@ describePg("extract CLI subprocess e2e (T9)", () => {
       CREATE TABLE IF NOT EXISTS chunks (
         id uuid PRIMARY KEY,
         content text NOT NULL,
+        source_ref text NOT NULL DEFAULT '',
         created_at timestamptz NOT NULL DEFAULT now()
       )
     `);

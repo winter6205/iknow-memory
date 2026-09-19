@@ -479,3 +479,195 @@ describe("AnthropicLLMClient prompt wiring (G3)", () => {
     expect(fake.messages.create).toHaveBeenCalledTimes(2);
   });
 });
+
+// ─── T3 (graph-index-standard-fast): enrichment leg ──────────────────────
+
+describe("FakeLLMClient enrichment capabilities", () => {
+  it("plain queue-only fake carries NO optional enrichment methods (capability absent)", () => {
+    const client = new FakeLLMClient({ queue: [{ kind: "ok", outputs: [] }] });
+    expect(client.describeEntities).toBeUndefined();
+    expect(client.extractClaims).toBeUndefined();
+  });
+
+  it("describeQueue / claimsQueue are consumed FIFO when configured", async () => {
+    const client = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [] }],
+      describeQueue: [
+        { kind: "ok", descriptions: [{ canonicalName: "A", description: "d" }] },
+      ],
+      claimsQueue: [
+        { kind: "ok", claims: [] },
+        { kind: "failed", errorCode: "format", errorMsg: "bad" },
+      ],
+    });
+    expect(client.describeEntities).toBeTypeOf("function");
+    expect(client.extractClaims).toBeTypeOf("function");
+
+    expect(await client.describeEntities!({ entities: [] })).toMatchObject({
+      kind: "ok",
+    });
+    await expect(
+      client.describeEntities!({ entities: [] })
+    ).rejects.toThrow(/queue exhausted/i);
+
+    expect(await client.extractClaims!({ chunkText: "x", entities: [] })).toEqual(
+      { kind: "ok", claims: [] }
+    );
+    expect(await client.extractClaims!({ chunkText: "x", entities: [] })).toEqual(
+      { kind: "failed", errorCode: "format", errorMsg: "bad" }
+    );
+  });
+});
+
+describe("AnthropicLLMClient enrichment methods (T3)", () => {
+  function makeFakeAnthropic(impl: (params: unknown) => Promise<unknown>) {
+    return {
+      messages: {
+        create: vi.fn(async (params: unknown) => impl(params)),
+      },
+    };
+  }
+
+  function makeClient(fake: ReturnType<typeof makeFakeAnthropic>) {
+    return new AnthropicLLMClient({
+      model: "test-model",
+      apiKey: "sk-test",
+      baseUrl: "https://api.test/v1",
+      anthropic: fake as never,
+      sleep: async () => {},
+    });
+  }
+
+  function textMessage(text: string) {
+    return { content: [{ type: "text", text }] };
+  }
+
+  function userPrompt(
+    fake: ReturnType<typeof makeFakeAnthropic>,
+    call = 0
+  ): string {
+    const params = fake.messages.create.mock.calls[call]?.[0] as {
+      messages?: Array<{ content: unknown }>;
+    };
+    return String(params.messages?.[0]?.content ?? "");
+  }
+
+  it("describeEntities parses the {descriptions:[...]} wrapper onto canonicalName drafts", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(
+        JSON.stringify({
+          descriptions: [
+            { entity: "Alice", description: "Alice is an Acme engineer." },
+          ],
+        })
+      )
+    );
+
+    const result = await makeClient(fake).describeEntities!({
+      entities: [{ canonicalName: "Alice", descriptions: ["a", "b"] }],
+    });
+
+    expect(result).toEqual({
+      kind: "ok",
+      descriptions: [
+        { canonicalName: "Alice", description: "Alice is an Acme engineer." },
+      ],
+    });
+    // The prompt carries the entity name and every description in its list.
+    expect(userPrompt(fake)).toContain("Alice");
+    expect(userPrompt(fake)).toContain("a");
+    expect(userPrompt(fake)).toContain("b");
+  });
+
+  it("describeEntities accepts a bare array and empty results", async () => {
+    const fake = makeFakeAnthropic(async () => textMessage("[]"));
+    const result = await makeClient(fake).describeEntities!({ entities: [] });
+    expect(result).toEqual({ kind: "ok", descriptions: [] });
+  });
+
+  it("describeEntities classifies transport failure 5xx×3 like extract", async () => {
+    const fake = makeFakeAnthropic(async () => {
+      throw Object.assign(new Error("upstream 500"), { status: 500 });
+    });
+    const result = await makeClient(fake).describeEntities!({ entities: [] });
+    expect(result).toMatchObject({ kind: "failed", errorCode: "5xx" });
+    expect(fake.messages.create).toHaveBeenCalledTimes(3);
+  });
+
+  it("describeEntities bad JSON is a sealed format failure WITHOUT retry", async () => {
+    const fake = makeFakeAnthropic(async () => textMessage("{ nope"));
+    const result = await makeClient(fake).describeEntities!({ entities: [] });
+    expect(result).toMatchObject({ kind: "failed", errorCode: "format" });
+    // Enrichment misses skip their leg (ADR 0069) — no second billable call.
+    expect(fake.messages.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("extractClaims parses claims with optional time bounds and defaults", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(
+        JSON.stringify({
+          claims: [
+            {
+              entity: "Alice",
+              claim: "Alice joined Acme in 2024.",
+              validFrom: "2024-01-15",
+              confidence: 0.9,
+            },
+          ],
+        })
+      )
+    );
+
+    const result = await makeClient(fake).extractClaims!({
+      chunkText: "Alice joined Acme in 2024.",
+      entities: ["Alice"],
+    });
+
+    expect(result).toMatchObject({ kind: "ok" });
+    if (result.kind !== "ok") throw new Error("narrow");
+    expect(result.claims).toEqual([
+      {
+        entity: "Alice",
+        claim: "Alice joined Acme in 2024.",
+        validFrom: "2024-01-15",
+        validTo: null,
+        confidence: 0.9,
+        evidenceSpan: "",
+      },
+    ]);
+    expect(userPrompt(fake)).toContain("Alice joined Acme in 2024.");
+  });
+
+  it("extractClaims rejects a confidence outside [0,1] as sealed format", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(
+        JSON.stringify([
+          {
+            entity: "Alice",
+            claim: "c",
+            validFrom: null,
+            validTo: null,
+            confidence: 1.5,
+            evidenceSpan: "",
+          },
+        ])
+      )
+    );
+    const result = await makeClient(fake).extractClaims!({
+      chunkText: "x",
+      entities: ["Alice"],
+    });
+    expect(result).toMatchObject({ kind: "failed", errorCode: "format" });
+  });
+
+  it("extractClaims accepts an empty claim list as a legal zero-claim run", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(JSON.stringify({ claims: [] }))
+    );
+    const result = await makeClient(fake).extractClaims!({
+      chunkText: "x",
+      entities: ["Alice"],
+    });
+    expect(result).toEqual({ kind: "ok", claims: [] });
+  });
+});

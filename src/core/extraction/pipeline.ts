@@ -18,7 +18,8 @@
  * method-conflict check (T1) → runExtractMethod → persistOutputs (canonical
  * merge) → enrichStandardChunk (T3, standard only: survivor descriptions +
  * claims) → emitProjectionIntents (same transaction as the ledger rows it
- * describes) → recordChunkExtractMethod (T1 version claim) → markSucceeded →
+ * describes) → recordChunkExtractMethod (T1 version claim) → C-state READY →
+ * STALE demotion when the chunk wrote graph rows (T5 gap) → markSucceeded →
  * COMMIT. The
  * ES precision layer mirrors AFTER commit, fail-open, never aborting the
  * chunk.
@@ -40,7 +41,7 @@ import {
   recordChunkExtractMethod,
   runExtractMethod,
 } from "./method.js";
-import type { ExtractMethod } from "../types.js";
+import { COMMUNITY_INDEX_STATUS, type ExtractMethod } from "../types.js";
 import {
   insertRecord,
   markSucceeded,
@@ -485,6 +486,18 @@ async function processChunk(
     // never leaves a version claim behind, and the overwrite guard keeps a
     // conflicting method from being replaced (SC2).
     await recordChunkExtractMethod(client, chunk.id, method);
+    // T5 review gap (graph-index-standard-fast): producer-side C demotion.
+    // Graph rows committed by this chunk make the stored summary generation
+    // outdated; a chunk that persisted nothing (`projected` empty) leaves the
+    // state untouched. Riding the SAME transaction means a rolled-back chunk
+    // never demotes, and a committed graph change never stays `ready`. The
+    // WHERE guard keeps precedence: only READY moves to STALE — a failed
+    // build is not resurrected, an in-flight rebuild is not interrupted,
+    // and a missing row is a no-op (the community-summary swap to READY is
+    // the recovery path either way).
+    if (counts.projected.length > 0) {
+      await demoteCommunityIndexState(client);
+    }
     await markSucceeded(client, recordId, {
       triplesCount: counts.triples,
       unmappedCount: counts.unmapped,
@@ -528,6 +541,22 @@ async function processChunk(
       errorMsg: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+/**
+ * Move the singleton C-ready row READY → STALE (see the call site in
+ * `processChunk` and `COMMUNITY_INDEX_STATUS` in core/types). Both literals
+ * ride as binds so the vocabulary keeps its SSOT in the constant; the
+ * `WHERE id = 1 AND status = <ready>` guard is the whole precedence rule —
+ * no INSERT, so the state row only ever exists via a community-summary run.
+ */
+async function demoteCommunityIndexState(client: Queryable): Promise<void> {
+  await client.query(
+    `UPDATE community_index_state
+        SET status = $1, updated_at = now()
+      WHERE id = 1 AND status = $2`,
+    [COMMUNITY_INDEX_STATUS.STALE, COMMUNITY_INDEX_STATUS.READY]
+  );
 }
 
 /**

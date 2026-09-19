@@ -291,7 +291,9 @@ async function createCommunitySummaries(
 
 /**
  * community_index_state: the corpus-level C-ready (就绪) singleton written
- * by the community-summary CLI (graph-index-standard-fast T5).
+ * by the community-summary CLI (graph-index-standard-fast T5) and demoted
+ * READY → STALE by the extract pipeline whenever a chunk transaction
+ * actually persists graph rows (T5 review gap).
  *
  * One row (CHECK id = 1) describes the WHOLE report generation, because the
  * CLI swaps `community_summaries` atomically — a partial generation is by

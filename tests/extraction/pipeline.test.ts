@@ -670,6 +670,165 @@ class RecordingEmbedder {
   }
 }
 
+// ─── T5 gap (graph-index-standard-fast): producer-side C-state demotion ──
+
+/** SQL fragment identifying the singleton `community_index_state` UPDATE. */
+const STATE_DEMOTION = "UPDATE community_index_state";
+
+describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
+  it("standard chunk that changes the graph demotes ready→stale inside the chunk transaction", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    // The demotion rides the SAME transaction as the graph rows it makes
+    // stale: after the triple INSERT, before COMMIT. A chunk that committed
+    // new edges while the state row still said `ready` is exactly the gap
+    // this closes.
+    const begin = client.indexOf("BEGIN");
+    const tripleInsert = client.indexOf("INSERT INTO triples");
+    const demotion = client.indexOf(STATE_DEMOTION);
+    const commit = client.indexOf("COMMIT");
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(tripleInsert).toBeGreaterThanOrEqual(0);
+    expect(demotion).toBeGreaterThan(tripleInsert);
+    expect(demotion).toBeLessThan(commit);
+    expect(client.valuesList[demotion]).toEqual(["stale", "ready"]);
+  });
+
+  it("fast chunk that changes the graph demotes ready→stale too", async () => {
+    const client = new FakeQueryable();
+    // Empty queue: fast never dials the LLM; a call would throw and the
+    // chunk would land as a write-failure, not the expected success.
+    const llm = new FakeLLMClient({ queue: [] });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "the a Alice Bob" }],
+      { batchSize: 1, method: "fast" }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    const tripleInsert = client.indexOf("INSERT INTO triples");
+    const demotion = client.indexOf(STATE_DEMOTION);
+    const commit = client.indexOf("COMMIT");
+    expect(tripleInsert).toBeGreaterThanOrEqual(0);
+    expect(demotion).toBeGreaterThan(tripleInsert);
+    expect(demotion).toBeLessThan(commit);
+  });
+
+  it("a chunk whose outputs were all rejected as self-loops emits no demotion", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [
+        {
+          kind: "ok",
+          outputs: [{ ...GROUNDED_OUTPUT, tail: "Alice", tailType: "person" }],
+        },
+      ],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Alice." }],
+      { batchSize: 1 }
+    );
+
+    // SC5 failed leg: the chunk persisted no graph rows, so the summary
+    // generation is still current — the state row must not move.
+    expect(summary.failed).toBe(1);
+    expect(client.indexOf(STATE_DEMOTION)).toBe(-1);
+  });
+
+  it("a chunk with zero outputs emits no demotion", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({ queue: [{ kind: "ok", outputs: [] }] });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.succeeded).toBe(1);
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(client.indexOf(STATE_DEMOTION)).toBe(-1);
+  });
+
+  it("the demotion guard is SQL-level: only the singleton ready row is touched", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+    });
+
+    await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    // Absent row → the UPDATE matches nothing (a no-op, never an INSERT).
+    // in_progress/failed → the WHERE status='ready' clause skips it, so a
+    // demotion never resurrects a failed build nor interrupts an in-flight
+    // rebuild. The guard, not client-side branching, carries the semantics
+    // (real-row enforcement is pinned by tests/schema-bootstrap.test.ts).
+    const demotion = client.indexOf(STATE_DEMOTION);
+    expect(demotion).toBeGreaterThanOrEqual(0);
+    const sql = client.queries[demotion]!;
+    expect(sql).toContain("SET status = $1");
+    expect(sql).toContain("updated_at = now()");
+    expect(sql).toContain("WHERE id = 1 AND status = $2");
+    expect(client.valuesList[demotion]).toEqual(["stale", "ready"]);
+  });
+
+  it("a demotion write error rolls the chunk back like any other write", async () => {
+    const client = new FakeQueryable();
+    const baseQuery = client.query.bind(client);
+    client.query = async (text: string, values: unknown[] = []) => {
+      if (text.includes(STATE_DEMOTION)) {
+        // Record first so the failure point is observable in the sequence.
+        client.queries.push(text);
+        client.valuesList.push(values);
+        throw new Error("simulated community_index_state write failure");
+      }
+      return baseQuery(text, values);
+    };
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    // The demotion is part of the all-or-nothing chunk transaction: if it
+    // fails, the new triples roll back with it — no committed graph change
+    // is left sitting on a `ready` state.
+    expect(summary.writeFailures).toBe(1);
+    expect(summary.succeeded).toBe(0);
+    expect(client.indexOf("ROLLBACK")).toBeGreaterThan(
+      client.indexOf(STATE_DEMOTION)
+    );
+    expect(client.indexOf("COMMIT")).toBe(-1);
+  });
+});
+
 describe("processBatch entity-description embedding class (T6)", () => {
   it("standard re-embeds each summarized description inside the chunk transaction", async () => {
     const client = new FakeQueryable();

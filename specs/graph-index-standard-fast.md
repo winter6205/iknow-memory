@@ -78,6 +78,8 @@ Joint terms **抽图窗**, **Fast 抽图**, **实体描述**, **claim**, **具�
 2. Integer **Leiden default seed**.
 3. Embedding **model id / dimension** if not the existing NineRouter/env embedder.
 
+**Note (2026-09-19):** assumption 9's **tunable** prune thresholds are satisfied programmatically — `FastPruneOptions` (`src/core/extraction/fast.ts`) takes `weakPercentile` (default 40th percentile) and `minDegree` (default 1) as index-job config. An operator CLI/env surface stays deferred until a real tuning need appears (YAGNI).
+
 ## Inherits / Changes
 
 **Inherits:** ADR-0001 / ADR-0008 / ADR-0004; P0 extract + L0–L3 merge; projection outbox + drain; `specs/p0-extraction.md`; `specs/neo4j-graph-arm.md`; community **summary on ledger** from `specs/retrieve-community.md`.

@@ -16,7 +16,10 @@
  *   0 success — incl. `--dry-run`, `--list-unmapped`, `--list-failed`,
  *     `--backfill-embeddings`, and mark-and-continue batches where SOME
  *     chunks failed extraction (Success Criterion #6).
- *   1 config / fatal — bad DB URL, Postgres unreachable, ConfigError.
+ *   1 config / fatal — bad DB URL, Postgres unreachable, ConfigError —
+ *     and the T4 job fail: a `--method fast` run whose every chunk died
+ *     typed FAST_EMPTY_GRAPH (an empty Chinese fast graph is a JOB fail,
+ *     spec assumption / plan T4 acceptance).
  *   2 usage error (unknown / malformed / mutually exclusive flags) OR a
  *     write-partial-failure (a chunk's transaction rolled back — distinct
  *     from the expected per-chunk extraction failures mark-and-continue
@@ -43,7 +46,9 @@ import {
   selectPendingChunks,
   selectPendingChunksBySourceRef,
   processBatch,
+  type BatchSummary,
 } from "../core/extraction/pipeline.js";
+import { FAST_EMPTY_GRAPH_CODE } from "../core/extraction/fast.js";
 import { embedEntity, toVectorLiteral } from "../core/extraction/persist.js";
 import {
   buildLlmClient,
@@ -346,10 +351,42 @@ async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
       batchSize: flags.batchSize,
       ...(method !== null ? { method } : {}),
     });
-    return summary.writeFailures > 0 ? 2 : 0;
+    // Exit precedence: writeFailures → 2 first (unchanged), then the T4
+    // job fail, then mark-and-continue 0 (any success, or a non-fast run).
+    if (summary.writeFailures > 0) return 2;
+    if (isEmptyFastGraphJobFail(method, summary)) {
+      deps.logger.error("fast-empty-graph-job-fail", {
+        batchId: summary.batchId,
+        processed: summary.processed,
+        failed: summary.failed,
+      });
+      return 1;
+    }
+    return 0;
   } finally {
     client.release();
   }
+}
+
+/**
+ * T4 acceptance at the JOB level: a fast run that processed chunks and lost
+ * every single one of them with at least one typed FAST_EMPTY_GRAPH is not a
+ * success — the operator asked for a graph and the Chinese-content fast leg
+ * produced none. Standard runs and mixed fast runs (any success) keep the
+ * mark-and-continue exit 0; the caller checks writeFailures first, so a
+ * rolled-back chunk outranks this fail.
+ */
+function isEmptyFastGraphJobFail(
+  method: ExtractMethod | null,
+  summary: BatchSummary
+): boolean {
+  return (
+    method === "fast" &&
+    summary.processed > 0 &&
+    summary.succeeded === 0 &&
+    summary.failed > 0 &&
+    summary.failureCodes.includes(FAST_EMPTY_GRAPH_CODE)
+  );
 }
 
 /** `--list-unmapped`: report relation_raw buckets, no LLM, no extraction. */

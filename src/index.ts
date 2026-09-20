@@ -45,7 +45,7 @@ import {
   type EmbeddingClient,
 } from "./core/embedder.js";
 import {
-  createSlotEmbeddingSource,
+  createSlotSourceFromGraphragEnv,
   type SlotEmbeddingSource,
 } from "./core/embed-slots.js";
 import { MemoryBackend } from "./core/storage/memory-backend.js";
@@ -319,13 +319,9 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
         `GRAPHRAG_MEMORY_STORAGE=pgvector requires the optional "pg" dependency — \`npm install pg\` (${(err as Error).message})`
       );
     }
-    const backend = new mod.PgvectorBackend(
-      env.dbUrl,
-      env.embedDimensions,
-      undefined,
-      {},
-      env.embedModel
-    );
+    const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions, {
+      embedModel: env.embedModel,
+    });
     // Fail before the stdio transport opens: dimension, ANN-index, and
     // embedding-generation boot-guard errors are server-startup failures,
     // not tool responses. The guard replaces the retired drop-and-add
@@ -363,15 +359,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
       apiKey: env.embedApiKey,
       dimensions: env.embedDimensions,
     });
-    slotEmbedding = createSlotEmbeddingSource(
-      {
-        apiKey: env.embedApiKey,
-        baseUrl: env.embedBaseUrl,
-        model: env.embedModel,
-        dimensions: env.embedDimensions,
-      },
-      embedder
-    );
+    slotEmbedding = createSlotSourceFromGraphragEnv(env, embedder);
   } else embedder = new UnavailableEmbedder();
 
   // Thread the validated retrieval config into the server deps so

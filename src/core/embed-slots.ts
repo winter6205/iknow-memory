@@ -112,6 +112,79 @@ export function slotWriteWidths(state: EmbeddingGenerationState | null, envDimen
   };
 }
 
+/** One dual-write SQL statement's slot fragments (review repair B). */
+export interface SlotWriteFragments {
+  /** INSERT column-list piece: `embedding` / `embedding, embedding_g2`. */
+  columns: string;
+  /** VALUES piece with `::vector` casts on the caller's param indices. */
+  valuePlaceholders: string;
+  /** ON CONFLICT DO UPDATE piece copying EXCLUDED into each slot column. */
+  excludedAssignments: string;
+  /** UPDATE SET piece: `<slot> = $n::vector` per touched slot. */
+  parameterizedAssignments: string;
+}
+
+/**
+ * DUAL-WRITE SQL FRAGMENTS — the SSOT for the slot triplet that the chunk
+ * upsert, the entity insert, the entity re-embed UPDATE and the community
+ * swap INSERT each used to hand-roll (review repair B). Every fragment is
+ * built from the SAME two validated identifiers, so no statement can drift
+ * into writing only one of the open slots. The `$n` indices come from the
+ * caller because the parameter layouts differ: the chunk upsert keeps its
+ * incoming vector LAST in the values array ($3/$11) while the INSERT sites
+ * number the slots contiguously. Both identifiers are re-asserted here —
+ * they land in the SQL as raw text, never as bind parameters.
+ */
+export function slotWriteFragments(args: {
+  activeSlot: string;
+  incomingSlot: string | null;
+  /** 1-based `$n` of the active slot's vector parameter. */
+  activeParam: number;
+  /** 1-based `$n` of the incoming vector param; required while dual-writing. */
+  incomingParam?: number;
+}): SlotWriteFragments {
+  assertEmbeddingSlotIdentifier(args.activeSlot);
+  if (!Number.isInteger(args.activeParam) || args.activeParam < 1) {
+    throw new GraphragError(
+      `slotWriteFragments: activeParam must be a 1-based placeholder index, got ${args.activeParam}`,
+      "INVALID_INPUT"
+    );
+    // EXIT: a bogus index would build SQL that binds the vector to nothing.
+  }
+  if (args.incomingSlot === null) {
+    return {
+      columns: args.activeSlot,
+      valuePlaceholders: `$${args.activeParam}::vector`,
+      excludedAssignments: `${args.activeSlot} = EXCLUDED.${args.activeSlot}`,
+      parameterizedAssignments: `${args.activeSlot} = $${args.activeParam}::vector`,
+    };
+  }
+  assertEmbeddingSlotIdentifier(args.incomingSlot);
+  if (
+    args.incomingParam === undefined ||
+    !Number.isInteger(args.incomingParam) ||
+    args.incomingParam < 1
+  ) {
+    throw new GraphragError(
+      "slotWriteFragments: incomingParam is required (a 1-based placeholder " +
+        "index) while a dual-write slot is open",
+      "INVALID_INPUT"
+    );
+    // EXIT: silently dropping the incoming column here is exactly the
+    // half-write the dual-write contract refuses.
+  }
+  return {
+    columns: `${args.activeSlot}, ${args.incomingSlot}`,
+    valuePlaceholders: `$${args.activeParam}::vector, $${args.incomingParam}::vector`,
+    excludedAssignments:
+      `${args.activeSlot} = EXCLUDED.${args.activeSlot}, ` +
+      `${args.incomingSlot} = EXCLUDED.${args.incomingSlot}`,
+    parameterizedAssignments:
+      `${args.activeSlot} = $${args.activeParam}::vector, ` +
+      `${args.incomingSlot} = $${args.incomingParam}::vector`,
+  };
+}
+
 /**
  * Embed `texts` once per slot the write touches, each batch produced by
  * the embedder for THAT slot's pair. `state === null` (pre-ledger store or
@@ -216,6 +289,41 @@ export function createSlotEmbeddingSource(
         { persistsEmbeddings: true }
       ),
   };
+}
+
+/**
+ * The embedding slice of `GraphragEnv` this factory reads. Deliberately a
+ * structural type: `config.ts` may import core modules, so importing it
+ * back here would risk a cycle — the env object satisfies this shape
+ * directly and TypeScript checks the field names at every wiring site.
+ */
+export interface GraphragEnvEmbedFields {
+  embedApiKey: string | undefined;
+  embedBaseUrl: string | undefined;
+  embedModel: string | undefined;
+  embedDimensions: number;
+}
+
+/**
+ * Wiring SSOT (review repair C): build the slot source from the process's
+ * GRAPHRAG_MEMORY_EMBED_* configuration. The passed embedder covers
+ * whichever pair matches env (the boot guard's contract); secondary
+ * embedders reuse the SAME credentials with each recorded pair. Five entry
+ * points used to hand-roll the field mapping — this is now the one place.
+ */
+export function createSlotSourceFromGraphragEnv(
+  env: GraphragEnvEmbedFields,
+  embedder: EmbeddingClient
+): SlotEmbeddingSource {
+  return createSlotEmbeddingSource(
+    {
+      apiKey: env.embedApiKey,
+      baseUrl: env.embedBaseUrl,
+      model: env.embedModel,
+      dimensions: env.embedDimensions,
+    },
+    embedder
+  );
 }
 
 /**

@@ -35,6 +35,21 @@ export interface ChunkRecord {
 }
 
 /**
+ * Per-write generation binding for `StorageBackend.upsert` (embedding
+ * generation rotate, review repair E). The tool layer embeds against the
+ * ledger state it reads from the backend cache; passing THAT exact state
+ * here makes it the single source for validation AND the dual-write, so a
+ * rotate opening mid-process can never half-decide on one state and write
+ * on another. When `generation` is absent (undefined) the backend re-reads
+ * the ledger fresh, preserving the self-healing behavior of callers that
+ * never bind a state (extract / community paths).
+ */
+export interface ChunkUpsertOptions {
+  /** `null` = the caller asserts no ledger row (legacy single-column write). */
+  generation?: EmbeddingGenerationState | null;
+}
+
+/**
  * A 资料 prose SoR row (operator-console T1 / ADR-0010).
  *
  * One row holds the full body text the injector pushed; the dashboard and
@@ -241,7 +256,10 @@ export interface RetrieveResult {
 
 /** Storage backend contract — both MemoryBackend and PgvectorBackend implement this. */
 export interface StorageBackend {
-  upsert(chunks: ChunkRecord[]): Promise<string[]>; // returns chunk ids
+  upsert(
+    chunks: ChunkRecord[],
+    options?: ChunkUpsertOptions
+  ): Promise<string[]>; // returns chunk ids
   /**
    * The embedding-generation ledger as last read by the backend
    * (embedding generation rotate T1/T2). Optional: memory-mode and test

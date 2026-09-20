@@ -42,14 +42,20 @@ function openState(
 /** Recording backend: MemoryBackend + ledger state + captured upsert rows. */
 class DualWriteMemoryBackend extends MemoryBackend {
   upserted: ChunkRecord[][] = [];
+  /** Review repair E: the options each upsert saw — the state must be threaded. */
+  upsertedOptions: ({ generation?: EmbeddingGenerationState | null } | undefined)[] = [];
   constructor(
     dimensions: number,
     private readonly state: EmbeddingGenerationState | null
   ) {
     super(dimensions);
   }
-  override async upsert(chunks: ChunkRecord[]): Promise<string[]> {
+  override async upsert(
+    chunks: ChunkRecord[],
+    options?: { generation?: EmbeddingGenerationState | null }
+  ): Promise<string[]> {
     this.upserted.push(chunks.map((c) => ({ ...c })));
+    this.upsertedOptions.push(options);
     return super.upsert(chunks);
   }
   getGenerationState(): EmbeddingGenerationState | undefined {
@@ -96,7 +102,8 @@ const envelope = {
 
 describe("ingest dual-write while a rotate is open", () => {
   it("passes BOTH slot vectors on every ChunkRecord, computed with the two pairs", async () => {
-    const storage = new DualWriteMemoryBackend(TEST_DIM, openState());
+    const state = openState();
+    const storage = new DualWriteMemoryBackend(TEST_DIM, state);
     const { source, calls } = makeSlotSource("m1");
     const deps: IngestDeps = {
       embedder: new FakeEmbedder(TEST_DIM),
@@ -117,6 +124,10 @@ describe("ingest dual-write while a rotate is open", () => {
       expect(record.incoming_embedding).not.toEqual(record.embedding);
     }
     expect(calls).toEqual(["env", "build:m2", "m2"]);
+    // Review repair E: the SAME state object the embeddings were computed
+    // against travels to the backend, so validation and the write never
+    // consult a different ledger read.
+    expect(storage.upsertedOptions[0]?.generation).toBe(state);
   });
 
   it("refuses the whole ingest when the secondary embed fails — nothing stored", async () => {

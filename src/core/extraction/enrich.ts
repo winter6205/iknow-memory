@@ -40,6 +40,7 @@ import { computeEntityEmbeddingText } from "../entities/embedding.js";
 import {
   embedWithSlotFallback,
   readSlotGenerationState,
+  slotWriteFragments,
   slotWriteTargets,
   type SlotEmbeddingSource,
 } from "../embed-slots.js";
@@ -355,12 +356,15 @@ async function reembedDescriptions(
       counts.embedSkipped += 1;
       continue;
     }
+    // Review repair B: the per-slot SET list comes from the shared
+    // fragments SSOT (bind positions: id $1, active $2, incoming $3).
+    const { parameterizedAssignments } = slotWriteFragments({
+      ...targets,
+      activeParam: 2,
+      incomingParam: 3,
+    });
     await client.query(
-      `UPDATE entities SET ${targets.activeSlot} = $2::vector${
-        targets.incomingSlot === null
-          ? ""
-          : `, ${targets.incomingSlot} = $3::vector`
-      } WHERE id = $1`,
+      `UPDATE entities SET ${parameterizedAssignments} WHERE id = $1`,
       [
         entries[i]!.entityId,
         toVectorLiteral(vector),

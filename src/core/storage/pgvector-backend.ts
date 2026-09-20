@@ -68,6 +68,7 @@ import {
 import { GraphragError } from "../errors.js";
 import {
   SOURCE_DOC_STATUS,
+  type ChunkUpsertOptions,
   type EmbeddingGenerationState,
 } from "../types.js";
 import {
@@ -81,7 +82,11 @@ import {
   guardEmbeddingBoot,
   readGenerationState,
 } from "./embedding-generation.js";
-import { slotWriteTargets, slotWriteWidths } from "../embed-slots.js";
+import {
+  slotWriteFragments,
+  slotWriteTargets,
+  slotWriteWidths,
+} from "../embed-slots.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
 import {
   CHUNK_BY_ID_SQL,
@@ -156,6 +161,17 @@ export interface PgvectorPoolStats {
   observedConcurrentConnections: number;
   peakConcurrentConnections: number;
   connectionWaitTimeouts: number;
+}
+
+/** Constructor overrides past the required (dbUrl, dimensions) pair. */
+export interface PgvectorBackendOptions {
+  annMaxDimensions?: number;
+  poolOptions?: PgvectorPoolOptions;
+  /**
+   * Desired embed model from the operator setting (loadEnv().embedModel);
+   * the generation boot guard compares the (model, dimensions) pair.
+   */
+  embedModel?: string;
 }
 
 /** Serialized pgvector literal: `[0.1,0.2,...]` with no spaces. */
@@ -483,6 +499,8 @@ export class PgvectorBackend
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
   private readonly poolConfig: PgvectorPoolConfig;
+  private readonly annMaxDimensions: number | undefined;
+  private readonly embedModel: string | undefined;
   private generation: EmbeddingGenerationState | undefined;
   private observedConcurrentConnections = 0;
   private peakConcurrentConnections = 0;
@@ -491,15 +509,12 @@ export class PgvectorBackend
   constructor(
     private readonly dbUrl: string,
     private readonly dimensions: number,
-    private readonly annMaxDimensions?: number,
-    poolOptions: PgvectorPoolOptions = {},
-    /**
-     * Desired embed model from the operator setting (loadEnv().embedModel);
-     * the generation boot guard compares the (model, dimensions) pair.
-     */
-    private readonly embedModel?: string
+    options: PgvectorBackendOptions = {}
   ) {
+    this.annMaxDimensions = options.annMaxDimensions;
+    this.embedModel = options.embedModel;
     const defaults = readPgvectorPoolConfig();
+    const poolOptions = options.poolOptions ?? {};
     this.poolConfig = {
       max: validatePoolParameter(
         "PostgreSQL pool max",
@@ -775,28 +790,39 @@ export class PgvectorBackend
     }
   }
 
-  async upsert(chunks: ChunkRecord[]): Promise<string[]> {
+  async upsert(
+    chunks: ChunkRecord[],
+    options?: ChunkUpsertOptions
+  ): Promise<string[]> {
     if (chunks.length === 0) return [];
     const pool = await this.ensureReady();
 
-    // T2 dual-write: re-read the ledger per batch — a rotate may have been
-    // opened after this process booted. The cached boot state is refreshed
-    // so the tool layer self-heals against the same ledger.
-    const state = await readGenerationState(pool);
-    if (state !== null) this.generation = state;
-    const { activeSlot, incomingSlot } = slotWriteTargets(state);
+    // Review repair E: a caller that already embedded against a specific
+    // ledger state (tools reading the backend cache) passes it here, so the
+    // SAME state decides validation AND the dual-write — no fresh re-read
+    // that could half-decide against the embeddings we were handed. When the
+    // option is absent, the T2 behavior stands: re-read the ledger per batch
+    // — a rotate may have been opened after this process booted — and refresh
+    // the cached boot state so the tool layer self-heals against the ledger.
+    let state: EmbeddingGenerationState | null;
+    if (options !== undefined && options.generation !== undefined) {
+      state = options.generation;
+    } else {
+      state = await readGenerationState(pool);
+      if (state !== null) this.generation = state;
+    }
+    const targets = slotWriteTargets(state);
     const widths = slotWriteWidths(state, this.dimensions);
-    this.validateUpsertVectors(chunks, activeSlot, widths, incomingSlot);
+    this.validateUpsertVectors(chunks, targets.activeSlot, widths, targets.incomingSlot);
 
-    const slotColumns = `${activeSlot}${
-      incomingSlot === null ? "" : `, ${incomingSlot}`
-    }`;
-    const slotPlaceholders = `$3::vector${
-      incomingSlot === null ? "" : ", $11::vector"
-    }`;
-    const slotAssignments = `${activeSlot} = EXCLUDED.${activeSlot}${
-      incomingSlot === null ? "" : `,\n             ${incomingSlot} = EXCLUDED.${incomingSlot}`
-    }`;
+    // Review repair B: the slot column/placeholder/SET triplet comes from
+    // the shared fragments SSOT. The incoming vector stays LAST in the
+    // values array ($11), hence the explicit non-contiguous indices.
+    const {
+      columns: slotColumns,
+      valuePlaceholders: slotPlaceholders,
+      excludedAssignments: slotAssignments,
+    } = slotWriteFragments({ ...targets, activeParam: 3, incomingParam: 11 });
 
     // Each chunk is its own INSERT ... ON CONFLICT. A single multi-row
     // INSERT would be marginally faster, but per-row keeps the SQL
@@ -853,7 +879,7 @@ export class PgvectorBackend
             chunk.created_at,
             chunk.source_doc_id ?? null,
             chunk.ordinal ?? null,
-            ...(incomingSlot === null
+            ...(targets.incomingSlot === null
               ? []
               : [toVectorLiteral(chunk.incoming_embedding as number[])]),
           ]

@@ -85,7 +85,9 @@ type TableFillRows = Record<string, unknown>[];
 interface FakeRotateDbOptions {
   singleton: FakeLedgerRow | null;
   /** Per-class incoming-missing counts for the cutover completeness check. */
-  missing?: Partial<Record<"chunks" | "entities" | "community_summaries", number>>;
+  missing?: Partial<
+    Record<"chunks" | "entities" | "community_summaries", number>
+  >;
   /** Successive scan batches per table (popped one per SELECT). */
   fillBatches?: Partial<
     Record<"chunks" | "entities" | "community_summaries", TableFillRows[]>
@@ -105,7 +107,9 @@ function makeRotateDb(options: FakeRotateDbOptions) {
   const client = {
     query: vi.fn(async (sql: string, values: unknown[] = []) => {
       queries.push({ sql, values });
-      if (/^SELECT 1 FROM embedding_generation WHERE id = 1 FOR UPDATE/.test(sql)) {
+      if (
+        /^SELECT 1 FROM embedding_generation WHERE id = 1 FOR UPDATE/.test(sql)
+      ) {
         return { rows: row === null ? [] : [{ ok: 1 }] };
       }
       if (/SELECT active_slot[\s\S]*FROM embedding_generation/i.test(sql)) {
@@ -151,19 +155,27 @@ function makeRotateDb(options: FakeRotateDbOptions) {
         return { rows: [] };
       }
       const countMatch =
-        /^SELECT count\(\*\)::int AS missing FROM (chunks|entities|community_summaries)\b/.exec(sql);
+        /^SELECT count\(\*\)::int AS missing FROM (chunks|entities|community_summaries)\b/.exec(
+          sql
+        );
       if (countMatch !== null) {
-        const table = countMatch[1] as keyof NonNullable<FakeRotateDbOptions["missing"]>;
+        const table = countMatch[1] as keyof NonNullable<
+          FakeRotateDbOptions["missing"]
+        >;
         return { rows: [{ missing: options.missing?.[table] ?? 0 }] };
       }
       const scanMatch =
-        /^SELECT [\s\S]+ FROM (chunks|entities|community_summaries) WHERE .* IS NULL ORDER BY id LIMIT \$1/.exec(sql);
+        /^SELECT [\s\S]+ FROM (chunks|entities|community_summaries) WHERE .* IS NULL ORDER BY id LIMIT \$1/.exec(
+          sql
+        );
       if (scanMatch !== null) {
         const table = scanMatch[1] as keyof typeof batches;
         return { rows: batches[table].shift() ?? [] };
       }
       const updateMatch =
-        /^UPDATE (chunks|entities|community_summaries) SET (\w+) = \$2::vector WHERE id = \$1 AND \2 IS NULL RETURNING id/.exec(sql);
+        /^UPDATE (chunks|entities|community_summaries) SET (\w+) = \$2::vector WHERE id = \$1 AND \2 IS NULL RETURNING id/.exec(
+          sql
+        );
       if (updateMatch !== null) {
         fillUpdates.push({
           table: updateMatch[1],
@@ -240,7 +252,9 @@ describe("cutoverRotate (completeness gate + one pointer flip)", () => {
       missing: { chunks: 0, entities: 2 },
     });
 
-    const error = await cutoverRotate(db.client).catch((caught: unknown) => caught);
+    const error = await cutoverRotate(db.client).catch(
+      (caught: unknown) => caught
+    );
 
     expect(error).toBeInstanceOf(GraphragError);
     expect(error).toMatchObject({ code: "INVALID_INPUT" });
@@ -280,7 +294,10 @@ describe("cutoverRotate (completeness gate + one pointer flip)", () => {
     const db = makeRotateDb({ singleton: openRow() });
     await cutoverRotate(db.client);
     const begin = indexOfSql(db.queries, /^BEGIN$/);
-    const lock = indexOfSql(db.queries, /^SELECT 1 FROM embedding_generation .*FOR UPDATE$/);
+    const lock = indexOfSql(
+      db.queries,
+      /^SELECT 1 FROM embedding_generation .*FOR UPDATE$/
+    );
     const count = indexOfSql(db.queries, /AS missing FROM chunks/);
     const flip = indexOfSql(db.queries, /UPDATE embedding_generation/);
     const commit = indexOfSql(db.queries, /^COMMIT$/);
@@ -300,7 +317,9 @@ describe("cutoverRotate (completeness gate + one pointer flip)", () => {
       }),
     });
 
-    const error = await cutoverRotate(db.client).catch((caught: unknown) => caught);
+    const error = await cutoverRotate(db.client).catch(
+      (caught: unknown) => caught
+    );
     expect(error).toBeInstanceOf(GraphragError);
     expect(error).toMatchObject({ code: "INVALID_INPUT" });
     expect(transcript(db.queries)).not.toMatch(/UPDATE embedding_generation/);
@@ -318,7 +337,9 @@ describe("cutoverRotate (completeness gate + one pointer flip)", () => {
       }),
     });
 
-    const error = await cutoverRotate(db.client).catch((caught: unknown) => caught);
+    const error = await cutoverRotate(db.client).catch(
+      (caught: unknown) => caught
+    );
     expect(error).toBeInstanceOf(GraphragError);
     expect(error).toMatchObject({ code: "INVALID_INPUT" });
     expect((error as Error).message).toContain("embedding");
@@ -327,7 +348,9 @@ describe("cutoverRotate (completeness gate + one pointer flip)", () => {
 
   it("refuses typed STORAGE_ERROR when the singleton row is absent", async () => {
     const db = makeRotateDb({ singleton: null });
-    const error = await cutoverRotate(db.client).catch((caught: unknown) => caught);
+    const error = await cutoverRotate(db.client).catch(
+      (caught: unknown) => caught
+    );
     expect(error).toBeInstanceOf(GraphragError);
     expect(error).toMatchObject({ code: "STORAGE_ERROR" });
   });
@@ -344,7 +367,9 @@ describe("rollbackRotate (post-cutover flip back)", () => {
       }),
     });
 
-    const error = await rollbackRotate(db.client).catch((caught: unknown) => caught);
+    const error = await rollbackRotate(db.client).catch(
+      (caught: unknown) => caught
+    );
     expect(error).toBeInstanceOf(GraphragError);
     expect(error).toMatchObject({ code: "INVALID_INPUT" });
     expect((error as Error).message).toMatch(/nothing to roll back/);
@@ -381,7 +406,9 @@ describe("rollbackRotate (post-cutover flip back)", () => {
       }),
     });
 
-    const error = await rollbackRotate(db.client).catch((caught: unknown) => caught);
+    const error = await rollbackRotate(db.client).catch(
+      (caught: unknown) => caught
+    );
     expect(error).toBeInstanceOf(GraphragError);
     expect(error).toMatchObject({ code: "INVALID_INPUT" });
     expect(transcript(db.queries)).not.toMatch(/UPDATE embedding_generation/);
@@ -408,7 +435,9 @@ describe("dropInactiveSlot (index + column removal; idempotent no-op)", () => {
         `ALTER TABLE ${table} DROP COLUMN IF EXISTS embedding_g2`
       );
     }
-    expect(text).toMatch(/UPDATE embedding_generation[\s\S]*SET incoming_slot = NULL/);
+    expect(text).toMatch(
+      /UPDATE embedding_generation[\s\S]*SET incoming_slot = NULL/
+    );
     const row = db.ledgerRow();
     expect(row?.incoming_slot).toBeNull();
     expect(row?.rotate_mode).toBeNull();
@@ -421,7 +450,9 @@ describe("dropInactiveSlot (index + column removal; idempotent no-op)", () => {
     const first = await dropInactiveSlot(db.client);
     expect(first.droppedSlots).toEqual(["embedding"]);
     const text = transcript(db.queries);
-    expect(text).toContain("ALTER TABLE chunks DROP COLUMN IF EXISTS embedding");
+    expect(text).toContain(
+      "ALTER TABLE chunks DROP COLUMN IF EXISTS embedding"
+    );
     expect(text).not.toMatch(/DROP COLUMN IF EXISTS embedding_g2/);
     expect(db.ledgerRow()?.rollback_slot).toBeNull();
     expect(db.ledgerRow()?.active_slot).toBe("embedding_g2");
@@ -459,7 +490,9 @@ describe("dropInactiveSlot (index + column removal; idempotent no-op)", () => {
       singleton: cutOverRow({ rollback_slot: "embedding_g2" }),
     });
 
-    const error = await dropInactiveSlot(db.client).catch((caught: unknown) => caught);
+    const error = await dropInactiveSlot(db.client).catch(
+      (caught: unknown) => caught
+    );
     expect(error).toBeInstanceOf(GraphragError);
     expect(error).toMatchObject({ code: "STORAGE_ERROR" });
     expect(transcript(db.queries)).not.toMatch(/DROP\s+(COLUMN|INDEX|TABLE)/i);
@@ -500,7 +533,11 @@ describe("fillIncoming (embed toward the incoming slot from ledger text)", () =>
         chunks: [[{ id: UUID_A, content: "slice one" }]],
         entities: [
           [
-            { id: UUID_B, canonical_name: "Alice Smith", description: "works at Acme" },
+            {
+              id: UUID_B,
+              canonical_name: "Alice Smith",
+              description: "works at Acme",
+            },
             { id: UUID_C, canonical_name: "Acme Corp", description: "" },
           ],
         ],
@@ -520,7 +557,10 @@ describe("fillIncoming (embed toward the incoming slot from ledger text)", () =>
 
     expect(summary.perTable.chunks).toEqual({ scanned: 1, filled: 1 });
     expect(summary.perTable.entities).toEqual({ scanned: 2, filled: 2 });
-    expect(summary.perTable.community_summaries).toEqual({ scanned: 1, filled: 1 });
+    expect(summary.perTable.community_summaries).toEqual({
+      scanned: 1,
+      filled: 1,
+    });
     // The secondary embedder is built EXACTLY for the recorded incoming pair.
     expect(secondaryPairs).toEqual([{ model: "m2", dimensions: 8 }]);
     // Ledger text per class: chunk content raw, entity via the assembler,
@@ -541,7 +581,9 @@ describe("fillIncoming (embed toward the incoming slot from ledger text)", () =>
     expect(text).not.toMatch(/UPDATE \w+ SET embedding WHERE/);
     // Scans restrict to the missing rows only.
     expect(text).toMatch(/FROM chunks WHERE embedding_g2 IS NULL/);
-    expect(text).toMatch(/FROM entities WHERE retired = false AND embedding_g2 IS NULL/);
+    expect(text).toMatch(
+      /FROM entities WHERE retired = false AND embedding_g2 IS NULL/
+    );
     expect(text).toMatch(/FROM community_summaries WHERE embedding_g2 IS NULL/);
     // A fill run is row-autocommitted: no wrapper transaction around the writes.
     expect(text).not.toMatch(/^BEGIN$/m);
@@ -660,9 +702,7 @@ describe("PgvectorBackend downtime read refuse (T4)", () => {
     const backend = new PgvectorBackend(
       "postgres://example.invalid/downtime",
       dimensions,
-      2000,
-      {},
-      embedModel
+      { annMaxDimensions: 2000, embedModel }
     );
     (backend as unknown as { pool: typeof pool }).pool = pool;
     return { backend, queries };
@@ -686,7 +726,8 @@ describe("PgvectorBackend downtime read refuse (T4)", () => {
     const before = queries.length;
 
     for (const read of [
-      () => backend.search(unit8(), { limit: 5, validAt: "2026-06-01T00:00:00Z" }),
+      () =>
+        backend.search(unit8(), { limit: 5, validAt: "2026-06-01T00:00:00Z" }),
       () => backend.graphArmSeed.seedEntitiesByEmbedding(unit8(), 5),
       () => backend.communitySummaries.searchCommunitySummaries(unit8(), 5),
     ]) {
@@ -705,7 +746,10 @@ describe("PgvectorBackend downtime read refuse (T4)", () => {
     await booted(backend);
     const before = queries.length;
 
-    await backend.search(unit8(), { limit: 5, validAt: "2026-06-01T00:00:00Z" });
+    await backend.search(unit8(), {
+      limit: 5,
+      validAt: "2026-06-01T00:00:00Z",
+    });
 
     expect(queries.length).toBeGreaterThan(before);
     expect(queries[before]!.sql).toContain("FROM chunks");

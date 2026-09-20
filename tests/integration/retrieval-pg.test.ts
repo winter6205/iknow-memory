@@ -376,7 +376,7 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
     client = new pg.Client({ connectionString: SCHEMA_URL });
     await client.connect();
     await resetSchema(client);
-    backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
   });
 
   afterAll(async () => {

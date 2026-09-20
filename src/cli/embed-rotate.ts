@@ -34,7 +34,7 @@ import { createLogger, writeStderr, type Logger } from "../logging.js";
 import { GraphragError } from "../core/errors.js";
 import { buildEmbedderClient, type EmbedderClientEnv } from "../core/extraction/clients.js";
 import {
-  createSlotEmbeddingSource,
+  createSlotSourceFromGraphragEnv,
   type SlotEmbeddingSource,
 } from "../core/embed-slots.js";
 import {
@@ -303,7 +303,7 @@ function fillSource(env: GraphragEnv): SlotEmbeddingSource {
   const embedder = buildEmbedderClient(embedderEnv, {
     persistsEmbeddings: true,
   });
-  return createSlotEmbeddingSource(embedderEnv, embedder);
+  return createSlotSourceFromGraphragEnv(env, embedder);
 }
 
 /** Top-level entry: wire real deps, exit with the CLI exit code. */

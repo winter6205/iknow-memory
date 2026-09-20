@@ -73,9 +73,7 @@ function makeBackend(
   const backend = new PgvectorBackend(
     "postgres://example.invalid/retrieval",
     dimensions,
-    2000,
-    {},
-    embedModel
+    { annMaxDimensions: 2000, embedModel }
   );
   (backend as unknown as { pool: typeof pool }).pool = pool;
   return { backend, queries };
@@ -208,7 +206,10 @@ describe("PgvectorBackend reads — slot resolution guardrails", () => {
 
   it("refuses a corrupt active slot BEFORE issuing any read SQL", async () => {
     const { backend, queries } = makeBackend(
-      ledgerRow({ active_slot: "embedding; DROP TABLE chunks", active_model: "m2" })
+      ledgerRow({
+        active_slot: "embedding; DROP TABLE chunks",
+        active_model: "m2",
+      })
     );
     await booted(backend);
     const before = queries.length;

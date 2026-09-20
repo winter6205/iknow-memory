@@ -592,7 +592,10 @@ export function createIngestHandler(deps: IngestDeps) {
     for (const [sourceDocId, kept] of keptIdsBySourceDoc) {
       await deps.storage.deleteChunksForSourceDoc(sourceDocId, kept);
     }
-    const ids = await deps.storage.upsert(records);
+    // Review repair E: bind the write to the SAME ledger state the slices
+    // were embedded against above — the backend must not re-read the ledger
+    // and decide the dual-write against a different (fresher) state.
+    const ids = await deps.storage.upsert(records, { generation });
     // 就绪 only AFTER the chunk rows are durable. ingest writes the same
     // (资料 row, chunk rows) pair push does, so it reaches the same state:
     // docs/CONTEXT.md 资料集合 defines 就绪 as status ready AND count ≥ 1,

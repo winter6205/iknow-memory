@@ -67,7 +67,7 @@ describePg("chunk vector ANN index (SC-2)", () => {
     await client.connect();
     await pgHarness.resetSchema(client);
     await client.query(`SET search_path TO "${SCHEMA}", public`);
-    backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
   });
 
   afterAll(async () => {

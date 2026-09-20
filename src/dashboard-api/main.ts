@@ -7,7 +7,7 @@ import { ConfigError, loadEnv, type GraphragEnv } from "../config.js";
 import { createLogger, writeStderr } from "../logging.js";
 import { buildRetrieveDeps, buildRetrieveReranker } from "../index.js";
 import { NineRouterEmbedder, UnavailableEmbedder } from "../core/embedder.js";
-import { createSlotEmbeddingSource } from "../core/embed-slots.js";
+import { createSlotSourceFromGraphragEnv } from "../core/embed-slots.js";
 import { MemoryBackend } from "../core/storage/memory-backend.js";
 import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { createNeo4jPprRanker } from "../core/graph/neo4j-ppr.js";
@@ -46,13 +46,9 @@ async function buildStorage(
       `GRAPHRAG_MEMORY_STORAGE=pgvector requires the optional "pg" dependency — \`npm install pg\` (${(err as Error).message})`
     );
   }
-  const backend = new mod.PgvectorBackend(
-    env.dbUrl,
-    env.embedDimensions,
-    undefined,
-    {},
-    env.embedModel
-  );
+  const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions, {
+    embedModel: env.embedModel,
+  });
   // The generation boot guard inside initialize() replaces the retired
   // drop-and-add dim align: desired ≠ active without an open rotate is a
   // typed ConfigError boot failure, never a DROP of the live column.
@@ -92,15 +88,7 @@ export async function main(): Promise<void> {
   const logger = createLogger(env.logLevel);
   const storage = await buildStorage(env);
   const embedder = buildEmbedder(env);
-  const slotEmbedding = createSlotEmbeddingSource(
-    {
-      apiKey: env.embedApiKey,
-      baseUrl: env.embedBaseUrl,
-      model: env.embedModel,
-      dimensions: env.embedDimensions,
-    },
-    embedder
-  );
+  const slotEmbedding = createSlotSourceFromGraphragEnv(env, embedder);
   const precision =
     env.elasticsearch === undefined
       ? undefined

@@ -1,22 +1,24 @@
 import { describe, expect, it } from "vitest";
 
 import { ConfigError } from "../../src/config.js";
-import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
-
-type PoolOptions = {
-  max?: number;
-  connectionWaitTimeoutMs?: number;
-};
+import {
+  PgvectorBackend,
+  type PgvectorBackendOptions,
+} from "../../src/core/storage/pgvector-backend.js";
 
 const Backend = PgvectorBackend as unknown as new (
   dbUrl: string,
   dimensions: number,
-  annMaxDimensions: number,
-  poolOptions?: PoolOptions
+  options?: PgvectorBackendOptions
 ) => PgvectorBackend;
 
-function makeBackend(options?: PoolOptions): PgvectorBackend {
-  return new Backend("postgres://example.invalid/retrieval", 32, 2000, options);
+function makeBackend(
+  poolOptions?: PgvectorBackendOptions["poolOptions"]
+): PgvectorBackend {
+  return new Backend("postgres://example.invalid/retrieval", 32, {
+    annMaxDimensions: 2000,
+    poolOptions,
+  });
 }
 
 describe("PgvectorBackend connection pool parameters", () => {

@@ -40,10 +40,12 @@ import type { EmbeddingClient } from "../embedder.js";
 import {
   embedWithSlotFallback,
   readSlotGenerationState,
+  slotWriteFragments,
   slotWriteTargets,
   type SlotEmbeddingSource,
   type SlotVectorBatches,
 } from "../embed-slots.js";
+import { activeSlotForRead } from "../storage/embedding-generation.js";
 import type { EmbeddingGenerationState } from "../types.js";
 import { normalizeEntityType, type EntityType } from "./entity-type.js";
 
@@ -469,7 +471,14 @@ async function resolveEntity(
   mergedLoserIds: string[];
 }> {
   const excluded = new Set(opts.excludeIds ?? []);
-  const live = (await loadEntities(client)).filter((c) => !excluded.has(c.id));
+  // Review repair A: read the generation ledger ONCE per resolution and
+  // thread it down — the candidate-vector SELECT, the slot write targets
+  // and the cosine gates must all see the SAME state, so a rotate opening
+  // mid-resolution cannot half-bind the read to one generation.
+  const state = await readSlotGenerationState(client);
+  const live = (await loadEntities(client, state)).filter(
+    (c) => !excluded.has(c.id)
+  );
   const { canonicalId, decision } = await mergeEntitiesWithGating(
     incoming,
     live,
@@ -490,7 +499,7 @@ async function resolveEntity(
         client,
         loserId,
         incoming,
-        await embedEntityForWrite(deps, client, incoming)
+        await embedEntityForWrite(deps, client, incoming, state)
       );
       await linkMergedEntity(client, loserId, survivorId);
       mergedLoserIds.push(loserId);
@@ -511,7 +520,7 @@ async function resolveEntity(
     client,
     id,
     incoming,
-    await embedEntityForWrite(deps, client, incoming)
+    await embedEntityForWrite(deps, client, incoming, state)
   );
   await insertAlias(client, id, incoming.canonicalName, "name");
   return { id, canonicalName: incoming.canonicalName, mergedLoserIds: [] };
@@ -521,12 +530,20 @@ async function resolveEntity(
  * Load live entities as merge candidates, carrying the stored embedding and
  * the `metadata.description` value (A7/A13) so the L2/L3 gates see production
  * data instead of empty strings.
+ *
+ * Review repair A (T3 read binding): the vector column is the ledger's
+ * ACTIVE slot via `activeSlotForRead` — after a cutover the merge cosine
+ * reads the new generation only, and a later drop of the legacy column
+ * cannot crash this read. `state === null` (pre-ledger store, injected
+ * test deps) keeps the legacy `embedding` column, unchanged.
  */
 export async function loadEntities(
-  client: Queryable
+  client: Queryable,
+  state: EmbeddingGenerationState | null = null
 ): Promise<CandidateEntity[]> {
+  const slot = activeSlotForRead(state);
   const { rows } = await client.query(
-    `SELECT id, canonical_name, type, embedding::text AS embedding,
+    `SELECT id, canonical_name, type, ${slot}::text AS embedding,
             coalesce(metadata->>'description', '') AS description
        FROM entities WHERE retired = false`,
     []
@@ -581,11 +598,14 @@ export interface EntitySlotVectors {
 export async function embedEntityForWrite(
   deps: ExtractPersistDeps,
   client: Queryable,
-  incoming: { canonicalName: string; description: string }
+  incoming: { canonicalName: string; description: string },
+  /** Ledger read by the caller; omitted here re-reads (standalone callers). */
+  state?: EmbeddingGenerationState | null
 ): Promise<EntitySlotVectors> {
-  const state = await readSlotGenerationState(client);
-  const batches = await embedEntityBatches(deps, state, incoming);
-  const targets = slotWriteTargets(state);
+  const generation =
+    state === undefined ? await readSlotGenerationState(client) : state;
+  const batches = await embedEntityBatches(deps, generation, incoming);
+  const targets = slotWriteTargets(generation);
   return {
     active: requireEntityVector(incoming, batches.active[0]),
     incoming:
@@ -667,16 +687,21 @@ export async function insertEntity(
   }
   // A7: description rides in the existing metadata JSONB — the spec-1 DDL is
   // frozen, so there is no description column to write.
-  // T2 dual-write: while a rotate is open the incoming slot column joins
-  // the same INSERT, so the row lands in BOTH generations atomically.
+  // T2 dual-write / review repair B: while a rotate is open the incoming
+  // slot column joins the same INSERT through the shared fragments SSOT, so
+  // the row lands in BOTH generations atomically. The slot columns stay
+  // contiguous; the values array keeps metadata at $5 and the incoming
+  // vector last at $6, matching the existing bind-position contract.
   const { activeSlot, incomingSlot } = vectors;
+  const { columns, valuePlaceholders } = slotWriteFragments({
+    activeSlot,
+    incomingSlot,
+    activeParam: 4,
+    incomingParam: 6,
+  });
   await client.query(
-    `INSERT INTO entities (id, canonical_name, type, ${activeSlot}, metadata, retired${
-      incomingSlot === null ? "" : `, ${incomingSlot}`
-    })
-     VALUES ($1, $2, $3, $4::vector, $5::jsonb, false${
-       incomingSlot === null ? "" : ", $6::vector"
-     })`,
+    `INSERT INTO entities (id, canonical_name, type, ${columns}, metadata, retired)
+     VALUES ($1, $2, $3, ${valuePlaceholders}, $5::jsonb, false)`,
     [
       id,
       incoming.canonicalName,

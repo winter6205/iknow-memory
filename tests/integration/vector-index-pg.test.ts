@@ -15,6 +15,7 @@ import {
   buildVectorSearchQuery,
   PgvectorBackend,
 } from "../../src/core/storage/pgvector-backend.js";
+import { EMBEDDING_SLOT_BASE } from "../../src/core/storage/embedding-generation.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 1536;
@@ -121,10 +122,16 @@ describePg("chunk vector ANN index (SC-2)", () => {
     );
     expect(settings.rows[0]?.enable_seqscan).toBe("on");
 
-    const retrieval = buildVectorSearchQuery(new Array<number>(DIM).fill(0), {
-      validAt: VALID_AT,
-      limit: 10,
-    });
+    // T3 made the read slot an explicit argument; this pre-ledger proof
+    // pins the ANN index on the legacy column, so it names it directly.
+    const retrieval = buildVectorSearchQuery(
+      new Array<number>(DIM).fill(0),
+      {
+        validAt: VALID_AT,
+        limit: 10,
+      },
+      EMBEDDING_SLOT_BASE
+    );
     expect(retrieval.sql).toContain("valid_from <= $2::timestamptz");
     expect(retrieval.sql).toContain(
       "(valid_until IS NULL OR valid_until > $2::timestamptz)"

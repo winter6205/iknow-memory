@@ -59,6 +59,7 @@ import {
   supportsCommunitySummaries,
 } from "../storage/backend.js";
 import { GraphragError } from "../errors.js";
+import { activeQueryEmbedder } from "../embed-slots.js";
 import {
   COMMUNITY_INDEX_STATUS,
   COMMUNITY_SUMMARY_INDEX_FAILURE,
@@ -109,7 +110,16 @@ export const modeCReportFirstArm: SearchModeArm = async function assembleModeCRe
 
   // One embed per retrieve (the assembler's standing contract): the memo
   // lets the drop call reuse the vector the report arm already produced.
-  const embedder = memoizeQueryEmbedder(deps.embedder, args.query);
+  // T3: that one vector belongs to the ledger's ACTIVE generation — the
+  // same binding the B assembler applies to its own query embed.
+  const embedder = memoizeQueryEmbedder(
+    activeQueryEmbedder({
+      embedder: deps.embedder,
+      slotEmbedding: deps.slotEmbedding,
+      state: deps.storage.getGenerationState?.() ?? null,
+    }),
+    args.query
+  );
   const pool = Math.max(args.limit, ARM_CANDIDATE_POOL);
 
   // Parallel by construction: the ES arm starts before the embedding is
@@ -334,7 +344,15 @@ async function fillWindows(
     // see the routing key as an exact-match term.
     const envelope = await assembleRetrievalResult(
       { ...args, filters: stripCDropWindowsFilter(args.filters) },
-      { ...deps, embedder }
+      {
+        ...deps,
+        embedder,
+        // The embedder handed down is ALREADY the active-pair embedder
+        // behind the query memo; clearing the source stops the B assembler
+        // from re-resolving past the wrapper and re-embedding — the
+        // one-embed-per-retrieve contract survives the C drop (T3).
+        slotEmbedding: undefined,
+      }
     );
     return {
       hits: envelope.chunks.map(toFusedFromWindowChunk),

@@ -28,6 +28,7 @@ import {
   type ToolResult,
 } from "./registry.js";
 import type { EmbeddingClient } from "../core/embedder.js";
+import type { SlotEmbeddingSource } from "../core/embed-slots.js";
 import type { SearchOptions, StorageBackend } from "../core/types.js";
 import type { LexicalStorageBackend } from "../core/storage/backend.js";
 import type {
@@ -148,6 +149,12 @@ export interface RetrieveDeps {
   inputValidationFailureCounter?: InputValidationFailureCounter;
   /** Optional read-only projection outbox wait seam. */
   projectionDrain?: ProjectionDrainWaiter;
+  /**
+   * Embedding rotate T3: per-slot embedder source so the query embed runs
+   * against the ACTIVE generation while an open rotate points env at the
+   * incoming pair. Absent → the env embedder is used as-is.
+   */
+  slotEmbedding?: SlotEmbeddingSource;
 }
 
 export function createRetrieveHandler(deps: RetrieveDeps) {
@@ -226,6 +233,9 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         debug: deps.debug,
         capabilityObservations: deps.capabilityObservations,
         projectionDrain: deps.projectionDrain,
+        ...(deps.slotEmbedding !== undefined
+          ? { slotEmbedding: deps.slotEmbedding }
+          : {}),
       },
       control
     );

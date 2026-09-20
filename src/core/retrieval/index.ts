@@ -79,6 +79,8 @@ import {
 } from "../storage/backend.js";
 import type { EmbeddingClient } from "../embedder.js";
 import { GraphragError } from "../errors.js";
+import { activeQueryEmbedder } from "../embed-slots.js";
+import type { SlotEmbeddingSource } from "../embed-slots.js";
 
 /**
  * How many candidates each arm draws when its results will be fused.
@@ -133,6 +135,13 @@ export interface AssembleDeps {
   embedder: EmbeddingClient;
   /** May implement the lexical and/or graph seams; neither is required. */
   storage: StorageBackend;
+  /**
+   * Slot embedder source for the T3 query-embed binding: while a rotate
+   * is open the env embedder may target the INCOMING generation, and the
+   * query must then be embedded with the ledger's ACTIVE pair. Absent →
+   * the env embedder is used unchanged (memory mode / unwired hosts).
+   */
+  slotEmbedding?: SlotEmbeddingSource;
   /** Optional Elasticsearch precision-layer chunk search. */
   lexical?: import("../storage/backend.js").LexicalStorageBackend;
   /** Optional Elasticsearch precision-layer entity search. */
@@ -201,7 +210,17 @@ export async function assembleRetrievalResult(
   // feeds the vector search and the graph arm's seed lookup. Missing
   // credentials skip this call entirely; a configured provider that throws
   // is converted to an attempted-and-failed vector outcome.
-  const queryEmbedding = await resolveQueryEmbedding(deps.embedder, args.query);
+  //
+  // T3 binding: the query is embedded with the ledger's ACTIVE generation.
+  // The cached boot state lives on the backend (`getGenerationState`);
+  // without a ledger or without a wired slot source this is env-embedder
+  // passthrough — today's behavior, unchanged.
+  const queryEmbedder = activeQueryEmbedder({
+    embedder: deps.embedder,
+    slotEmbedding: deps.slotEmbedding,
+    state: deps.storage.getGenerationState?.() ?? null,
+  });
+  const queryEmbedding = await resolveQueryEmbedding(queryEmbedder, args.query);
   const embedding = queryEmbedding.embedding;
 
   // Fusion weights may fall back to the archived graph config. Optional-arm

@@ -27,6 +27,7 @@
 import { ConfigError } from "../../config.js";
 import { GraphragError } from "../../core/errors.js";
 import type { EmbeddingClient } from "../../core/embedder.js";
+import type { SlotEmbeddingSource } from "../../core/embed-slots.js";
 import type { StorageBackend } from "../../core/types.js";
 import type {
   EmbedderClientEnv,
@@ -192,6 +193,8 @@ function toolResultToBody(result: ToolResultContent): {
  */
 export interface IngestWriteDeps {
   embedder: EmbeddingClient;
+  /** Embedding rotate T2: forwarded to the shared ingest handler. */
+  slotEmbedding?: SlotEmbeddingSource;
   storage: StorageBackend;
   precision?: PrecisionIndexer;
   logger?: Logger;

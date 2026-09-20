@@ -693,19 +693,22 @@ function buildCliDeps(
     model: env.embedModel,
     dimensions: env.embedDimensions,
   };
+  // LLM first, embedder second: the credential guards must surface in the
+  // pre-T2 order (a keyless real extraction reports the LLM refusal).
+  const llm = buildLlmClient(
+    {
+      authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+      baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
+      model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
+    },
+    { extraction: isRealExtraction(flags) }
+  );
   const embedder = buildEmbedderClient(embedderEnv, {
     persistsEmbeddings: persistsEmbeddings(flags),
   });
   return {
     pool,
-    llm: buildLlmClient(
-      {
-        authToken: process.env.ANTHROPIC_AUTH_TOKEN,
-        baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
-        model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
-      },
-      { extraction: isRealExtraction(flags) }
-    ),
+    llm,
     embedder,
     slotEmbedding: createSlotEmbeddingSource(embedderEnv, embedder),
     dims: env.embedDimensions,

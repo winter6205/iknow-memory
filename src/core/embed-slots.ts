@@ -218,6 +218,28 @@ export function createSlotEmbeddingSource(
   };
 }
 
+/**
+ * Retrieve read binding (T3): the embedder for the QUERY vector, pinned to
+ * the ledger's ACTIVE generation. The boot guard only lets a process run
+ * with desired != active when a rotate is open and desired == incoming, so
+ * the env embedder can target the INCOMING cosine space — the query must
+ * then come from the active pair instead. `embedderForPair` returns the env
+ * embedder UNCHANGED when desired == active, and a cached secondary for
+ * the active pair otherwise. With no ledger state (pre-ledger store,
+ * memory mode) or an unwired source the env embedder passes through —
+ * today's behavior, unchanged.
+ */
+export function activeQueryEmbedder(args: {
+  embedder: EmbeddingClient;
+  slotEmbedding?: SlotEmbeddingSource;
+  state: EmbeddingGenerationState | null;
+}): EmbeddingClient {
+  if (args.state === null || args.slotEmbedding === undefined) {
+    return args.embedder;
+  }
+  return embedderForPair(args.slotEmbedding, args.state.active);
+}
+
 // One secondary embedder per (source, pair): persist batches several writes
 // against the same foreign generation and must not rebuild the HTTP client
 // per row.

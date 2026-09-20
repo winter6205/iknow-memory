@@ -96,6 +96,21 @@ export function assertEmbeddingSlotIdentifier(slot: string): void {
   assertSafeSlot(slot);
 }
 
+/**
+ * Read-side slot binding (T3): THE single point every vector read resolves
+ * the physical column with — the ledger's ACTIVE slot, legacy `embedding`
+ * for a pre-ledger store, typed refusal for a corrupt identifier. T4's
+ * cutover/downtime paths reuse this same function; no read site may
+ * interpolate a slot it has not passed through here first.
+ */
+export function activeSlotForRead(
+  state: EmbeddingGenerationState | null | undefined
+): string {
+  const slot = state?.activeSlot ?? EMBEDDING_SLOT_BASE;
+  assertSafeSlot(slot);
+  return slot;
+}
+
 interface GenerationRow {
   active_slot: string;
   active_model: string | null;

@@ -304,19 +304,19 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
         `GRAPHRAG_MEMORY_STORAGE=pgvector requires the optional "pg" dependency — \`npm install pg\` (${(err as Error).message})`
       );
     }
-    const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions);
-    // Fail before the stdio transport opens: dimension and ANN-index
-    // bootstrap errors are server-startup failures, not tool responses.
+    const backend = new mod.PgvectorBackend(
+      env.dbUrl,
+      env.embedDimensions,
+      undefined,
+      {},
+      env.embedModel
+    );
+    // Fail before the stdio transport opens: dimension, ANN-index, and
+    // embedding-generation boot-guard errors are server-startup failures,
+    // not tool responses. The guard replaces the retired drop-and-add
+    // dim-align rotation (specs/embedding-generation.md): a desired
+    // generation with no open rotate is a typed ConfigError, never a DROP.
     await backend.initialize();
-    const { alignEmbeddingDimensions } =
-      await import("./core/storage/embed-dim-align.js");
-    const { Pool } = await import("pg");
-    const alignPool = new Pool({ connectionString: env.dbUrl });
-    try {
-      await alignEmbeddingDimensions(alignPool, env.embedDimensions);
-    } finally {
-      await alignPool.end();
-    }
     storage = backend;
   } else {
     storage = new MemoryBackend(env.embedDimensions);

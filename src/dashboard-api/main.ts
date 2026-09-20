@@ -13,7 +13,6 @@ import { createNeo4jPprRanker } from "../core/graph/neo4j-ppr.js";
 import { connectNeo4j } from "../core/graph/neo4j-writer.js";
 import type { StorageBackend, StorageReadPort } from "../core/types.js";
 
-import { alignEmbeddingDimensions } from "../core/storage/embed-dim-align.js";
 import { createDashboardServer, readDashboardConfig } from "./index.js";
 import { createNeo4jSessionFactory } from "./graph-session.js";
 import type {
@@ -46,7 +45,16 @@ async function buildStorage(
       `GRAPHRAG_MEMORY_STORAGE=pgvector requires the optional "pg" dependency — \`npm install pg\` (${(err as Error).message})`
     );
   }
-  const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions);
+  const backend = new mod.PgvectorBackend(
+    env.dbUrl,
+    env.embedDimensions,
+    undefined,
+    {},
+    env.embedModel
+  );
+  // The generation boot guard inside initialize() replaces the retired
+  // drop-and-add dim align: desired ≠ active without an open rotate is a
+  // typed ConfigError boot failure, never a DROP of the live column.
   await backend.initialize();
   return backend;
 }
@@ -120,9 +128,6 @@ export async function main(): Promise<void> {
           connectionString: env.dbUrl,
         })
       : undefined;
-  if (pgPoolRaw !== undefined) {
-    await alignEmbeddingDimensions(pgPoolRaw, env.embedDimensions);
-  }
   const pgPool: (ExtractPool & BackfillPool & DrainPool) | undefined =
     pgPoolRaw !== undefined
       ? (pgPoolRaw as unknown as ExtractPool & BackfillPool & DrainPool)

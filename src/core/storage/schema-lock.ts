@@ -41,6 +41,7 @@ const BOOTSTRAP_TABLES = [
   "extraction_records",
   "community_summaries",
   "community_index_state",
+  "embedding_generation",
   "projection_outbox",
   "source_documents",
 ] as const;

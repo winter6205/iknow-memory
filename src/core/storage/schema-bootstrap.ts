@@ -429,6 +429,18 @@ async function createEmbeddingGeneration(
                             CHECK (rotate_mode IN (${sqlTextList(EMBED_ROTATE_MODES)})),
       updated_at          timestamptz NOT NULL DEFAULT now()
     )`);
+  // T4 rollback columns. A deployed store already has the table, so its
+  // shape evolves HERE (the singleton's one DDL home) via guarded ADDs —
+  // CREATE IF NOT EXISTS alone would never reach it.
+  await client.query(
+    "ALTER TABLE embedding_generation ADD COLUMN IF NOT EXISTS rollback_slot text NULL"
+  );
+  await client.query(
+    "ALTER TABLE embedding_generation ADD COLUMN IF NOT EXISTS rollback_model text NULL"
+  );
+  await client.query(
+    "ALTER TABLE embedding_generation ADD COLUMN IF NOT EXISTS rollback_dimensions integer NULL"
+  );
 }
 
 /**

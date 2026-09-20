@@ -59,6 +59,8 @@ function openRotateState(
     incomingSlot: "embedding_g2",
     incoming: { model: "m2", dimensions: DIM },
     rotateMode: "dual_write",
+    rollbackSlot: null,
+    rollback: null,
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
   };

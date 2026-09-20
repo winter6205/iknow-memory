@@ -10,6 +10,7 @@
     "iknow-memory": "bin/iknow-memory.js",
     "iknow-memory-config": "bin/iknow-memory-config.js",
     "extract": "bin/extract.js",
+    "embed-rotate": "bin/embed-rotate.js",
     "consolidate": "bin/consolidate.js",
     "eval": "bin/eval.js"
   },
@@ -46,6 +47,7 @@
     "graph:backfill": "node dist/cli/graph-backfill.js",
     "graph:drain": "node dist/cli/graph-drain.js",
     "community:summary": "node dist/cli/community-summary.js",
+    "embed:rotate": "node dist/cli/embed-rotate.js",
     "es:reindex": "node dist/cli/es-reindex.js",
     "prepare": "husky"
   },

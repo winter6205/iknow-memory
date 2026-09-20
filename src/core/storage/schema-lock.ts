@@ -32,6 +32,12 @@ const BOOTSTRAP_COLUMNS = [
   ["source_documents", "status"],
   ["source_documents", "failure_code"],
   ["source_documents", "extract_method"],
+  // T4 rollback columns: added by forward-compat ALTERs in
+  // createEmbeddingGeneration, so they MUST be probed (bootstrap-columns
+  // lockstep) or deployed databases never get them.
+  ["embedding_generation", "rollback_slot"],
+  ["embedding_generation", "rollback_model"],
+  ["embedding_generation", "rollback_dimensions"],
 ] as const;
 const BOOTSTRAP_TABLES = [
   "entities",

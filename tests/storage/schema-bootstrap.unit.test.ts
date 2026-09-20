@@ -5,6 +5,7 @@ import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import {
   SOURCE_DOC_STATUS,
   COMMUNITY_INDEX_STATUS,
+  EMBED_ROTATE_MODES,
 } from "../../src/core/types.js";
 
 function recordingClient(): {
@@ -160,6 +161,61 @@ describe("upSchemaBootstrap source_documents ledger (operator-console T1)", () =
     expect(addColumn).toContain(`DEFAULT 'in_progress'`);
     expect(check).toContain(`'in_progress'`);
     expect(addColumn).not.toMatch(/DEFAULT\s+''\s/);
+  });
+});
+
+// embedding generation rotate T1: the generation pointer singleton. One row
+// (CHECK id = 1) shared by all three vector classes; the rotate_mode CHECK
+// derives its literal list from EMBED_ROTATE_MODES (types.ts), same
+// constant-side doctrine as the source_documents CHECKs above.
+describe("upSchemaBootstrap embedding_generation (T1 generation ledger)", () => {
+  it("creates the singleton with slot/model/dimensions + rotate_mode CHECK", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+
+    const create = queries.find((query) =>
+      /CREATE TABLE IF NOT EXISTS embedding_generation/i.test(query)
+    );
+    expect(
+      create,
+      "embedding_generation CREATE TABLE not emitted"
+    ).toBeDefined();
+    expect(create).toMatch(/CHECK \(id = 1\)/);
+    expect(create).toMatch(/active_slot\s+text NOT NULL/i);
+    expect(create).toMatch(/active_model\s+text NULL/i);
+    expect(create).toMatch(/active_dimensions\s+integer NOT NULL/i);
+    expect(create).toMatch(/incoming_slot\s+text NULL/i);
+    expect(create).toMatch(/incoming_model\s+text NULL/i);
+    expect(create).toMatch(/incoming_dimensions\s+integer NULL/i);
+    expect(create).toMatch(/rotate_mode\s+text NULL/i);
+    for (const mode of EMBED_ROTATE_MODES) {
+      expect(create, `rotate_mode CHECK misses '${mode}'`).toContain(
+        `'${mode}'`
+      );
+    }
+    expect(create).toMatch(/updated_at\s+timestamptz NOT NULL DEFAULT now\(\)/i);
+  });
+
+  it("names embedding_generation in the readiness probe so deployed DBs get it", async () => {
+    // Same lockstep doctrine as community_index_state above: the probe is
+    // the only mechanism that adds a new bootstrap table to an existing
+    // database, because a "ready" answer short-circuits the whole DDL.
+    const records: { sql: string; values?: unknown[] }[] = [];
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        records.push({ sql, values });
+        if (/AS ready/.test(sql)) return { rows: [{ ready: true }] };
+        if (/current_schema\(\)/.test(sql)) {
+          return { rows: [{ schema_name: "public" }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as PoolClient;
+    await upSchemaBootstrap(client, 1536, 2000);
+
+    const probe = records.find(({ sql }) => /AS ready/.test(sql));
+    expect(probe, "readiness probe not emitted").toBeDefined();
+    expect(probe!.values?.[0]).toContain("embedding_generation");
   });
 });
 

@@ -66,11 +66,15 @@ import {
   type PgvectorPoolConfig,
 } from "../../config.js";
 import { GraphragError } from "../errors.js";
-import { SOURCE_DOC_STATUS } from "../types.js";
+import {
+  SOURCE_DOC_STATUS,
+  type EmbeddingGenerationState,
+} from "../types.js";
 import {
   assertPgvectorAnnDimensions,
   upSchemaBootstrap,
 } from "./schema-bootstrap.js";
+import { guardEmbeddingBoot } from "./embedding-generation.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
 import {
   CHUNK_BY_ID_SQL,
@@ -455,6 +459,7 @@ export class PgvectorBackend
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
   private readonly poolConfig: PgvectorPoolConfig;
+  private generation: EmbeddingGenerationState | undefined;
   private observedConcurrentConnections = 0;
   private peakConcurrentConnections = 0;
   private connectionWaitTimeouts = 0;
@@ -463,7 +468,12 @@ export class PgvectorBackend
     private readonly dbUrl: string,
     private readonly dimensions: number,
     private readonly annMaxDimensions?: number,
-    poolOptions: PgvectorPoolOptions = {}
+    poolOptions: PgvectorPoolOptions = {},
+    /**
+     * Desired embed model from the operator setting (loadEnv().embedModel);
+     * the generation boot guard compares the (model, dimensions) pair.
+     */
+    private readonly embedModel?: string
   ) {
     const defaults = readPgvectorPoolConfig();
     this.poolConfig = {
@@ -503,6 +513,30 @@ export class PgvectorBackend
   }
 
   /**
+   * The generation ledger as recorded by the last successful boot guard:
+   * the slot names dual-write persist (T2) and cosine read binding (T3)
+   * consume. Undefined before the first completed initialize().
+   */
+  getGenerationState(): EmbeddingGenerationState | undefined {
+    return this.generation;
+  }
+
+  /**
+   * Seed or refuse against the embedding_generation singleton (spec:
+   * embedding generation rotate T1). A typed ConfigError here is a boot
+   * failure — a desired generation that is neither active nor the incoming
+   * slot of an open rotate must stop the process, never realign columns.
+   */
+  private async guardEmbeddingGenerationBoot(): Promise<EmbeddingGenerationState> {
+    const state = await guardEmbeddingBoot(this.pool!, {
+      model: this.embedModel,
+      dimensions: this.dimensions,
+    });
+    this.generation = state;
+    return state;
+  }
+
+  /**
    * Lazily initialize the pg module + connection pool + schema.
    *
    * Why a memoized promise (and not an `async` constructor): JS classes
@@ -535,6 +569,11 @@ export class PgvectorBackend
       this.pool = this.wrapPool(rawPool);
       try {
         await this.ensureTable();
+        // Same generation guard for every backend consumer (MCP server and
+        // the CLIs): seed the singleton or typed-refuse a config change that
+        // has no open rotate. Outside ensureTable's catch so the ConfigError
+        // keeps its type instead of becoming a STORAGE_ERROR wrapper.
+        await this.guardEmbeddingGenerationBoot();
       } catch (err) {
         // Reset pool so the next call retries from scratch (High-fix:
         // without this, a failed ensureTable leaves a broken pool that

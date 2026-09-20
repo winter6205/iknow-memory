@@ -122,6 +122,55 @@ export type CommunityIndexStatus =
   (typeof COMMUNITY_INDEX_STATUS)[keyof typeof COMMUNITY_INDEX_STATUS];
 
 /**
+ * Rotate-mode vocabulary for the embedding-generation ledger
+ * (embedding generation rotate T1; specs/embedding-generation.md).
+ *
+ * Persisted on `embedding_generation.rotate_mode` while an incoming slot is
+ * open: `dual_write` keeps vector reads on the active generation while
+ * persist writes land in both slots; `downtime` typed-refuses vector reads
+ * until cutover. The CHECK in schema-bootstrap.ts derives its literal list
+ * from this constant, mirroring the `SOURCE_DOC_STATUS` pattern.
+ */
+export const EMBED_ROTATE_MODES = ["dual_write", "downtime"] as const;
+
+export type EmbedRotateMode = (typeof EMBED_ROTATE_MODES)[number];
+
+/**
+ * One side of the generation pointer: the (model, dimensions) pair that
+ * defines which embeddings may share a cosine index. `model` is NULL when
+ * no embedding key is configured (the operator setting has no model to
+ * record), and the boot comparison treats NULL and "absent" as equal.
+ */
+export interface EmbeddingGenerationPair {
+  model: string | null;
+  dimensions: number;
+}
+
+/**
+ * The typed read of the `embedding_generation` singleton
+ * (embedding-generation.ts). All three vector classes (chunks, entities,
+ * community summaries) share this one pointer; cutover flips them together.
+ */
+export interface EmbeddingGenerationState {
+  /** Physical vector column name of the active generation. */
+  activeSlot: string;
+  active: EmbeddingGenerationPair;
+  /** Incoming slot name; null = no rotate is open. */
+  incomingSlot: string | null;
+  /** Incoming generation; undefined together with `incomingSlot`. */
+  incoming: EmbeddingGenerationPair | null;
+  rotateMode: EmbedRotateMode | null;
+  updatedAt: Date;
+}
+
+export function isEmbedRotateMode(value: unknown): value is EmbedRotateMode {
+  return (
+    typeof value === "string" &&
+    (EMBED_ROTATE_MODES as readonly string[]).includes(value)
+  );
+}
+
+/**
  * Stable failure code stored in `community_index_state.failure_code` when a
  * community-summary job fails. Spec 待写入 keeps public spellings as an
  * Open Question; this string is the fin `具名失败` token already pinned by

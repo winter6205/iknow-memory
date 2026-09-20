@@ -23,6 +23,7 @@ import {
   SOURCE_DOC_STATUS,
   EXTRACT_METHODS,
   COMMUNITY_INDEX_STATUS,
+  EMBED_ROTATE_MODES,
   type SourceDocStatus,
 } from "../types.js";
 import { upSchemaProjection } from "./schema-projection.js";
@@ -400,6 +401,37 @@ async function createCommunityIndexState(
 }
 
 /**
+ * embedding_generation: the singleton pointer for the stored vector
+ * generation (embedding generation rotate T1; specs/embedding-generation.md).
+ *
+ * One row (CHECK id = 1) records the ACTIVE physical vector column plus the
+ * optional INCOMING slot of an open rotate, each with its own (model,
+ * dimensions). All three vector classes — chunks, entities,
+ * community_summaries — share this one pointer; cutover flips them together
+ * and reads never mix slots. The columns live beside the singleton because
+ * adding one is an operator rotate (openRotate), never a silent boot align.
+ * `rotate_mode` derives its CHECK from EMBED_ROTATE_MODES (types.ts), same
+ * constant-side doctrine as `community_index_state.status`.
+ */
+async function createEmbeddingGeneration(
+  client: SchemaBootstrapClient
+): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS embedding_generation (
+      id                  integer PRIMARY KEY CHECK (id = 1),
+      active_slot         text NOT NULL,
+      active_model        text NULL,
+      active_dimensions   integer NOT NULL,
+      incoming_slot       text NULL,
+      incoming_model      text NULL,
+      incoming_dimensions integer NULL,
+      rotate_mode         text NULL
+                            CHECK (rotate_mode IN (${sqlTextList(EMBED_ROTATE_MODES)})),
+      updated_at          timestamptz NOT NULL DEFAULT now()
+    )`);
+}
+
+/**
  * source_documents: the 资料 prose SoR (operator-console T1; ADR-0010).
  *
  * One row holds the full body text the injector pushed; the dashboard and
@@ -535,6 +567,7 @@ export async function upSchemaBootstrap(
     await createExtractionRecords(client);
     await createCommunitySummaries(client, dimensions);
     await createCommunityIndexState(client);
+    await createEmbeddingGeneration(client);
     await createSourceDocuments(client);
     await upSchemaProjection(client);
     // ALTER chunks back-pointers must come after `source_documents` exists

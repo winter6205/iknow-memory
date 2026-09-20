@@ -1,7 +1,11 @@
 /**
+ * The shared embed-boundary module.
+ *
  * SC10 embed process log — the ONE shared contract for every
  * `embedder.embed(...)` call site (src/tools/ingest.ts, src/tools/push.ts,
- * src/cli/extract.ts entity embedding).
+ * src/cli/extract.ts entity embedding). Also hosts `embedTextForSlice`, the
+ * chunk embed-input wrap (specs/contextual-wrap-embed.md), so wrap and log
+ * stay one authoritative boundary the tools import from.
  *
  * One structured entry per embed call (not per item), whitelist fields only.
  * Content text, entity SSOT text and embeddings never travel with the line;
@@ -10,6 +14,26 @@
  */
 import type { EmbeddingClient } from "./embedder.js";
 import type { Logger } from "../logging.js";
+
+/**
+ * Contextual wrap for the CHUNK embed input (specs/contextual-wrap-embed.md):
+ * a non-empty 资料 `title` is prepended to the slice text, `title\nslice`.
+ * Null / empty / whitespace-only title → the slice verbatim.
+ *
+ * EMBED-INPUT ONLY — the stored chunk `content` and 资料 `content` stay the
+ * pushed bytes, and the retrieve query side never calls this (raw query).
+ * Pure string concat, not keyed on entity type; a wrap "failure" is
+ * impossible, so the existing embed hard-fail stays the only failure path.
+ */
+export function embedTextForSlice(
+  title: string | null | undefined,
+  sliceContent: string
+): string {
+  if (title == null || title.trim() === "") {
+    return sliceContent;
+  }
+  return `${title}\n${sliceContent}`;
+}
 
 /**
  * Emit the SC10 embed log around a single `embedder.embed(...)` call.

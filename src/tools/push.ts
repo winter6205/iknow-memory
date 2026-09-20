@@ -43,6 +43,7 @@ import {
   computeContentIdentity,
   computeSourceDocId,
   DEFAULT_CONTENT_IDENTITY_VERSIONS,
+  embedTextForSlice,
   embedWithLog,
   type ContentIdentityVersions,
 } from "./ingest.js";
@@ -458,8 +459,10 @@ export function createPushHandler(deps: PushDeps) {
       }
     }
 
+    // Embed INPUT carries the 资料 title (contextual wrap); the chunk rows
+    // written below keep the pushed bytes.
     const sliceTexts = envelopes.flatMap((env) =>
-      env.slices.map((slice) => slice.content)
+      env.slices.map((slice) => embedTextForSlice(env.title, slice.content))
     );
     // Nothing has been written yet, so an embed failure fails the whole
     // batch: every envelope in it names a 失败 attempt.

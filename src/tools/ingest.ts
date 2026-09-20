@@ -382,10 +382,11 @@ function assertSliceInvariants(
  *
  * The implementation now lives in core/embed-log.ts (single contract shared
  * with the extract CLI's "entity-embed" event); this re-export keeps the
- * historical import path for push.ts and existing tests.
+ * historical import path for push.ts and existing tests. `embedTextForSlice`
+ * (the chunk embed-input wrap) rides the same path from the same module.
  */
-export { embedWithLog } from "../core/embed-log.js";
-import { embedWithLog } from "../core/embed-log.js";
+export { embedWithLog, embedTextForSlice } from "../core/embed-log.js";
+import { embedWithLog, embedTextForSlice } from "../core/embed-log.js";
 
 /**
  * Per-envelope preflight: per-chunk size cap (1MB), empty-content reject,
@@ -472,8 +473,10 @@ export function createIngestHandler(deps: IngestDeps) {
       0
     );
     // Embed slice texts in one call (slice text is final — no re-chunking).
+    // The embed INPUT carries the 资料 title (contextual wrap); the stored
+    // chunk content below stays the pushed bytes.
     const sliceTexts = envelopes.flatMap((env) =>
-      env.slices.map((slice) => slice.content)
+      env.slices.map((slice) => embedTextForSlice(env.title, slice.content))
     );
     const embeddings = await embedWithLog(
       deps.logger,

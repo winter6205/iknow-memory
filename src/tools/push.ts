@@ -36,6 +36,7 @@ import {
 } from "../core/embed-slots.js";
 import type {
   ChunkRecord,
+  EmbeddingGenerationState,
   SourceDocRecord,
   StorageBackend,
 } from "../core/types.js";
@@ -387,6 +388,12 @@ interface EnvelopeWriteContext {
   embeddings: number[][];
   /** Incoming-slot batch; non-null only while a dual-write rotate is open. */
   incomingEmbeddings: number[][] | null;
+  /**
+   * Review repair E: the ledger state the embeddings above were produced
+   * against, threaded into the upsert so the backend validates AND
+   * dual-writes against the SAME state instead of re-reading a fresher one.
+   */
+  generation: EmbeddingGenerationState | null;
   embeddingCursor: number;
   identityVersions: ContentIdentityVersions;
   now: string;
@@ -455,7 +462,11 @@ async function writeEnvelope(
   // upsert collapses same-id writes: a re-push of the same
   // (source_ref, content) returns the existing chunk_id and adds
   // zero new rows (the cross-repo idempotency baseline).
-  const ids = await storage.upsert(records);
+  // Review repair E: hand the backend the exact ledger state the
+  // embeddings were produced against — no fresh re-read mid-batch.
+  const ids = await storage.upsert(records, {
+    generation: ctx.generation,
+  });
   return { records, ids, sourceDocId };
 }
 
@@ -484,13 +495,18 @@ export function createPushHandler(deps: PushDeps) {
     );
     // Nothing has been written yet, so an embed failure fails the whole
     // batch: every envelope in it names a 失败 attempt.
+    // Review repair E: ONE ledger read per batch — the state the slices are
+    // embedded against is threaded into every envelope's upsert, so the
+    // backend never re-reads a fresher state mid-batch.
+    const generation = deps.storage.getGenerationState?.() ?? null;
     const batches = await withFailureRecord(deps.storage, allRefs, () =>
-      embedSlices(deps, sliceTexts)
+      embedSlices(deps, sliceTexts, generation)
     );
 
     const ctx: EnvelopeWriteContext = {
       embeddings: batches.active,
       incomingEmbeddings: batches.incoming,
+      generation,
       embeddingCursor: 0,
       identityVersions: {
         ...DEFAULT_CONTENT_IDENTITY_VERSIONS,
@@ -542,12 +558,13 @@ export function createPushHandler(deps: PushDeps) {
  */
 async function embedSlices(
   deps: PushDeps,
-  sliceTexts: string[]
+  sliceTexts: string[],
+  state: EmbeddingGenerationState | null
 ): Promise<SlotVectorBatches> {
   const batches = await embedWithSlotFallback({
     embedder: deps.embedder,
     slotEmbedding: deps.slotEmbedding,
-    state: deps.storage.getGenerationState?.() ?? null,
+    state,
     site: "push",
     texts: sliceTexts,
     logger: deps.logger,

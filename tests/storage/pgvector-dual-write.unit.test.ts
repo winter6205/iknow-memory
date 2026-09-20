@@ -10,7 +10,10 @@ import { describe, expect, it } from "vitest";
 
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import { GraphragError } from "../../src/core/errors.js";
-import type { ChunkRecord } from "../../src/core/types.js";
+import type {
+  ChunkRecord,
+  EmbeddingGenerationState,
+} from "../../src/core/types.js";
 
 interface GenerationLedgerRow {
   active_slot: string;
@@ -65,9 +68,7 @@ function makeBackend(
   const backend = new PgvectorBackend(
     "postgres://example.invalid/retrieval",
     dimensions,
-    2000,
-    {},
-    "m2"
+    { annMaxDimensions: 2000, embedModel: "m2" }
   );
   (backend as unknown as { pool: typeof pool }).pool = pool;
   return { backend, queries };
@@ -216,7 +217,12 @@ describe("PgvectorBackend.upsert — unchanged behavior without an open rotate",
 
   it("rotate closed (incoming_slot NULL) writes only the active column", async () => {
     const { backend, queries } = makeBackend(
-      ledgerRow({ incoming_slot: null, incoming_model: null, incoming_dimensions: null, rotate_mode: null })
+      ledgerRow({
+        incoming_slot: null,
+        incoming_model: null,
+        incoming_dimensions: null,
+        rotate_mode: null,
+      })
     );
 
     await backend.upsert([chunkRecord()]);
@@ -264,12 +270,88 @@ describe("PgvectorBackend.upsert — unchanged behavior without an open rotate",
       ledgerRow({ active_slot: "embedding; DROP TABLE chunks" })
     );
 
-    const err = await backend
-      .upsert([chunkRecord()])
-      .catch((e: unknown) => e);
+    const err = await backend.upsert([chunkRecord()]).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(GraphragError);
     expect((err as GraphragError).code).toBe("STORAGE_ERROR");
     expect(insertQueries(queries)).toHaveLength(0);
+  });
+});
+
+// ─── Review repair E: the caller-bound generation is the SSOT ─────────────
+
+/** Open dual-write state, mirroring `ledgerRow()` above. */
+function openGeneration(): EmbeddingGenerationState {
+  return {
+    activeSlot: "embedding",
+    active: { model: "m1", dimensions: 8 },
+    incomingSlot: "embedding_g2",
+    incoming: { model: "m2", dimensions: 8 },
+    rotateMode: "dual_write",
+    rollbackSlot: null,
+    rollback: null,
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
+  };
+}
+
+describe("PgvectorBackend.upsert — caller-bound generation (review repair E)", () => {
+  it("dual-writes the PROVIDED state and never re-reads the ledger", async () => {
+    // The fake DB answers NO ledger row at all: a fresh re-read would
+    // single-column write. The provided open-rotate state must drive the
+    // dual-write instead, and must be the ONLY state consulted.
+    const { backend, queries } = makeBackend(null);
+
+    await backend.upsert(
+      [chunkRecord({ incoming_embedding: [2, 2, 2, 2, 2, 2, 2, 2] })],
+      { generation: openGeneration() }
+    );
+
+    expect(
+      queries.filter((q) => /FROM embedding_generation/.test(q.sql))
+    ).toHaveLength(0);
+    const inserts = insertQueries(queries);
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]!.sql).toContain("embedding_g2 = EXCLUDED.embedding_g2");
+  });
+
+  it("validates the incoming vector against the PROVIDED state before ANY round-trip", async () => {
+    // Same store (fake says no ledger row) + a chunk lacking the incoming
+    // vector: the bound open rotate must refuse it without touching the DB.
+    const { backend, queries } = makeBackend(null);
+
+    const err = await backend
+      .upsert([chunkRecord()], { generation: openGeneration() })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(GraphragError);
+    expect((err as GraphragError).code).toBe("EMBEDDING_FAILED");
+    expect(queries).toHaveLength(0);
+  });
+
+  it("an explicit null generation means no ledger — single-column SQL, no re-read", async () => {
+    // The fake DB now claims a rotate is OPEN; the caller's explicit null
+    // still wins: no re-read, no dual-write.
+    const { backend, queries } = makeBackend(ledgerRow());
+
+    await backend.upsert([chunkRecord()], { generation: null });
+
+    expect(
+      queries.filter((q) => /FROM embedding_generation/.test(q.sql))
+    ).toHaveLength(0);
+    expect(insertQueries(queries)[0]!.sql).not.toContain("embedding_g2");
+  });
+
+  it("an empty options object keeps today's fresh re-read", async () => {
+    const { backend, queries } = makeBackend(ledgerRow());
+
+    await backend.upsert(
+      [chunkRecord({ incoming_embedding: [2, 2, 2, 2, 2, 2, 2, 2] })],
+      {}
+    );
+
+    expect(
+      queries.filter((q) => /FROM embedding_generation/.test(q.sql)).length
+    ).toBeGreaterThan(0);
+    expect(insertQueries(queries)[0]!.sql).toContain("embedding_g2");
   });
 });

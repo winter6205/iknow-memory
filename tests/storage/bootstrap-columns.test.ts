@@ -232,7 +232,7 @@ describePg(
       const c = client!;
 
       // First deployment: full DDL.
-      const first = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+      const first = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
       try {
         await first.initialize();
       } finally {
@@ -253,7 +253,7 @@ describePg(
       expect(gone.rowCount).toBe(0);
 
       // Redeploy: the same bootstrap a restarted server runs.
-      const second = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+      const second = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
       try {
         await second.initialize();
       } finally {

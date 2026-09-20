@@ -51,7 +51,7 @@ import {
 import { FAST_EMPTY_GRAPH_CODE } from "../core/extraction/fast.js";
 import { embedEntity, toVectorLiteral } from "../core/extraction/persist.js";
 import {
-  createSlotEmbeddingSource,
+  createSlotSourceFromGraphragEnv,
   readSlotGenerationState,
   slotWriteTargets,
   type SlotEmbeddingSource,
@@ -710,7 +710,7 @@ function buildCliDeps(
     pool,
     llm,
     embedder,
-    slotEmbedding: createSlotEmbeddingSource(embedderEnv, embedder),
+    slotEmbedding: createSlotSourceFromGraphragEnv(env, embedder),
     dims: env.embedDimensions,
     logger: createLogger(env.logLevel),
     ...(precision !== undefined ? { precision } : {}),

@@ -20,9 +20,13 @@ import {
 import {
   insertEntity,
   loadEntities,
+  persistOutputs,
+  type ExtractPersistDeps,
 } from "../../src/core/extraction/persist.js";
 import { GraphragError } from "../../src/core/errors.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
+import type { ExtractionOutput } from "../../src/core/extraction/types.js";
+import type { EmbeddingGenerationState } from "../../src/core/types.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js";
 import { ALLOWED } from "../../src/core/extraction/vocabulary.js";
@@ -564,6 +568,109 @@ describe("loadEntities read half (A13)", () => {
 
     expect(candidates[0]?.embedding).toBeUndefined();
     expect(candidates[0]?.description).toBe("");
+  });
+
+  // ─── review repair A: cross-generation entity read ──────────────────────
+
+  /** Post-cutover ledger state: the live vectors live in `embedding_g2`. */
+  function postCutoverState(): EmbeddingGenerationState {
+    return {
+      activeSlot: "embedding_g2",
+      active: { model: "m2", dimensions: 8 },
+      incomingSlot: null,
+      incoming: null,
+      rotateMode: null,
+      rollbackSlot: null,
+      rollback: null,
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+    };
+  }
+
+  it("selects the LEDGER's active slot column when a state is given", async () => {
+    const client = new FakeClient();
+    client.rowsOverride = () => [];
+
+    await loadEntities(client, postCutoverState());
+
+    const select = client.queries.find((q) => /FROM entities/.test(q));
+    expect(select).toBeDefined();
+    expect(select).toContain("embedding_g2::text AS embedding");
+    // The legacy column must never be named by the read once the ledger
+    // points elsewhere — after the T4 drop the column simply does not
+    // exist, and before the drop the two slots are different generations.
+    expect(select).not.toMatch(/(^|[\s,(])embedding::text/);
+  });
+
+  it("persistOutputs binds the merge-candidate read to the ledger slot", async () => {
+    // The ledger row the boot guard would have recorded after a cutover to
+    // m2. resolveEntity must read it ONCE and select the vectors from THAT
+    // slot, so the L3 cosine never mixes generations and never names a
+    // dropped column.
+    const client = new FakeClient();
+    client.rowsOverride = (text) => {
+      if (/FROM embedding_generation/.test(text)) {
+        return [
+          {
+            active_slot: "embedding_g2",
+            active_model: "m2",
+            active_dimensions: 8,
+            incoming_slot: null,
+            incoming_model: null,
+            incoming_dimensions: null,
+            rotate_mode: null,
+            rollback_slot: null,
+            rollback_model: null,
+            rollback_dimensions: null,
+            updated_at: new Date("2026-01-01T00:00:00Z"),
+          },
+        ];
+      }
+      return [];
+    };
+    const deps: ExtractPersistDeps = {
+      embedder: new FakeEmbedder(8),
+      logger: silentLogger(),
+      now: () => "2026-08-07T00:00:00.000Z",
+    };
+    const output: ExtractionOutput = {
+      head: "Alice Smith",
+      headType: "person",
+      relationRaw: "works at",
+      relationNorm: "MEMBER_OF",
+      tail: "Acme Corp",
+      tailType: "organization",
+      description: "Alice Smith works at Acme Corp",
+      evidenceSpan: "Alice Smith works at Acme Corp",
+      confidence: 0.9,
+    };
+
+    await persistOutputs(
+      deps,
+      client,
+      "00000000-0000-4000-8000-000000000000",
+      "Alice Smith works at Acme Corp",
+      [output],
+      "2026-08-07T00:00:00.000Z"
+    );
+
+    const candidateSelects = client.queries.filter(
+      (q) => /FROM entities WHERE retired = false/.test(q)
+    );
+    expect(candidateSelects.length).toBeGreaterThan(0);
+    for (const sql of candidateSelects) {
+      expect(sql).toContain("embedding_g2::text AS embedding");
+      expect(sql).not.toMatch(/(^|[\s,(])embedding::text/);
+    }
+    // The row write follows the same slot — the entity INSERT names the
+    // ledger's active column, never the legacy one.
+    const entityInserts = client.queries.filter((q) =>
+      /^INSERT INTO entities/.test(q.trim())
+    );
+    expect(entityInserts.length).toBeGreaterThan(0);
+    for (const sql of entityInserts) {
+      expect(sql).toContain("embedding_g2");
+      expect(sql).not.toMatch(/[(,\s]embedding[,\s)]/);
+    }
   });
 });
 

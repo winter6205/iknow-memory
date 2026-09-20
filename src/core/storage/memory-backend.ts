@@ -8,6 +8,7 @@
  */
 import type {
   ChunkRecord,
+  ChunkUpsertOptions,
   PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
@@ -151,7 +152,12 @@ export class MemoryBackend
    * Throws GraphragError EMBEDDING_DIM_MISMATCH if a chunk's embedding has
    * a length other than the configured dimensions.
    */
-  async upsert(chunks: ChunkRecord[]): Promise<string[]> {
+  async upsert(
+    chunks: ChunkRecord[],
+    // Memory mode has no generation ledger, so a caller-bound state is
+    // accepted (same StorageBackend contract) and has nothing to bind to.
+    _options?: ChunkUpsertOptions
+  ): Promise<string[]> {
     // Pre-validate all chunks before mutating the store so a bad chunk in
     // position N does not leave the first N-1 chunks half-persisted.
     for (const chunk of chunks) {

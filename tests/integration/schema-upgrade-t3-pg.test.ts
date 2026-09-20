@@ -65,7 +65,7 @@ describePg("P0 schema upgrade lands the T3 资料 status columns", () => {
     // First boot = a deployment that bootstrapped before T3 shipped. It uses
     // the production entry point (`PgvectorBackend.initialize`), because the
     // stage-1 `chunks` table is owned by that path and `upSchemaBootstrap` needs it.
-    const first = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+    const first = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
     try {
       await first.initialize();
     } finally {
@@ -123,7 +123,7 @@ describePg("P0 schema upgrade lands the T3 资料 status columns", () => {
     // The upgraded schema is what a 资料 read/write actually runs against:
     // the INSERT names `status`, the list SELECT reads `sd.status` +
     // `sd.failure_code`. Both failed before the probe learned these columns.
-    const backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+    const backend = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
     try {
       await backend.initialize();
       const ref = "docs/upgraded.md";

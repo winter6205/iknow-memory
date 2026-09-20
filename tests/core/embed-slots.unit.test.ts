@@ -13,10 +13,12 @@ import { ConfigError } from "../../src/config.js";
 import { GraphragError } from "../../src/core/errors.js";
 import {
   createSlotEmbeddingSource,
+  createSlotSourceFromGraphragEnv,
   dualWriteOpen,
   embedSlotVectors,
   embedWithSlotFallback,
   readSlotGenerationState,
+  slotWriteFragments,
   slotWriteTargets,
   type SlotEmbeddingSource,
 } from "../../src/core/embed-slots.js";
@@ -354,5 +356,113 @@ describe("createSlotEmbeddingSource", () => {
     expect(() =>
       source.buildEmbedder({ model: "m2", dimensions: 8 })
     ).toThrow(ConfigError);
+  });
+});
+
+describe("createSlotSourceFromGraphragEnv (review repair C)", () => {
+  it("maps the GRAPHRAG_MEMORY_EMBED_* fields onto the slot source", () => {
+    const calls: string[] = [];
+    const source = createSlotSourceFromGraphragEnv(
+      {
+        embedApiKey: "test-key-not-secret",
+        embedBaseUrl: "https://embed.invalid/v1",
+        embedModel: "m1",
+        embedDimensions: 8,
+      },
+      taggingEmbedder("env", calls)
+    );
+
+    // desired carries the ENV pair exactly as the boot guard compared it…
+    expect(source.desired).toEqual({ model: "m1", dimensions: 8 });
+    // …and the secondary is built from the SAME credentials with the
+    // requested pair — the mapping every wiring site used to hand-roll.
+    const secondary = source.buildEmbedder({ model: "m2", dimensions: 16 });
+    expect(secondary.modelId).toBe("m2");
+  });
+
+  it("keyless GraphragEnv fields flow through to the same ConfigError refusal", () => {
+    const calls: string[] = [];
+    const source = createSlotSourceFromGraphragEnv(
+      {
+        embedApiKey: undefined,
+        embedBaseUrl: undefined,
+        embedModel: undefined,
+        embedDimensions: 8,
+      },
+      taggingEmbedder("env", calls)
+    );
+    expect(source.desired).toEqual({ model: null, dimensions: 8 });
+    expect(() =>
+      source.buildEmbedder({ model: "m2", dimensions: 8 })
+    ).toThrow(ConfigError);
+  });
+});
+
+describe("slotWriteFragments (review repair B)", () => {
+  it("single-slot: no incoming column, one placeholder/copy/assignment", () => {
+    const f = slotWriteFragments({
+      activeSlot: "embedding",
+      incomingSlot: null,
+      activeParam: 4,
+    });
+    expect(f.columns).toBe("embedding");
+    expect(f.valuePlaceholders).toBe("$4::vector");
+    expect(f.excludedAssignments).toBe("embedding = EXCLUDED.embedding");
+    expect(f.parameterizedAssignments).toBe("embedding = $4::vector");
+  });
+
+  it("dual-write: both columns; placeholders follow the caller's param map", () => {
+    // The chunk upsert keeps its incoming vector LAST in the values array
+    // ($11) while the column list stays contiguous — the helper must take
+    // the indices from the caller, not assume a shape.
+    const f = slotWriteFragments({
+      activeSlot: "embedding",
+      incomingSlot: "embedding_g2",
+      activeParam: 3,
+      incomingParam: 11,
+    });
+    expect(f.columns).toBe("embedding, embedding_g2");
+    expect(f.valuePlaceholders).toBe("$3::vector, $11::vector");
+    expect(f.excludedAssignments).toBe(
+      "embedding = EXCLUDED.embedding, embedding_g2 = EXCLUDED.embedding_g2"
+    );
+    expect(f.parameterizedAssignments).toBe(
+      "embedding = $3::vector, embedding_g2 = $11::vector"
+    );
+  });
+
+  it("dual-write without an incomingParam is a typed refusal", () => {
+    expect(() =>
+      slotWriteFragments({
+        activeSlot: "embedding",
+        incomingSlot: "embedding_g2",
+        activeParam: 4,
+      })
+    ).toThrow(GraphragError);
+    expect(() =>
+      slotWriteFragments({
+        activeSlot: "embedding",
+        incomingSlot: "embedding_g2",
+        activeParam: 4,
+      })
+    ).toThrow(/incomingParam/);
+  });
+
+  it("rejects slot names that are not valid identifiers (interpolation guard)", () => {
+    expect(() =>
+      slotWriteFragments({
+        activeSlot: "embedding; DROP TABLE chunks",
+        incomingSlot: null,
+        activeParam: 3,
+      })
+    ).toThrow(GraphragError);
+    expect(() =>
+      slotWriteFragments({
+        activeSlot: "embedding",
+        incomingSlot: "embedding--",
+        activeParam: 3,
+        incomingParam: 4,
+      })
+    ).toThrow(GraphragError);
   });
 });

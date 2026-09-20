@@ -50,7 +50,7 @@ describePg("PgvectorBackend storage reads (T1)", () => {
     client = pgHarness.createClient(SCHEMA_URL);
     await client.connect();
     await pgHarness.resetSchema(client);
-    backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
     await backend.initialize();
   });
 

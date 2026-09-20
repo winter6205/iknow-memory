@@ -402,6 +402,19 @@ export async function openRotate(
     );
     // EXIT: one incoming slot at a time — cutover/drop (T4) closes it.
   }
+  // Review repair F: `cutoverRotate` refuses while a rollback generation
+  // awaits its drop; opening here would let a re-open + drop destroy the
+  // in-flight incoming along with the pending rollback. Same refusal, one
+  // place, BEFORE any DDL.
+  if (state.rollbackSlot !== null) {
+    throw new GraphragError(
+      `openRotate: the previous generation's slot ${state.rollbackSlot} ` +
+        `still awaits its drop — run drop first`,
+      "INVALID_INPUT"
+    );
+    // EXIT: drop the pending rollback generation before opening a new
+    // rotate; the ledger must carry at most one inactive pointer pair.
+  }
   const slot = await nextFreeSlot(client);
   await client.query("BEGIN");
   try {

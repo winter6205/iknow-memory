@@ -45,7 +45,7 @@ function makeBackend(
   const backend = new PgvectorBackend(
     "postgres://example.invalid/retrieval",
     dimensions,
-    annMaxDimensions
+    { annMaxDimensions }
   );
   (backend as unknown as { pool: FakePgPool }).pool = pool;
   return { backend, queries };

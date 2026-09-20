@@ -53,7 +53,7 @@ describePg("source_documents ledger (operator-console T1)", () => {
     await resetSchema(admin);
     // Boot against the empty schema exactly as a fresh `iknow_memory`
     // database would feel to `ensureTable()`.
-    backend = new PgvectorBackend(SCHEMA_URL, DIM, 2000);
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
     await backend.initialize();
   });
 

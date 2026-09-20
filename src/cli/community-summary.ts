@@ -36,9 +36,10 @@ import { createLogger, type Logger, writeStderr } from "../logging.js";
 import { NineRouterEmbedder, type EmbeddingClient } from "../core/embedder.js";
 import { GraphragError } from "../core/errors.js";
 import {
-  createSlotEmbeddingSource,
+  createSlotSourceFromGraphragEnv,
   embedWithSlotFallback,
   readSlotGenerationState,
+  slotWriteFragments,
   slotWriteTargets,
   type SlotEmbeddingSource,
 } from "../core/embed-slots.js";
@@ -372,15 +373,20 @@ async function swapCommunitySummaries(
   await client.query("BEGIN");
   try {
     await client.query("DELETE FROM community_summaries", []);
+    // Review repair B: the slot column/placeholder pair comes from the
+    // shared fragments SSOT (slots stay last in the column list, so the
+    // bind positions 5/6 match the values array below).
+    const { columns, valuePlaceholders } = slotWriteFragments({
+      activeSlot,
+      incomingSlot,
+      activeParam: 5,
+      incomingParam: 6,
+    });
     for (const row of pending) {
       await client.query(
         `INSERT INTO community_summaries
-           (id, community_id, summary, entity_ids, ${activeSlot}${
-             incomingSlot === null ? "" : `, ${incomingSlot}`
-           })
-         VALUES ($1, $2, $3, $4, $5::vector${
-           incomingSlot === null ? "" : ", $6::vector"
-         })`,
+           (id, community_id, summary, entity_ids, ${columns})
+         VALUES ($1, $2, $3, $4, ${valuePlaceholders})`,
         [
           randomUUID(),
           row.communityId,
@@ -521,15 +527,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     embedder,
     dimensions: env.embedDimensions,
     logger: createLogger(env.logLevel),
-    slotEmbedding: createSlotEmbeddingSource(
-      {
-        apiKey: env.embedApiKey,
-        baseUrl: env.embedBaseUrl,
-        model: env.embedModel,
-        dimensions: env.embedDimensions,
-      },
-      embedder
-    ),
+    slotEmbedding: createSlotSourceFromGraphragEnv(env, embedder),
   };
   try {
     return await runCli(argv, deps);

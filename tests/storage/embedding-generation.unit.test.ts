@@ -28,6 +28,9 @@ interface FakeGenerationRow {
   incoming_model: string | null;
   incoming_dimensions: number | null;
   rotate_mode: string | null;
+  rollback_slot?: string | null;
+  rollback_model?: string | null;
+  rollback_dimensions?: number | null;
   updated_at: Date;
 }
 
@@ -112,7 +115,9 @@ function transcript(queries: { sql: string }[]): string {
   return queries.map(({ sql }) => sql).join("\n");
 }
 
-function activeRow(overrides: Partial<FakeGenerationRow> = {}): FakeGenerationRow {
+function activeRow(
+  overrides: Partial<FakeGenerationRow> = {}
+): FakeGenerationRow {
   return {
     active_slot: "embedding",
     active_model: "m1",
@@ -296,6 +301,35 @@ describe("openRotate (incoming slots + indexes; refuse paths)", () => {
     expect(transcript(queries)).not.toMatch(/ALTER TABLE|CREATE INDEX/i);
   });
 
+  // Review repair F: `cutover` refuses while a rollback generation awaits
+  // its drop; `openRotate` must refuse the same way, or a re-open followed
+  // by `drop` would destroy the in-flight incoming alongside the rollback.
+  it("refuses typed while a cutover-displaced rollback generation awaits its drop", async () => {
+    const { client, queries } = makeFakeDb({
+      singleton: activeRow({
+        active_slot: "embedding_g2",
+        active_model: "m2",
+        active_dimensions: 6,
+        rollback_slot: "embedding",
+        rollback_model: "m1",
+        rollback_dimensions: 8,
+      }),
+    });
+
+    const error = await openRotate(
+      client,
+      { model: "m3", dimensions: 4 },
+      "dual_write",
+      2000
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GraphragError);
+    expect(error).toMatchObject({ code: "INVALID_INPUT" });
+    expect((error as Error).message).toContain("embedding");
+    expect((error as Error).message).toMatch(/drop/i);
+    expect(transcript(queries)).not.toMatch(/ALTER TABLE|CREATE INDEX/i);
+  });
+
   it("rejects a rotate mode outside the vocabulary (input contract)", async () => {
     const { client, queries } = makeFakeDb({ singleton: activeRow() });
 
@@ -361,10 +395,10 @@ describe("openRotate (incoming slots + indexes; refuse paths)", () => {
     await openRotate(client, desired, "downtime", 2000);
 
     const text = transcript(queries);
-    expect(text).toMatch(/ALTER TABLE chunks ADD COLUMN embedding_g3 vector\(6\)/i);
     expect(text).toMatch(
-      /CREATE INDEX IF NOT EXISTS chunks_embedding_g3_idx/i
+      /ALTER TABLE chunks ADD COLUMN embedding_g3 vector\(6\)/i
     );
+    expect(text).toMatch(/CREATE INDEX IF NOT EXISTS chunks_embedding_g3_idx/i);
   });
 
   it("refuses typed when the singleton row is absent (boot must seed first)", async () => {
@@ -420,17 +454,24 @@ describe("PgvectorBackend boot-guard wiring", () => {
     const backend = new PgvectorBackend(
       "postgres://example.invalid/retrieval",
       8,
-      2000,
-      {},
-      "m2"
+      { annMaxDimensions: 2000, embedModel: "m2" }
     );
     (
-      backend as unknown as { pool: { query: (sql: string, values: unknown[]) => Promise<{ rows: unknown[] }> } }
+      backend as unknown as {
+        pool: {
+          query: (
+            sql: string,
+            values: unknown[]
+          ) => Promise<{ rows: unknown[] }>;
+        };
+      }
     ).pool = {
       query: async (sql: string, values?: unknown[]) =>
-        (client.client as unknown as {
-          query: (s: string, v?: unknown[]) => Promise<{ rows: unknown[] }>;
-        }).query(sql, values),
+        (
+          client.client as unknown as {
+            query: (s: string, v?: unknown[]) => Promise<{ rows: unknown[] }>;
+          }
+        ).query(sql, values),
     };
     return backend;
   }
@@ -453,7 +494,9 @@ describe("PgvectorBackend boot-guard wiring", () => {
     const state = await guard(backend);
     expect(state).toMatchObject({ active: { dimensions: 8 } });
     expect(
-      (backend as unknown as { getGenerationState: () => unknown }).getGenerationState()
+      (
+        backend as unknown as { getGenerationState: () => unknown }
+      ).getGenerationState()
     ).toMatchObject({ active: { model: "m2", dimensions: 8 } });
   });
 });

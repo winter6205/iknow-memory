@@ -262,7 +262,7 @@ describePg("extract-persist-pg: embedding + description + aliases (T1)", () => {
     );
     expect(Number(total.rows[0]?.n ?? "0")).toBe(2); // head + tail
 
-    const backend = new PgvectorBackend(schemaDbUrl(), DIM, 2000);
+    const backend = new PgvectorBackend(schemaDbUrl(), DIM, { annMaxDimensions: 2000 });
     try {
       const [probe] = await new FakeEmbedder(DIM).embed(["Alice Smith"]);
       const seeds = await backend.graphArmSeed.seedEntitiesByEmbedding(

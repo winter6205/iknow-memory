@@ -24,6 +24,7 @@ import type {
   GraphRanker,
   RetrieveConfig,
 } from "./types.js";
+import type { EntityType } from "../extraction/entity-type.js";
 import type {
   RetrievedChunk,
   SearchOptions,
@@ -113,13 +114,26 @@ export function hasOptionalArms(arms: OptionalArmSet): boolean {
 }
 
 /**
+ * Attach the per-request seed type to an arm's deps without touching the
+ * resolved arm set: `entityType` is request state, so it rides a shallow
+ * copy made at start time (plans/entity-type-and-filter.md T3). Absent =
+ * all types, and the deps object is returned untouched.
+ */
+function withSeedEntityType<T extends { entityType?: EntityType }>(
+  deps: T,
+  entityType: EntityType | undefined
+): T {
+  return entityType === undefined ? deps : { ...deps, entityType };
+}
+
+/**
  * Start all configured optional arms before awaiting any result, preserving
  * the retrieve latency contract that vector, lexical, graph, and embedding
  * reads overlap.
  */
 export async function runOptionalArms(
   queryEmbedding: number[] | undefined,
-  query: { query: string; validAt: string },
+  query: { query: string; validAt: string; entityType?: EntityType },
   searchOpts: SearchOptions,
   arms: OptionalArmSet
 ): Promise<OptionalArmResults> {
@@ -131,7 +145,10 @@ export async function runOptionalArms(
     weighted.push(
       runGraphArmSafe(
         queryEmbedding,
-        { storage: arms.graph.seed, config: arms.graph.config },
+        withSeedEntityType<GraphArmDeps>(
+          { storage: arms.graph.seed, config: arms.graph.config },
+          query.entityType
+        ),
         new Date(query.validAt)
       )
     );
@@ -142,7 +159,7 @@ export async function runOptionalArms(
       ? undefined
       : runNeo4jGraphArm(
           queryEmbedding,
-          arms.neo4jGraph,
+          withSeedEntityType(arms.neo4jGraph, query.entityType),
           query.validAt,
           query.query
         );
@@ -151,7 +168,9 @@ export async function runOptionalArms(
       ? undefined
       : startNodeEmbeddingArm(
           queryEmbedding,
-          arms.nodeEmbedding,
+          arms.nodeEmbedding === undefined
+            ? undefined
+            : withSeedEntityType(arms.nodeEmbedding, query.entityType),
           query.validAt
         );
   const communitySummary =

@@ -58,8 +58,11 @@ function entityRow(entityId: string, chunkId: string): EntityChunkRow {
 }
 
 class NodeEmbeddingBackend implements StorageBackend {
+  seedTypes: Array<string | undefined> = [];
+
   readonly entityEmbedding: EntityEmbeddingStorage = {
-    seedEntitiesByEmbedding: async (_embedding, _topK) => {
+    seedEntitiesByEmbedding: async (_embedding, _topK, entityType) => {
+      this.seedTypes.push(entityType);
       if (this.seedError !== undefined) throw this.seedError;
       return [{ id: "entity-1", canonical_name: "Entity 1", score: 0.99 }];
     },
@@ -134,5 +137,29 @@ describe("retrieve node embedding path", () => {
       "entity-ranked",
     ]);
     expect(out.degraded).toBeUndefined();
+  });
+
+  // plans/entity-type-and-filter.md T3: the resolved entity type rides the
+  // assemble args down to the seed seam; absent = all types.
+  it("forwards args.entityType to the entity seed seam", async () => {
+    const storage = new NodeEmbeddingBackend();
+
+    await assembleRetrievalResult(
+      { query: "entity", validAt: NOW, limit: 2, entityType: "person" },
+      { embedder: new FixedEmbedder(), storage, retrieveConfig: CFG }
+    );
+
+    expect(storage.seedTypes).toEqual(["person"]);
+  });
+
+  it("omitted args.entityType keeps the seed seam unfiltered", async () => {
+    const storage = new NodeEmbeddingBackend();
+
+    await assembleRetrievalResult(
+      { query: "entity", validAt: NOW, limit: 2 },
+      { embedder: new FixedEmbedder(), storage, retrieveConfig: CFG }
+    );
+
+    expect(storage.seedTypes).toEqual([undefined]);
   });
 });

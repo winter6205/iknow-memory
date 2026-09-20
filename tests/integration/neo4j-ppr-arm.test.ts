@@ -280,8 +280,8 @@ describeGraph(
 
       const entities: Array<[string, string, string, number[]]> = [
         [ALICE, "Alice Smith", "person", unit([1, 0, 0, 0, 0, 0, 0, 0])],
-        [ACME, "Acme Corp", "system", unit([0, 1, 0, 0, 0, 0, 0, 0])],
-        [WIDGET, "Widget", "concept", unit([0, 0, 1, 0, 0, 0, 0, 0])],
+        [ACME, "Acme Corp", "organization", unit([0, 1, 0, 0, 0, 0, 0, 0])],
+        [WIDGET, "Widget", "person", unit([0, 0, 1, 0, 0, 0, 0, 0])],
       ];
       for (const [id, name, type, vector] of entities) {
         await client.query(

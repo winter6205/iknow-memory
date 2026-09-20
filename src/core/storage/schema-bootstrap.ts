@@ -18,6 +18,7 @@
  */
 import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
 import { GraphragError } from "../errors.js";
+import { ENTITY_TYPES } from "../extraction/entity-type.js";
 import {
   SOURCE_DOC_STATUS,
   EXTRACT_METHODS,
@@ -66,6 +67,12 @@ export interface SchemaBootstrapClient {
  * entities.embedding column must match chunks.embedding width so vector
  * writes into either table share one dimension contract (specs/p0-schema.md
  * #6 Q1: N = chunks embedding dim).
+ *
+ * The type CHECK is a single source: its literal list is derived from
+ * `ENTITY_TYPES` (extraction/entity-type.ts) — the same constant the
+ * normalize-on-write mapper admits — so a taxonomy change can never leave
+ * the DDL rejecting (or admitting) values the writers disagree with
+ * (entity-type-and-filter review C1).
  */
 async function createEntities(
   client: SchemaBootstrapClient,
@@ -75,7 +82,8 @@ async function createEntities(
     CREATE TABLE IF NOT EXISTS entities (
       id            uuid PRIMARY KEY,
       canonical_name text NOT NULL,
-      type          text NOT NULL CHECK (type IN ('person','concept','system','event')),
+      type          text NOT NULL CONSTRAINT entities_type_closed_check
+                      CHECK (type IN (${sqlTextList(ENTITY_TYPES)})),
       embedding     vector(${dimensions}),
       metadata      jsonb DEFAULT '{}',
       merged_into   uuid REFERENCES entities(id) ON DELETE SET NULL,
@@ -86,6 +94,80 @@ async function createEntities(
   await client.query(`
     CREATE INDEX IF NOT EXISTS entities_canonical_name_idx
       ON entities (canonical_name)`);
+}
+
+/**
+ * Closed-set CHECK upgrade for EXISTING databases (entity-type-and-filter
+ * review C1). `CREATE TABLE IF NOT EXISTS` only protects fresh stores: a
+ * deployed `entities` still carries the shipped legacy CHECK
+ * (`'person','concept','system','event'`), which admits rows persist now
+ * refuses and rejects the new types `organization`/`place`.
+ *
+ * why=operator-approved destructive upgrade: the review explicitly
+ * authorized HARD-deleting existing rows whose type falls outside the closed
+ * set — a re-extract rebuilds them with a legal type, and keeping rows the
+ * CHECK cannot admit would fail validation on the ADD CONSTRAINT below.
+ * FK posture per table, so the DELETE order is load-bearing:
+ *   - `triples.head_id/tail_id` are ON DELETE RESTRICT — the referencing
+ *     edges are deleted first (an edge dangling off a removed concept is
+ *     meaningless under the closed set);
+ *   - `entity_aliases.entity_id` and `claims.entity_id` are ON DELETE
+ *     CASCADE — removed with their row, no manual step;
+ *   - `entities.merged_into` is ON DELETE SET NULL — a surviving row that
+ *     pointed at a deleted loser simply loses the audit pointer (no
+ *     dangling reference);
+ *   - `projection_outbox` carries no FK by design (Neo4j drain re-reads it),
+ *     and `community_summaries.entity_ids` is an unenforced uuid[] — both
+ *     self-heal on the next community generation / projection drain.
+ *
+ * The replacement is idempotent and named `entities_type_closed_check`: the
+ * readiness probe (schema-lock.ts) treats its presence as the marker that
+ * this upgrade already ran, so a legacy database is "not ready" until the
+ * swap happened. The destructive DELETEs are additionally gated on the live
+ * catalog — they run only when the legacy `entities_type_check` is actually
+ * present — so a fresh or already-upgraded store (and the unit tests'
+ * recording fake, whose catalog reads come back empty) emits no data-level
+ * writes at all: bootstrap keeps its "dry-run writes nothing" contract.
+ */
+async function upgradeEntitiesTypeCheck(
+  client: SchemaBootstrapClient
+): Promise<void> {
+  const closed = sqlTextList(ENTITY_TYPES);
+  const { rows } = await client.query(
+    `SELECT k.conname
+       FROM pg_constraint k
+       JOIN pg_class t ON t.oid = k.conrelid
+       JOIN pg_namespace n ON n.oid = t.relnamespace
+      WHERE n.nspname = current_schema()
+        AND t.relname = 'entities'
+        AND k.conname IN ('entities_type_check', 'entities_type_closed_check')`
+  );
+  const names = new Set(
+    rows.map((row) => (row as { conname: string }).conname)
+  );
+  // Fresh CREATE already pinned the closed set; an upgraded store carries
+  // the new name — either way there is nothing to migrate.
+  if (names.has("entities_type_closed_check")) return;
+  if (names.has("entities_type_check")) {
+    await client.query(`
+      DELETE FROM triples
+       WHERE head_id IN (SELECT id FROM entities WHERE type NOT IN (${closed}))
+          OR tail_id IN (SELECT id FROM entities WHERE type NOT IN (${closed}))`);
+    await client.query(`
+      DELETE FROM entities WHERE type NOT IN (${closed})`);
+    // The legacy inline CHECK carries Postgres' auto-generated name.
+    await client.query(`
+      ALTER TABLE entities DROP CONSTRAINT IF EXISTS entities_type_check`);
+  }
+  await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE entities
+        ADD CONSTRAINT entities_type_closed_check
+        CHECK (type IN (${closed}));
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
 }
 
 /** entity_aliases: surface forms pointing at a canonical entity (CASCADE). */
@@ -447,6 +529,8 @@ export async function upSchemaBootstrap(
     await createEntities(client, dimensions);
     await createEntityAliases(client);
     await createTriples(client);
+    // After createTriples: the upgrade's edge cleanup names `triples`.
+    await upgradeEntitiesTypeCheck(client);
     await createClaims(client);
     await createExtractionRecords(client);
     await createCommunitySummaries(client, dimensions);

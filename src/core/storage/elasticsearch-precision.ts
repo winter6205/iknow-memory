@@ -22,6 +22,7 @@ import type {
   SearchOptions,
 } from "../types.js";
 import type { EntityLexicalStorage } from "../retrieval/types.js";
+import type { EntityType } from "../extraction/entity-type.js";
 
 /** Minimal ES API used by this bounded context. */
 export interface ElasticsearchClientLike {
@@ -401,14 +402,28 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
     }
   }
 
+  /**
+   * Lexical entity seed search. `entityType` (resolved
+   * `filters.entity_type`, plans/entity-type-and-filter.md T3) adds a term
+   * filter on the projected entity `type` so the lexical half of the graph
+   * arm's seed fusion cannot smuggle other types into a restricted seed set.
+   */
   async searchEntities(
     query: string,
     limit: number,
-    precision: PrecisionSearchOptions = {}
+    precision: PrecisionSearchOptions = {},
+    entityType?: EntityType
   ): Promise<Array<{ id: string; canonical_name: string; score?: number }>> {
     if (limit <= 0 || query.trim() === "") return [];
     if (precision.cjkSegmentation === false && hasCjk(query)) return [];
     await this.ensureIndex(this.config.entityIndex, "entity");
+    const entityFilter: Record<string, unknown>[] = [
+      { term: { retired: false } },
+      { bool: { must_not: { exists: { field: "merged_into" } } } },
+    ];
+    if (entityType !== undefined) {
+      entityFilter.push({ term: { type: entityType } });
+    }
     const fields = lexicalFields(
       precision.fieldBoost ?? true,
       precision.fieldBoosts ?? {
@@ -452,10 +467,7 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
         query: {
           bool: {
             must: [{ bool: { should, minimum_should_match: 1 } }],
-            filter: [
-              { term: { retired: false } },
-              { bool: { must_not: { exists: { field: "merged_into" } } } },
-            ],
+            filter: entityFilter,
           },
         },
         _source: ["id", "canonical_name"],

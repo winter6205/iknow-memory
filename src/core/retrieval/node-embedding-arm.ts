@@ -12,12 +12,18 @@ import type {
   EntityEmbeddingStorage,
   RetrieveConfig,
 } from "./types.js";
+import type { EntityType } from "../extraction/entity-type.js";
 import { supportsEntityEmbedding } from "../storage/backend.js";
 import type { StorageBackend } from "../types.js";
 
 export interface NodeEmbeddingArmDeps {
   storage: EntityEmbeddingStorage;
   config: RetrieveConfig;
+  /**
+   * Resolved `filters.entity_type` seed restriction
+   * (plans/entity-type-and-filter.md T3); absent = all types.
+   */
+  entityType?: EntityType;
 }
 
 /** Resolve the optional direct entity-embedding path. */
@@ -48,7 +54,8 @@ export async function runNodeEmbeddingArm(
 ): Promise<ArmResult> {
   const seeds = await deps.storage.seedEntitiesByEmbedding(
     queryEmbedding,
-    deps.config.entityLinkTopK
+    deps.config.entityLinkTopK,
+    deps.entityType
   );
   if (seeds.length === 0) {
     return { arm: "node-embedding", hits: [], belowFloor: false };

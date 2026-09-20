@@ -58,7 +58,7 @@ const GROUNDED_OUTPUT = {
   relationRaw: "works at",
   relationNorm: "RELATED_TO",
   tail: "Acme Corp",
-  tailType: "system",
+  tailType: "organization",
   description: "Alice works at Acme Corp",
   evidenceSpan: "Alice works at Acme Corp",
   confidence: 0.9,

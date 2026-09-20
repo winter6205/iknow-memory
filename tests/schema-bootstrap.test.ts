@@ -22,6 +22,7 @@ import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { upSchemaBootstrap } from "../src/core/storage/schema-bootstrap.js";
+import { ENTITY_TYPES } from "../src/core/extraction/entity-type.js";
 import { SOURCE_DOC_STATUS, COMMUNITY_INDEX_STATUS } from "../src/core/types.js";
 import {
   createPgIntegrationHarness,
@@ -321,18 +322,41 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
       expect(aliasIdx!.definition).toMatch(/\(alias\)/);
     });
 
-    it("CHECK rejects an unknown entities.type value", async () => {
-      const c = requireClient();
-      // Minimal NOT-NULL columns only — embedding is nullable, metadata
-      // has a server default, so omitting them isolates the CHECK.
-      await expect(
-        c.query(
-          `INSERT INTO entities (id, canonical_name, type)
+    it.each(["robot", "concept", "system"])(
+      // entity-type-and-filter T1: the closed set is
+      // person/organization/place/event — the legacy 'concept'/'system'
+      // values must be rejected by the CHECK exactly like any unknown type.
+      "CHECK rejects an unknown entities.type value (%s)",
+      async (badType) => {
+        const c = requireClient();
+        // Minimal NOT-NULL columns only — embedding is nullable, metadata
+        // has a server default, so omitting them isolates the CHECK.
+        await expect(
+          c.query(
+            `INSERT INTO entities (id, canonical_name, type)
              VALUES ($1, $2, $3)`,
-          [crypto.randomUUID(), "robot-x", "robot"]
-        )
-      ).rejects.toThrow();
-    });
+            [crypto.randomUUID(), `bad-type-${badType}`, badType]
+          )
+        ).rejects.toThrow();
+      }
+    );
+
+    it.each(["person", "organization", "place", "event"])(
+      "CHECK accepts the closed-set value %s",
+      async (okType) => {
+        const c = requireClient();
+        await c.query(
+          `INSERT INTO entities (id, canonical_name, type)
+           VALUES ($1, $2, $3)`,
+          [crypto.randomUUID(), `ok-type-${okType}`, okType]
+        );
+        const { rows } = await c.query<{ type: string }>(
+          `SELECT type FROM entities WHERE canonical_name = $1`,
+          [`ok-type-${okType}`]
+        );
+        expect(rows[0]?.type).toBe(okType);
+      }
+    );
 
     it("CHECK rejects an unknown entity_aliases.alias_type value", async () => {
       const c = requireClient();
@@ -1219,7 +1243,7 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
     ): Promise<string> {
       const entityId = crypto.randomUUID();
       await c.query(
-        `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'concept')`,
+        `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'person')`,
         [entityId, `claims-${entityId}`]
       );
       const id = crypto.randomUUID();
@@ -1367,6 +1391,148 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
       ).rejects.toThrow();
     });
   });
+
+  // -------------------------------------------------------------------
+  // Review C1 (entity-type-and-filter): the closed-set CHECK must also
+  // reach EXISTING databases. `CREATE TABLE IF NOT EXISTS` alone leaves a
+  // legacy store on its old CHECK; up() must idempotently upgrade the
+  // constraint, hard-deleting non-closed-set rows (operator-approved
+  // destructive upgrade) and the RESTRICT-guarded triples that reference
+  // them. The upgrade must leave the readiness probe satisfied so a second
+  // up() is a no-op.
+  // -------------------------------------------------------------------
+  describe("entities type CHECK upgrade over a legacy store", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    it("replaces the legacy CHECK, deletes stale rows/edges, stays idempotent", async () => {
+      const c = requireClient();
+      // Rebuild the pre-T1 world from scratch: minimal chunks stand-in,
+      // legacy `entities` with the shipped old CHECK, legacy `triples` whose
+      // FKs are ON DELETE RESTRICT (exactly what a deployed store looks like).
+      await pgHarness.resetSchema(c);
+      await c.query(`SET search_path TO "${SCHEMA}", public`);
+      await c.query("CREATE EXTENSION IF NOT EXISTS vector");
+      await c.query(`
+        CREATE TABLE chunks (
+          id uuid PRIMARY KEY,
+          content text NOT NULL,
+          embedding vector(1536) NOT NULL,
+          valid_from timestamptz NOT NULL,
+          valid_until timestamptz NULL,
+          source_ref text NOT NULL,
+          metadata jsonb NOT NULL,
+          created_at timestamptz NOT NULL
+        )
+      `);
+      await c.query(`
+        CREATE TABLE entities (
+          id            uuid PRIMARY KEY,
+          canonical_name text NOT NULL,
+          type          text NOT NULL CHECK (type IN ('person','concept','system','event')),
+          embedding     vector(1536),
+          metadata      jsonb DEFAULT '{}',
+          merged_into   uuid REFERENCES entities(id) ON DELETE SET NULL,
+          retired       boolean NOT NULL DEFAULT false,
+          created_at    timestamptz NOT NULL DEFAULT now()
+        )`);
+      await c.query(`
+        CREATE TABLE triples (
+          id              uuid PRIMARY KEY,
+          head_id         uuid NOT NULL REFERENCES entities(id) ON DELETE RESTRICT,
+          tail_id         uuid NOT NULL REFERENCES entities(id) ON DELETE RESTRICT,
+          relation_raw    text NOT NULL,
+          relation_norm   text NOT NULL,
+          confidence      real NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+          source_chunk_id uuid REFERENCES chunks(id) ON DELETE SET NULL,
+          valid_window    tstzrange NOT NULL,
+          created_at      timestamptz NOT NULL DEFAULT now()
+        )`);
+
+      const personId = crypto.randomUUID();
+      const conceptId = crypto.randomUUID();
+      const systemId = crypto.randomUUID();
+      await c.query(
+        `INSERT INTO entities (id, canonical_name, type) VALUES
+           ($1, 'legacy-person', 'person'),
+           ($2, 'legacy-concept', 'concept'),
+           ($3, 'legacy-system', 'system')`,
+        [personId, conceptId, systemId]
+      );
+      await c.query(
+        `INSERT INTO triples (id, head_id, tail_id, relation_raw,
+                              relation_norm, confidence, valid_window)
+         VALUES ($1, $2, $3, 'mentions', 'RELATED_TO', 0.9, tstzrange(now(), NULL, '[)'))`,
+        [crypto.randomUUID(), personId, conceptId]
+      );
+
+      await expect(upSchemaBootstrap(c, 1536, 2000)).resolves.toBeUndefined();
+
+      // Non-closed-set rows are hard-deleted; closed-set rows survive.
+      const survivors = await c.query<{ canonical_name: string }>(
+        `SELECT canonical_name FROM entities ORDER BY canonical_name`
+      );
+      expect(survivors.rows.map((r) => r.canonical_name)).toEqual([
+        "legacy-person",
+      ]);
+      // The RESTRICT-guarded edge off the deleted concept is gone too.
+      const edges = await c.query(
+        `SELECT 1 FROM triples WHERE head_id = $1 OR tail_id = $2`,
+        [personId, conceptId]
+      );
+      expect(edges.rowCount).toBe(0);
+
+      // The legacy constraint name is replaced; the new one carries exactly
+      // ENTITY_TYPES (kills the double-source drift the review flagged).
+      const cons = await c.query<{ conname: string; condef: string }>(
+        `SELECT k.conname, pg_get_constraintdef(k.oid) AS condef
+           FROM pg_constraint k
+           JOIN pg_class t ON t.oid = k.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = $1 AND t.relname = 'entities'
+            AND k.contype = 'c'`,
+        [SCHEMA]
+      );
+      const typeChecks = cons.rows.filter((r) =>
+        /type/.test(r.condef.replace(/\s+/g, " "))
+      );
+      expect(
+        typeChecks.some((r) =>
+          ENTITY_TYPES.every((t) => r.condef.includes(`'${t}'`))
+        ),
+        `no CHECK admits exactly ENTITY_TYPES: ${JSON.stringify(cons.rows)}`
+      ).toBe(true);
+      expect(cons.rows.map((r) => r.conname)).not.toContain(
+        "entities_type_check"
+      );
+
+      // Writing a legacy value is now rejected by the re-pinned CHECK.
+      await expect(
+        c.query(
+          `INSERT INTO entities (id, canonical_name, type)
+             VALUES ($1, 'post-upgrade-concept', 'concept')`,
+          [crypto.randomUUID()]
+        )
+      ).rejects.toThrow();
+
+      // Idempotent: a second up() (probe may or may not short-circuit) is a
+      // no-op and does not touch the survivor.
+      await expect(
+        upSchemaBootstrap(c, 1536, 2000)
+      ).resolves.toBeUndefined();
+      const after = await c.query(
+        `SELECT 1 FROM entities WHERE id = $1`,
+        [personId]
+      );
+      expect(after.rowCount).toBe(1);
+    });
+  });
 });
 
 async function insertFkProbeChunk(
@@ -1396,11 +1562,11 @@ async function mintTripleEntities(
   const tailId = crypto.randomUUID();
   await c.query(
     `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, $3)`,
-    [headId, `t4-head-${headId}`, "concept"]
+    [headId, `t4-head-${headId}`, "person"]
   );
   await c.query(
     `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, $3)`,
-    [tailId, `t4-tail-${tailId}`, "concept"]
+    [tailId, `t4-tail-${tailId}`, "person"]
   );
   return { headId, tailId };
 }

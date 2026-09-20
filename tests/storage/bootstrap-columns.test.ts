@@ -278,7 +278,7 @@ describePg(
       const tail = randomUUID();
       for (const id of [head, tail]) {
         await c.query(
-          `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'concept')`,
+          `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'person')`,
           [id, `bootstrap-columns-${id}`]
         );
       }

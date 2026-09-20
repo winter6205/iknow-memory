@@ -293,7 +293,7 @@ describePg("extract CLI subprocess e2e (T9)", () => {
       [headId, `seed-head-${headId}`]
     );
     await c.query(
-      `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'system')`,
+      `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'organization')`,
       [tailId, `seed-tail-${tailId}`]
     );
     for (const raw of [
@@ -462,7 +462,7 @@ function cannedOutput(head: string, tail: string) {
     relationRaw: "relates to",
     relationNorm: "RELATED_TO",
     tail,
-    tailType: "system",
+    tailType: "organization",
     description: `${head} relates to ${tail}`,
     evidenceSpan: `${head} relates to ${tail}`,
     confidence: 0.9,

@@ -55,7 +55,7 @@ function schemaDbUrl(): string {
 
 interface SeedEntity {
   canonicalName: string;
-  type: "person" | "concept" | "system" | "event";
+  type: "person" | "organization" | "place" | "event";
 }
 
 interface SeedTriple {
@@ -457,7 +457,7 @@ describePg("extraction-eval-pg: scoring persisted triples (E-T7)", () => {
           "GROUNDED:Alice Smith works for Acme Corp. GROUNDED:Alice-entity, Acme-entity.",
         entities: [
           { canonicalName: "Alice Smith", type: "person" },
-          { canonicalName: "Acme Corp", type: "system" },
+          { canonicalName: "Acme Corp", type: "organization" },
         ],
         triples: [
           {
@@ -504,8 +504,8 @@ describePg("extraction-eval-pg: scoring persisted triples (E-T7)", () => {
         content:
           "GROUNDED:Acme Corp owns Dunder Mifflin paper assets. GROUNDED:Acme, Dunder.",
         entities: [
-          { canonicalName: "Acme Corp", type: "system" },
-          { canonicalName: "Dunder Mifflin", type: "system" },
+          { canonicalName: "Acme Corp", type: "organization" },
+          { canonicalName: "Dunder Mifflin", type: "organization" },
         ],
         triples: [
           {
@@ -557,7 +557,7 @@ describePg("extraction-eval-pg: scoring persisted triples (E-T7)", () => {
         content: "GROUNDED:Alice Smith works for Acme Corp.",
         entities: [
           { canonicalName: "Alice Smith", type: "person" },
-          { canonicalName: "Acme Corp", type: "system" },
+          { canonicalName: "Acme Corp", type: "organization" },
         ],
         triples: [
           {

@@ -24,12 +24,18 @@ import type {
   GraphArmStorage,
   RetrieveConfig,
 } from "./types.js";
+import type { EntityType } from "../extraction/entity-type.js";
 import { redactDiagnostic, writeStderr } from "../../logging.js";
 
 /** Runtime deps injected by the retrieve orchestrator (T5). */
 export interface GraphArmDeps {
   storage: GraphArmStorage;
   config: RetrieveConfig;
+  /**
+   * Resolved `filters.entity_type` seed restriction
+   * (plans/entity-type-and-filter.md T3); absent = all types.
+   */
+  entityType?: EntityType;
 }
 
 /**
@@ -89,7 +95,8 @@ async function getSeedEntities(
 ): Promise<Array<{ id: string; canonical_name: string }>> {
   return deps.storage.seedEntitiesByEmbedding(
     embedding,
-    deps.config.entityLinkTopK
+    deps.config.entityLinkTopK,
+    deps.entityType
   );
 }
 

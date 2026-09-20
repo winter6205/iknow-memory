@@ -37,8 +37,8 @@ _Avoid_: `config.json`; `iknow-memory config`; copying DSN and keys into host MC
 **资料集合**: the operator-visible set of pushed **资料** (documents) and their successful **chunk** counts on the existing 资料/dashboard page. Ready means status ready and chunk count ≥ 1. Empty store is legal empty **retrieve**, not `degraded`.
 _Avoid_: "knowledge base page in the host"; "dataset" as a second product name; treating memory facts as members of this set
 
-**entity**: a canonical real-world referent extracted from chunks (person, concept, system, event). Identified by UUID, carries `canonical_name`, `type`, `embedding`, `metadata`. Multiple surface forms (aliases) resolve to one entity. _Stage: P0 (implemented)._
-_Avoid_: "node" (graph-generic, use only when discussing Neo4j topology); "concept" (one entity type, not the general term); "mention" (a mention is an occurrence, not the canonical entity)
+**entity**: a canonical real-world referent extracted from chunks. Production `type` is a closed, mutually exclusive set enforced by the Postgres CHECK: person, organization, place, event (`specs/entity-type-and-filter.md`). Identified by UUID, carries `canonical_name`, `type`, `embedding`, `metadata`. Multiple surface forms (aliases) resolve to one entity. _Stage: P0 (implemented)._
+_Avoid_: "node" (graph-generic, use only when discussing Neo4j topology); "concept"/"system" (retired as stored entity types, never general terms; unknown proposed types are typed-skipped, not bucketed); "mention" (a mention is an occurrence, not the canonical entity)
 
 **triple**: a directed typed edge `(head_entity, relation, tail_entity)` extracted from a chunk. Carries `confidence`, `source_chunk_id`, **evidence span** (`evidence_span`), `valid_window`, `created_at`. The atomic unit of graph knowledge. _Stage: P0 (implemented)._
 _Avoid_: "fact" (too ambiguous in retrieval context; use "graph fact" / "temporal fact" if needed); "edge" (graph-generic, use only in Neo4j context); "link" (rule-based linkers do not produce typed edges)

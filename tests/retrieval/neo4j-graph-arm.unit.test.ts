@@ -58,16 +58,21 @@ function chunkRow(
 class FakeArmStorage implements Neo4jArmStorage {
   seeds: Array<{ id: string; canonical_name: string }> = [];
   rows: EntityChunkRow[] = [];
-  seedCalls: Array<{ embedding: number[]; topK: number }> = [];
+  seedCalls: Array<{
+    embedding: number[];
+    topK: number;
+    entityType?: string;
+  }> = [];
   chunkCalls: Array<{ ids: string[]; validAt: string; limit: number }> = [];
   seedError: unknown;
   chunkError: unknown;
 
   async seedEntitiesByEmbedding(
     embedding: number[],
-    topK: number
+    topK: number,
+    entityType?: string
   ): Promise<Array<{ id: string; canonical_name: string }>> {
-    this.seedCalls.push({ embedding, topK });
+    this.seedCalls.push({ embedding, topK, entityType });
     if (this.seedError !== undefined) throw this.seedError;
     return this.seeds;
   }
@@ -161,6 +166,60 @@ describe("runNeo4jGraphArm — seed → PPR → chunks", () => {
       "vector-only",
       "lexical-only",
     ]);
+  });
+
+  it("narrows BOTH the vector and the lexical entity seed with deps.entityType", async () => {
+    // plans/entity-type-and-filter.md T3: person-only seeds means the
+    // lexical half cannot smuggle other types into the fusion.
+    const { storage, ranker } = happyPath();
+    const lexicalCalls: Array<{ entityType?: string }> = [];
+    const lexical = {
+      searchEntities: async (
+        _query: string,
+        _limit: number,
+        _precision?: unknown,
+        entityType?: string
+      ) => {
+        lexicalCalls.push({ entityType });
+        return [];
+      },
+    };
+
+    await runNeo4jGraphArm(
+      EMBEDDING,
+      { storage, ranker, config: CFG, entityLexical: lexical, entityType: "person" },
+      NOW,
+      "alice"
+    );
+
+    expect(storage.seedCalls[0]?.entityType).toBe("person");
+    expect(lexicalCalls[0]?.entityType).toBe("person");
+  });
+
+  it("omitted deps.entityType leaves both seed paths unfiltered", async () => {
+    const { storage, ranker } = happyPath();
+    const lexicalCalls: Array<{ entityType?: string }> = [];
+    const lexical = {
+      searchEntities: async (
+        _query: string,
+        _limit: number,
+        _precision?: unknown,
+        entityType?: string
+      ) => {
+        lexicalCalls.push({ entityType });
+        return [];
+      },
+    };
+
+    await runNeo4jGraphArm(
+      EMBEDDING,
+      { storage, ranker, config: CFG, entityLexical: lexical },
+      NOW,
+      "alice"
+    );
+
+    expect(storage.seedCalls[0]?.entityType).toBeUndefined();
+    expect(lexicalCalls[0]?.entityType).toBeUndefined();
   });
 
   it("keeps vector entity seeds when the lexical seed lookup fails", async () => {

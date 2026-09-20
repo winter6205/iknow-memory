@@ -67,7 +67,7 @@ const CANNED_OUTPUT = {
   relationRaw: "works at",
   relationNorm: "MEMBER_OF",
   tail: "Acme",
-  tailType: "system",
+  tailType: "organization",
   description: "Alice works at Acme",
   evidenceSpan: "Alice works at Acme",
   confidence: 0.9,

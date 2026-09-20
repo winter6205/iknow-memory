@@ -146,7 +146,7 @@ export function VisGraph({ data, onSelectNode }: VisGraphProps) {
                 border: `1px solid ${INK_ACTOR.border}`,
               }}
             />
-            person / company
+            person / organization
           </span>
           <span className="inline-flex items-center gap-1.5">
             <span
@@ -156,7 +156,7 @@ export function VisGraph({ data, onSelectNode }: VisGraphProps) {
                 border: `1px solid ${INK_ARTIFACT.border}`,
               }}
             />
-            project / doc / note / meeting
+            place / event
           </span>
         </div>
       </div>

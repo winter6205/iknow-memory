@@ -413,7 +413,7 @@ for (let i = 0; i < ENTITIES; i++) {
   const id = randomUUID();
   eIds.push(id);
   buf.push(
-    `('${id}','entity-${i}','concept','${await vec(computeEntityEmbeddingText(`entity-${i}`, "latency"))}'::vector)`
+    `('${id}','entity-${i}','${["person", "organization", "place", "event"][i % 4]}','${await vec(computeEntityEmbeddingText(`entity-${i}`, "latency"))}'::vector)`
   );
 }
 await c.query(

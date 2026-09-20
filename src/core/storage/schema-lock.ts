@@ -159,6 +159,21 @@ async function schemaBootstrapIsReady(
                AND a.attnum > 0
                AND NOT a.attisdropped
           )
+       )
+       AND EXISTS (
+         -- entity-type-and-filter review C1: presence of the renamed closed-set
+         -- CHECK is the marker that the destructive entities-type upgrade has
+         -- already run in this schema. A store still carrying the legacy
+         -- auto-named entities_type_check misses this name, so the probe
+         -- answers "not ready" and upSchemaBootstrap replays the (idempotent)
+         -- DDL including upgradeEntitiesTypeCheck.
+         SELECT 1
+           FROM pg_constraint k
+           JOIN pg_class t ON t.oid = k.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND t.relname = 'entities'
+            AND k.conname = 'entities_type_closed_check'
        ) AS ready`,
     [
       BOOTSTRAP_TABLES,

@@ -4,6 +4,7 @@ import { FakeEmbedder } from "../src/core/embedder.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import { GraphragError } from "../src/core/errors.js";
 import { REAL_DB_NOT_WIRED_REASON } from "../src/core/retrieval/search-mode.js";
+import { ENTITY_TYPES } from "../src/core/extraction/entity-type.js";
 import {
   COMMUNITY_INDEX_STATUS,
   COMMUNITY_SUMMARY_INDEX_FAILURE,
@@ -13,6 +14,11 @@ import type {
   RetrievedChunk,
   SearchOptions,
 } from "../src/core/types.js";
+import type {
+  GraphArmStorage,
+  RetrieveConfig,
+} from "../src/core/retrieval/types.js";
+import type { GraphRagStorageBackend } from "../src/core/storage/backend.js";
 import type { ToolResult } from "../src/tools/registry.js";
 
 /** Test dimension — injected into FakeEmbedder and MemoryBackend. */
@@ -87,6 +93,53 @@ class RecordingLexicalBackend extends MemoryBackend {
     this.lexicalFilterCalls.push(opts.filters);
     return [];
   }
+}
+
+/**
+ * Graph-rag backend that records the entity type the seed seam received and
+ * the exact-match filters the vector search got — the probe for driving the
+ * `filters.entity_type` control through the full
+ * handler → arm → seam chain without a live Postgres
+ * (plans/entity-type-and-filter.md T3).
+ */
+class RecordingSeedBackend implements GraphRagStorageBackend {
+  seedCalls: Array<{ topK: number; entityType?: string }> = [];
+  searchFilterCalls: Array<SearchOptions["filters"]> = [];
+
+  readonly graphArmSeed: GraphArmStorage = {
+    seedEntitiesByEmbedding: async (
+      _embedding: number[],
+      topK: number,
+      entityType?: string
+    ): Promise<Array<{ id: string; canonical_name: string }>> => {
+      this.seedCalls.push({
+        topK,
+        ...(entityType !== undefined ? { entityType } : {}),
+      });
+      return [{ id: "e-person", canonical_name: "Alice" }];
+    },
+    chunksByOneHopFromEntities: async (): Promise<
+      Array<{
+        id: string;
+        content: string;
+        source_ref: string;
+        valid_from: string;
+        valid_until: string | null;
+      }>
+    > => [],
+  };
+
+  async upsert(): Promise<string[]> {
+    return [];
+  }
+  async search(
+    _queryEmbedding: number[],
+    opts: SearchOptions
+  ): Promise<RetrievedChunk[]> {
+    this.searchFilterCalls.push(opts.filters);
+    return [];
+  }
+  async close(): Promise<void> {}
 }
 
 describe("createRetrieveHandler", () => {
@@ -340,6 +393,131 @@ describe("createRetrieveHandler", () => {
       }
       // B answers through the hybrid pipeline, un-degraded.
       expect(parseResultBody(result).chunks.map((c) => c.id)).toEqual(["x"]);
+    });
+  });
+
+  // plans/entity-type-and-filter.md T3: `filters.entity_type` is a routing
+  // control like `search_mode`, not a chunk-matching filter. Missing = all
+  // types (zero behavior change); the four closed values restrict the
+  // graph/entity seeds; anything else is a typed INVALID_INPUT carrying the
+  // stable `invalid_entity_type` token — never a silent ignore.
+  describe("filters.entity_type (T3)", () => {
+    const SEED_GRAPH_CONFIG: RetrieveConfig = {
+      w_vec: 1,
+      w_bm25: 0,
+      w_graph: 1,
+      bm25Enabled: false,
+      graphEnabled: false,
+      rerankEnabled: false,
+      entityLinkTopK: 8,
+      candidateCap: 50,
+      graphArmFloor: 3,
+    };
+
+    function seedHandler(backendOverride?: RecordingSeedBackend) {
+      const recording = backendOverride ?? new RecordingSeedBackend();
+      const h = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage: recording,
+        graphConfig: SEED_GRAPH_CONFIG,
+      });
+      return { h, recording };
+    }
+
+    it("invalid value throws GraphragError INVALID_INPUT with the stable reason token", async () => {
+      await expect(
+        handler({ query: "anything", filters: { entity_type: "widget" } })
+      ).rejects.toBeInstanceOf(GraphragError);
+      let thrown: unknown;
+      try {
+        await handler({ query: "anything", filters: { entity_type: "widget" } });
+      } catch (err) {
+        thrown = err;
+      }
+      const error = thrown as GraphragError;
+      expect(error.code).toBe("INVALID_INPUT");
+      expect(error.message).toContain("invalid_entity_type");
+      expect(error.message).toContain("person | organization | place | event");
+    });
+
+    it("empty string, wrong case and retired spellings are typed invalid, never silently ignored", async () => {
+      for (const bad of ["", "Person", "concept", "system", "person "]) {
+        await expect(
+          handler({ query: "anything", filters: { entity_type: bad } })
+        ).rejects.toBeInstanceOf(GraphragError);
+      }
+    });
+
+    it("an invalid value never reaches the seed seam", async () => {
+      const { h, recording } = seedHandler();
+      await expect(
+        h({ query: "anything", filters: { entity_type: "widget" } })
+      ).rejects.toBeInstanceOf(GraphragError);
+      expect(recording.seedCalls).toEqual([]);
+    });
+
+    it("omitted key keeps the seed unfiltered (all types, today's behavior)", async () => {
+      const { h, recording } = seedHandler();
+      await h({ query: "anything" });
+      expect(recording.seedCalls.length).toBeGreaterThan(0);
+      for (const call of recording.seedCalls) {
+        expect(call.entityType).toBeUndefined();
+      }
+    });
+
+    it("each legal value reaches the seed seam as the typed filter", async () => {
+      for (const t of ENTITY_TYPES) {
+        const { h, recording } = seedHandler();
+        await h({ query: "anything", filters: { entity_type: t } });
+        expect(recording.seedCalls.length).toBeGreaterThan(0);
+        for (const call of recording.seedCalls) {
+          expect(call.entityType).toBe(t);
+        }
+      }
+    });
+
+    it("entity_type never becomes a vector exact-match filter", async () => {
+      const { h, recording } = seedHandler();
+      await h({
+        query: "anything",
+        filters: { source_ref: "docs/x.md", entity_type: "person" },
+      });
+      expect(recording.searchFilterCalls.length).toBeGreaterThan(0);
+      for (const filters of recording.searchFilterCalls) {
+        expect(filters).not.toHaveProperty("entity_type");
+        expect(filters?.source_ref).toBe("docs/x.md");
+      }
+    });
+
+    it("entity_type never reaches the lexical arm's exact-match filters", async () => {
+      // Same leak class the ES precision layer turns into a term clause:
+      // `entity_type` matching no chunk field would silently zero the arm.
+      const lexical = new RecordingLexicalBackend(TEST_DIM);
+      const hybridHandler = createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage: backend,
+        lexical,
+        retrieveConfig: {
+          w_vec: 0.7,
+          w_bm25: 0.15,
+          w_graph: 0.15,
+          bm25Enabled: true,
+          graphEnabled: false,
+          rerankEnabled: false,
+          entityLinkTopK: 8,
+          candidateCap: 50,
+          graphArmFloor: 3,
+        },
+      });
+      await hybridHandler({
+        query: "anything",
+        filters: { source_ref: "docs/x.md", entity_type: "person" },
+      });
+      expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
+      for (const filters of lexical.lexicalFilterCalls) {
+        expect(filters).not.toHaveProperty("entity_type");
+        expect(filters?.source_ref).toBe("docs/x.md");
+      }
     });
   });
 

@@ -46,15 +46,20 @@ class FakeStorage implements GraphArmStorage {
   }> = [];
   seedError: Error | null = null;
   rowError: Error | null = null;
-  seedCalls: Array<{ embedding: number[]; topK: number }> = [];
+  seedCalls: Array<{
+    embedding: number[];
+    topK: number;
+    entityType?: string;
+  }> = [];
   oneHopCalls: Array<{ seedIds: string[]; validAt: string; limit: number }> =
     [];
 
   async seedEntitiesByEmbedding(
     embedding: number[],
-    topK: number
+    topK: number,
+    entityType?: string
   ): Promise<Array<{ id: string; canonical_name: string }>> {
-    this.seedCalls.push({ embedding, topK });
+    this.seedCalls.push({ embedding, topK, entityType });
     if (this.seedError) throw this.seedError;
     return this.seedEntities;
   }
@@ -95,6 +100,27 @@ function row(id: string): {
 }
 
 describe("runGraphArm", () => {
+  it("passes deps.entityType to the seed seam; absent means all types", async () => {
+    // plans/entity-type-and-filter.md T3: the resolved type rides the arm
+    // deps, never the exact-match filters.
+    const typed = new FakeStorage();
+    typed.seedEntities = [{ id: "e1", canonical_name: "Alice" }];
+    await runGraphArm(
+      QUERY_VEC,
+      { storage: typed, config: CFG, entityType: "person" },
+      new Date("2024-01-01T00:00:00Z")
+    );
+    expect(typed.seedCalls[0]?.entityType).toBe("person");
+
+    const untyped = new FakeStorage();
+    await runGraphArm(
+      QUERY_VEC,
+      { storage: untyped, config: CFG },
+      new Date("2024-01-01T00:00:00Z")
+    );
+    expect(untyped.seedCalls[0]?.entityType).toBeUndefined();
+  });
+
   it("returns a degraded result when seedEntitiesByEmbedding throws", async () => {
     const storage = new FakeStorage();
     storage.seedError = new Error("seed boom");

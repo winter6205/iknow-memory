@@ -17,7 +17,11 @@ import {
   type CliPool,
   type CliDeps,
 } from "../../src/cli/extract.js";
-import { loadEntities } from "../../src/core/extraction/persist.js";
+import {
+  insertEntity,
+  loadEntities,
+} from "../../src/core/extraction/persist.js";
+import { GraphragError } from "../../src/core/errors.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js";
@@ -253,11 +257,11 @@ describe("entity-type normalization through the pipeline (CR High #2)", () => {
         outputs: [
           {
             head: "Alice",
-            headType: "Organization", // → concept
+            headType: "Organization", // → organization
             relationRaw: "works at",
             relationNorm: "MEMBER_OF",
             tail: "Acme",
-            tailType: "Location", // → system
+            tailType: "Location", // → place
             description: "Alice works at Acme",
             evidenceSpan: "Alice works at Acme",
             confidence: 0.9,
@@ -292,15 +296,15 @@ describe("entity-type normalization through the pipeline (CR High #2)", () => {
       }
     }
     expect(entityInserts.length).toBeGreaterThanOrEqual(2);
-    const closedSet = ["person", "concept", "system", "event"];
+    const closedSet = ["person", "organization", "place", "event"];
     for (const values of entityInserts) {
       const type = values[2] as string; // (id, canonical_name, type, …)
       expect(closedSet).toContain(type);
     }
     // The wonky types were folded to their mapped families.
     const persistedTypes = entityInserts.map((v) => v[2]);
-    expect(persistedTypes).toContain("concept"); // Organization
-    expect(persistedTypes).toContain("system"); // Location
+    expect(persistedTypes).toContain("organization"); // Organization
+    expect(persistedTypes).toContain("place"); // Location
   });
 });
 
@@ -328,7 +332,7 @@ const ALICE_OUTPUT = {
   relationRaw: "works at",
   relationNorm: "MEMBER_OF",
   tail: "Acme Corp",
-  tailType: "system",
+  tailType: "organization",
   description: "Alice Smith works at Acme Corp",
   evidenceSpan: "Alice Smith works at Acme Corp",
   confidence: 0.9,
@@ -784,7 +788,7 @@ describe("merged_into is persisted for fuzzy merges (T5)", () => {
             ...SELF_LOOP_OUTPUT,
             head: "Alicia Smith",
             tail: "Acme",
-            tailType: "system",
+            tailType: "organization",
           },
         ],
       }),
@@ -880,7 +884,7 @@ describe("self-loop outputs are extract rejects (T4 / SC5)", () => {
           // Self-loop: dropped.
           { ...SELF_LOOP_OUTPUT, tail: SELF_LOOP_OUTPUT.head },
           // Valid triple: head and tail differ.
-          { ...SELF_LOOP_OUTPUT, tail: "Acme Corp", tailType: "system" },
+          { ...SELF_LOOP_OUTPUT, tail: "Acme Corp", tailType: "organization" },
         ],
       }),
     });
@@ -964,7 +968,7 @@ describe("self-loop outputs are extract rejects (T4 / SC5)", () => {
     const client = await runOutput({
       ...SELF_LOOP_OUTPUT,
       tail: " alice   smith ",
-      tailType: "system",
+      tailType: "organization",
     });
 
     const inserts = boundValuesFor(client, /INSERT INTO entities/);
@@ -1070,7 +1074,7 @@ function relationOutput(over: {
     relationRaw: over.relationRaw,
     relationNorm: over.relationNorm,
     tail,
-    tailType: "system",
+    tailType: "organization",
     description: `${head} ${over.relationRaw} ${tail}`,
     evidenceSpan: `${head} ${over.relationRaw} ${tail}`,
     confidence: 0.8,
@@ -1928,7 +1932,7 @@ describe("extract → precision.indexEntities (T5 entity projection)", () => {
       {
         id: "id-tail",
         canonical_name: ALICE_OUTPUT.tail,
-        type: "system",
+        type: "organization",
         retired: false,
         aliases: [ALICE_OUTPUT.tail],
       },
@@ -2021,7 +2025,7 @@ describe("extract → precision.indexEntities (T5 entity projection)", () => {
             ...SELF_LOOP_OUTPUT,
             head: "Alicia Smith",
             tail: "Acme",
-            tailType: "system",
+            tailType: "organization",
           },
         ],
       }),
@@ -2057,7 +2061,7 @@ describe("extract → precision.indexEntities (T5 entity projection)", () => {
             ...SELF_LOOP_OUTPUT,
             head: "Alicia Smith",
             tail: "Acme",
-            tailType: "system",
+            tailType: "organization",
           },
         ],
       }),
@@ -2250,5 +2254,85 @@ describe("runCliFromEnv precision wiring (production entry point)", () => {
     // the pipeline's precision calls are silent no-ops on the unconfigured
     // path (same posture as the MCP push/ingest wiring).
     expect(layerInstances).toHaveLength(0);
+  });
+});
+
+// ─── Review C4: closed-set typed skip + insertEntity fail-closed ────────
+
+/**
+ * `runCli` against one scanned chunk with a scripted standard-method output,
+ * capturing warn events so the typed-skip log is assertable.
+ */
+async function runOneStandardOutput(
+  outputs: unknown[]
+): Promise<{ client: FakeClient; warnings: Array<{ event: string; data?: unknown }> }> {
+  const client = new FakeClient();
+  scanOneChunk(client);
+  const llm = new FakeLLMClient({
+    scripted: async () => ({ kind: "ok" as const, outputs }),
+  });
+  const warnings: Array<{ event: string; data?: unknown }> = [];
+  const deps: CliDeps = {
+    ...makeDeps(client, llm),
+    logger: {
+      ...silentLogger(),
+      warn: (event: string, data?: unknown) => {
+        warnings.push({ event, data });
+      },
+    },
+  };
+  const code = await runCli(["--batch-size", "1"], deps);
+  expect(code).toBe(0);
+  return { client, warnings };
+}
+
+describe("closed-set typed skip on the standard leg (review C4)", () => {
+  it("headType 'widget' writes zero entity rows and logs exactly one typed skip", async () => {
+    const { client, warnings } = await runOneStandardOutput([
+      { ...ALICE_OUTPUT, headType: "widget" },
+    ]);
+    expect(
+      client.queries.filter((q) => q.includes("INSERT INTO entities"))
+    ).toHaveLength(0);
+    expect(
+      client.queries.filter((q) => q.includes("INSERT INTO triples"))
+    ).toHaveLength(0);
+    const skips = warnings.filter(
+      (w) => w.event === "entity-type-unknown-skip"
+    );
+    expect(skips).toHaveLength(1);
+    expect(skips[0]!.data).toMatchObject({
+      headType: "widget",
+      reason: "type-outside-closed-set",
+    });
+  });
+
+  it("truncates an oversized raw type in the skip log (64-char cap)", async () => {
+    const longType = "w".repeat(100);
+    const { warnings } = await runOneStandardOutput([
+      { ...ALICE_OUTPUT, headType: longType },
+    ]);
+    const skips = warnings.filter(
+      (w) => w.event === "entity-type-unknown-skip"
+    );
+    expect(skips).toHaveLength(1);
+    expect((skips[0]!.data as { headType: string }).headType).toBe(
+      "w".repeat(64)
+    );
+  });
+});
+
+describe("insertEntity fail-closed backstop (review C4)", () => {
+  it("a direct call with a type outside the closed set throws INVALID_INPUT and emits no INSERT", async () => {
+    const client = new FakeClient();
+    const err = await insertEntity(
+      client,
+      "00000000-0000-4000-8000-0000000000aa",
+      { canonicalName: "Widget", type: "widget", description: "d" },
+      [0, 0]
+    ).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GraphragError);
+    expect((err as GraphragError).code).toBe("INVALID_INPUT");
+    expect(client.queries).toEqual([]);
   });
 });

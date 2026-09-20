@@ -162,7 +162,7 @@ describeGraph("graph-neo4j: idempotent projection into a live graph", () => {
   async function seedLedger(): Promise<void> {
     for (const [id, name, type] of [
       [ALICE, "Alice Smith", "person"],
-      [ACME, "Acme Corp", "system"],
+      [ACME, "Acme Corp", "organization"],
     ] as const) {
       await pgClient.query(
         `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, $3)`,

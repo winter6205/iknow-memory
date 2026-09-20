@@ -218,6 +218,12 @@ export interface GraphragEnv {
   /** Dedicated HTTP rerank endpoint; undefined means the adapter is skipped. */
   rerankUrl: string | undefined;
   /**
+   * TypeSafe Jev (System One) credentials for extract/merge/retrieve judges,
+   * or undefined when no key is configured. Missing key does not fail-start
+   * until the judge adapters are the production default.
+   */
+  jev: JevConfig | undefined;
+  /**
    * Write-time contradiction resolution switch (extract pipeline T4).
    *
    * ON (default, ADR-0009): a triple whose (head, relation_norm) matches an
@@ -244,6 +250,17 @@ export interface GraphragEnv {
  * on `https://api.minimaxi.com/anthropic`.
  */
 export interface RerankConfig {
+  apiKey: string;
+  model: string;
+  baseUrl: string;
+}
+
+/**
+ * Credentials for TypeSafe Jev (`POST {baseUrl}/v1/systemone`).
+ * Secret: `GRAPHRAG_MEMORY_JEV_API_KEY`, then vendor `TYPESAFE_API_KEY`.
+ * Model / base URL default to `jev-latest` / `https://api.typesafe.ai`.
+ */
+export interface JevConfig {
   apiKey: string;
   model: string;
   baseUrl: string;
@@ -579,6 +596,16 @@ export const RETRIEVAL_VECTOR_ENABLED_VAR =
   "GRAPHRAG_MEMORY_RETRIEVAL_VECTOR_ENABLED";
 const LLM_AUTH_TOKEN_VAR = "ANTHROPIC_AUTH_TOKEN";
 const RERANK_API_KEY_NAME_VAR = "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV";
+/** Operator-setting / env name for the TypeSafe Jev secret. */
+export const JEV_API_KEY_VAR = "GRAPHRAG_MEMORY_JEV_API_KEY";
+/** Official SDK env name; used when the namespaced key is absent. */
+const TYPESAFE_API_KEY_VAR = "TYPESAFE_API_KEY";
+export const JEV_MODEL_VAR = "GRAPHRAG_MEMORY_JEV_MODEL";
+const TYPESAFE_DEFAULT_MODEL_VAR = "TYPESAFE_DEFAULT_MODEL";
+export const JEV_BASE_URL_VAR = "GRAPHRAG_MEMORY_JEV_BASE_URL";
+const TYPESAFE_BASE_URL_VAR = "TYPESAFE_BASE_URL";
+const DEFAULT_JEV_MODEL = "jev-latest";
+const DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai";
 const ANTHROPIC_MODEL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_MODEL";
 const ANTHROPIC_BASE_URL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL";
 /** China MiniMax Anthropic-compatible SDK base (not api.minimax.io). */
@@ -960,6 +987,25 @@ function parseRerankConfig(): RerankConfig | undefined {
   return { apiKey, model, baseUrl };
 }
 
+function resolveJevApiKey(): string | undefined {
+  return readTrimmed(JEV_API_KEY_VAR) ?? readTrimmed(TYPESAFE_API_KEY_VAR);
+}
+
+function parseJevConfig(): JevConfig | undefined {
+  const apiKey = resolveJevApiKey();
+  if (apiKey === undefined) return undefined;
+  const model =
+    readTrimmed(JEV_MODEL_VAR) ??
+    readTrimmed(TYPESAFE_DEFAULT_MODEL_VAR) ??
+    DEFAULT_JEV_MODEL;
+  const baseUrl = (
+    readTrimmed(JEV_BASE_URL_VAR) ??
+    readTrimmed(TYPESAFE_BASE_URL_VAR) ??
+    DEFAULT_JEV_BASE_URL
+  ).replace(/\/$/, "");
+  return { apiKey, model, baseUrl };
+}
+
 function isElasticsearchIndexName(value: string): boolean {
   return (
     value.length > 0 &&
@@ -1137,6 +1183,7 @@ export function loadEnv(): GraphragEnv {
   const elasticsearch = parseElasticsearchConfig();
   const rerank = parseRerankConfig();
   const rerankUrl = readTrimmed(RETRIEVAL_RERANK_URL_VAR);
+  const jev = parseJevConfig();
   // Extract write-time supersede switch (T4). ADR-0009: defaults to ON —
   // resolving contradictions at write time is ledger infrastructure, and
   // the explicit off is the test/escape hatch (graphEnabled-shaped).
@@ -1170,6 +1217,7 @@ export function loadEnv(): GraphragEnv {
     elasticsearch,
     rerank,
     rerankUrl,
+    jev,
     extractWriteTimeSupersede,
   };
 }

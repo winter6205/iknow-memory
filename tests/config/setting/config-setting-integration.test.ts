@@ -72,6 +72,12 @@ const SCRUB_KEYS = [
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL",
   "ANTHROPIC_AUTH_TOKEN",
   "NINE_ROUTER_KEY",
+  "GRAPHRAG_MEMORY_JEV_API_KEY",
+  "GRAPHRAG_MEMORY_JEV_MODEL",
+  "GRAPHRAG_MEMORY_JEV_BASE_URL",
+  "TYPESAFE_API_KEY",
+  "TYPESAFE_BASE_URL",
+  "TYPESAFE_DEFAULT_MODEL",
 ] as const;
 
 describe("loadEnv — operator setting resolution", () => {
@@ -230,6 +236,22 @@ describe("loadEnv — operator setting resolution", () => {
         );
       }
     );
+  });
+
+  it("loads GRAPHRAG_MEMORY_JEV_API_KEY from setting.json when not exported in the shell", () => {
+    withEnv({}, () => {
+      writeSetting({
+        GRAPHRAG_MEMORY_JEV_API_KEY: "file-jev-secret",
+        GRAPHRAG_MEMORY_JEV_MODEL: "jev-1.13.0",
+        GRAPHRAG_MEMORY_JEV_BASE_URL: "https://api.typesafe.ai",
+      });
+      const env = loadEnv();
+      expect(env.jev).toEqual({
+        apiKey: "file-jev-secret",
+        model: "jev-1.13.0",
+        baseUrl: "https://api.typesafe.ai",
+      });
+    });
   });
 
   it("missing setting.json does not block start (no error, defaults applied)", () => {

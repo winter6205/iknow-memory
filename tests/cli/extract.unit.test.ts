@@ -2135,6 +2135,7 @@ describe("runCliFromEnv precision wiring (production entry point)", () => {
       elasticsearch,
       rerank: undefined,
       rerankUrl: undefined,
+      jev: undefined,
       // Required on GraphragEnv since the ADR-0009 default flip; this
       // suite pins the precision wiring, not the supersede switch.
       extractWriteTimeSupersede: true,

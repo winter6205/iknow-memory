@@ -65,6 +65,8 @@ const HOST_SMOKE_SCRUBBED_ENV_KEYS = [
   "ANTHROPIC_AUTH_TOKEN",
   "GRAPHRAG_MEMORY_RERANK_API_KEY_ENV",
   "MINIMAX_API_KEY",
+  "GRAPHRAG_MEMORY_JEV_API_KEY",
+  "TYPESAFE_API_KEY",
   "NINE_ROUTER_KEY",
   // A parent Neo4j URI / rerank URL must not leak into the child; both are
   // replaced below with the values this suite pins (ADR-0006).

@@ -75,6 +75,19 @@ const ANTHROPIC_VARS = [
 ] as const;
 
 /**
+ * TypeSafe Jev (System One) judge credentials. Scrubbed so a live
+ * operator key in setting.json / shell cannot leak into default assertions.
+ */
+const JEV_VARS = [
+  "GRAPHRAG_MEMORY_JEV_API_KEY",
+  "GRAPHRAG_MEMORY_JEV_MODEL",
+  "GRAPHRAG_MEMORY_JEV_BASE_URL",
+  "TYPESAFE_API_KEY",
+  "TYPESAFE_BASE_URL",
+  "TYPESAFE_DEFAULT_MODEL",
+] as const;
+
+/**
  * The GRAPHRAG_MEMORY_NEO4J_* family (#70 T1). Scrubbed wherever the
  * Neo4j block is under assertion so an operator's live sidecar
  * credentials cannot turn a "not configured" case into a configured one.
@@ -125,6 +138,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
     ...PGVECTOR_VARS,
     ...NEO4J_VARS,
     ...ANTHROPIC_VARS,
+    ...JEV_VARS,
     ...ELASTICSEARCH_VARS,
   ];
   const saved = new Map<string, string | undefined>();
@@ -167,6 +181,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "embedModel",
       "extractWriteTimeSupersede",
       "ingestBatchLimit",
+      "jev",
       "logLevel",
       "neo4j",
       "pgvectorAnnMaxDimensions",
@@ -292,6 +307,7 @@ const DOTENV_MASK_KEYS = [
   ...PGVECTOR_VARS,
   ...NEO4J_VARS,
   ...ANTHROPIC_VARS,
+  ...JEV_VARS,
   ...EXTRACT_SUPERSEDE_VARS,
   ...ELASTICSEARCH_VARS,
 ] as const;
@@ -2104,5 +2120,68 @@ describe("loadEnv — ES precision-layer fail-start (ADR-0007)", () => {
         expect(() => loadEnv()).toThrow(ConfigError);
       }
     );
+  });
+});
+
+describe("loadEnv — Jev (TypeSafe System One) operator setting", () => {
+  it("leaves jev undefined when no TypeSafe key is configured", () => {
+    withEnv({}, () => {
+      expect(loadEnv().jev).toBeUndefined();
+    });
+  });
+
+  it("loads Jev from GRAPHRAG_MEMORY_JEV_API_KEY with official model and base URL defaults", () => {
+    withEnv(
+      { GRAPHRAG_MEMORY_JEV_API_KEY: "ts-test-key-not-a-real-secret" },
+      () => {
+        expect(loadEnv().jev).toEqual({
+          apiKey: "ts-test-key-not-a-real-secret",
+          model: "jev-latest",
+          baseUrl: "https://api.typesafe.ai",
+        });
+      }
+    );
+  });
+
+  it("falls back to TYPESAFE_API_KEY when the namespaced key is absent", () => {
+    withEnv({ TYPESAFE_API_KEY: "vendor-key-not-a-real-secret" }, () => {
+      expect(loadEnv().jev?.apiKey).toBe("vendor-key-not-a-real-secret");
+      expect(loadEnv().jev?.model).toBe("jev-latest");
+    });
+  });
+
+  it("prefers GRAPHRAG_MEMORY_JEV_API_KEY over TYPESAFE_API_KEY", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_JEV_API_KEY: "namespaced-jev-key",
+        TYPESAFE_API_KEY: "vendor-jev-key",
+      },
+      () => {
+        expect(loadEnv().jev?.apiKey).toBe("namespaced-jev-key");
+      }
+    );
+  });
+
+  it("honors GRAPHRAG_MEMORY_JEV_MODEL and strips a trailing slash on GRAPHRAG_MEMORY_JEV_BASE_URL", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_JEV_API_KEY: "k",
+        GRAPHRAG_MEMORY_JEV_MODEL: "jev-1.13.0",
+        GRAPHRAG_MEMORY_JEV_BASE_URL: "https://api.typesafe.ai/",
+      },
+      () => {
+        expect(loadEnv().jev).toEqual({
+          apiKey: "k",
+          model: "jev-1.13.0",
+          baseUrl: "https://api.typesafe.ai",
+        });
+      }
+    );
+  });
+
+  it("does not refuse boot when the Jev key is missing (judge fail-start is a later wave)", () => {
+    withEnv({}, () => {
+      expect(() => loadEnv()).not.toThrow();
+    });
   });
 });

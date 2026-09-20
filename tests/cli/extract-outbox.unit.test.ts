@@ -39,7 +39,7 @@ const ALICE_OUTPUT = {
   relationRaw: "works at",
   relationNorm: "MEMBER_OF",
   tail: "Acme Corp",
-  tailType: "system",
+  tailType: "organization",
   description: "Alice Smith works at Acme Corp",
   evidenceSpan: "Alice Smith works at Acme Corp",
   confidence: 0.9,

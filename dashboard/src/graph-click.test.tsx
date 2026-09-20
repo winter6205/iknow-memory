@@ -112,7 +112,7 @@ describe("GraphPage — graph node click opens an entity, not a 资料", () => {
         return jsonResponse(200, {
           nodes: [
             { id: ENT_ID, name: "Alice", type: "person" },
-            { id: OTHER_ID, name: "Acme", type: "system" },
+            { id: OTHER_ID, name: "Acme", type: "organization" },
           ],
           edges: [{ from: ENT_ID, to: OTHER_ID, type: "works_for" }],
         });
@@ -170,7 +170,7 @@ describe("GraphPage — graph node click opens an entity, not a 资料", () => {
         return jsonResponse(200, {
           nodes: [
             { id: ENT_ID, name: "Alice", type: "person" },
-            { id: OTHER_ID, name: "Acme", type: "system" },
+            { id: OTHER_ID, name: "Acme", type: "organization" },
           ],
           edges: [{ from: ENT_ID, to: OTHER_ID, type: "works_for" }],
         });

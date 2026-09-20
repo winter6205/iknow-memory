@@ -2,9 +2,11 @@
  * Retrieval layer types — bounded context for the graph-arm + RRF fusion
  * pipeline (spec-3, p0-integration T2).
  *
- * No project imports (this file is a leaf). Errors follow the
- * *Error suffix convention from src/core/errors.ts.
+ * No value imports (this file stays a runtime leaf; the only edge is the
+ * type-only `EntityType` from extraction, erased at compile time). Errors
+ * follow the *Error suffix convention from src/core/errors.ts.
  */
+import type { EntityType } from "../extraction/entity-type.js";
 
 /**
  * A retrieval arm the fusion layer understands.
@@ -562,11 +564,14 @@ export interface ParentWindowStorage {
  *
  * The optional score is the cosine similarity calculated by Postgres. A
  * backend may omit it when it only exposes deterministic seed order.
+ * `entityType` (plans/entity-type-and-filter.md T3) restricts the seed to
+ * one entity type; absent = every type, byte-for-byte the old behavior.
  */
 export interface EntityEmbeddingStorage {
   seedEntitiesByEmbedding(
     embedding: number[],
-    topK: number
+    topK: number,
+    entityType?: EntityType
   ): Promise<Array<{ id: string; canonical_name: string; score?: number }>>;
   chunksByEntityIds(
     entityIds: readonly string[],
@@ -575,7 +580,11 @@ export interface EntityEmbeddingStorage {
   ): Promise<EntityChunkRow[]>;
 }
 
-/** Entity lookup supplied by the precision layer during seed finding. */
+/**
+ * Entity lookup supplied by the precision layer during seed finding.
+ * `entityType` narrows the lexical seed exactly like the vector seed, so
+ * the RRF fusion cannot smuggle other types into a filtered seed set.
+ */
 export interface EntityLexicalStorage {
   searchEntities(
     query: string,
@@ -587,7 +596,8 @@ export interface EntityLexicalStorage {
       phrase?: boolean;
       fieldBoost?: boolean;
       fieldBoosts?: Record<string, number>;
-    }
+    },
+    entityType?: EntityType
   ): Promise<Array<{ id: string; canonical_name: string; score?: number }>>;
 }
 
@@ -665,7 +675,8 @@ export interface Neo4jArmStorage extends EntityEmbeddingStorage {}
 export interface GraphArmStorage {
   seedEntitiesByEmbedding(
     embedding: number[],
-    topK: number
+    topK: number,
+    entityType?: EntityType
   ): Promise<Array<{ id: string; canonical_name: string; score?: number }>>;
   chunksByOneHopFromEntities(
     seedIds: string[],

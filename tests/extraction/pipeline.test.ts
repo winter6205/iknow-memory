@@ -75,7 +75,7 @@ const GROUNDED_OUTPUT = {
   relationRaw: "works at",
   relationNorm: "RELATED_TO",
   tail: "Acme Corp",
-  tailType: "system",
+  tailType: "organization",
   description: "Alice works at Acme Corp",
   evidenceSpan: "Alice works at Acme Corp",
   confidence: 0.9,
@@ -357,7 +357,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
     expect(recordIdx).toBeLessThan(commitIdx);
   });
 
-  it("method 'fast' runs the pure NLP extractor, persists fast-tagged triples, and never calls the LLM", async () => {
+  it("method 'fast' runs the pure NLP extractor, typed-skips its unknown type at persist, and never calls the LLM", async () => {
     const client = new FakeQueryable();
     // Empty queue: any LLM call would throw "queue exhausted" and the chunk
     // would land as a write-failure, not a success.
@@ -370,16 +370,16 @@ describe("processBatch extract-method routing (T1 seam)", () => {
       { batchSize: 1, method: "fast" }
     );
 
-    // "alice"/"bob" survive stopword filtering → one co-occurrence edge →
-    // the SAME canonical merge/persist path the standard leg uses.
+    // "alice"/"bob" survive stopword filtering → one co-occurrence edge.
+    // entity-type-and-filter T1: fast nodes carry the unclassified type
+    // "concept" — outside the closed persist set — so the edge is
+    // typed-skipped (no entity row, no triple), fail-closed rather than a
+    // fallback bucket. The chunk itself still succeeds (mark-and-continue).
     expect(summary.succeeded).toBe(1);
     expect(summary.failed).toBe(0);
-    const tripleIdx = client.indexOf("INSERT INTO triples");
-    expect(tripleIdx).toBeGreaterThanOrEqual(0);
-    expect(client.valuesList[tripleIdx]).toContain("co_occurs_with");
-    // Provenance: the fast triples carry the 'fast' extractor tag, not 'llm'.
-    expect(client.valuesList[tripleIdx]).toContain("fast");
-    // The success leg claims the version for fast (T1 spine unchanged).
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(client.indexOf("INSERT INTO entities")).toBe(-1);
+    // The success leg still claims the version for fast (T1 spine unchanged).
     const recordIdx = client.indexOf("UPDATE source_documents");
     expect(client.valuesList[recordIdx]).toEqual(["chunk-1", "fast"]);
   });
@@ -705,7 +705,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
     expect(client.valuesList[demotion]).toEqual(["stale", "ready"]);
   });
 
-  it("fast chunk that changes the graph demotes ready→stale too", async () => {
+  it("fast chunk typed-skipped by the closed set changes no graph and emits no demotion", async () => {
     const client = new FakeQueryable();
     // Empty queue: fast never dials the LLM; a call would throw and the
     // chunk would land as a write-failure, not the expected success.
@@ -718,13 +718,14 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
       { batchSize: 1, method: "fast" }
     );
 
+    // entity-type-and-filter T1: fast's unclassified type is typed-skipped,
+    // so the graph never moves — and a chunk that moved nothing must not
+    // demote the community index (same posture as the all-self-loop test).
     expect(summary.succeeded).toBe(1);
     const tripleInsert = client.indexOf("INSERT INTO triples");
     const demotion = client.indexOf(STATE_DEMOTION);
-    const commit = client.indexOf("COMMIT");
-    expect(tripleInsert).toBeGreaterThanOrEqual(0);
-    expect(demotion).toBeGreaterThan(tripleInsert);
-    expect(demotion).toBeLessThan(commit);
+    expect(tripleInsert).toBe(-1);
+    expect(demotion).toBe(-1);
   });
 
   it("a chunk whose outputs were all rejected as self-loops emits no demotion", async () => {

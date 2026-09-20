@@ -155,10 +155,14 @@ function toVectorLiteral(embedding: number[]): string {
 /**
  * Soft-merge survivor-only seed query (T3 contract):
  * `merged_into IS NULL AND retired = false`, ordered by cosine distance.
+ * `$3` is the optional `filters.entity_type` seed restriction
+ * (plans/entity-type-and-filter.md T3): NULL keeps every type — the exact
+ * pre-filter plan shape — and a type value narrows the seed set.
  */
 const SEED_ENTITIES_SQL =
   "SELECT id, canonical_name, 1 - (embedding <=> $1::vector) AS score FROM entities " +
   "WHERE embedding IS NOT NULL AND merged_into IS NULL AND retired = false " +
+  "AND ($3::text IS NULL OR type = $3) " +
   "ORDER BY embedding <=> $1::vector LIMIT $2";
 
 /**
@@ -1494,13 +1498,16 @@ export class PgvectorBackend
     /**
      * Top-K seed entities by cosine similarity to `embedding`.
      * Soft-merge survivor-only (merged_into IS NULL AND retired = false).
+     * `entityType` (resolved `filters.entity_type`) restricts the seed to
+     * one entity type; undefined binds $3 to NULL = every type.
      */
-    seedEntitiesByEmbedding: async (embedding, topK) => {
+    seedEntitiesByEmbedding: async (embedding, topK, entityType) => {
       try {
         const pool = await this.ensureReady();
         const result = await pool.query(SEED_ENTITIES_SQL, [
           toVectorLiteral(embedding),
           topK,
+          entityType ?? null,
         ]);
         return result.rows.map((r) => {
           const row = r as {
@@ -1572,8 +1579,8 @@ export class PgvectorBackend
    * it ranked back onto chunks.
    */
   readonly neo4jArmSeed: Neo4jArmStorage = {
-    seedEntitiesByEmbedding: (embedding, topK) =>
-      this.graphArmSeed.seedEntitiesByEmbedding(embedding, topK),
+    seedEntitiesByEmbedding: (embedding, topK, entityType) =>
+      this.graphArmSeed.seedEntitiesByEmbedding(embedding, topK, entityType),
 
     chunksByEntityIds: async (entityIds, validAt, limit) => {
       // Same empty-array short-circuit as the one-hop query: ANY over an
@@ -1618,8 +1625,8 @@ export class PgvectorBackend
    * the Postgres half of the Neo4j arm; no entity vector is copied to Neo4j.
    */
   readonly entityEmbedding: EntityEmbeddingStorage = {
-    seedEntitiesByEmbedding: (embedding, topK) =>
-      this.neo4jArmSeed.seedEntitiesByEmbedding(embedding, topK),
+    seedEntitiesByEmbedding: (embedding, topK, entityType) =>
+      this.neo4jArmSeed.seedEntitiesByEmbedding(embedding, topK, entityType),
     chunksByEntityIds: (entityIds, validAt, limit) =>
       this.neo4jArmSeed.chunksByEntityIds(entityIds, validAt, limit),
   };

@@ -14,6 +14,12 @@
  * arm (plans T2), C → the report-first community-summary arm (plans T3),
  * D → the typed `real_db_not_wired` refusal (plans T4; see
  * src/core/retrieval/search-mode.ts).
+ *
+ * `filters.entity_type` (plans/entity-type-and-filter.md T3) is resolved
+ * and stripped the same way: missing → all types, one of the closed set →
+ * typed seed restriction for the graph/entity-embedding arms, anything
+ * else → typed INVALID_INPUT. It is a routing control, never a chunk
+ * exact-match key; `tools/list` still exposes the single `retrieve`.
  */
 import { z } from "zod";
 import {
@@ -50,6 +56,11 @@ import {
   stripSearchModeFilter,
   type SearchModeControl,
 } from "../core/retrieval/search-mode.js";
+import {
+  invalidEntityTypeMessage,
+  parseEntityTypeFilter,
+  stripEntityTypeFilter,
+} from "../core/retrieval/wire-filters.js";
 import { GraphragError } from "../core/errors.js";
 
 const DEFAULT_LIMIT = 10;
@@ -155,6 +166,17 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         "INVALID_INPUT"
       );
     }
+    // Same contract for `filters.entity_type` (plans/entity-type-and-filter
+    // .md T3): resolve before any arm runs; missing = all types, outside
+    // the closed set = typed refusal, never a silent ignore. The arms see
+    // only the value below — the key is stripped from the exact-match map.
+    const entityTypeFilter = parseEntityTypeFilter(input.filters);
+    if (entityTypeFilter.kind === "invalid") {
+      throw new GraphragError(
+        invalidEntityTypeMessage(entityTypeFilter.value),
+        "INVALID_INPUT"
+      );
+    }
     // Routing keys are resolved and stripped HERE, once, for every 档
     // (review I2): each backend applies `filters` as exact-match term
     // clauses, so a left-over control key silently zeros the arm that
@@ -163,8 +185,8 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     const control: SearchModeControl = {
       cDropWindows: cDropWindowsEnabled(input.filters),
     };
-    const matchFilters = stripCDropWindowsFilter(
-      stripSearchModeFilter(input.filters)
+    const matchFilters = stripEntityTypeFilter(
+      stripCDropWindowsFilter(stripSearchModeFilter(input.filters))
     );
     const retrieveConfig = applyPreset(
       deps.retrieveConfig,
@@ -186,6 +208,9 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         validAt: opts.validAt,
         limit: opts.limit,
         filters: opts.filters,
+        ...(entityTypeFilter.entityType !== undefined
+          ? { entityType: entityTypeFilter.entityType }
+          : {}),
       },
       {
         embedder: deps.embedder,
@@ -286,7 +311,9 @@ export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
   description:
     "Ranked chunk search over the knowledge memory store, filtered by " +
     "temporal validity. filters.search_mode (A | B | C | D) selects the " +
-    "retrieval tier; missing defaults to B.",
+    "retrieval tier; missing defaults to B. filters.entity_type (person | " +
+    "organization | place | event) optionally restricts graph/entity " +
+    "seeding; missing recalls all types.",
   inputSchema:
     deps.inputValidationFailureCounter === undefined
       ? RetrieveInputSchema

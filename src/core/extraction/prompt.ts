@@ -13,6 +13,7 @@
  * from "./types.js"`.
  */
 import { PROMPT_HINT } from "./vocabulary.js";
+import { ENTITY_TYPES } from "./entity-type.js";
 
 /**
  * Local mirror of the canonical ExtractionOutput shape (T2 owns the
@@ -58,14 +59,20 @@ export function buildExtractionPrompt(chunkText: string): string {
     "}",
     "where each ExtractionOutput has these fields:",
     "  - head: string (entity mention)",
-    "  - headType: string (entity type, one of: person, concept, system, event)",
+    `  - headType: string (entity type, one of: ${ENTITY_TYPES.join(", ")})`,
     "  - relationRaw: string (the surface form you used in the text)",
     '  - relationNorm: string (one of the allowed terms, or "UNMAPPED")',
     "  - tail: string (entity mention)",
-    "  - tailType: string (entity type, one of: person, concept, system, event)",
+    `  - tailType: string (entity type, one of: ${ENTITY_TYPES.join(", ")})`,
     "  - description: string  // MANDATORY, non-empty",
     "  - evidenceSpan: string  // MANDATORY, verbatim substring of the chunk",
     "  - confidence: number  // in [0, 1]",
+    "",
+    "Entity types are a CLOSED set: only the four values listed for",
+    "headType/tailType can be stored; anything else is dropped. Use the",
+    "closest one and normalize synonyms: company/org/team -> organization,",
+    "location/geo -> place, human/individual -> person, incident/occurrence",
+    "-> event.",
     "",
     "MANDATORY: every output must include a non-empty description AND a",
     "verbatim evidenceSpan. Outputs missing either field are invalid.",

@@ -72,6 +72,7 @@ import type {
   SearchOptions,
   StorageBackend,
 } from "../types.js";
+import type { EntityType } from "../extraction/entity-type.js";
 import {
   supportsNeighborChunks,
   supportsProjectionDrain,
@@ -111,6 +112,13 @@ export interface AssembleArgs {
    * Optional: absent → unfiltered vector search.
    */
   filters?: Record<string, string>;
+  /**
+   * Resolved `filters.entity_type` seed restriction
+   * (plans/entity-type-and-filter.md T3). Like `search_mode` this is a
+   * routing control the handler resolves and strips: arms see only this
+   * typed value, never the filter key. Absent → all types.
+   */
+  entityType?: EntityType;
 }
 
 /**

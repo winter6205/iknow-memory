@@ -290,7 +290,7 @@ describePg("extract CLI + graph-arm subprocess e2e (T7)", () => {
       const [entityVec] = await embedder.embed([`entity-${i}`]);
       await c.query(
         `INSERT INTO entities (id, canonical_name, type, embedding)
-         VALUES ($1, $2, 'concept', $3::vector)`,
+         VALUES ($1, $2, 'person', $3::vector)`,
         [entityId, `case4-entity-${i}`, `[${entityVec!.join(",")}]`]
       );
       entityIds.push(entityId);
@@ -672,11 +672,11 @@ describePg("extract CLI + graph-arm subprocess e2e (T7)", () => {
     const headId = randomUUID();
     const tailId = randomUUID();
     await c.query(
-      `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'system')`,
+      `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'organization')`,
       [headId, `seed-head-${headId}`]
     );
     await c.query(
-      `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'system')`,
+      `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, 'organization')`,
       [tailId, `seed-tail-${tailId}`]
     );
     for (const raw of ["vibes at", "vibes at"]) {
@@ -707,7 +707,7 @@ function cannedOutput(head: string, tail: string) {
     relationRaw: "relates to",
     relationNorm: "RELATED_TO",
     tail,
-    tailType: "system",
+    tailType: "organization",
     description: `${head} relates to ${tail}`,
     evidenceSpan: `${head} relates to ${tail}`,
     confidence: 0.9,

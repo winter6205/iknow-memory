@@ -342,6 +342,41 @@ describe("ElasticsearchPrecisionLayer", () => {
     );
     expect(JSON.stringify(bulkCalls[0]?.[0])).toContain("����");
   });
+  // plans/entity-type-and-filter.md T3: the entity lexical seed is half of
+  // the neo4j arm's seed fusion, so it must honor the typed entity filter
+  // too — as a term clause, never as a chunk exact-match filter.
+  it("entityType restricts entity search with a term filter", async () => {
+    const client = fakeClient();
+    const layer = new ElasticsearchPrecisionLayer(
+      {
+        node: "http://localhost:9200",
+        chunkIndex: "chunks",
+        entityIndex: "entities",
+      },
+      { client }
+    );
+    const searchRequests: Record<string, unknown>[] = [];
+    client.search = vi.fn(async (req: Record<string, unknown>) => {
+      searchRequests.push(req);
+      return { hits: { hits: [] } };
+    });
+
+    await layer.searchEntities("alice", 3, {}, "person");
+    const filtered = searchRequests[0] as {
+      query: { bool: { filter: unknown[] } };
+    };
+    expect(filtered.query.bool.filter).toContainEqual({
+      term: { type: "person" },
+    });
+
+    await layer.searchEntities("alice", 3);
+    const unfiltered = searchRequests[1] as {
+      query: { bool: { filter: unknown[] } };
+    };
+    expect(unfiltered.query.bool.filter).not.toContainEqual({
+      term: { type: expect.anything() },
+    });
+  });
 });
 
 /**

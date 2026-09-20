@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildExtractionPrompt } from "../../src/core/extraction/prompt.js";
 import { ALLOWED } from "../../src/core/extraction/vocabulary.js";
+import { ENTITY_TYPES } from "../../src/core/extraction/entity-type.js";
 
 describe("buildExtractionPrompt", () => {
   it("includes every ALLOWED relation in the vocabulary list", () => {
@@ -36,5 +37,16 @@ describe("buildExtractionPrompt", () => {
     // Both the "raw json" phrasing and an explicit "no markdown" / anti-fence note
     // are acceptable; either demonstrates the instruction is present.
     expect(lower).toMatch(/no markdown|raw json/);
+  });
+
+  it("offers exactly the four closed entity types and never teaches concept/system", () => {
+    const prompt = buildExtractionPrompt("any chunk");
+    const closedList = ENTITY_TYPES.join(", ");
+    expect(ENTITY_TYPES).toEqual(["person", "organization", "place", "event"]);
+    // Both headType and tailType advertise the same closed set.
+    expect(prompt.match(new RegExp(`one of: ${closedList}`, "g"))).toHaveLength(2);
+    // The legacy open-set types must not appear anywhere as storable values.
+    expect(prompt).not.toMatch(/\bconcept\b/i);
+    expect(prompt).not.toMatch(/\bsystem\b/i);
   });
 });

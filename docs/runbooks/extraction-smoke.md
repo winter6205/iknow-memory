@@ -90,25 +90,33 @@ SELECT count(*) FROM entities;
 ## 6. Entity-type normalization
 
 `entities.type` is pinned by a DDL CHECK constraint to exactly
-`('person','concept','system','event')` (specs/p0-schema.md). The LLM emits
-an open-string type, so the CLI normalizes every `headType` / `tailType` into
-that closed set at the boundary (`src/cli/entity-type.ts :: normalizeEntityType`)
-before the INSERT — otherwise a non-listed raw type (e.g. `"Organization"`,
+`('person','organization','place','event')` (specs/entity-type-and-filter.md).
+The LLM emits an open-string type, so the persist layer normalizes every
+`headType` / `tailType` into that closed set at the boundary
+(`src/core/extraction/entity-type.ts :: normalizeEntityType`) before the
+INSERT — otherwise a non-listed raw type (e.g. `"Organization"`,
 `"Location"`) would violate the CHECK and roll back the whole chunk (exit 2).
 
 Mapping (case-insensitive; input is trimmed + lowercased first):
 
-| Raw LLM type                                                       | Persisted                        |
-| ------------------------------------------------------------------ | -------------------------------- |
-| person, human, individual, user, agent                             | person                           |
-| organization, company, team, group, org, concept                   | concept                          |
-| system, tool, platform, service, location, place, system_component | system                           |
-| event, incident, occurrence, action                                | event                            |
-| anything else / empty / unknown                                    | concept (with an info-level log) |
+| Raw LLM type                                       | Persisted / action               |
+| -------------------------------------------------- | -------------------------------- |
+| person, human, individual, user, agent             | person                           |
+| organization, company, org, team                   | organization                     |
+| place, location, geo                               | place                            |
+| event, incident, occurrence, action                | event                            |
+| anything else / empty / unknown                    | not persisted (typed skip)       |
 
-The mapping is a conservative, defensible default — operators can tune it in
-`src/cli/entity-type.ts`. Unknown types fold to `concept` and emit a structured
-`normalize-entity-type-fallback` info log so the folding is auditable.
+There is deliberately no catch-all bucket: an unknown proposed type makes
+`normalizeEntityType` return `null`, and the persist layer typed-skips the
+whole output — no entity row is written — emitting a structured
+`entity-type-unknown-skip` warn log so the drop is auditable
+(`src/core/extraction/persist.ts`).
+
+Known limitation (fast leg): `--method fast` co-occurrence nodes carry the
+unclassified type `concept`, so under the closed set a fast run currently
+persists **zero** entities — every output is typed-skipped above — until the
+fast method gets its own typed-node scheme (follow-up).
 
 ## 7. Troubleshooting
 

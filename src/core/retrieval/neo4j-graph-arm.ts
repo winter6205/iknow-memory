@@ -40,6 +40,7 @@ import type {
   RankedEntity,
   RetrieveConfig,
 } from "./types.js";
+import type { EntityType } from "../extraction/entity-type.js";
 import { redactDiagnostic, writeStderr } from "../../logging.js";
 import { rrfFuseEntitySeeds } from "./rrf.js";
 
@@ -52,6 +53,13 @@ export interface Neo4jGraphArmDeps {
   config: RetrieveConfig;
   /** Optional ES entity index used during entity finding. */
   entityLexical?: EntityLexicalStorage;
+  /**
+   * Resolved `filters.entity_type` seed restriction
+   * (plans/entity-type-and-filter.md T3); absent = all types. BOTH the
+   * vector and the lexical seed halves honor it so a filtered seed set
+   * stays closed under RRF fusion.
+   */
+  entityType?: EntityType;
 }
 
 /** An empty contribution that is explicitly NOT a degradation. */
@@ -126,7 +134,8 @@ async function getSeedEntities(
 ): Promise<SeedResult> {
   const vectorPromise = deps.storage.seedEntitiesByEmbedding(
     embedding,
-    deps.config.entityLinkTopK
+    deps.config.entityLinkTopK,
+    deps.entityType
   );
   if (query === undefined || deps.entityLexical === undefined) {
     return { seeds: await vectorPromise, observations: [] };
@@ -135,7 +144,8 @@ async function getSeedEntities(
   const lexicalPromise = deps.entityLexical.searchEntities(
     query,
     deps.config.entityLinkTopK,
-    precisionOptions(deps.config)
+    precisionOptions(deps.config),
+    deps.entityType
   );
   const [vector, lexical] = await Promise.allSettled([
     vectorPromise,

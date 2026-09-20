@@ -98,7 +98,7 @@ const GROUNDED_OUTPUT = {
   relationRaw: "works at",
   relationNorm: "RELATED_TO",
   tail: "Acme Corp",
-  tailType: "system",
+  tailType: "organization",
   description: "Alice works at Acme Corp",
   evidenceSpan: "Alice works at Acme Corp",
   confidence: 0.9,
@@ -196,7 +196,7 @@ describe("runCli --source-ref selector", () => {
 });
 
 describe("runCli --method fast (T4 NLP leg)", () => {
-  it("persists fast-tagged triples through the shared merge path with no LLM; exit 0", async () => {
+  it("typed-skips fast outputs (unclassified type is outside the closed set); exit 0", async () => {
     const client = new FakeClient();
     client.rowsOverride = (text) =>
       /FROM chunks c/.test(text) ? [CHUNK_ROW] : [];
@@ -204,25 +204,45 @@ describe("runCli --method fast (T4 NLP leg)", () => {
     // chunk into a write-failure (exit 2). Exit 0 therefore also proves the
     // fast leg dialed no LLM.
     const llm = new FakeLLMClient({ queue: [] });
+    const warnings: Array<{ event: string; data?: Record<string, unknown> }> =
+      [];
+    const deps: CliDeps = {
+      ...makeDeps(client, llm),
+      logger: {
+        level: "error",
+        debug: () => {},
+        info: () => {},
+        warn: (event, data) => {
+          warnings.push({ event, data });
+        },
+        error: () => {},
+      },
+    };
 
     const code = await runCli(
       ["--method", "fast", "--batch-size", "1"],
-      makeDeps(client, llm)
+      deps
     );
 
     expect(code).toBe(0);
-    const tripleWrites = client.queries.filter((q) =>
-      q.includes("INSERT INTO triples")
+    // entity-type-and-filter T1: fast nodes carry the unclassified type
+    // "concept", which normalizes to null (no catch-all bucket), so every
+    // co-occurrence output is typed-skipped at persist — no entity row and
+    // no edge (a dangling FK is worse than a zero-graph chunk).
+    expect(
+      client.queries.filter((q) => q.includes("INSERT INTO triples"))
+    ).toHaveLength(0);
+    expect(
+      client.queries.filter((q) => q.includes("INSERT INTO entities"))
+    ).toHaveLength(0);
+    const skips = warnings.filter(
+      (w) => w.event === "entity-type-unknown-skip"
     );
-    // alice/works/acme/corp → 4 terms → 6 co-occurrence edges, all written
-    // via the canonical persist path.
-    expect(tripleWrites).toHaveLength(6);
-    const firstTriple = client.valuesList[
-      client.queries.findIndex((q) => q.includes("INSERT INTO triples"))
-    ]!;
-    expect(firstTriple).toContain("co_occurs_with");
-    expect(firstTriple).toContain("fast");
-    // The success leg claims the version for fast (T1 spine).
+    // alice/works/acme/corp → 4 terms → 6 co-occurrence edges, all skipped.
+    expect(skips).toHaveLength(6);
+    expect(skips[0]?.data).toMatchObject({ reason: "type-outside-closed-set" });
+    // The success leg still claims the version for fast (T1 spine): a
+    // typed skip is mark-and-continue, not a write failure.
     const recordIdx = client.queries.findIndex((q) =>
       q.includes("UPDATE source_documents")
     );
@@ -325,9 +345,11 @@ describe("runCli job exit codes for an empty fast graph (T4 acceptance)", () => 
     );
 
     expect(code).toBe(0);
-    // Both legs ran: the English chunk persisted, the Chinese one failed.
+    // Both legs ran: the English chunk succeeded (T1: its fast edges are
+    // typed-skipped at persist, so the success shows as the fast version
+    // claim, not a triple INSERT), the Chinese one failed.
     expect(
-      client.queries.find((q) => q.includes("INSERT INTO triples"))
+      client.queries.find((q) => q.includes("UPDATE source_documents"))
     ).toBeDefined();
     expect(
       client.queries.find((q) => q.includes("SET status = 'failed'"))
@@ -338,10 +360,12 @@ describe("runCli job exit codes for an empty fast graph (T4 acceptance)", () => 
     const client = new FakeClient();
     client.rowsOverride = (text) =>
       /FROM chunks c/.test(text) ? [CHUNK_ROW, EMPTY_GRAPH_CHUNK_ROW] : [];
-    // The English chunk's persist throws mid-transaction (write failure),
-    // so succeeded === 0 while the Chinese chunk carries FAST_EMPTY_GRAPH —
-    // the writeFailures → 2 rule must fire before the job-fail → 1 rule.
-    client.failOn = /INSERT INTO entities/;
+    // The English chunk's success-leg version claim throws mid-transaction
+    // (write failure — fast edges are typed-skipped since T1, so the entity
+    // INSERT leg no longer exists to break), leaving succeeded === 0 while
+    // the Chinese chunk carries FAST_EMPTY_GRAPH — the writeFailures → 2
+    // rule must fire before the job-fail → 1 rule.
+    client.failOn = /UPDATE source_documents/;
     const llm = new FakeLLMClient({ queue: [] });
 
     const code = await runCli(

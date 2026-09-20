@@ -102,7 +102,7 @@ function output(
     relationRaw: raw,
     relationNorm: claim,
     tail,
-    tailType: "system",
+    tailType: "organization",
     description: `${head} ${raw} ${tail}`,
     evidenceSpan: `${head} ${raw} ${tail}`,
     confidence: 0.8,

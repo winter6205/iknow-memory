@@ -54,7 +54,15 @@ export const FAST_EXTRACTOR_TAG = "fast";
 export const FAST_DEFAULT_WEAK_PERCENTILE = 40;
 /** Endpoints below this degree are rare specks; 1 keeps every survivor. */
 export const FAST_DEFAULT_MIN_DEGREE = 1;
-/** Entity type for fast nodes: unclassified surface terms are concepts. */
+/**
+ * Entity type for fast nodes: unclassified surface terms. The closed
+ * persist set (entity-type-and-filter T1: person/organization/place/event)
+ * has no "unclassified" member, so this value normalizes to null at the
+ * persist boundary and every fast output is typed-skipped there (no entity
+ * row, no edge). Deliberate fail-closed: labeling co-occurrence terms as one
+ * of the four would write false types; giving fast real typing is a separate
+ * follow-up decision, not a fallback bucket here.
+ */
 const FAST_ENTITY_TYPE = "concept";
 
 /** One co-occurrence edge candidate keyed by the shared child (ADR-0077). */

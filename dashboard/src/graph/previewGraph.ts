@@ -2,34 +2,35 @@ import type { GraphBody } from "../api";
 
 /**
  * Operator visual-QA fixture. Not ledger / Neo4j. Open /graph?preview=1.
- * Dense demo cast (actor + artifact types). Open /graph?preview=1.
+ * Dense demo cast over the closed entity type set
+ * (person / organization / place / event). Open /graph?preview=1.
  */
 export const PREVIEW_GRAPH: GraphBody = {
   nodes: [
-    { id: "pv-c-beihai", name: "北海航科", type: "company" },
-    { id: "pv-c-northwind", name: "Northwind Labs", type: "company" },
-    { id: "pv-c-qingshi", name: "青石资本", type: "company" },
-    { id: "pv-c-helix", name: "Helix Grid", type: "company" },
+    { id: "pv-c-beihai", name: "北海航科", type: "organization" },
+    { id: "pv-c-northwind", name: "Northwind Labs", type: "organization" },
+    { id: "pv-c-qingshi", name: "青石资本", type: "organization" },
+    { id: "pv-c-helix", name: "Helix Grid", type: "organization" },
     { id: "pv-p-lin", name: "林晓", type: "person" },
     { id: "pv-p-maya", name: "Maya Chen", type: "person" },
     { id: "pv-p-gao", name: "高远", type: "person" },
     { id: "pv-p-owen", name: "Owen Blake", type: "person" },
-    { id: "pv-j-hetu", name: "河图一期", type: "project" },
-    { id: "pv-j-atlas", name: "Atlas Pilot", type: "project" },
-    { id: "pv-j-lighthouse", name: "灯塔评审", type: "project" },
-    { id: "pv-j-harbor", name: "Harbor Sync", type: "project" },
-    { id: "pv-n-weekly", name: "周报备忘", type: "note" },
-    { id: "pv-n-standup", name: "Standup notes", type: "note" },
-    { id: "pv-n-risk", name: "风险清单", type: "note" },
-    { id: "pv-n-design", name: "Design memo", type: "note" },
-    { id: "pv-d-mou", name: "合作备忘录", type: "doc" },
-    { id: "pv-d-rfc", name: "RFC-14", type: "doc" },
-    { id: "pv-d-budget", name: "预算草案", type: "doc" },
-    { id: "pv-d-onboard", name: "Onboarding guide", type: "doc" },
-    { id: "pv-m-qsync", name: "季度同步", type: "meeting" },
-    { id: "pv-m-kickoff", name: "Kickoff", type: "meeting" },
-    { id: "pv-m-review", name: "设计评审", type: "meeting" },
-    { id: "pv-m-retro", name: "Retro", type: "meeting" },
+    { id: "pv-j-hetu", name: "河图一期启动", type: "event" },
+    { id: "pv-j-atlas", name: "Atlas Pilot 启动", type: "event" },
+    { id: "pv-j-lighthouse", name: "灯塔评审", type: "event" },
+    { id: "pv-j-harbor", name: "Harbor Sync", type: "event" },
+    { id: "pv-n-weekly", name: "深圳研发中心", type: "place" },
+    { id: "pv-n-standup", name: "上海办公室", type: "place" },
+    { id: "pv-n-risk", name: "新加坡数据中心", type: "place" },
+    { id: "pv-n-design", name: "慕尼黑办公室", type: "place" },
+    { id: "pv-d-mou", name: "北京", type: "place" },
+    { id: "pv-d-rfc", name: "杭州", type: "place" },
+    { id: "pv-d-budget", name: "三亚", type: "place" },
+    { id: "pv-d-onboard", name: "Osaka", type: "place" },
+    { id: "pv-m-qsync", name: "季度同步", type: "event" },
+    { id: "pv-m-kickoff", name: "Kickoff", type: "event" },
+    { id: "pv-m-review", name: "设计评审", type: "event" },
+    { id: "pv-m-retro", name: "Retro", type: "event" },
   ],
   edges: [
     { from: "pv-p-lin", to: "pv-c-beihai", type: "works_at" },

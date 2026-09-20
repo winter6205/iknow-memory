@@ -155,7 +155,7 @@ describePg(
     async function seedLedger(): Promise<void> {
       for (const [id, name, type, retired] of [
         [ALICE, "Alice Smith", "person", false],
-        [ACME, "Acme Corp", "system", false],
+        [ACME, "Acme Corp", "organization", false],
         [RETIRED, "Old Alias", "person", true],
       ] as const) {
         await client.query(

@@ -38,7 +38,7 @@ import { computeEntityEmbeddingText } from "../entities/embedding.js";
 import { GraphragError } from "../errors.js";
 import type { EmbeddingClient } from "../embedder.js";
 import { embedWithLog } from "../embed-log.js";
-import { normalizeEntityType } from "./entity-type.js";
+import { normalizeEntityType, type EntityType } from "./entity-type.js";
 
 /**
  * Everything the persist half needs from its caller. The batch orchestrator
@@ -133,9 +133,20 @@ export async function persistOutputs(
   const mergedLoserIds = new Set<string>();
   const survivors: SurvivorRef[] = [];
   for (const out of outputs) {
+    // Closed-set gate (entity-type-and-filter T1): a type outside
+    // person/organization/place/event normalizes to null. Neither endpoint
+    // may become an entity row, and an edge dangling off a skipped entity
+    // would break the triple FK — so the whole output is typed-skipped
+    // (mark-and-continue, never a fallback bucket).
+    const headType = normalizeEntityType(out.headType);
+    const tailType = normalizeEntityType(out.tailType);
+    if (headType === null || tailType === null) {
+      logUnknownTypeSkip(deps, chunkId, out, headType === null, tailType === null);
+      continue;
+    }
     if (
       normalizeAlias(out.head) === normalizeAlias(out.tail) &&
-      normalizeEntityType(out.headType) === normalizeEntityType(out.tailType)
+      headType === tailType
     ) {
       logSelfLoopRejection(deps, chunkId, out);
       selfLoopCount += 1;
@@ -147,7 +158,7 @@ export async function persistOutputs(
       tailId,
       tailName,
       mergedLoserIds: losers,
-    } = await resolveEndpoints(deps, client, out);
+    } = await resolveEndpoints(deps, client, out, headType, tailType);
     // Both endpoints are projectable nodes even when the triple below is
     // rejected — an entity with no edge is still a node the graph arm can
     // seed on.
@@ -231,7 +242,9 @@ export async function persistOutputs(
 async function resolveEndpoints(
   deps: ExtractPersistDeps,
   client: Queryable,
-  out: ExtractionOutput
+  out: ExtractionOutput,
+  headType: EntityType,
+  tailType: EntityType
 ): Promise<{
   headId: string;
   headName: string;
@@ -239,11 +252,12 @@ async function resolveEndpoints(
   tailName: string;
   mergedLoserIds: string[];
 }> {
-  // Normalize LLM types to the closed P0 set up front (CR High #2) so the
-  // merge gates and the persisted row agree on the same type value.
+  // `headType`/`tailType` arrive normalized from persistOutputs (CR High #2
+  // plus the T1 closed-set gate) so the merge gates and the persisted row
+  // agree on the same CHECK-safe type value.
   const head = await resolveEntity(deps, client, {
     canonicalName: out.head,
-    type: normalizeEntityType(out.headType),
+    type: headType,
     description: out.description,
   });
   const tail = await resolveEntity(
@@ -251,7 +265,7 @@ async function resolveEndpoints(
     client,
     {
       canonicalName: out.tail,
-      type: normalizeEntityType(out.tailType),
+      type: tailType,
       description: out.description,
     },
     { excludeIds: [head.id] }
@@ -284,6 +298,33 @@ function logSelfLoopRejection(
     tail: out.tail,
     relationRaw: out.relationRaw,
     reason: "head-equals-tail",
+  });
+}
+
+/**
+ * The closed-set leg of the persist gate (T1): an endpoint type the mapper
+ * refused (null) makes this output unprojectable. Warn so the skip is
+ * observable in the batch log — the raw proposed types are included because
+ * they are short metadata, never ingest-body.
+ */
+function logUnknownTypeSkip(
+  deps: ExtractPersistDeps,
+  chunkId: string,
+  out: ExtractionOutput,
+  headUnknown: boolean,
+  tailUnknown: boolean
+): void {
+  deps.logger.warn("entity-type-unknown-skip", {
+    chunkId,
+    head: out.head,
+    tail: out.tail,
+    relationRaw: out.relationRaw,
+    // Cap the raw type: it is unbounded provider output, and one pathological
+    // response must not blow up the log line's size (64 chars is well past any
+    // realistic type word, so the skip stays diagnosable).
+    headType: headUnknown ? out.headType.slice(0, 64) : null,
+    tailType: tailUnknown ? out.tailType.slice(0, 64) : null,
+    reason: "type-outside-closed-set",
   });
 }
 
@@ -517,18 +558,33 @@ export async function embedEntity(
   return vector;
 }
 
-async function insertEntity(
+/**
+ * Persist one entity row. The production path always runs through
+ * `persistOutputs`, whose closed-set gate normalizes the type first; the
+ * normalize + throw below is the fail-closed backstop for a caller that
+ * bypasses that gate. Exported as a test seam (same posture as
+ * `loadEntities`) so the backstop's typed error is pinable directly —
+ * through `persistOutputs` an unknown type can never reach it.
+ */
+export async function insertEntity(
   client: Queryable,
   id: string,
   incoming: IncomingEntity,
   embedding: number[]
 ): Promise<void> {
-  // CR High #2: the DDL pins entities.type to a closed 4-value CHECK set
-  // (person/concept/system/event). The LLM emits an open-string type, so we
-  // normalize it into the closed set here — otherwise the INSERT would reject
-  // the whole chunk transaction (write-failure) on any non-listed raw type
-  // (e.g. "Organization", "Location").
+  // CR High #2 backstop: the DDL pins entities.type to the closed 4-value
+  // CHECK set (person/organization/place/event). persistOutputs already
+  // typed-skips unknown types, so a null here means a caller bypassed that
+  // gate — fail closed with a typed error rather than let the INSERT roll
+  // back the whole chunk transaction (or worse, land in a fallback bucket).
   const type = normalizeEntityType(incoming.type);
+  if (type === null) {
+    throw new GraphragError(
+      `refusing to insert entity "${incoming.canonicalName}" with ` +
+        `type "${incoming.type}" outside the closed set`,
+      "INVALID_INPUT"
+    );
+  }
   // A7: description rides in the existing metadata JSONB — the spec-1 DDL is
   // frozen, so there is no description column to write.
   await client.query(

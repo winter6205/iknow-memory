@@ -159,16 +159,17 @@ async function seedChunk(
 
 async function seedEntity(
   c: pg.Client,
-  over: { name?: string; desc?: string } = {}
+  over: { name?: string; desc?: string; type?: string } = {}
 ): Promise<string> {
   const id = randomUUID();
   const name = over.name ?? `entity-${id}`;
   const desc = over.desc ?? "desc";
+  const type = over.type ?? "organization";
   const vec = await embedVec(computeEntityEmbeddingText(name, desc));
   await c.query(
     `INSERT INTO entities (id, canonical_name, type, embedding)
-     VALUES ($1, $2, 'concept', $3::vector)`,
-    [id, name, vecLiteral(vec)]
+     VALUES ($1, $2, $3, $4::vector)`,
+    [id, name, type, vecLiteral(vec)]
   );
   return id;
 }
@@ -210,7 +211,7 @@ async function bulkEntities(c: pg.Client, n: number): Promise<string[]> {
     const vec = vecLiteral(
       await embedVec(computeEntityEmbeddingText(name, "latency"))
     );
-    buf.push(`('${id}','${name}','concept','${vec}'::vector)`);
+    buf.push(`('${id}','${name}','organization','${vec}'::vector)`);
   }
   await c.query(
     `INSERT INTO entities (id, canonical_name, type, embedding) VALUES ${buf.join(",")}`
@@ -321,7 +322,7 @@ const SC4_CORPUS = [
     relationRaw: entry.relationRaw,
     relationNorm: entry.relationNorm,
     tail: SC4_TAIL,
-    tailType: "system",
+    tailType: "organization",
     description: entry.description,
     evidenceSpan: entry.description,
     confidence: 0.9,
@@ -621,6 +622,52 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
     const ids = rows.map((r) => r.id);
     expect(ids).toContain(live);
     expect(ids).not.toContain(past); // past chunk's valid_window excludes now
+  });
+
+  it("12. entity_type seed filter: SQL restricts to one type, omit recalls all", async () => {
+    // plans/entity-type-and-filter.md T3: the typed filter lands as a bind
+    // parameter on SEED_ENTITIES_SQL; `$n IS NULL OR type = $n` keeps the
+    // omitted call byte-for-byte the old behavior.
+    const c = client!;
+    await resetSchema(c);
+    const alice = await seedEntity(c, {
+      name: "Alice",
+      desc: "works at Acme",
+      type: "person",
+    });
+    const acme = await seedEntity(c, {
+      name: "Acme",
+      desc: "works at Acme",
+      type: "organization",
+    });
+    const vec = await embedVec(computeEntityEmbeddingText("Alice", "works at Acme"));
+
+    const all = await backend!.graphArmSeed!.seedEntitiesByEmbedding(vec, 10);
+    const allIds = all.map((s) => s.id);
+    expect(allIds).toContain(alice);
+    expect(allIds).toContain(acme);
+
+    const persons = await backend!.graphArmSeed!.seedEntitiesByEmbedding(
+      vec,
+      10,
+      "person"
+    );
+    expect(persons.map((s) => s.id)).toEqual([alice]);
+
+    const orgs = await backend!.graphArmSeed!.seedEntitiesByEmbedding(
+      vec,
+      10,
+      "organization"
+    );
+    expect(orgs.map((s) => s.id)).toEqual([acme]);
+
+    // The entity-embedding seam shares the same filtered SQL path.
+    const embSeeds = await backend!.entityEmbedding.seedEntitiesByEmbedding(
+      vec,
+      10,
+      "person"
+    );
+    expect(embSeeds.map((s) => s.id)).toEqual([alice]);
   });
 
   it("11. neighboring evidence reads the same-source ±1 window after ranking", async () => {

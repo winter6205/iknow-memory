@@ -132,7 +132,7 @@ describePg("graph-backfill-pg: ledger scans + reconcile idempotence", () => {
   async function seedLedger(c: pg.Client): Promise<void> {
     for (const [id, name, type, retired] of [
       [ALICE, "Alice Smith", "person", false],
-      [ACME, "Acme Corp", "system", false],
+      [ACME, "Acme Corp", "organization", false],
       [RETIRED, "Old Alias", "person", true],
     ] as const) {
       await c.query(
@@ -189,7 +189,7 @@ describePg("graph-backfill-pg: ledger scans + reconcile idempotence", () => {
     expect(code).toBe(0);
     expect(writer.nodes).toEqual([
       { id: ALICE, canonicalName: "Alice Smith", type: "person" },
-      { id: ACME, canonicalName: "Acme Corp", type: "system" },
+      { id: ACME, canonicalName: "Acme Corp", type: "organization" },
     ]);
     expect(writer.edges).toHaveLength(1);
     expect(writer.edges[0]).toMatchObject({

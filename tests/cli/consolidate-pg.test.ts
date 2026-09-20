@@ -84,8 +84,8 @@ describePg("consolidate CLI against Postgres", () => {
       `INSERT INTO entities (id, canonical_name, type)
        VALUES
          ('11111111-1111-4111-8111-111111111111', 'Alice', 'person'),
-         ('22222222-2222-4222-8222-222222222222', 'Acme', 'system'),
-         ('33333333-3333-4333-8333-333333333333', 'Globex', 'system')`
+         ('22222222-2222-4222-8222-222222222222', 'Acme', 'organization'),
+         ('33333333-3333-4333-8333-333333333333', 'Globex', 'organization')`
     );
     await client.query(
       `INSERT INTO triples

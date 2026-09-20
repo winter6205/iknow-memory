@@ -137,8 +137,12 @@ describe("GraphPage — graph-lag distinction", () => {
     expect(screen.getByTestId("graph-hud").textContent).toMatch(
       /1 nodes · 0 edges/
     );
-    expect(screen.getByText(/person \/ company/)).toBeTruthy();
-    expect(screen.getByText(/project \/ doc \/ note \/ meeting/)).toBeTruthy();
+    expect(screen.getByText(/person \/ organization/)).toBeTruthy();
+    expect(screen.getByText(/place \/ event/)).toBeTruthy();
+    // entity-type-and-filter review C2: the closed set leaves no historical
+    // values in the store, so the legend has exactly two entries — no
+    // third "其它（历史值）" item.
+    expect(screen.queryByText(/其它（历史值）/)).toBeNull();
     const fit = screen.getByRole("button", { name: "归位" });
     expect(fit).toBeTruthy();
     await userEvent.click(fit);

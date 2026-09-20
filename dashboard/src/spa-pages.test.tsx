@@ -275,6 +275,39 @@ describe("EntityDetailPage", () => {
     ).toBe(`/browse/entities/${ENT_ID}/neighborhood`);
   });
 
+  // Closed entity type set (entity-type-and-filter T1): the detail page must
+  // render the stored type string verbatim for each of the four legal values.
+  it.each(["person", "organization", "place", "event"])(
+    "displays the stored entity type %s verbatim",
+    async (type) => {
+      mockFetch((url) => {
+        if (url === `/api/entities/${ENT_ID}/backlinks`) {
+          return jsonResponse(200, {
+            entity: { id: ENT_ID, name: "Alice", type },
+            inbound: [],
+            outbound: [],
+          });
+        }
+        return jsonResponse(200, {
+          id: ENT_ID,
+          canonical_name: "Alice",
+          type,
+          retired: false,
+          aliases: [],
+        });
+      });
+      render(
+        <MemoryRouter initialEntries={[`/browse/entities/${ENT_ID}`]}>
+          <Routes>
+            <Route path="/browse/entities/:id" element={<EntityDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      );
+      expect(await screen.findByTestId("page-state-ready")).toBeTruthy();
+      expect(screen.getByText(type)).toBeTruthy();
+    }
+  );
+
   it("shows 出链 / 入链 cards with named neighbor links from GET backlinks", async () => {
     mockFetch((url) => {
       if (url === `/api/entities/${ENT_ID}/backlinks`) {
@@ -284,7 +317,7 @@ describe("EntityDetailPage", () => {
             {
               id: OTHER_ID,
               name: "Acme",
-              type: "system",
+              type: "organization",
               relation: "delegates_to",
             },
           ],
@@ -292,7 +325,7 @@ describe("EntityDetailPage", () => {
             {
               id: OTHER_ID,
               name: "Acme",
-              type: "system",
+              type: "organization",
               relation: "works_for",
             },
           ],
@@ -400,7 +433,7 @@ describe("NeighborhoodPage", () => {
           {
             id: OTHER_ID,
             name: "Acme",
-            type: "system",
+            type: "organization",
             relation: "delegates_to",
           },
         ],
@@ -441,7 +474,7 @@ describe("NeighborhoodPage", () => {
           {
             id: OTHER_ID,
             name: "Acme",
-            type: "system",
+            type: "organization",
             relation: "works_for",
           },
         ],
@@ -622,7 +655,7 @@ describe("GraphPage", () => {
       return jsonResponse(200, {
         nodes: [
           { id: ENT_ID, name: "Alice", type: "person" },
-          { id: OTHER_ID, name: "Acme", type: "system" },
+          { id: OTHER_ID, name: "Acme", type: "organization" },
         ],
         edges: [{ from: ENT_ID, to: OTHER_ID, type: "works_for" }],
       });

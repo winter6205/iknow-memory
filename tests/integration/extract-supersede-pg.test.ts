@@ -215,8 +215,8 @@ describePg(
       const tail2Id = randomUUID();
       await seedEntities(c, [
         { id: headId, name: "Alice", type: "person" },
-        { id: tail1Id, name: "Acme", type: "system" },
-        { id: tail2Id, name: "Globex", type: "system" },
+        { id: tail1Id, name: "Acme", type: "organization" },
+        { id: tail2Id, name: "Globex", type: "organization" },
       ]);
 
       // Pre-seed the older triple directly (a contradicting tail, an
@@ -255,7 +255,7 @@ describePg(
                 relationRaw: "works at",
                 relationNorm: "works_for",
                 tail: "Globex",
-                tailType: "system",
+                tailType: "organization",
                 description: "Alice works at Globex on the platform",
                 evidenceSpan: "Alice Smith works at Globex Corp",
                 confidence: 0.9,
@@ -344,8 +344,8 @@ describePg(
       const tail2Id = randomUUID();
       await seedEntities(c, [
         { id: headId, name: "Bob", type: "person" },
-        { id: tail1Id, name: "Initech", type: "system" },
-        { id: tail2Id, name: "Hooli", type: "system" },
+        { id: tail1Id, name: "Initech", type: "organization" },
+        { id: tail2Id, name: "Hooli", type: "organization" },
       ]);
 
       const olderId = randomUUID();
@@ -378,7 +378,7 @@ describePg(
                 relationRaw: "works at",
                 relationNorm: "works_for",
                 tail: "Hooli",
-                tailType: "system",
+                tailType: "organization",
                 description: "Bob works at Hooli on the platform",
                 evidenceSpan: "Bob Jones works at Hooli",
                 confidence: 0.9,
@@ -436,9 +436,9 @@ describePg(
       const tail3Id = randomUUID();
       await seedEntities(c, [
         { id: headId, name: "Carol", type: "person" },
-        { id: tail1Id, name: "Pied Piper", type: "system" },
-        { id: tail2Id, name: "Aviato", type: "system" },
-        { id: tail3Id, name: "Raviga", type: "system" },
+        { id: tail1Id, name: "Pied Piper", type: "organization" },
+        { id: tail2Id, name: "Aviato", type: "organization" },
+        { id: tail3Id, name: "Raviga", type: "organization" },
       ]);
 
       // Older triple already present.
@@ -470,7 +470,7 @@ describePg(
                 relationRaw: "works at",
                 relationNorm: "works_for",
                 tail: "Aviato",
-                tailType: "system",
+                tailType: "organization",
                 description: "Carol works at Aviato",
                 evidenceSpan: "Carol Smith works at Aviato",
                 confidence: 0.9,
@@ -488,7 +488,7 @@ describePg(
                 relationRaw: "works at",
                 relationNorm: "works_for",
                 tail: "Raviga",
-                tailType: "system",
+                tailType: "organization",
                 description: "Carol works at Raviga",
                 evidenceSpan: "Carol Smith works at Raviga",
                 confidence: 0.9,

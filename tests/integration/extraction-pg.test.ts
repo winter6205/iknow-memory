@@ -162,7 +162,7 @@ describePg(
     ): Promise<string> {
       const id = randomUUID();
       const canonicalName = over.canonicalName ?? `entity-${id}`;
-      const type = over.type ?? "concept";
+      const type = over.type ?? "person";
       await c.query(
         `INSERT INTO entities (id, canonical_name, type) VALUES ($1, $2, $3)`,
         [id, canonicalName, type]
@@ -234,13 +234,13 @@ describePg(
 
       const survivorId = await mintEntity(c, {
         canonicalName: "Canonical Corp",
-        type: "concept",
+        type: "organization",
       });
       const loserId = randomUUID();
       await c.query(
         `INSERT INTO entities (id, canonical_name, type, merged_into)
          VALUES ($1, $2, $3, $4)`,
-        [loserId, "Canonical Corp (old)", "concept", survivorId]
+        [loserId, "Canonical Corp (old)", "organization", survivorId]
       );
 
       // Chain walk: loser -> survivor.

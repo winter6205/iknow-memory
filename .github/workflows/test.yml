@@ -74,12 +74,11 @@ jobs:
       - name: Verify ES is reachable from the runner
         # The compose healthcheck only proves the container's own loopback
         # answers; `up --wait` returning "healthy" does NOT prove the host's
-        # published path works. scripts/wait-for-es.ts polls the same client
-        # the suite uses and reports the real error code. See its header for
-        # the failure that motivated it.
+        # published path works. scripts/wait-for-es.sh polls until the port
+        # answers. See its header for the failures that motivated it.
         env:
           ES_URL: http://127.0.0.1:9200
-        run: npx tsx scripts/wait-for-es.ts
+        run: bash scripts/wait-for-es.sh
       - name: ES reachability diagnostics
         if: failure()
         run: |
@@ -119,7 +118,7 @@ jobs:
       # 127.0.0.1 rather than localhost, per docs/mcp-config.md: the host
       # side should not depend on where getaddrinfo puts ::1 vs 127.0.0.1.
       # (Not the cause of the first test-es failure — that was a transient
-      # connection reset from the published port; see wait-for-es.ts.)
+      # connection reset from the published port; see wait-for-es.sh.)
       GRAPHRAG_MEMORY_ES_URL: http://127.0.0.1:9200
     steps:
       - uses: actions/checkout@v4
@@ -145,7 +144,7 @@ jobs:
         # weeks without ever going red).
         env:
           ES_URL: http://127.0.0.1:9200
-        run: npx tsx scripts/wait-for-es.ts
+        run: bash scripts/wait-for-es.sh
       - name: ES reachability diagnostics
         if: failure()
         run: |

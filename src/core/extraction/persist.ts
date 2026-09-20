@@ -37,7 +37,14 @@ import { resolveCanonicalId } from "../entities/resolve.js";
 import { computeEntityEmbeddingText } from "../entities/embedding.js";
 import { GraphragError } from "../errors.js";
 import type { EmbeddingClient } from "../embedder.js";
-import { embedWithLog } from "../embed-log.js";
+import {
+  embedWithSlotFallback,
+  readSlotGenerationState,
+  slotWriteTargets,
+  type SlotEmbeddingSource,
+  type SlotVectorBatches,
+} from "../embed-slots.js";
+import type { EmbeddingGenerationState } from "../types.js";
 import { normalizeEntityType, type EntityType } from "./entity-type.js";
 
 /**
@@ -49,6 +56,12 @@ export interface ExtractPersistDeps {
   logger: Logger;
   /** Injectable clock for deterministic started_at in tests. */
   now?: () => string;
+  /**
+   * Embedding rotate T2: where to get the embedder for the OTHER slot's
+   * (model, dimensions) pair while a `dual_write` rotate is open. Absent →
+   * legacy single-generation embed; an OPEN rotate then typed-refuses.
+   */
+  slotEmbedding?: SlotEmbeddingSource;
   /**
    * T4 write-time supersede switch. Forwarded to `upsertTriple` so a
    * contradicting older row is retired in the same per-chunk transaction
@@ -477,7 +490,7 @@ async function resolveEntity(
         client,
         loserId,
         incoming,
-        await embedEntity(deps, incoming)
+        await embedEntityForWrite(deps, client, incoming)
       );
       await linkMergedEntity(client, loserId, survivorId);
       mergedLoserIds.push(loserId);
@@ -494,7 +507,12 @@ async function resolveEntity(
     };
   }
   const id = randomUUID();
-  await insertEntity(client, id, incoming, await embedEntity(deps, incoming));
+  await insertEntity(
+    client,
+    id,
+    incoming,
+    await embedEntityForWrite(deps, client, incoming)
+  );
   await insertAlias(client, id, incoming.canonicalName, "name");
   return { id, canonicalName: incoming.canonicalName, mergedLoserIds: [] };
 }
@@ -532,11 +550,58 @@ export async function loadEntities(
  * or, for a row that predates that write path, once at the CLI's
  * `--backfill-embeddings` time, which is why this takes the name/description
  * pair rather than a whole `IncomingEntity`.
+ *
+ * T2 slot awareness: the ACTIVE-slot vector, embedded with the active
+ * generation's pair when the ledger says so (the `--backfill-embeddings`
+ * repair never touches the incoming slot, so `includeIncoming` is false).
  */
 export async function embedEntity(
   deps: ExtractPersistDeps,
-  incoming: { canonicalName: string; description: string }
+  incoming: { canonicalName: string; description: string },
+  state: EmbeddingGenerationState | null = null
 ): Promise<number[]> {
+  const batches = await embedEntityBatches(deps, state, incoming, false);
+  return requireEntityVector(incoming, batches.active[0]);
+}
+
+/**
+ * The vectors one entity write must land in BOTH open generations with
+ * (embedding generation rotate T2, dual-write): the active vector plus the
+ * incoming-slot vector embedded with the INCOMING pair, and the physical
+ * slot columns the INSERT names. All batches are computed before the caller
+ * writes, so a secondary embed failure leaves the row unwritten.
+ */
+export interface EntitySlotVectors {
+  active: number[];
+  incoming: number[] | null;
+  activeSlot: string;
+  incomingSlot: string | null;
+}
+
+export async function embedEntityForWrite(
+  deps: ExtractPersistDeps,
+  client: Queryable,
+  incoming: { canonicalName: string; description: string }
+): Promise<EntitySlotVectors> {
+  const state = await readSlotGenerationState(client);
+  const batches = await embedEntityBatches(deps, state, incoming);
+  const targets = slotWriteTargets(state);
+  return {
+    active: requireEntityVector(incoming, batches.active[0]),
+    incoming:
+      batches.incoming === null
+        ? null
+        : requireEntityVector(incoming, batches.incoming[0]),
+    ...targets,
+  };
+}
+
+async function embedEntityBatches(
+  deps: ExtractPersistDeps,
+  state: EmbeddingGenerationState | null,
+  incoming: { canonicalName: string; description: string },
+  includeIncoming?: boolean
+): Promise<SlotVectorBatches> {
   const text = computeEntityEmbeddingText(
     incoming.canonicalName,
     incoming.description
@@ -545,10 +610,25 @@ export async function embedEntity(
   // embedded SSOT text itself never travels with the log line. Same shared
   // contract as the tools' "embed" event; no itemCount (single text) and
   // the caller's injectable clock drives `time`.
-  const [vector] = await embedWithLog(deps.logger, deps.embedder, [text], {
+  return embedWithSlotFallback({
+    embedder: deps.embedder,
+    slotEmbedding: deps.slotEmbedding,
+    state,
+    site: "entity",
+    texts: [text],
+    logger: deps.logger,
     eventName: "entity-embed",
     now: () => depsNow(deps),
+    ...(includeIncoming === undefined
+      ? {}
+      : { includeIncoming }),
   });
+}
+
+function requireEntityVector(
+  incoming: { canonicalName: string },
+  vector: number[] | undefined
+): number[] {
   if (!vector) {
     throw new GraphragError(
       `embedder returned no vector for entity "${incoming.canonicalName}"`,
@@ -570,7 +650,7 @@ export async function insertEntity(
   client: Queryable,
   id: string,
   incoming: IncomingEntity,
-  embedding: number[]
+  vectors: EntitySlotVectors
 ): Promise<void> {
   // CR High #2 backstop: the DDL pins entities.type to the closed 4-value
   // CHECK set (person/organization/place/event). persistOutputs already
@@ -587,15 +667,25 @@ export async function insertEntity(
   }
   // A7: description rides in the existing metadata JSONB — the spec-1 DDL is
   // frozen, so there is no description column to write.
+  // T2 dual-write: while a rotate is open the incoming slot column joins
+  // the same INSERT, so the row lands in BOTH generations atomically.
+  const { activeSlot, incomingSlot } = vectors;
   await client.query(
-    `INSERT INTO entities (id, canonical_name, type, embedding, metadata, retired)
-     VALUES ($1, $2, $3, $4::vector, $5::jsonb, false)`,
+    `INSERT INTO entities (id, canonical_name, type, ${activeSlot}, metadata, retired${
+      incomingSlot === null ? "" : `, ${incomingSlot}`
+    })
+     VALUES ($1, $2, $3, $4::vector, $5::jsonb, false${
+       incomingSlot === null ? "" : ", $6::vector"
+     })`,
     [
       id,
       incoming.canonicalName,
       type,
-      toVectorLiteral(embedding),
+      toVectorLiteral(vectors.active),
       JSON.stringify({ description: incoming.description }),
+      ...(incomingSlot === null
+        ? []
+        : [toVectorLiteral(vectors.incoming as number[])]),
     ]
   );
 }

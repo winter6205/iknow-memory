@@ -29,6 +29,11 @@ import {
   type ToolResult,
 } from "./registry.js";
 import type { EmbeddingClient } from "../core/embedder.js";
+import {
+  embedWithSlotFallback,
+  type SlotEmbeddingSource,
+  type SlotVectorBatches,
+} from "../core/embed-slots.js";
 import type {
   ChunkRecord,
   SourceDocRecord,
@@ -44,7 +49,6 @@ import {
   computeSourceDocId,
   DEFAULT_CONTENT_IDENTITY_VERSIONS,
   embedTextForSlice,
-  embedWithLog,
   type ContentIdentityVersions,
 } from "./ingest.js";
 import {
@@ -211,6 +215,12 @@ export interface PushDeps {
    * threads the server logger in.
    */
   logger?: Logger;
+  /**
+   * Embedding rotate T2: embedder source for the OTHER slot's pair while a
+   * `dual_write` rotate is open (mirrors IngestDeps). Absent → an open
+   * rotate is a typed refuse, never a one-slot write.
+   */
+  slotEmbedding?: SlotEmbeddingSource;
 }
 
 /**
@@ -375,6 +385,8 @@ async function withFailureRecord<T>(
  */
 interface EnvelopeWriteContext {
   embeddings: number[][];
+  /** Incoming-slot batch; non-null only while a dual-write rotate is open. */
+  incomingEmbeddings: number[][] | null;
   embeddingCursor: number;
   identityVersions: ContentIdentityVersions;
   now: string;
@@ -424,6 +436,12 @@ async function writeEnvelope(
       id: computeChunkId(env.source_ref, contentIdentity),
       content: slice.content,
       embedding: ctx.embeddings[ctx.embeddingCursor]!,
+      ...(ctx.incomingEmbeddings === null
+        ? {}
+        : {
+            incoming_embedding:
+              ctx.incomingEmbeddings[ctx.embeddingCursor]!,
+          }),
       source_ref: env.source_ref,
       metadata: env.metadata,
       valid_from: env.valid_from,
@@ -466,12 +484,13 @@ export function createPushHandler(deps: PushDeps) {
     );
     // Nothing has been written yet, so an embed failure fails the whole
     // batch: every envelope in it names a 失败 attempt.
-    const embeddings = await withFailureRecord(deps.storage, allRefs, () =>
+    const batches = await withFailureRecord(deps.storage, allRefs, () =>
       embedSlices(deps, sliceTexts)
     );
 
     const ctx: EnvelopeWriteContext = {
-      embeddings,
+      embeddings: batches.active,
+      incomingEmbeddings: batches.incoming,
       embeddingCursor: 0,
       identityVersions: {
         ...DEFAULT_CONTENT_IDENTITY_VERSIONS,
@@ -515,26 +534,41 @@ export function createPushHandler(deps: PushDeps) {
   };
 }
 
-/** Embed every slice, refusing a count mismatch (a silent truncation). */
+/**
+ * Embed every slice for each generation slot the write touches, refusing a
+ * count mismatch (a silent truncation). T2 dual-write: both slot batches
+ * are computed BEFORE any envelope write, so a secondary embed failure
+ * fails the whole batch with nothing written (both-or-neither).
+ */
 async function embedSlices(
   deps: PushDeps,
   sliceTexts: string[]
-): Promise<number[][]> {
-  const embeddings = await embedWithLog(
-    deps.logger,
-    deps.embedder,
-    sliceTexts,
-    {
-      itemCount: sliceTexts.length,
-    }
-  );
-  if (embeddings.length !== sliceTexts.length) {
+): Promise<SlotVectorBatches> {
+  const batches = await embedWithSlotFallback({
+    embedder: deps.embedder,
+    slotEmbedding: deps.slotEmbedding,
+    state: deps.storage.getGenerationState?.() ?? null,
+    site: "push",
+    texts: sliceTexts,
+    logger: deps.logger,
+    itemCount: sliceTexts.length,
+  });
+  if (batches.active.length !== sliceTexts.length) {
     throw new GraphragError(
-      `push: embedding count ${embeddings.length} does not match slice count ${sliceTexts.length}`,
+      `push: embedding count ${batches.active.length} does not match slice count ${sliceTexts.length}`,
       "EMBEDDING_FAILED"
     );
   }
-  return embeddings;
+  if (
+    batches.incoming !== null &&
+    batches.incoming.length !== sliceTexts.length
+  ) {
+    throw new GraphragError(
+      `push: incoming embedding count ${batches.incoming.length} does not match slice count ${sliceTexts.length}`,
+      "EMBEDDING_FAILED"
+    );
+  }
+  return batches;
 }
 
 /**

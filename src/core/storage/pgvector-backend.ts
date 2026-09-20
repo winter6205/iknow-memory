@@ -74,7 +74,11 @@ import {
   assertPgvectorAnnDimensions,
   upSchemaBootstrap,
 } from "./schema-bootstrap.js";
-import { guardEmbeddingBoot } from "./embedding-generation.js";
+import {
+  guardEmbeddingBoot,
+  readGenerationState,
+} from "./embedding-generation.js";
+import { slotWriteTargets, slotWriteWidths } from "../embed-slots.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
 import {
   CHUNK_BY_ID_SQL,
@@ -755,38 +759,45 @@ export class PgvectorBackend
     if (chunks.length === 0) return [];
     const pool = await this.ensureReady();
 
-    // Validate embedding dimensions BEFORE any DB round-trip so a bad
-    // batch fails fast and the whole upsert is atomic on the caller's
-    // side. (Postgres would reject with a dimension error, but we'd rather
-    // surface a typed GraphragError than a pg driver error.)
-    for (const chunk of chunks) {
-      if (chunk.embedding.length !== this.dimensions) {
-        throw new GraphragError(
-          `PgvectorBackend.upsert: chunk "${chunk.id}" embedding length ${chunk.embedding.length} !== ${this.dimensions}`,
-          "EMBEDDING_DIM_MISMATCH"
-        );
-      }
-    }
+    // T2 dual-write: re-read the ledger per batch — a rotate may have been
+    // opened after this process booted. The cached boot state is refreshed
+    // so the tool layer self-heals against the same ledger.
+    const state = await readGenerationState(pool);
+    if (state !== null) this.generation = state;
+    const { activeSlot, incomingSlot } = slotWriteTargets(state);
+    const widths = slotWriteWidths(state, this.dimensions);
+    this.validateUpsertVectors(chunks, activeSlot, widths, incomingSlot);
+
+    const slotColumns = `${activeSlot}${
+      incomingSlot === null ? "" : `, ${incomingSlot}`
+    }`;
+    const slotPlaceholders = `$3::vector${
+      incomingSlot === null ? "" : ", $11::vector"
+    }`;
+    const slotAssignments = `${activeSlot} = EXCLUDED.${activeSlot}${
+      incomingSlot === null ? "" : `,\n             ${incomingSlot} = EXCLUDED.${incomingSlot}`
+    }`;
 
     // Each chunk is its own INSERT ... ON CONFLICT. A single multi-row
     // INSERT would be marginally faster, but per-row keeps the SQL
     // straightforward and lets pg report which id failed. We do NOT wrap
     // in a transaction here: ON CONFLICT (id) DO UPDATE is per-row atomic
-    // already, and a partial failure mode (some chunks persist, others
-    // don't) is acceptable — the caller can retry the missing ids.
+    // already — the row-atomic dual-write T2 needs — and a partial failure
+    // mode (some chunks persist, others don't) is acceptable; the caller
+    // can retry the missing ids.
     const ids: string[] = [];
     try {
       for (const chunk of chunks) {
         await pool.query(
           `INSERT INTO chunks
-             (id, content, embedding, valid_from, valid_until,
+             (id, content, ${slotColumns}, valid_from, valid_until,
               source_ref, metadata, created_at,
               source_doc_id, ordinal)
-           VALUES ($1, $2, $3::vector, $4, $5, $6, $7::jsonb, $8,
+           VALUES ($1, $2, ${slotPlaceholders}, $4, $5, $6, $7::jsonb, $8,
                    $9, $10)
            ON CONFLICT (id) DO UPDATE SET
              content = EXCLUDED.content,
-             embedding = EXCLUDED.embedding,
+             ${slotAssignments},
              valid_from = EXCLUDED.valid_from,
              valid_until = CASE
                WHEN chunks.metadata ? '${CONTENT_INVALIDATIONS_METADATA_KEY}'
@@ -822,6 +833,9 @@ export class PgvectorBackend
             chunk.created_at,
             chunk.source_doc_id ?? null,
             chunk.ordinal ?? null,
+            ...(incomingSlot === null
+              ? []
+              : [toVectorLiteral(chunk.incoming_embedding as number[])]),
           ]
         );
         ids.push(chunk.id);
@@ -833,6 +847,43 @@ export class PgvectorBackend
       );
     }
     return ids;
+  }
+
+  /**
+   * Validate the whole batch BEFORE the first round-trip (both-or-neither):
+   * the active vector must match the ledger's active width, and while a
+   * dual-write rotate is open the incoming vector must be present at the
+   * incoming width — a row half-written in one generation only is exactly
+   * what T4's cutover fill must never have to guess about.
+   */
+  private validateUpsertVectors(
+    chunks: ChunkRecord[],
+    activeSlot: string,
+    widths: { activeDimensions: number; incomingDimensions: number | null },
+    incomingSlot: string | null
+  ): void {
+    for (const chunk of chunks) {
+      if (chunk.embedding.length !== widths.activeDimensions) {
+        throw new GraphragError(
+          `PgvectorBackend.upsert: chunk "${chunk.id}" ${activeSlot} length ${chunk.embedding.length} !== ${widths.activeDimensions}`,
+          "EMBEDDING_DIM_MISMATCH"
+        );
+      }
+      if (incomingSlot !== null) {
+        const incoming = chunk.incoming_embedding;
+        if (
+          incoming === undefined ||
+          incoming.length !== widths.incomingDimensions
+        ) {
+          throw new GraphragError(
+            `PgvectorBackend.upsert: chunk "${chunk.id}" lacks the incoming-slot vector for the open dual-write rotate (slot ${incomingSlot})`,
+            "EMBEDDING_FAILED"
+          );
+          // EXIT: dual-write is all-or-nothing per row; refuse the batch
+          // rather than half-write the rotate (spec T2 both-or-neither).
+        }
+      }
+    }
   }
 
   async invalidateSourceRef(

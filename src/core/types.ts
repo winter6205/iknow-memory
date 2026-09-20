@@ -24,6 +24,14 @@ export interface ChunkRecord {
   source_doc_id?: string;
   /** Zero-based ordinal of this chunk within its source document. */
   ordinal?: number;
+  /**
+   * Vector for the INCOMING generation slot, embedded with the incoming
+   * (model, dimensions) pair (embedding generation rotate T2). Present only
+   * while a `dual_write` rotate is open; the pgvector backend refuses the
+   * batch when the rotate is open and this field is missing, so a row can
+   * never be half-written into one generation only.
+   */
+  incoming_embedding?: number[];
 }
 
 /**
@@ -227,6 +235,13 @@ export interface RetrieveResult {
 /** Storage backend contract — both MemoryBackend and PgvectorBackend implement this. */
 export interface StorageBackend {
   upsert(chunks: ChunkRecord[]): Promise<string[]>; // returns chunk ids
+  /**
+   * The embedding-generation ledger as last read by the backend
+   * (embedding generation rotate T1/T2). Optional: memory-mode and test
+   * backends have no generations, and an absent read means "no rotate is
+   * open" for the dual-write decision at the tool layer.
+   */
+  getGenerationState?(): EmbeddingGenerationState | undefined;
   search(
     queryEmbedding: number[],
     opts: SearchOptions

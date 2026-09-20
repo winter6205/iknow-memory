@@ -29,6 +29,8 @@ import {
 } from "./registry.js";
 import { resolveToolBatchLimit } from "./batch-limit.js";
 import type { EmbeddingClient } from "../core/embedder.js";
+import type { SlotEmbeddingSource } from "../core/embed-slots.js";
+import { embedWithSlotFallback } from "../core/embed-slots.js";
 import type {
   ChunkRecord,
   SourceDocRecord,
@@ -235,6 +237,13 @@ export interface IngestDeps {
    * threads the server logger in.
    */
   logger?: Logger;
+  /**
+   * Embedding rotate T2: where to get an embedder for the OTHER slot's
+   * (model, dimensions) pair while a `dual_write` rotate is open. Absent on
+   * memory/test deps — then an open rotate is a typed refuse, not a
+   * one-slot write.
+   */
+  slotEmbedding?: SlotEmbeddingSource;
 }
 
 /** Typed failure for a batch that would exceed the configured limit. */
@@ -386,7 +395,7 @@ function assertSliceInvariants(
  * (the chunk embed-input wrap) rides the same path from the same module.
  */
 export { embedWithLog, embedTextForSlice } from "../core/embed-log.js";
-import { embedWithLog, embedTextForSlice } from "../core/embed-log.js";
+import { embedTextForSlice } from "../core/embed-log.js";
 
 /**
  * Per-envelope preflight: per-chunk size cap (1MB), empty-content reject,
@@ -472,21 +481,39 @@ export function createIngestHandler(deps: IngestDeps) {
       (acc, env) => acc + env.slices.length,
       0
     );
-    // Embed slice texts in one call (slice text is final — no re-chunking).
     // The embed INPUT carries the 资料 title (contextual wrap); the stored
     // chunk content below stays the pushed bytes.
     const sliceTexts = envelopes.flatMap((env) =>
       env.slices.map((slice) => embedTextForSlice(env.title, slice.content))
     );
-    const embeddings = await embedWithLog(
-      deps.logger,
-      deps.embedder,
-      sliceTexts,
-      { itemCount: totalSlices }
-    );
+    // Embed slice texts in one call per touched generation slot (slice text
+    // is final — no re-chunking). T2 dual-write: while a `dual_write` rotate
+    // is open the incoming slot's batch is embedded with ITS OWN pair before
+    // any write happens — a secondary failure refuses the ingest with both
+    // slots unwritten (both-or-neither).
+    const generation = deps.storage.getGenerationState?.() ?? null;
+    const batches = await embedWithSlotFallback({
+      embedder: deps.embedder,
+      slotEmbedding: deps.slotEmbedding,
+      state: generation,
+      site: "ingest",
+      texts: sliceTexts,
+      logger: deps.logger,
+      itemCount: totalSlices,
+    });
+    const embeddings = batches.active;
     if (embeddings.length !== sliceTexts.length) {
       throw new GraphragError(
         `ingest: embedding count ${embeddings.length} does not match slice count ${sliceTexts.length}`,
+        "EMBEDDING_FAILED"
+      );
+    }
+    if (
+      batches.incoming !== null &&
+      batches.incoming.length !== sliceTexts.length
+    ) {
+      throw new GraphragError(
+        `ingest: incoming embedding count ${batches.incoming.length} does not match slice count ${sliceTexts.length}`,
         "EMBEDDING_FAILED"
       );
     }
@@ -534,6 +561,9 @@ export function createIngestHandler(deps: IngestDeps) {
           id: computeChunkId(env.source_ref, contentIdentity),
           content: slice.content,
           embedding: embeddings[embeddingCursor]!,
+          ...(batches.incoming === null
+            ? {}
+            : { incoming_embedding: batches.incoming[embeddingCursor]! }),
           source_ref: env.source_ref,
           metadata: env.metadata,
           valid_from: env.valid_from ?? now,

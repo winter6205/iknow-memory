@@ -37,7 +37,12 @@ import { randomUUID } from "node:crypto";
 import type { Logger } from "../../logging.js";
 import { normalizeAlias } from "../entities/merge.js";
 import { computeEntityEmbeddingText } from "../entities/embedding.js";
-import { embedWithLog } from "../embed-log.js";
+import {
+  embedWithSlotFallback,
+  readSlotGenerationState,
+  slotWriteTargets,
+  type SlotEmbeddingSource,
+} from "../embed-slots.js";
 import { GraphragError } from "../errors.js";
 import type { EmbeddingClient } from "../embedder.js";
 import type { ChunkInput } from "./extract.js";
@@ -98,6 +103,12 @@ export interface EnrichDeps {
    */
   embedder: EmbeddingClient;
   logger: Logger;
+  /**
+   * Embedding rotate T2: per-slot embedder source for the re-embed UPDATE
+   * (mirrors ExtractPersistDeps). Absent → legacy single-column write, or
+   * a typed refuse inside the sealed skip when a dual-write rotate is open.
+   */
+  slotEmbedding?: SlotEmbeddingSource;
 }
 
 /** One survivor of the merge, with this chunk's deduped description set. */
@@ -298,12 +309,23 @@ async function reembedDescriptions(
   const texts = entries.map((e) =>
     computeEntityEmbeddingText(e.canonicalName, e.draft)
   );
-  let vectors: number[][];
+  const state = await readSlotGenerationState(client);
+  const targets = slotWriteTargets(state);
+  let active: number[][];
+  let incoming: number[][] | null;
   try {
-    vectors = await embedWithLog(deps.logger, deps.embedder, texts, {
+    const batches = await embedWithSlotFallback({
+      embedder: deps.embedder,
+      slotEmbedding: deps.slotEmbedding,
+      state,
+      site: "entity-description",
+      texts,
+      logger: deps.logger,
       eventName: "entity-description-embed",
       itemCount: texts.length,
     });
+    active = batches.active;
+    incoming = batches.incoming;
   } catch (err) {
     // EXIT: sealed per-leg skip — the embed log already fired inside
     // embedWithLog; the description writes above stay committed with the
@@ -319,16 +341,31 @@ async function reembedDescriptions(
     return;
   }
   for (let i = 0; i < entries.length; i += 1) {
-    const vector = vectors[i];
-    if (!vector || vector.length === 0) {
-      // Row-level mark-and-continue: a short response skips THIS node's
-      // vector, the described siblings still land theirs.
+    const vector = active[i];
+    const incomingVector = incoming === null ? null : incoming[i];
+    if (
+      !vector ||
+      vector.length === 0 ||
+      (incoming !== null && (!incomingVector || incomingVector.length === 0))
+    ) {
+      // Row-level mark-and-continue (T2 both-or-neither per row): a short
+      // response — in EITHER open slot — skips THIS node's vector update
+      // entirely; a dual-write rotate never sees a one-generation-only
+      // description vector. The described siblings still land theirs.
       counts.embedSkipped += 1;
       continue;
     }
     await client.query(
-      `UPDATE entities SET embedding = $2::vector WHERE id = $1`,
-      [entries[i]!.entityId, toVectorLiteral(vector)]
+      `UPDATE entities SET ${targets.activeSlot} = $2::vector${
+        targets.incomingSlot === null
+          ? ""
+          : `, ${targets.incomingSlot} = $3::vector`
+      } WHERE id = $1`,
+      [
+        entries[i]!.entityId,
+        toVectorLiteral(vector),
+        ...(incomingVector === null ? [] : [toVectorLiteral(incomingVector)]),
+      ]
     );
     counts.embedded += 1;
   }

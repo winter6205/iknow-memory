@@ -59,7 +59,7 @@ function toPair(desired: DesiredEmbeddingGeneration): EmbeddingGenerationPair {
 }
 
 /** Generation equality: an absent configured model equals a NULL recorded one. */
-function sameGeneration(
+export function sameGenerationPair(
   a: EmbeddingGenerationPair,
   b: EmbeddingGenerationPair
 ): boolean {
@@ -89,6 +89,11 @@ function assertSafeSlot(slot: string): void {
     "STORAGE_ERROR"
   );
   // EXIT: identifiers are machine-generated; anything else is corruption.
+}
+
+/** Public seam for T2 write sites that interpolate a slot column into DML. */
+export function assertEmbeddingSlotIdentifier(slot: string): void {
+  assertSafeSlot(slot);
 }
 
 interface GenerationRow {
@@ -220,8 +225,8 @@ export async function guardEmbeddingBoot(
     }
   }
   const desiredPair = toPair(desired);
-  if (sameGeneration(desiredPair, state.active)) return state;
-  if (state.incoming !== null && sameGeneration(desiredPair, state.incoming)) {
+  if (sameGenerationPair(desiredPair, state.active)) return state;
+  if (state.incoming !== null && sameGenerationPair(desiredPair, state.incoming)) {
     return state;
   }
   throw new ConfigError(
@@ -325,7 +330,7 @@ export async function openRotate(
   }
   assertPgvectorAnnDimensions(desired.dimensions, annMaxDimensions);
   const desiredPair = toPair(desired);
-  if (sameGeneration(desiredPair, state.active)) {
+  if (sameGenerationPair(desiredPair, state.active)) {
     throw new GraphragError(
       `openRotate: desired ${pairLabel(desiredPair)} equals the active generation — nothing to rotate`,
       "INVALID_INPUT"

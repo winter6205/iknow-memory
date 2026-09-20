@@ -34,7 +34,15 @@ import {
 } from "../config.js";
 import { createLogger, type Logger, writeStderr } from "../logging.js";
 import { NineRouterEmbedder, type EmbeddingClient } from "../core/embedder.js";
-import { embedWithLog } from "../core/embed-log.js";
+import { GraphragError } from "../core/errors.js";
+import {
+  createSlotEmbeddingSource,
+  embedWithSlotFallback,
+  readSlotGenerationState,
+  slotWriteTargets,
+  type SlotEmbeddingSource,
+} from "../core/embed-slots.js";
+import type { EmbeddingGenerationState } from "../core/types.js";
 import {
   createNeo4jCommunityDetector,
   type Community,
@@ -74,6 +82,12 @@ export interface CommunitySummaryDeps {
   embedder: EmbeddingClient;
   dimensions: number;
   logger: Logger;
+  /**
+   * Embedding rotate T2: per-slot embedder source so a swap that runs while
+   * a `dual_write` rotate is open fills BOTH generation columns. Absent →
+   * legacy single-column swap; an open rotate typed-refuses inside the job.
+   */
+  slotEmbedding?: SlotEmbeddingSource;
 }
 
 interface Flags {
@@ -208,9 +222,17 @@ async function runSummaryJob(
   // Generation first, writes last: nothing touches the ledger until every
   // summary exists, which is what makes the job all-or-nothing. An empty
   // detection result is a complete (empty) generation and clears the ledger.
-  const pending = await generatePendingSummaries(client, communities, deps);
+  // T2: one ledger read binds the whole job — the swap writes exactly the
+  // slots this generation pass embedded for.
+  const generation = await readSlotGenerationState(client);
+  const pending = await generatePendingSummaries(
+    client,
+    communities,
+    deps,
+    generation
+  );
   try {
-    await swapCommunitySummaries(client, pending);
+    await swapCommunitySummaries(client, pending, generation);
   } catch (err) {
     throw new CommunitySummaryJobError("persist", errorMessage(err), err);
   }
@@ -247,12 +269,15 @@ interface PendingSummary {
   entityIds: string[];
   summary: string;
   embedding: number[];
+  /** Incoming-slot vector; present only while a dual-write rotate is open. */
+  incomingEmbedding?: number[];
 }
 
 async function generatePendingSummaries(
   client: CommunitySummaryDbClient,
   communities: readonly Community[],
-  deps: CommunitySummaryDeps
+  deps: CommunitySummaryDeps,
+  generation: EmbeddingGenerationState | null
 ): Promise<PendingSummary[]> {
   const pending: PendingSummary[] = [];
   for (const community of communities) {
@@ -271,20 +296,36 @@ async function generatePendingSummaries(
         throw new Error("summary client returned empty text");
       // T6 class 3 through the shared SC10 embed-log contract
       // (embed-log.ts is the one home for every embedder.embed call site).
-      const [embedding] = await embedWithLog(
-        deps.logger,
-        deps.embedder,
-        [summary],
-        { eventName: "community-summary-embed", itemCount: 1 }
-      );
+      // T2 dual-write: each touched slot's batch is embedded with its OWN
+      // pair before any ledger write — the job's all-or-nothing posture
+      // already gives both-or-neither for the whole generation.
+      const batches = await embedWithSlotFallback({
+        embedder: deps.embedder,
+        slotEmbedding: deps.slotEmbedding,
+        state: generation,
+        site: "community-summary",
+        texts: [summary],
+        logger: deps.logger,
+        eventName: "community-summary-embed",
+        itemCount: 1,
+      });
+      const [embedding] = batches.active;
       if (embedding === undefined || embedding.length === 0) {
         throw new Error("summary embedder returned no vector");
+      }
+      const incomingEmbedding = batches.incoming?.[0];
+      if (
+        batches.incoming !== null &&
+        (incomingEmbedding === undefined || incomingEmbedding.length === 0)
+      ) {
+        throw new Error("incoming-slot embedder returned no vector");
       }
       pending.push({
         communityId: community.id,
         entityIds: [...community.entityIds],
         summary,
         embedding,
+        ...(incomingEmbedding === undefined ? {} : { incomingEmbedding }),
       });
     } catch (err) {
       // EXIT: all-or-nothing — the first empty/error aborts the job before
@@ -311,22 +352,44 @@ async function generatePendingSummaries(
  */
 async function swapCommunitySummaries(
   client: CommunitySummaryDbClient,
-  pending: readonly PendingSummary[]
+  pending: readonly PendingSummary[],
+  generation: EmbeddingGenerationState | null
 ): Promise<void> {
+  const { activeSlot, incomingSlot } = slotWriteTargets(generation);
+  if (incomingSlot !== null) {
+    // T2 both-or-neither for the swap: refuse the whole transaction BEFORE
+    // BEGIN if any generated row lacks the incoming-slot vector.
+    const missing = pending.find((row) => row.incomingEmbedding === undefined);
+    if (missing !== undefined) {
+      throw new GraphragError(
+        `community summary swap: row for community "${missing.communityId}" lacks the incoming-slot vector for the open dual-write rotate`,
+        "EMBEDDING_FAILED"
+      );
+      // EXIT: generation is all-or-nothing anyway; a one-slot swap would
+      // half-write the rotate.
+    }
+  }
   await client.query("BEGIN");
   try {
     await client.query("DELETE FROM community_summaries", []);
     for (const row of pending) {
       await client.query(
         `INSERT INTO community_summaries
-           (id, community_id, summary, entity_ids, embedding)
-         VALUES ($1, $2, $3, $4, $5::vector)`,
+           (id, community_id, summary, entity_ids, ${activeSlot}${
+             incomingSlot === null ? "" : `, ${incomingSlot}`
+           })
+         VALUES ($1, $2, $3, $4, $5::vector${
+           incomingSlot === null ? "" : ", $6::vector"
+         })`,
         [
           randomUUID(),
           row.communityId,
           row.summary,
           row.entityIds,
           toVectorLiteral(row.embedding),
+          ...(incomingSlot === null
+            ? []
+            : [toVectorLiteral(row.incomingEmbedding as number[])]),
         ]
       );
     }
@@ -441,6 +504,12 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
   }
 
   const pool = new Pool({ connectionString: env.dbUrl });
+  const embedder = new NineRouterEmbedder({
+    baseUrl: env.embedBaseUrl!,
+    model: env.embedModel!,
+    apiKey: env.embedApiKey,
+    dimensions: env.embedDimensions,
+  });
   const deps: CommunitySummaryDeps = {
     pool: pool as unknown as CommunitySummaryPool,
     detector: createNeo4jCommunityDetector(neo4j),
@@ -449,14 +518,18 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
       model: env.rerank.model,
       baseUrl: env.rerank.baseUrl,
     }),
-    embedder: new NineRouterEmbedder({
-      baseUrl: env.embedBaseUrl!,
-      model: env.embedModel!,
-      apiKey: env.embedApiKey,
-      dimensions: env.embedDimensions,
-    }),
+    embedder,
     dimensions: env.embedDimensions,
     logger: createLogger(env.logLevel),
+    slotEmbedding: createSlotEmbeddingSource(
+      {
+        apiKey: env.embedApiKey,
+        baseUrl: env.embedBaseUrl,
+        model: env.embedModel,
+        dimensions: env.embedDimensions,
+      },
+      embedder
+    ),
   };
   try {
     return await runCli(argv, deps);

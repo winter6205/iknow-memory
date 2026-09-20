@@ -7,7 +7,14 @@
  * on all three tables (entities included), and a concurrent second rotate is
  * refused against the live singleton. Skips loudly when Postgres/pgvector is
  * unavailable (tests/integration/pg-test-harness.ts convention).
+ *
+ * The second suite adds the T2 dual-write persist proofs: a chunk and an
+ * entity written while a rotate is OPEN land in BOTH physical slots with
+ * vectors from DIFFERENT generations (the (model, dims) pair each slot was
+ * opened for), and `--backfill-embeddings` stays NULL-only on the active
+ * slot, never filling the incoming column.
  */
+import { randomUUID } from "node:crypto";
 import pg from "pg";
 import { afterAll, beforeAll, expect, it } from "vitest";
 
@@ -19,6 +26,19 @@ import {
   openRotate,
   readGenerationState,
 } from "../../src/core/storage/embedding-generation.js";
+import {
+  embedSlotVectors,
+  type SlotEmbeddingSource,
+} from "../../src/core/embed-slots.js";
+import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
+import {
+  persistOutputs,
+  type ExtractPersistDeps,
+} from "../../src/core/extraction/persist.js";
+import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
+import type { ExtractionOutput } from "../../src/core/extraction/types.js";
+import { runCli, type CliDeps } from "../../src/cli/extract.js";
+import type { ChunkRecord, EmbeddingGenerationPair } from "../../src/core/types.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 8;
@@ -227,5 +247,225 @@ describePg("embedding generation ledger (T1)", () => {
     }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(ConfigError);
     expect(await vectorWidth(c, "chunks", "embedding")).toBe(`vector(${DIM})`);
+  });
+});
+
+// ─── T2: dual-write persist while a rotate is OPEN ────────────────────────
+
+/** Deterministic width-DIM fake: the model tag makes the vector spaces differ. */
+function tagEmbedder(tag: string): EmbeddingClient {
+  return {
+    modelId: tag,
+    embed: async (texts: string[]) =>
+      texts.map((text) => {
+        const vector = new Array<number>(DIM).fill(text.length);
+        vector[0] = tag.charCodeAt(0);
+        vector[1] = tag.charCodeAt(1) ?? 0;
+        return vector;
+      }),
+  };
+}
+
+function slotSourceFor(
+  desiredModel: string
+): { source: SlotEmbeddingSource; built: EmbeddingGenerationPair[] } {
+  const built: EmbeddingGenerationPair[] = [];
+  const source: SlotEmbeddingSource = {
+    embedder: tagEmbedder(desiredModel),
+    desired: { model: desiredModel, dimensions: DIM },
+    buildEmbedder: (pair) => {
+      built.push(pair);
+      return tagEmbedder(pair.model ?? "none");
+    },
+  };
+  return { source, built };
+}
+
+function silentLogger() {
+  return {
+    level: "error" as const,
+    debug: () => {},
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  };
+}
+
+function chunkRecordFor(id: string, over: Partial<ChunkRecord> = {}): ChunkRecord {
+  return {
+    id,
+    content: "Alice Smith works at Acme Corp",
+    embedding: new Array<number>(DIM).fill(1),
+    valid_from: "2026-01-01T00:00:00Z",
+    valid_until: null,
+    source_ref: `docs/t2-${id.slice(0, 8)}.md`,
+    metadata: {},
+    created_at: "2026-01-01T00:00:00Z",
+    ...over,
+  };
+}
+
+describePg("embedding generation dual-write persist (T2)", () => {
+  let client: pg.Client | undefined;
+
+  beforeAll(async () => {
+    client = pgHarness.createClient(SCHEMA_URL);
+    await client.connect();
+  });
+
+  afterAll(async () => {
+    if (client) {
+      await client.end();
+      client = undefined;
+    }
+  });
+
+  /** Fresh schema + m1 boot + an OPEN m2/dual_write rotate; returns the state. */
+  async function openDualWriteRotate(
+    c: pg.Client
+  ): Promise<Awaited<ReturnType<typeof readGenerationState>>> {
+    await pgHarness.resetSchema(c);
+    await c.query(`SET search_path TO "${SCHEMA}", public`);
+    await bootBackend("m1");
+    return openRotate(c, { model: "m2", dimensions: DIM }, "dual_write", ANN_MAX);
+  }
+
+  it("chunk upsert persists both slots with vectors from DIFFERENT generations", async () => {
+    const c = client!;
+    const state = await openDualWriteRotate(c);
+    expect(state?.incomingSlot).toBe("embedding_g2");
+
+    // The T2 SSOT helper computes both slot batches (env == active m1 here).
+    const { source, built } = slotSourceFor("m1");
+    const batches = await embedSlotVectors(source, state, [
+      "Alice Smith works at Acme Corp",
+    ]);
+    expect(built).toEqual([{ model: "m2", dimensions: DIM }]);
+
+    const backend = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m2");
+    await backend.initialize();
+    const id = randomUUID();
+    await backend.upsert([
+      chunkRecordFor(id, {
+        embedding: batches.active[0]!,
+        incoming_embedding: batches.incoming![0]!,
+      }),
+    ]);
+    await backend.close();
+
+    const row = await c.query<{
+      embedding: string | null;
+      embedding_g2: string | null;
+    }>(
+      `SELECT embedding::text AS embedding, embedding_g2::text AS embedding_g2
+         FROM chunks WHERE id = $1`,
+      [id]
+    );
+    expect(row.rows[0]?.embedding).not.toBeNull();
+    expect(row.rows[0]?.embedding_g2).not.toBeNull();
+    expect(row.rows[0]?.embedding_g2).not.toBe(row.rows[0]?.embedding);
+  });
+
+  it("entity insert during an open rotate dual-writes both slots", async () => {
+    const c = client!;
+    await openDualWriteRotate(c);
+
+    const chunkId = randomUUID();
+    await c.query(
+      `INSERT INTO chunks (id, content, embedding, source_ref, valid_from,
+                           metadata, created_at)
+         VALUES ($1, $2, $3, $4, $5, '{}'::jsonb, $6)`,
+      [
+        chunkId,
+        "Alice Smith works at Acme Corp",
+        `[${new Array(DIM).fill(0).join(",")}]`,
+        "docs/rotate-test.md",
+        "2026-01-01T00:00:00Z",
+        "2026-01-01T00:00:00Z",
+      ]
+    );
+
+    const { source, built } = slotSourceFor("m1");
+    const deps: ExtractPersistDeps = {
+      embedder: tagEmbedder("m1"),
+      slotEmbedding: source,
+      logger: silentLogger(),
+      now: () => "2026-01-01T00:00:00Z",
+    };
+    const output: ExtractionOutput = {
+      head: "Alice Smith",
+      headType: "person",
+      relationRaw: "works at",
+      relationNorm: "MEMBER_OF",
+      tail: "Acme Corp",
+      tailType: "system",
+      description: "Alice Smith works at Acme Corp",
+      evidenceSpan: "Alice Smith works at Acme Corp",
+      confidence: 0.9,
+    };
+    await persistOutputs(
+      deps,
+      c,
+      chunkId,
+      "Alice Smith works at Acme Corp",
+      [output],
+      "2026-01-01T00:00:00Z"
+    );
+
+    const row = await c.query<{
+      embedding: string | null;
+      embedding_g2: string | null;
+    }>(
+      `SELECT embedding::text AS embedding, embedding_g2::text AS embedding_g2
+         FROM entities WHERE canonical_name = 'Alice Smith'`
+    );
+    expect(row.rows).toHaveLength(1);
+    expect(row.rows[0]?.embedding).not.toBeNull();
+    expect(row.rows[0]?.embedding_g2).not.toBeNull();
+    expect(row.rows[0]?.embedding_g2).not.toBe(row.rows[0]?.embedding);
+    // Exactly one secondary build (the incoming pair), used per entity write.
+    expect(built).toEqual([{ model: "m2", dimensions: DIM }]);
+  });
+
+  it("backfill with desired == active and non-NULL active vectors updates 0 rows and never fills the incoming slot", async () => {
+    const c = client!;
+    await openDualWriteRotate(c);
+
+    const entityId = randomUUID();
+    await c.query(
+      `INSERT INTO entities (id, canonical_name, type, embedding, metadata, retired)
+         VALUES ($1, 'Alice Smith', 'person', $2, '{}'::jsonb, false)`,
+      [
+        entityId,
+        `[${new Array(DIM).fill(3).join(",")}]`,
+      ]
+    );
+
+    const { source, built } = slotSourceFor("m1");
+    const pool = new pg.Pool({ connectionString: SCHEMA_URL });
+    const deps: CliDeps = {
+      pool,
+      llm: new FakeLLMClient({
+        scripted: async () => {
+          throw new Error("--backfill-embeddings must not call the LLM");
+        },
+      }),
+      embedder: new FakeEmbedder(DIM),
+      dims: DIM,
+      logger: silentLogger(),
+      slotEmbedding: source,
+    };
+
+    const code = await runCli(["--backfill-embeddings"], deps);
+    await pool.end();
+
+    expect(code).toBe(0);
+    const row = await c.query<{ embedding_g2: string | null }>(
+      `SELECT embedding_g2::text AS embedding_g2 FROM entities WHERE id = $1`,
+      [entityId]
+    );
+    expect(row.rows[0]?.embedding_g2).toBeNull();
+    // Backfill never embeds toward the incoming generation at all.
+    expect(built).toEqual([]);
   });
 });

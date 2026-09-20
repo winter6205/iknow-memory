@@ -1881,6 +1881,162 @@ describe("runCli --backfill-embeddings", () => {
   });
 });
 
+// ─── Embedding rotate T2: backfill stays NULL-only on the ACTIVE slot ─────
+
+import type { SlotEmbeddingSource } from "../../src/core/embed-slots.js";
+
+function generationLedgerRow(over: Record<string, unknown> = {}) {
+  return {
+    active_slot: "embedding",
+    active_model: "m1",
+    active_dimensions: 8,
+    incoming_slot: "embedding_g2",
+    incoming_model: "m2",
+    incoming_dimensions: 8,
+    rotate_mode: "dual_write",
+    updated_at: new Date("2026-01-01T00:00:00Z"),
+    ...over,
+  };
+}
+
+/**
+ * FakeClient serving an open-rotate ledger: the entities scan rows and
+ * UPDATEs behave as in the legacy tests; the ledger SELECT answers with
+ * `row`.
+ */
+function serveLedgerBackfill(
+  client: FakeClient,
+  row: Record<string, unknown> | null,
+  entityRows: unknown[]
+): void {
+  client.rowsOverride = (text) => {
+    if (/FROM embedding_generation/.test(text)) {
+      return row === null ? [] : [row];
+    }
+    if (/^\s*SELECT[\s\S]*FROM entities/.test(text)) return entityRows;
+    if (/^\s*UPDATE entities/.test(text)) return [{ id: "updated" }];
+    return [];
+  };
+}
+
+function spySlotSource(): {
+  source: SlotEmbeddingSource;
+  built: { model: string | null; dimensions: number }[];
+} {
+  const built: { model: string | null; dimensions: number }[] = [];
+  const source: SlotEmbeddingSource = {
+    embedder: new FakeEmbedder(8),
+    desired: { model: "m1", dimensions: 8 },
+    buildEmbedder: (pair) => {
+      built.push(pair);
+      return new FakeEmbedder(pair.dimensions);
+    },
+  };
+  return { source, built };
+}
+
+describe("runCli --backfill-embeddings during an open rotate (T2)", () => {
+  it("reads the generation ledger before scanning", async () => {
+    const client = new FakeClient();
+    serveLedgerBackfill(client, generationLedgerRow(), []);
+    const deps = makeDeps(client, throwingLlm());
+
+    const code = await runCli(["--backfill-embeddings"], deps);
+
+    expect(code).toBe(0);
+    expect(
+      client.queries.some((q) => /FROM embedding_generation/.test(q))
+    ).toBe(true);
+  });
+
+  it("with non-NULL active vectors: updates 0 rows and never fills the incoming slot", async () => {
+    const client = new FakeClient();
+    serveLedgerBackfill(client, generationLedgerRow(), []);
+    const { source, built } = spySlotSource();
+    const lines: LoggedLine[] = [];
+    const deps: CliDeps = {
+      ...makeDeps(client, throwingLlm()),
+      slotEmbedding: source,
+      logger: recordingLogger(lines),
+    };
+
+    const code = await runCli(["--backfill-embeddings"], deps);
+
+    expect(code).toBe(0);
+    expect(lines).toContainEqual({
+      msg: "backfill-embeddings-complete",
+      fields: { scanned: 0, backfilled: 0 },
+    });
+    const writes = client.queries.filter((q) =>
+      /^\s*(INSERT|UPDATE)\s/i.test(q)
+    );
+    expect(writes).toEqual([]);
+    // The incoming generation was never even embedded toward.
+    expect(built).toEqual([]);
+  });
+
+  it("scans and guards the ACTIVE slot only; the UPDATE never names the incoming column", async () => {
+    const client = new FakeClient();
+    serveLedgerBackfill(client, generationLedgerRow(), [
+      nullEmbeddingRow({
+        id: ENTITY_A,
+        canonicalName: "Alice Smith",
+        description: "Alice Smith works at Acme Corp",
+      }),
+    ]);
+    const { source, built } = spySlotSource();
+    const deps: CliDeps = {
+      ...makeDeps(client, throwingLlm()),
+      slotEmbedding: source,
+    };
+
+    const code = await runCli(["--backfill-embeddings"], deps);
+
+    expect(code).toBe(0);
+    const scan = sqlFor(client, /^\s*SELECT[\s\S]*FROM entities/);
+    expect(scan).toMatch(/embedding IS NULL/);
+    expect(scan).not.toContain("embedding_g2");
+    const update = sqlFor(client, /^\s*UPDATE entities/);
+    expect(update).toContain("SET embedding =");
+    expect(update).toContain("embedding IS NULL");
+    expect(update).not.toContain("embedding_g2");
+    // Backfill embeds the ACTIVE pair only — no secondary embedder built.
+    expect(built).toEqual([]);
+    // The written vector is the env (active-pair) embedder's output.
+    const [vector] = await new FakeEmbedder(8).embed([
+      computeEntityEmbeddingText(
+        "Alice Smith",
+        "Alice Smith works at Acme Corp"
+      ),
+    ]);
+    const updates = boundValuesFor(client, /^\s*UPDATE entities/);
+    expect(updates[0]![1]).toBe(`[${vector!.join(",")}]`);
+  });
+
+  it("follows the active slot name after cutover", async () => {
+    const client = new FakeClient();
+    serveLedgerBackfill(
+      client,
+      generationLedgerRow({
+        incoming_slot: null,
+        incoming_model: null,
+        incoming_dimensions: null,
+        rotate_mode: null,
+        active_slot: "embedding_g2",
+        active_model: "m2",
+      }),
+      []
+    );
+    const deps = makeDeps(client, throwingLlm());
+
+    const code = await runCli(["--backfill-embeddings"], deps);
+
+    expect(code).toBe(0);
+    const scan = sqlFor(client, /^\s*SELECT[\s\S]*FROM entities/);
+    expect(scan).toMatch(/embedding_g2 IS NULL/);
+  });
+});
+
 // ─── T5: precision-layer entity projection (specs/es-precision-layer.md) ──
 
 /** A recorded fake of the PrecisionIndexer write surface the CLI uses. */

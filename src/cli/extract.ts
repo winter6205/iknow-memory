@@ -51,6 +51,13 @@ import {
 import { FAST_EMPTY_GRAPH_CODE } from "../core/extraction/fast.js";
 import { embedEntity, toVectorLiteral } from "../core/extraction/persist.js";
 import {
+  createSlotEmbeddingSource,
+  readSlotGenerationState,
+  slotWriteTargets,
+  type SlotEmbeddingSource,
+} from "../core/embed-slots.js";
+import type { EmbeddingGenerationState } from "../core/types.js";
+import {
   buildLlmClient,
   buildEmbedderClient,
 } from "../core/extraction/clients.js";
@@ -134,6 +141,12 @@ export interface CliDeps {
    * merge-on-overlap shape.
    */
   writeTimeSupersede?: boolean;
+  /**
+   * Embedding generation rotate T2: the per-slot embed source the persist
+   * paths use to dual-write an open rotate. `--backfill-embeddings` reads it
+   * to embed the ACTIVE generation's pair, never the incoming slot.
+   */
+  slotEmbedding?: SlotEmbeddingSource;
 }
 
 type ParsedArgs = { ok: true; flags: CliFlags } | { ok: false; error: string };
@@ -540,17 +553,21 @@ async function backfillEmbeddings(deps: CliDeps): Promise<number> {
   const client = await deps.pool.connect();
   try {
     await upSchemaBootstrap(client, deps.dims);
+    // T2 contract: the repair is NULL-only on the ACTIVE slot of the ledger,
+    // never the incoming slot — read the pointer before the scan.
+    const state = await readSlotGenerationState(client);
+    const { activeSlot } = slotWriteTargets(state);
     const { rows } = await client.query(
       `SELECT id, canonical_name,
               coalesce(metadata->>'description', '') AS description
          FROM entities
-        WHERE retired = false AND embedding IS NULL
+        WHERE retired = false AND ${activeSlot} IS NULL
         ORDER BY created_at`,
       []
     );
     let backfilled = 0;
     for (const row of rows) {
-      backfilled += await backfillOne(deps, client, row);
+      backfilled += await backfillOne(deps, client, row, { state, activeSlot });
     }
     deps.logger.info("backfill-embeddings-complete", {
       scanned: rows.length,
@@ -564,23 +581,28 @@ async function backfillEmbeddings(deps: CliDeps): Promise<number> {
 
 /**
  * Embed and UPDATE one scanned row; returns how many rows the UPDATE actually
- * changed, which is what the run reports. The `embedding IS NULL` guard is
- * repeated in the WHERE clause so a vector some other writer stored between
- * the scan and this UPDATE survives (A8 first-write-wins) and is counted as
- * not backfilled rather than silently overwritten.
+ * changed, which is what the run reports. The `${slot.activeSlot} IS NULL`
+ * guard is repeated in the WHERE clause so a vector some other writer stored
+ * between the scan and this UPDATE survives (A8 first-write-wins) and is
+ * counted as not backfilled rather than silently overwritten.
  */
 async function backfillOne(
   deps: CliDeps,
   client: CliClient,
-  row: { id: string; canonical_name: string; description: string | null }
+  row: { id: string; canonical_name: string; description: string | null },
+  slot: { state: EmbeddingGenerationState | null; activeSlot: string }
 ): Promise<number> {
-  const embedding = await embedEntity(deps, {
-    canonicalName: row.canonical_name,
-    description: row.description ?? "",
-  });
+  const embedding = await embedEntity(
+    deps,
+    {
+      canonicalName: row.canonical_name,
+      description: row.description ?? "",
+    },
+    slot.state
+  );
   const { rows } = await client.query(
-    `UPDATE entities SET embedding = $2::vector
-      WHERE id = $1 AND embedding IS NULL
+    `UPDATE entities SET ${slot.activeSlot} = $2::vector
+      WHERE id = $1 AND ${slot.activeSlot} IS NULL
       RETURNING id`,
     [row.id, toVectorLiteral(embedding)]
   );
@@ -665,6 +687,15 @@ function buildCliDeps(
   precision: CliDeps["precision"],
   flags: CliFlags
 ): CliDeps {
+  const embedderEnv = {
+    apiKey: env.embedApiKey,
+    baseUrl: env.embedBaseUrl,
+    model: env.embedModel,
+    dimensions: env.embedDimensions,
+  };
+  const embedder = buildEmbedderClient(embedderEnv, {
+    persistsEmbeddings: persistsEmbeddings(flags),
+  });
   return {
     pool,
     llm: buildLlmClient(
@@ -675,15 +706,8 @@ function buildCliDeps(
       },
       { extraction: isRealExtraction(flags) }
     ),
-    embedder: buildEmbedderClient(
-      {
-        apiKey: env.embedApiKey,
-        baseUrl: env.embedBaseUrl,
-        model: env.embedModel,
-        dimensions: env.embedDimensions,
-      },
-      { persistsEmbeddings: persistsEmbeddings(flags) }
-    ),
+    embedder,
+    slotEmbedding: createSlotEmbeddingSource(embedderEnv, embedder),
     dims: env.embedDimensions,
     logger: createLogger(env.logLevel),
     ...(precision !== undefined ? { precision } : {}),

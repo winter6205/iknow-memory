@@ -75,6 +75,8 @@ import {
   upSchemaBootstrap,
 } from "./schema-bootstrap.js";
 import {
+  activeSlotForRead,
+  assertEmbeddingSlotIdentifier,
   guardEmbeddingBoot,
   readGenerationState,
 } from "./embedding-generation.js";
@@ -166,12 +168,19 @@ function toVectorLiteral(embedding: number[]): string {
  * `$3` is the optional `filters.entity_type` seed restriction
  * (plans/entity-type-and-filter.md T3): NULL keeps every type — the exact
  * pre-filter plan shape — and a type value narrows the seed set.
+ *
+ * T3 read binding: the slot column comes from `activeSlotForRead` — one
+ * generation per query, never both in one `ORDER BY <=>`.
  */
-const SEED_ENTITIES_SQL =
-  "SELECT id, canonical_name, 1 - (embedding <=> $1::vector) AS score FROM entities " +
-  "WHERE embedding IS NOT NULL AND merged_into IS NULL AND retired = false " +
-  "AND ($3::text IS NULL OR type = $3) " +
-  "ORDER BY embedding <=> $1::vector LIMIT $2";
+function seedEntitiesSql(slot: string): string {
+  assertEmbeddingSlotIdentifier(slot);
+  return (
+    `SELECT id, canonical_name, 1 - (${slot} <=> $1::vector) AS score FROM entities ` +
+    `WHERE ${slot} IS NOT NULL AND merged_into IS NULL AND retired = false ` +
+    `AND ($3::text IS NULL OR type = $3) ` +
+    `ORDER BY ${slot} <=> $1::vector LIMIT $2`
+  );
+}
 
 /**
  * One-hop traversal (T3 contract — single JOIN chunks, two-sided temporal
@@ -218,12 +227,16 @@ const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_re
     ORDER BY array_position($1::uuid[], ranked.entity_id), c.id
     LIMIT $3`;
 
-const COMMUNITY_SUMMARIES_SQL = `SELECT id, community_id, summary,
-    1 - (embedding <=> $1::vector) AS score
+/** Community-summary cosine read; slot bound per T3 (see seedEntitiesSql). */
+function communitySummariesSql(slot: string): string {
+  assertEmbeddingSlotIdentifier(slot);
+  return `SELECT id, community_id, summary,
+    1 - (${slot} <=> $1::vector) AS score
   FROM community_summaries
- WHERE embedding IS NOT NULL
- ORDER BY embedding <=> $1::vector ASC, id ASC
+ WHERE ${slot} IS NOT NULL
+ ORDER BY ${slot} <=> $1::vector ASC, id ASC
  LIMIT $2`;
+}
 
 const COMMUNITY_SUMMARY_BY_ID_SQL = `SELECT id, community_id, summary
   FROM community_summaries
@@ -364,11 +377,17 @@ export interface VectorSearchQuery {
  * Keeping EXPLAIN callers on this builder prevents a test-only query from
  * claiming that the production retrieval path uses the ANN index. The
  * validity-window predicates are part of the query by construction.
+ *
+ * `activeSlot` is REQUIRED (T3): the caller resolves it through
+ * `activeSlotForRead`, so no read can silently stay on the legacy column
+ * after a cutover. It is interpolated only after identifier validation.
  */
 export function buildVectorSearchQuery(
   queryEmbedding: number[],
-  opts: SearchOptions
+  opts: SearchOptions,
+  activeSlot: string
 ): VectorSearchQuery {
+  assertEmbeddingSlotIdentifier(activeSlot);
   const where = [...VALID_WINDOW_CLAUSES];
   const params: unknown[] = [toVectorLiteral(queryEmbedding), opts.validAt];
   appendFilterClauses(opts.filters ?? {}, where, params);
@@ -377,10 +396,10 @@ export function buildVectorSearchQuery(
   return {
     sql: `
       SELECT id, content, source_ref, valid_from, valid_until,
-             embedding <=> $1::vector AS distance
+             ${activeSlot} <=> $1::vector AS distance
       FROM chunks
       WHERE ${where.join(" AND ")}
-      ORDER BY embedding <=> $1::vector ASC
+      ORDER BY ${activeSlot} <=> $1::vector ASC
       LIMIT $${params.length}
     `,
     params,
@@ -1186,19 +1205,38 @@ export class PgvectorBackend
     }
   }
 
+  /**
+   * T3 read binding — the ONE place this backend resolves the physical
+   * ACTIVE slot for a cosine read (validated identifier, legacy fallback).
+   * T4's downtime refuse and the CLI reads should call `activeSlotForRead`
+   * with the same state rather than repeat the logic.
+   */
+  private activeReadSlot(): string {
+    return activeSlotForRead(this.generation);
+  }
+
   async search(
     queryEmbedding: number[],
     opts: SearchOptions
   ): Promise<RetrievedChunk[]> {
-    if (queryEmbedding.length !== this.dimensions) {
+    const pool = await this.ensureReady();
+    // The query vector belongs to the ACTIVE generation (T3 query-embed
+    // binding), so its width is checked against the LEDGER's active width —
+    // during a dimension rotate the env width describes the incoming one.
+    const activeDimensions =
+      this.generation?.active.dimensions ?? this.dimensions;
+    if (queryEmbedding.length !== activeDimensions) {
       throw new GraphragError(
-        `PgvectorBackend.search: query embedding length ${queryEmbedding.length} !== ${this.dimensions}`,
+        `PgvectorBackend.search: query embedding length ${queryEmbedding.length} !== active generation width ${activeDimensions}`,
         "EMBEDDING_DIM_MISMATCH"
       );
     }
-    const pool = await this.ensureReady();
 
-    const { sql, params } = buildVectorSearchQuery(queryEmbedding, opts);
+    const { sql, params } = buildVectorSearchQuery(
+      queryEmbedding,
+      opts,
+      this.activeReadSlot()
+    );
 
     let rows: unknown[];
     try {
@@ -1592,9 +1630,12 @@ export class PgvectorBackend
      * one entity type; undefined binds $3 to NULL = every type.
      */
     seedEntitiesByEmbedding: async (embedding, topK, entityType) => {
+      // Slot resolved before the try so a corrupt identifier surfaces as
+      // the typed refusal itself, not a wrapped read failure.
+      const slot = this.activeReadSlot();
       try {
         const pool = await this.ensureReady();
-        const result = await pool.query(SEED_ENTITIES_SQL, [
+        const result = await pool.query(seedEntitiesSql(slot), [
           toVectorLiteral(embedding),
           topK,
           entityType ?? null,
@@ -1760,9 +1801,11 @@ export class PgvectorBackend
       embedding: number[],
       limit: number
     ): Promise<CommunitySummaryRow[]> => {
+      // Same T3 binding as the entity seed: active slot only.
+      const slot = this.activeReadSlot();
       try {
         const pool = await this.ensureReady();
-        const result = await pool.query(COMMUNITY_SUMMARIES_SQL, [
+        const result = await pool.query(communitySummariesSql(slot), [
           toVectorLiteral(embedding),
           limit,
         ]);

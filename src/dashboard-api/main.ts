@@ -7,6 +7,7 @@ import { ConfigError, loadEnv, type GraphragEnv } from "../config.js";
 import { createLogger, writeStderr } from "../logging.js";
 import { buildRetrieveDeps, buildRetrieveReranker } from "../index.js";
 import { NineRouterEmbedder, UnavailableEmbedder } from "../core/embedder.js";
+import { createSlotEmbeddingSource } from "../core/embed-slots.js";
 import { MemoryBackend } from "../core/storage/memory-backend.js";
 import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { createNeo4jPprRanker } from "../core/graph/neo4j-ppr.js";
@@ -91,6 +92,15 @@ export async function main(): Promise<void> {
   const logger = createLogger(env.logLevel);
   const storage = await buildStorage(env);
   const embedder = buildEmbedder(env);
+  const slotEmbedding = createSlotEmbeddingSource(
+    {
+      apiKey: env.embedApiKey,
+      baseUrl: env.embedBaseUrl,
+      model: env.embedModel,
+      dimensions: env.embedDimensions,
+    },
+    embedder
+  );
   const precision =
     env.elasticsearch === undefined
       ? undefined
@@ -104,6 +114,7 @@ export async function main(): Promise<void> {
   const retrieveDeps = buildRetrieveDeps(
     {
       embedder,
+      slotEmbedding,
       storage,
       ...(precision !== undefined ? { precision } : {}),
       retrieval: env.retrieval,
@@ -135,6 +146,7 @@ export async function main(): Promise<void> {
   const writes: Parameters<typeof createDashboardServer>[0]["writes"] = {
     ingest: {
       embedder,
+      slotEmbedding,
       storage,
       ...(precision !== undefined ? { precision } : {}),
       logger,

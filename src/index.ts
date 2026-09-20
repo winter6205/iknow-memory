@@ -44,6 +44,10 @@ import {
   UnavailableEmbedder,
   type EmbeddingClient,
 } from "./core/embedder.js";
+import {
+  createSlotEmbeddingSource,
+  type SlotEmbeddingSource,
+} from "./core/embed-slots.js";
 import { MemoryBackend } from "./core/storage/memory-backend.js";
 import {
   ElasticsearchPrecisionLayer,
@@ -85,6 +89,13 @@ const EXIT_CODES = {
 /** Everything the ingest/retrieve handlers need, built once per server. */
 interface ServerDeps {
   embedder: EmbeddingClient;
+  /**
+   * Embedding generation rotate T2/T3: per-slot embedder source threaded to
+   * ingest/push (dual-write) and retrieve (active-pair query embed). Built
+   * only when real embedding credentials exist; absent keeps today's
+   * single-generation behavior (an open rotate then typed-refuses writes).
+   */
+  slotEmbedding?: SlotEmbeddingSource;
   /**
    * Both production backends implement StorageReadPort on top of
    * StorageBackend (operator-console T4 — read_source reads 资料 rows
@@ -149,6 +160,7 @@ export function buildRetrieveDeps(
   deps: Pick<
     ServerDeps,
     | "embedder"
+    | "slotEmbedding"
     | "storage"
     | "precision"
     | "retrieval"
@@ -159,6 +171,9 @@ export function buildRetrieveDeps(
 ): RetrieveDeps {
   return {
     embedder: deps.embedder,
+    ...(deps.slotEmbedding !== undefined
+      ? { slotEmbedding: deps.slotEmbedding }
+      : {}),
     storage: deps.storage,
     ...(deps.precision !== undefined
       ? {
@@ -333,6 +348,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
   // Both branches always pass `dimensions` through; the dim value is always
   // required by config so this is just plumbing.
   let embedder: EmbeddingClient;
+  let slotEmbedding: SlotEmbeddingSource | undefined;
   if (env.embedApiKey) {
     // loadEnv already enforces both when a key is present; defense-in-depth
     // mirrors the dbUrl check above (buildDeps is also callable from tests).
@@ -347,6 +363,15 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
       apiKey: env.embedApiKey,
       dimensions: env.embedDimensions,
     });
+    slotEmbedding = createSlotEmbeddingSource(
+      {
+        apiKey: env.embedApiKey,
+        baseUrl: env.embedBaseUrl,
+        model: env.embedModel,
+        dimensions: env.embedDimensions,
+      },
+      embedder
+    );
   } else embedder = new UnavailableEmbedder();
 
   // Thread the validated retrieval config into the server deps so
@@ -358,6 +383,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
   const reranker = buildRetrieveReranker(env);
   return {
     embedder,
+    ...(slotEmbedding !== undefined ? { slotEmbedding } : {}),
     storage,
     ...(precision !== undefined ? { precision } : {}),
     retrieval: env.retrieval,

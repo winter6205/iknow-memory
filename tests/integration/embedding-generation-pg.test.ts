@@ -13,6 +13,10 @@
  * vectors from DIFFERENT generations (the (model, dims) pair each slot was
  * opened for), and `--backfill-embeddings` stays NULL-only on the active
  * slot, never filling the incoming column.
+ *
+ * The third suite adds the T3 read-binding proof: before cutover, chunk
+ * search, entity seed and community-summary cosine all rank on the ACTIVE
+ * slot's vectors only — incoming-filled rows never surface or reorder.
  */
 import { randomUUID } from "node:crypto";
 import pg from "pg";
@@ -467,5 +471,118 @@ describePg("embedding generation dual-write persist (T2)", () => {
     expect(row.rows[0]?.embedding_g2).toBeNull();
     // Backfill never embeds toward the incoming generation at all.
     expect(built).toEqual([]);
+  });
+});
+
+// ─── T3: cosine reads bound to the ACTIVE slot before cutover ─────────────
+
+/** Width-DIM unit vector along axis `k` — makes cosine orderings exact. */
+function axis(k: number): number[] {
+  return new Array<number>(DIM).fill(0).map((_, i) => (i === k ? 1 : 0));
+}
+
+function vectorText(values: number[]): string {
+  return `[${values.join(",")}]`;
+}
+
+describePg("embedding generation active-slot read binding (T3)", () => {
+  let client: pg.Client | undefined;
+
+  beforeAll(async () => {
+    client = pgHarness.createClient(SCHEMA_URL);
+    await client.connect();
+  });
+
+  afterAll(async () => {
+    if (client) {
+      await client.end();
+      client = undefined;
+    }
+  });
+
+  it("before cutover, chunk/entity/community reads rank on ACTIVE vectors only", async () => {
+    const c = client!;
+    await pgHarness.resetSchema(c);
+    await c.query(`SET search_path TO "${SCHEMA}", public`);
+    await bootBackend("m1");
+    const state = await openRotate(
+      c,
+      { model: "m2", dimensions: DIM },
+      "dual_write",
+      ANN_MAX
+    );
+    expect(state.incomingSlot).toBe("embedding_g2");
+
+    // env == incoming: the process boots, and every read must stay on the
+    // ACTIVE (legacy) slot until cutover.
+    const backend = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m2");
+    await backend.initialize();
+    try {
+      const validAt = "2026-06-01T00:00:00Z";
+      const chunkA = randomUUID();
+      const chunkB = randomUUID();
+      // A is near the query on ACTIVE and far on incoming; B is the mirror.
+      // If any read touched embedding_g2, B would outrank A.
+      for (const [id, active, incoming] of [
+        [chunkA, axis(0), axis(1)],
+        [chunkB, axis(1), axis(0)],
+      ] as const) {
+        await c.query(
+          `INSERT INTO chunks (id, content, embedding, embedding_g2, source_ref,
+                               valid_from, metadata, created_at)
+           VALUES ($1, 'rotate read binding', $2::vector, $3::vector,
+                   'docs/rotate-read.md', '2026-01-01T00:00:00Z', '{}'::jsonb,
+                   '2026-01-01T00:00:00Z')`,
+          [id, vectorText(active), vectorText(incoming)]
+        );
+      }
+      const hits = await backend.search(axis(0), { limit: 5, validAt });
+      expect(hits.map((hit) => hit.id)).toEqual([chunkA, chunkB]);
+      expect(hits[0]!.score).toBeGreaterThan(hits[1]!.score);
+
+      // Entity with a NULL ACTIVE vector but a near incoming one must stay
+      // invisible; the near-active entity ranks first regardless of the
+      // incoming fill state.
+      const entityY = randomUUID();
+      const entityX = randomUUID();
+      await c.query(
+        `INSERT INTO entities (id, canonical_name, type, embedding, embedding_g2,
+                               metadata, retired)
+         VALUES ($1, 'Near Active', 'person', $2::vector, NULL, '{}'::jsonb, false),
+                ($3, 'Incoming Only', 'person', NULL, $4::vector, '{}'::jsonb, false)`,
+        [entityY, vectorText(axis(0)), entityX, vectorText(axis(0))]
+      );
+      const seeds = await backend.graphArmSeed.seedEntitiesByEmbedding(axis(0), 5);
+      expect(seeds.map((seed) => seed.id)).toEqual([entityY]);
+
+      // Community summaries: same mirror trick — active decides the order.
+      const sumP = randomUUID();
+      const sumQ = randomUUID();
+      await c.query(
+        `INSERT INTO community_summaries (id, community_id, summary, entity_ids,
+                                          embedding, embedding_g2)
+         VALUES ($1, 'com-p', 'near active', '{}', $2::vector, $3::vector),
+                ($4, 'com-q', 'near incoming', '{}', $5::vector, $6::vector)`,
+        [
+          sumP,
+          vectorText(axis(0)),
+          vectorText(axis(1)),
+          sumQ,
+          vectorText(axis(1)),
+          vectorText(axis(0)),
+        ]
+      );
+      const summaries = await backend.communitySummaries.searchCommunitySummaries(
+        axis(0),
+        5
+      );
+      expect(summaries.map((row) => row.id)).toEqual([sumP, sumQ]);
+
+      // And the emitted SQL never names both slots (no mixed-generation
+      // cosine) — proven exhaustively by the unit recording fakes in
+      // tests/storage/pgvector-active-read.unit.test.ts.
+    } finally {
+      await backend.close();
+    }
   });
 });

@@ -47,6 +47,7 @@ import { z } from "zod";
 
 import { GraphragError } from "../core/errors.js";
 import type { EmbeddingClient } from "../core/embedder.js";
+import { createSlotEmbeddingSource } from "../core/embed-slots.js";
 import {
   buildEmbedderClient,
   buildLlmClient,
@@ -438,6 +439,10 @@ function buildPipelineDeps(
   return {
     llm,
     embedder,
+    // Rotate T2: one seam for all states — with no ledger/no rotate open the
+    // source degenerates to the env embedder; with a dual-write rotate open
+    // the persist paths derive each slot's embedder from `embedderEnv`.
+    slotEmbedding: createSlotEmbeddingSource(deps.embedderEnv, embedder),
     logger: deps.logger ?? NOOP_LOGGER,
     ...(deps.precision !== undefined ? { precision: deps.precision } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),

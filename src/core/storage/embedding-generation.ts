@@ -119,7 +119,33 @@ interface GenerationRow {
   incoming_model: string | null;
   incoming_dimensions: number | null;
   rotate_mode: string | null;
+  // Rollback columns are T4 additions; a pre-T4 deployed row lacks them,
+  // which reads as "no cutover on record" rather than corruption.
+  rollback_slot?: string | null;
+  rollback_model?: string | null;
+  rollback_dimensions?: number | null;
   updated_at: Date;
+}
+
+/**
+ * Downtime read refuse (T4, spec assumption 7): while a `downtime` rotate
+ * is open the store is deliberately half-embedded toward the incoming
+ * slot, and a partial cosine result would be indistinguishable from a
+ * complete one — so every vector READ refuses with the typed named
+ * failure BEFORE issuing SQL. Placed beside `activeSlotForRead` because
+ * both are the read-binding SSOT; cutover clears the refuse by NULLing
+ * the incoming pointer.
+ */
+export function assertVectorReadsAllowed(
+  state: EmbeddingGenerationState | null | undefined
+): void {
+  if (state != null && state.incomingSlot !== null && state.rotateMode === "downtime") {
+    throw new GraphragError(
+      "embedding rotate downtime: vector retrieve refused until cutover",
+      "STORAGE_ERROR"
+    );
+    // EXIT: downtime path — the only way out is cutover (or aborting via drop).
+  }
 }
 
 /** The typed read of the singleton; null = no row yet (fresh or pre-ledger store). */
@@ -127,7 +153,7 @@ export async function readGenerationState(
   client: SchemaBootstrapClient
 ): Promise<EmbeddingGenerationState | null> {
   const result = await client.query(
-    "SELECT active_slot, active_model, active_dimensions, incoming_slot, incoming_model, incoming_dimensions, rotate_mode, updated_at FROM embedding_generation WHERE id = 1"
+    "SELECT active_slot, active_model, active_dimensions, incoming_slot, incoming_model, incoming_dimensions, rotate_mode, rollback_slot, rollback_model, rollback_dimensions, updated_at FROM embedding_generation WHERE id = 1"
   );
   const row = result.rows[0] as GenerationRow | undefined;
   if (row === undefined) return null;
@@ -146,6 +172,14 @@ export async function readGenerationState(
     );
     // EXIT: same doctrine — never guess half a generation.
   }
+  const rollbackSlot = row.rollback_slot ?? null;
+  if (rollbackSlot !== null && (row.rollback_dimensions ?? null) === null) {
+    throw new GraphragError(
+      "embedding_generation: rollback slot without rollback dimensions is corrupt",
+      "STORAGE_ERROR"
+    );
+    // EXIT: half a displaced generation cannot be rolled back or dropped safely.
+  }
   return {
     activeSlot: row.active_slot,
     active: {
@@ -161,6 +195,14 @@ export async function readGenerationState(
             dimensions: row.incoming_dimensions as number,
           },
     rotateMode: row.incoming_slot === null ? null : row.rotate_mode,
+    rollbackSlot,
+    rollback:
+      rollbackSlot === null
+        ? null
+        : {
+            model: row.rollback_model ?? null,
+            dimensions: row.rollback_dimensions as number,
+          },
     updatedAt: row.updated_at,
   };
 }

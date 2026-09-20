@@ -17,6 +17,12 @@
  * The third suite adds the T3 read-binding proof: before cutover, chunk
  * search, entity seed and community-summary cosine all rank on the ACTIVE
  * slot's vectors only — incoming-filled rows never surface or reorder.
+ *
+ * The fourth suite is the T4 live story: fill → completeness-gated cutover
+ * → reads follow the flipped pointer → rollback → reads follow it back →
+ * drop removes the inactive column, second drop no-ops — plus the downtime
+ * read refuse and a dimension-change rotate proving the old floats are
+ * never touched.
  */
 import { randomUUID } from "node:crypto";
 import pg from "pg";
@@ -30,6 +36,12 @@ import {
   openRotate,
   readGenerationState,
 } from "../../src/core/storage/embedding-generation.js";
+import {
+  cutoverRotate,
+  dropInactiveSlot,
+  fillIncoming,
+  rollbackRotate,
+} from "../../src/core/storage/embedding-rotate.js";
 import {
   embedSlotVectors,
   type SlotEmbeddingSource,
@@ -584,5 +596,325 @@ describePg("embedding generation active-slot read binding (T3)", () => {
     } finally {
       await backend.close();
     }
+  });
+});
+
+// ─── T4: fill → cutover → reads flip → rollback → drop (live story) ───────
+
+describePg("embedding generation rotate cutover/rollback/drop (T4)", () => {
+  let client: pg.Client | undefined;
+
+  beforeAll(async () => {
+    client = pgHarness.createClient(SCHEMA_URL);
+    await client.connect();
+  });
+
+  afterAll(async () => {
+    if (client) {
+      await client.end();
+      client = undefined;
+    }
+  });
+
+  async function seedLegacyRows(c: pg.Client): Promise<{
+    chunkA: string;
+    chunkB: string;
+    retiredId: string;
+  }> {
+    const chunkA = randomUUID();
+    const chunkB = randomUUID();
+    for (const [id, active] of [
+      [chunkA, axis(0)],
+      [chunkB, axis(1)],
+    ] as const) {
+      await c.query(
+        `INSERT INTO chunks (id, content, embedding, source_ref, valid_from,
+                             metadata, created_at)
+         VALUES ($1, 'rotate lifecycle', $2::vector, 'docs/rotate-t4.md',
+                 '2026-01-01T00:00:00Z', '{}'::jsonb, '2026-01-01T00:00:00Z')`,
+        [id, vectorText(active)]
+      );
+    }
+    await c.query(
+      `INSERT INTO entities (id, canonical_name, type, embedding, metadata, retired)
+       VALUES ($1, 'Alice Smith', 'person', $2::vector,
+               '{"description":"works at Acme"}'::jsonb, false),
+              ($3, 'Acme Corp', 'system', $4::vector, '{}'::jsonb, false),
+              ($5, 'Old Gone', 'person', $6::vector, '{}'::jsonb, true)`,
+      [
+        randomUUID(),
+        vectorText(axis(0)),
+        randomUUID(),
+        vectorText(axis(1)),
+        randomUUID(),
+        vectorText(axis(0)),
+      ]
+    );
+    const retired = await c.query<{ id: string }>(
+      `SELECT id FROM entities WHERE canonical_name = 'Old Gone'`
+    );
+    await c.query(
+      `INSERT INTO community_summaries (id, community_id, summary, entity_ids, embedding)
+       VALUES ($1, 'com-t4', 'cluster about Acme', '{}', $2::vector)`,
+      [randomUUID(), vectorText(axis(0))]
+    );
+    return { chunkA, chunkB, retiredId: retired.rows[0]!.id };
+  }
+
+  it("full rotate story: refuse incomplete, fill incoming only, flip, read on the flip, roll back, drop, no-op", async () => {
+    const c = client!;
+    await pgHarness.resetSchema(c);
+    await c.query(`SET search_path TO "${SCHEMA}", public`);
+    await bootBackend("m1");
+    const { chunkA, chunkB, retiredId } = await seedLegacyRows(c);
+    const oldActive = await c.query<{ embedding: string }>(
+      `SELECT embedding::text AS embedding FROM chunks WHERE id = $1`,
+      [chunkA]
+    );
+
+    await openRotate(c, { model: "m2", dimensions: DIM }, "dual_write", ANN_MAX);
+
+    // (1) Cutover refuses typed while the incoming column is still empty,
+    // naming the FIRST incomplete class (chunks) and its missing count.
+    const refusal = await cutoverRotate(c).catch((caught: unknown) => caught);
+    expect(refusal).toBeInstanceOf(GraphragError);
+    expect(refusal).toMatchObject({ code: "INVALID_INPUT" });
+    expect((refusal as Error).message).toContain("chunks");
+    expect((refusal as Error).message).toContain("2");
+    expect((await readGenerationState(c))?.activeSlot).toBe("embedding");
+
+    // (2) Fill embeds only the incoming-IS-NULL rows toward the incoming
+    // pair; the retired entity is out of scope; a second run fills nothing.
+    const { source, built } = slotSourceFor("m1");
+    const summary = await fillIncoming(c, source);
+    expect(summary.perTable).toEqual({
+      chunks: { scanned: 2, filled: 2 },
+      entities: { scanned: 2, filled: 2 },
+      community_summaries: { scanned: 1, filled: 1 },
+    });
+    expect(built).toEqual([{ model: "m2", dimensions: DIM }]);
+    expect(
+      (
+        await c.query<{ embedding_g2: string | null }>(
+          `SELECT embedding_g2::text AS embedding_g2 FROM entities WHERE id = $1`,
+          [retiredId]
+        )
+      ).rows[0]?.embedding_g2
+    ).toBeNull();
+    const again = await fillIncoming(c, source);
+    expect(again.perTable.chunks).toEqual({ scanned: 0, filled: 0 });
+    expect(again.perTable.entities.filled).toBe(0);
+    // Fill never rewrote the ACTIVE column.
+    const afterFill = await c.query<{ embedding: string }>(
+      `SELECT embedding::text AS embedding FROM chunks WHERE id = $1`,
+      [chunkA]
+    );
+    expect(afterFill.rows[0]?.embedding).toBe(oldActive.rows[0]?.embedding);
+
+    // (3) Cutover flips ALL three classes with one pointer move and records
+    // the displaced generation as the rollback pair.
+    const flipped = await cutoverRotate(c);
+    expect(flipped.activeSlot).toBe("embedding_g2");
+    expect(flipped.active).toEqual({ model: "m2", dimensions: DIM });
+    expect(flipped.rollbackSlot).toBe("embedding");
+    expect(flipped.rollback).toEqual({ model: "m1", dimensions: DIM });
+    expect(flipped.incomingSlot).toBeNull();
+    expect(flipped.rotateMode).toBeNull();
+
+    // (4) Reads follow the flip: rank the incoming slot differently from
+    // the legacy one — the live search must order by the NEW column.
+    await c.query(
+      `UPDATE chunks SET embedding_g2 = $2::vector WHERE id = $1`,
+      [chunkA, vectorText(axis(1))]
+    );
+    await c.query(
+      `UPDATE chunks SET embedding_g2 = $2::vector WHERE id = $1`,
+      [chunkB, vectorText(axis(0))]
+    );
+    const newGen = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m2");
+    await newGen.initialize();
+    const stale = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m1");
+    const oldGenRefused = await stale
+      .initialize()
+      .then(() => undefined)
+      .catch((caught: unknown) => caught);
+    await stale.close();
+    expect(oldGenRefused).toBeInstanceOf(ConfigError); // old env no longer boots
+    try {
+      const hits = await newGen.search(axis(0), {
+        limit: 5,
+        validAt: "2026-06-01T00:00:00Z",
+      });
+      expect(hits.map((hit) => hit.id)).toEqual([chunkB, chunkA]);
+    } finally {
+      await newGen.close();
+    }
+
+    // (5) Rollback swaps active back; reads follow; the displaced
+    // generation stays tracked.
+    const rolled = await rollbackRotate(c);
+    expect(rolled.activeSlot).toBe("embedding");
+    expect(rolled.rollbackSlot).toBe("embedding_g2");
+    const oldGen = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m1");
+    await oldGen.initialize();
+    try {
+      const hits = await oldGen.search(axis(0), {
+        limit: 5,
+        validAt: "2026-06-01T00:00:00Z",
+      });
+      expect(hits.map((hit) => hit.id)).toEqual([chunkA, chunkB]);
+    } finally {
+      await oldGen.close();
+    }
+
+    // (6) Drop removes the inactive generation's index + column across all
+    // three tables and clears the ledger; a second drop is a no-op.
+    const dropped = await dropInactiveSlot(c);
+    expect(dropped.droppedSlots).toEqual(["embedding_g2"]);
+    for (const table of ["chunks", "entities", "community_summaries"]) {
+      expect(await vectorWidth(c, table, "embedding_g2")).toBeUndefined();
+      expect(await indexNames(c, table)).not.toContain(
+        `${table}_embedding_g2_idx`
+      );
+      expect(await vectorWidth(c, table, "embedding")).toBe(`vector(${DIM})`);
+    }
+    const settled = await readGenerationState(c);
+    expect(settled.rollbackSlot).toBeNull();
+    expect(settled.rollback).toBeNull();
+    const second = await dropInactiveSlot(c);
+    expect(second.droppedSlots).toEqual([]);
+    // The surviving generation's data is intact end to end.
+    const kept = await c.query<{ embedding: string }>(
+      `SELECT embedding::text AS embedding FROM chunks WHERE id = $1`,
+      [chunkA]
+    );
+    expect(kept.rows[0]?.embedding).toBe(oldActive.rows[0]?.embedding);
+  });
+
+  it("downtime rotate refuses all three vector reads until cutover clears it", async () => {
+    const c = client!;
+    await pgHarness.resetSchema(c);
+    await c.query(`SET search_path TO "${SCHEMA}", public`);
+    await bootBackend("m1");
+    await seedLegacyRows(c);
+    await openRotate(c, { model: "m2", dimensions: DIM }, "downtime", ANN_MAX);
+
+    const backend = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m1");
+    await backend.initialize();
+    try {
+      for (const read of [
+        () =>
+          backend.search(axis(0), {
+            limit: 5,
+            validAt: "2026-06-01T00:00:00Z",
+          }),
+        () => backend.graphArmSeed.seedEntitiesByEmbedding(axis(0), 5),
+        () => backend.communitySummaries.searchCommunitySummaries(axis(0), 5),
+      ]) {
+        const error = await read().catch((caught: unknown) => caught);
+        expect(error).toBeInstanceOf(GraphragError);
+        expect(error).toMatchObject({ code: "STORAGE_ERROR" });
+        expect((error as Error).message).toBe(
+          "embedding rotate downtime: vector retrieve refused until cutover"
+        );
+      }
+    } finally {
+      await backend.close();
+    }
+
+    // fill + cutover clear the blind window: the new-gen backend reads live.
+    await fillIncoming(c, slotSourceFor("m1").source);
+    await cutoverRotate(c);
+    const after = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m2");
+    await after.initialize();
+    try {
+      const hits = await after.search(axis(0), {
+        limit: 5,
+        validAt: "2026-06-01T00:00:00Z",
+      });
+      expect(hits.length).toBeGreaterThan(0);
+    } finally {
+      await after.close();
+    }
+  });
+
+  it("dimension change: the incoming slot is the NEW width and the old floats stay byte-identical", async () => {
+    const c = client!;
+    await pgHarness.resetSchema(c);
+    await c.query(`SET search_path TO "${SCHEMA}", public`);
+    await bootBackend("m1");
+    const chunk = randomUUID();
+    await c.query(
+      `INSERT INTO chunks (id, content, embedding, source_ref, valid_from,
+                           metadata, created_at)
+       VALUES ($1, 'rotate dim change', $2::vector, 'docs/rotate-t4-dim.md',
+               '2026-01-01T00:00:00Z', '{}'::jsonb, '2026-01-01T00:00:00Z')`,
+      [chunk, vectorText(axis(0))]
+    );
+    const before = await c.query<{ embedding: string }>(
+      `SELECT embedding::text AS embedding FROM chunks WHERE id = $1`,
+      [chunk]
+    );
+
+    await openRotate(c, { model: "m1", dimensions: 6 }, "downtime", ANN_MAX);
+    expect(await vectorWidth(c, "chunks", "embedding_g2")).toBe("vector(6)");
+
+    // Width-aware slot source: the secondary embeds at the RECORDED pair's
+    // width, which is the whole point of a dimension rotate.
+    const pairEmbedder = (pair: EmbeddingGenerationPair): EmbeddingClient => ({
+      modelId: `${pair.model ?? "none"}-${pair.dimensions}`,
+      embed: async (texts: string[]) =>
+        texts.map(() => new Array<number>(pair.dimensions).fill(0.5)),
+    });
+    const source: SlotEmbeddingSource = {
+      embedder: pairEmbedder({ model: "m1", dimensions: DIM }),
+      desired: { model: "m1", dimensions: DIM },
+      buildEmbedder: pairEmbedder,
+    };
+    const summary = await fillIncoming(c, source);
+    expect(summary.perTable.chunks).toEqual({ scanned: 1, filled: 1 });
+
+    await cutoverRotate(c);
+    const six = new PgvectorBackend(SCHEMA_URL, 6, ANN_MAX, {}, "m1");
+    await six.initialize();
+    try {
+      const hits = await six.search(new Array<number>(6).fill(0.5), {
+        limit: 5,
+        validAt: "2026-06-01T00:00:00Z",
+      });
+      expect(hits.map((hit) => hit.id)).toEqual([chunk]);
+    } finally {
+      await six.close();
+    }
+
+    // Roll back to width 8: old floats untouched, reads work again.
+    await rollbackRotate(c);
+    const eight = new PgvectorBackend(SCHEMA_URL, DIM, ANN_MAX, {}, "m1");
+    await eight.initialize();
+    try {
+      const hits = await eight.search(axis(0), {
+        limit: 5,
+        validAt: "2026-06-01T00:00:00Z",
+      });
+      expect(hits[0]?.id).toBe(chunk);
+    } finally {
+      await eight.close();
+    }
+    const after = await c.query<{ embedding: string }>(
+      `SELECT embedding::text AS embedding FROM chunks WHERE id = $1`,
+      [chunk]
+    );
+    expect(after.rows[0]?.embedding).toBe(before.rows[0]?.embedding);
+
+    // Drop removes the never-settled NEW generation.
+    const dropped = await dropInactiveSlot(c);
+    expect(dropped.droppedSlots).toEqual(["embedding_g2"]);
+    expect(await vectorWidth(c, "chunks", "embedding_g2")).toBeUndefined();
+    expect(await vectorWidth(c, "chunks", "embedding")).toBe(`vector(${DIM})`);
+    const final = await c.query<{ embedding: string }>(
+      `SELECT embedding::text AS embedding FROM chunks WHERE id = $1`,
+      [chunk]
+    );
+    expect(final.rows[0]?.embedding).toBe(before.rows[0]?.embedding);
   });
 });

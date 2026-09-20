@@ -168,6 +168,13 @@ export interface EmbeddingGenerationState {
   /** Incoming generation; undefined together with `incomingSlot`. */
   incoming: EmbeddingGenerationPair | null;
   rotateMode: EmbedRotateMode | null;
+  /**
+   * Slot of the generation a cutover displaced (T4); null = no cutover is
+   * on record, so there is nothing to roll back or drop.
+   */
+  rollbackSlot: string | null;
+  /** Displaced pair; undefined together with `rollbackSlot`. */
+  rollback: EmbeddingGenerationPair | null;
   updatedAt: Date;
 }
 

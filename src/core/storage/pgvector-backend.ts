@@ -77,6 +77,7 @@ import {
 import {
   activeSlotForRead,
   assertEmbeddingSlotIdentifier,
+  assertVectorReadsAllowed,
   guardEmbeddingBoot,
   readGenerationState,
 } from "./embedding-generation.js";
@@ -1208,10 +1209,12 @@ export class PgvectorBackend
   /**
    * T3 read binding — the ONE place this backend resolves the physical
    * ACTIVE slot for a cosine read (validated identifier, legacy fallback).
-   * T4's downtime refuse and the CLI reads should call `activeSlotForRead`
-   * with the same state rather than repeat the logic.
+   * T4's downtime refuse sits here too: all three vector reads (chunk
+   * search, entity seed, community cosine) funnel through this method, so
+   * the refuse fires before any SELECT leaves the backend.
    */
   private activeReadSlot(): string {
+    assertVectorReadsAllowed(this.generation);
     return activeSlotForRead(this.generation);
   }
 

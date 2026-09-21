@@ -234,7 +234,10 @@ async function requireCommunityIndexReady(
 
 function communitySummaryNotReady(detail: string): GraphragError {
   return new GraphragError(
-    `retrieve ${SEARCH_MODE_FILTER_KEY}=C is not ready: ` +
+    // The CANONICAL token is named, never the retired letter: `global` and
+    // the `C` alias produce byte-identical copy, so a host maps this failure
+    // deterministically instead of branching on how it happened to spell it.
+    `retrieve ${SEARCH_MODE_FILTER_KEY}=global is not ready: ` +
       `${COMMUNITY_SUMMARY_INDEX_FAILURE} (${detail})`,
     "STORAGE_ERROR"
   );

@@ -1,5 +1,11 @@
 # Spec: search-mode retrieve (档 consumption)
 
+> **Superseded in part (2026-09-21) by** [`search-mode-graph-global.md`](search-mode-graph-global.md):
+> the wire **token set** and its **default** are owned there —
+> `filters.search_mode` ∈ `A|graph|global|D`, missing key → **`graph`**, and
+> `B`/`C` are migration aliases only. What each 档 **consumes** (below) stays
+> authoritative here and is deliberately not restated there.
+>
 > **Status:** assumption gate confirmed 2026-09-17 (two-repo sync with fin spec 3 of 4).
 > **Sibling spec (fin):** [`../../fin/specs/search-mode-retrieve.md`](../../fin/specs/search-mode-retrieve.md)
 > **Index write path:** [`graph-index-standard-fast.md`](graph-index-standard-fast.md)

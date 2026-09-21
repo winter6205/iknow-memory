@@ -312,8 +312,22 @@ async function createExtractionRecords(
       unmapped_count integer NOT NULL DEFAULT 0,
       started_at     timestamptz NOT NULL,
       finished_at    timestamptz,
-      created_at     timestamptz NOT NULL DEFAULT now()
+      created_at     timestamptz NOT NULL DEFAULT now(),
+      proposed_payload jsonb NULL,
+      discarded_at   timestamptz NULL
     )`);
+  // extract-verify T1 forward-compat ALTER: deployments whose
+  // extraction_records predates the judge gate get the reviewable proposal
+  // column (proposed triples + per-triple verdicts on judge-failed legs).
+  await client.query(`
+    ALTER TABLE extraction_records
+      ADD COLUMN IF NOT EXISTS proposed_payload jsonb NULL`);
+  // extract-verify T2 forward-compat ALTER: a discarded review record keeps
+  // its `failed` status (the status CHECK is a closed vocabulary) and leaves
+  // the maintenance lane via this stamp instead.
+  await client.query(`
+    ALTER TABLE extraction_records
+      ADD COLUMN IF NOT EXISTS discarded_at timestamptz NULL`);
   // listFailed / batch aggregate / cleanup (#7 Q3a, P0d verdicts 5-6).
   await client.query(`
     CREATE INDEX IF NOT EXISTS extraction_records_chunk_id_idx

@@ -121,6 +121,35 @@ export type ClaimsResponse =
   | { kind: "ok"; claims: ClaimOutput[] }
   | { kind: "failed"; errorCode: string; errorMsg: string };
 
+// ─── Grounded judge before persist ─────────────────────────────────────────
+
+/** Input to the per-chunk groundedness judge: chunk text + proposed triples. */
+export interface JudgeInput {
+  chunkText: string;
+  candidates: ExtractionOutput[];
+}
+
+/**
+ * The judge's answer for ONE candidate: `index` is the candidate's position
+ * in `JudgeInput.candidates`; `grounded` is the yes/no; `reason` explains the
+ * verdict. The wire schema requires it on both yes and no (JudgeItemSchema
+ * in llm-client.ts), so a sealed record always carries the model's wording.
+ */
+export interface TripleVerdict {
+  index: number;
+  grounded: boolean;
+  reason: string;
+}
+
+/**
+ * Sealed outcome of one judge call. `failed` covers transport/format/throw
+ * misses at the adapter boundary — the judge gate in judge.ts converts them
+ * (and adapter absence) into the chunk-level JUDGE_DOWN failure.
+ */
+export type JudgeResponse =
+  | { kind: "ok"; verdicts: TripleVerdict[] }
+  | { kind: "failed"; errorCode: string; errorMsg: string };
+
 /**
  * Chunk content is empty or whitespace-only. Raised before any LLM call —
  * an empty prompt is a wasted, billable round-trip and always a format error.

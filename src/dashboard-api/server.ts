@@ -1,7 +1,8 @@
 /**
  * dashboard-api http.Server factory — health, stats, query, browse, timeline,
- * and the T8 thin writes (ingest / extract / invalidate / graph:backfill /
- * graph:drain).
+ * the T8 thin writes (ingest / extract / invalidate / graph:backfill /
+ * graph:drain), and the extract-verify T3 maintenance lane (failed
+ * extraction list + promote / discard over the same core runners).
  */
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { ServerResponse } from "node:http";
@@ -37,6 +38,12 @@ import {
   type IngestWriteDeps,
   type InvalidateWriteDeps,
 } from "./handlers/writes.js";
+import {
+  discardWriteHandler,
+  failedListHandler,
+  promoteWriteHandler,
+  type MaintenanceDeps,
+} from "./handlers/maintenance.js";
 import { asReadPort } from "./handlers/read-port.js";
 import type { OpenGraphSession } from "./graph-session.js";
 import type { EmbeddingClient } from "../core/embedder.js";
@@ -82,6 +89,14 @@ export interface DashboardWriteDeps {
   };
   graphBackfill?: GraphBackfillWriteDeps;
   graphDrain?: GraphDrainWriteDeps;
+  /**
+   * extract-verify T3 maintenance lane: the failed-extraction list and the
+   * promote / discard actions over `extraction_records`. The chunk→资料
+   * back-pointer is read in one batched SQL on the handler's own leased
+   * client. Re-extract rides the existing extract thin write, so it needs
+   * no deps of its own.
+   */
+  maintenance?: MaintenanceDeps;
   /** Shared Postgres pool for extract / graph writes. Required by those
    *  endpoints; absent → the handlers answer 503 STORAGE_ERROR. */
   pgPool?: ExtractPool | BackfillPool | DrainPool;
@@ -409,6 +424,26 @@ function buildThinWriteRoutes(deps: DashboardServerDeps): Route[] {
       handler: graphDrainWriteHandler(writes.graphDrain),
     });
   }
+  // Maintenance lane — failed list + promote/discard
+  // over the same core runners the CLI drives.
+  if (writes.maintenance !== undefined) {
+    const maintenanceDeps: MaintenanceDeps = writes.maintenance;
+    routes.push({
+      method: "GET",
+      pattern: "/api/maintenance/failed",
+      handler: failedListHandler(maintenanceDeps),
+    });
+    routes.push({
+      method: "POST",
+      pattern: "/api/maintenance/promote",
+      handler: promoteWriteHandler(maintenanceDeps),
+    });
+    routes.push({
+      method: "POST",
+      pattern: "/api/maintenance/discard",
+      handler: discardWriteHandler(maintenanceDeps),
+    });
+  }
   return routes;
 }
 
@@ -435,5 +470,8 @@ function missingWriteRoutes(): Route[] {
       handler: stub,
     },
     { method: "POST", pattern: "/api/writes/graph-drain", handler: stub },
+    { method: "GET", pattern: "/api/maintenance/failed", handler: stub },
+    { method: "POST", pattern: "/api/maintenance/promote", handler: stub },
+    { method: "POST", pattern: "/api/maintenance/discard", handler: stub },
   ];
 }

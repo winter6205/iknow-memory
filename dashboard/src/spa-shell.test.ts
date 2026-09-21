@@ -81,7 +81,7 @@ describe("chrome", () => {
     expect(html).toMatch(/Fira[+ ]Code/);
   });
 
-  it("hosts routes for the six operator surfaces", () => {
+  it("hosts routes for the seven operator surfaces", () => {
     const paths = NAV_ITEMS.map((item) => item.path);
     expect(paths).toEqual([
       "/",
@@ -90,6 +90,7 @@ describe("chrome", () => {
       "/browse",
       "/timeline",
       "/graph",
+      "/maintenance",
     ]);
   });
 

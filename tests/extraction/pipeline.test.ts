@@ -28,7 +28,12 @@ import {
   type ExtractPipelineDeps,
 } from "../../src/core/extraction/pipeline.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
+import type { LLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
+import {
+  JUDGE_DOWN_CODE,
+  JUDGE_REJECTED_CODE,
+} from "../../src/core/extraction/judge.js";
 import { SELF_LOOP_REJECTED_CODE } from "../../src/core/extraction/records.js";
 import { EXTRACT_METHOD_CONFLICT_CODE } from "../../src/core/extraction/method.js";
 import { FAST_EMPTY_GRAPH_CODE } from "../../src/core/extraction/fast.js";
@@ -60,7 +65,7 @@ const SILENT_LOGGER: Logger = {
   error: () => {},
 };
 
-function makeDeps(llm: FakeLLMClient): ExtractPipelineDeps {
+function makeDeps(llm: LLMClient): ExtractPipelineDeps {
   return {
     llm,
     embedder: new FakeEmbedder(8),
@@ -111,13 +116,16 @@ describe("selectPendingChunks (CLI pending scan)", () => {
     expect(client.valuesList[0]).toEqual(["2026-01-01T00:00:00Z", 5]);
   });
 
-  it("applies --only-failed excluding SELF_LOOP_REJECTED rows", async () => {
+  it("applies --only-failed excluding SELF_LOOP_REJECTED and discarded rows", async () => {
     const client = new FakeQueryable();
     await selectPendingChunks(client, { batchSize: 5, onlyFailed: true });
 
     const sql = client.queries[0]!;
     expect(sql).toContain("row_number() OVER (PARTITION BY chunk_id");
     expect(sql).toContain("error_code != 'SELF_LOOP_REJECTED'");
+    // T2: a discarded review record must not be re-picked by the re-extract
+    // scan either (the operator said no to THAT proposal, not to the chunk).
+    expect(sql).toContain("discarded_at IS NULL");
     // Both filters compose with AND; the since filter stays absent.
     expect(sql).toContain(" AND ");
   });
@@ -752,7 +760,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
     expect(client.indexOf(STATE_DEMOTION)).toBe(-1);
   });
 
-  it("a chunk with zero outputs emits no demotion", async () => {
+  it("a chunk with zero outputs is an empty-proposal judge fail and emits no demotion", async () => {
     const client = new FakeQueryable();
     const llm = new FakeLLMClient({ queue: [{ kind: "ok", outputs: [] }] });
 
@@ -763,7 +771,10 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
       { batchSize: 1 }
     );
 
-    expect(summary.succeeded).toBe(1);
+    // extract-verify T1: an empty proposal is a reject class — the chunk
+    // never reaches persist, so there is nothing to demote either.
+    expect(summary.failed).toBe(1);
+    expect(summary.failureCodes).toEqual([JUDGE_REJECTED_CODE]);
     expect(client.indexOf("INSERT INTO triples")).toBe(-1);
     expect(client.indexOf(STATE_DEMOTION)).toBe(-1);
   });
@@ -887,4 +898,223 @@ describe("processBatch entity-description embedding class (T6)", () => {
       true
     );
   });
+});
+
+// ─── extract-verify T1: grounded judge gates every persist path ───────────
+
+describe("processBatch grounded judge gate (extract-verify T1)", () => {
+  it("a rejected triple fails the chunk: no triples, no outbox, failed record with the proposal payload", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+      scriptedJudge: async () => ({
+        kind: "ok",
+        verdicts: [
+          { index: 0, grounded: false, reason: "tail invented by the model" },
+        ],
+      }),
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.succeeded).toBe(0);
+    expect(summary.failed).toBe(1);
+    expect(summary.failureCodes).toEqual([JUDGE_REJECTED_CODE]);
+    // Nothing becomes graph fact: zero triple writes AND zero projection
+    // intents (Neo4j never hears about the rejected proposal).
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(client.indexOf("INSERT INTO entities")).toBe(-1);
+    expect(client.indexOf("INSERT INTO projection_outbox")).toBe(-1);
+    // Spec acceptance "资料 count unchanged": the rejected leg never touches
+    // the source_documents ledger — no method recording, no row write.
+    expect(client.indexOf("UPDATE source_documents")).toBe(-1);
+    expect(client.indexOf("INSERT INTO source_documents")).toBe(-1);
+    // The failed leg keeps its record row + payload and commits (mark, not roll back).
+    const failedIdx = client.indexOf("proposed_payload");
+    expect(failedIdx).toBeGreaterThanOrEqual(0);
+    expect(client.valuesList[failedIdx]).toContain(JUDGE_REJECTED_CODE);
+    expect(
+      client.valuesList[failedIdx]!.some(
+        (v) =>
+          typeof v === "string" && v.includes("tail invented by the model")
+      )
+    ).toBe(true);
+    // The stored payload is enough to replay later: triples + verdicts.
+    const payload = JSON.parse(
+      client.valuesList[failedIdx]!.find(
+        (v) => typeof v === "string" && v.includes('"triples"')
+      ) as string
+    );
+    expect(payload.triples).toHaveLength(1);
+    expect(payload.triples[0].head).toBe("Alice");
+    expect(payload.verdicts[0].grounded).toBe(false);
+    expect(client.indexOf("COMMIT")).toBeGreaterThan(failedIdx);
+    expect(client.indexOf("ROLLBACK")).toBe(-1);
+  });
+
+  it("a judge down (throwing adapter) is fail-closed: JUDGE_DOWN leg, zero graph writes", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+      scriptedJudge: async () => {
+        throw new Error("judge timed out");
+      },
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.failed).toBe(1);
+    expect(summary.failureCodes).toEqual([JUDGE_DOWN_CODE]);
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(client.indexOf("INSERT INTO projection_outbox")).toBe(-1);
+    const failedIdx = client.indexOf("proposed_payload");
+    expect(client.valuesList[failedIdx]).toContain(JUDGE_DOWN_CODE);
+    expect(
+      client.valuesList[failedIdx]!.some(
+        (v) => typeof v === "string" && v.includes("judge timed out")
+      )
+    ).toBe(true);
+  });
+
+  it("a client without the judge adapter fails the chunk closed", async () => {
+    const client = new FakeQueryable();
+    const llm = {
+      extract: async () => ({ kind: "ok", outputs: [GROUNDED_OUTPUT] }),
+    } as unknown as LLMClient;
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(summary.failed).toBe(1);
+    expect(summary.failureCodes).toEqual([JUDGE_DOWN_CODE]);
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+  });
+
+  it("the batch continues past a judge-rejected chunk", async () => {
+    const client = new FakeQueryable();
+    const llm = new FakeLLMClient({
+      queue: [
+        { kind: "ok", outputs: [GROUNDED_OUTPUT] },
+        { kind: "ok", outputs: [GROUNDED_OUTPUT] },
+      ],
+      scriptedJudge: async (input) => ({
+        kind: "ok",
+        verdicts: input.candidates.map((_, index) => ({
+          index,
+          grounded: input.chunkText !== "Alice works at Acme Corp.",
+          reason: "scripted",
+        })),
+      }),
+    });
+
+    const outcomes: string[] = [];
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [
+        { id: "chunk-reject", content: "Alice works at Acme Corp." },
+        { id: "chunk-pass", content: "Alice works at Acme Corp. Too." },
+      ],
+      { batchSize: 2, onChunkOutcome: (o) => outcomes.push(o.kind) }
+    );
+
+    expect(summary.processed).toBe(2);
+    expect(summary.failed).toBe(1);
+    expect(summary.succeeded).toBe(1);
+    expect(outcomes).toEqual(["failed", "ok"]);
+    // The passing sibling still persisted: exactly the judge leg of chunk 1
+    // precedes it, and the batch's second transaction committed normally.
+    expect(client.indexOf("INSERT INTO triples")).toBeGreaterThanOrEqual(0);
+  });
+
+  it("a fast-method chunk is judged too: reject means zero triples, zero outbox", async () => {
+    const client = new FakeQueryable();
+    let judgeCalls = 0;
+    const llm = new FakeLLMClient({
+      queue: [],
+      scriptedJudge: async (input) => {
+        judgeCalls += 1;
+        return {
+          kind: "ok",
+          verdicts: input.candidates.map((_, index) => ({
+            index,
+            grounded: false,
+            reason: "co-occurrence alone is not grounded",
+          })),
+        };
+      },
+    });
+
+    const summary = await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "the a Alice Bob" }],
+      { batchSize: 1, method: "fast" }
+    );
+
+    // The judge gate applies to fast chunks even though the fast extractor
+    // itself dials no model.
+    expect(judgeCalls).toBe(1);
+    expect(summary.failed).toBe(1);
+    expect(summary.failureCodes).toEqual([JUDGE_REJECTED_CODE]);
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(client.indexOf("INSERT INTO entities")).toBe(-1);
+    expect(client.indexOf("INSERT INTO projection_outbox")).toBe(-1);
+    expect(client.indexOf("UPDATE source_documents")).toBe(-1);
+    const failedIdx = client.indexOf("proposed_payload");
+    expect(failedIdx).toBeGreaterThanOrEqual(0);
+    expect(client.valuesList[failedIdx]).toContain(JUDGE_REJECTED_CODE);
+    expect(client.indexOf("COMMIT")).toBeGreaterThan(failedIdx);
+  });
+
+  it("the judge runs after extract and BEFORE any persist write", async () => {
+    const client = new FakeQueryable();
+    let sawGraphWrite = true;
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
+      scriptedJudge: async (input) => {
+        // Proof of ordering: at judge time no triple/outbox write has run.
+        sawGraphWrite = client.queries.some(
+          (q) =>
+            q.includes("INSERT INTO triples") ||
+            q.includes("INSERT INTO projection_outbox")
+        );
+        return allYes(input);
+      },
+    });
+
+    await processBatch(
+      makeDeps(llm),
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(sawGraphWrite).toBe(false);
+  });
+
+  function allYes(input: { candidates: { head: string }[] }) {
+    return {
+      kind: "ok",
+      verdicts: input.candidates.map((_, index) => ({
+        index,
+        grounded: true,
+        reason: "stated",
+      })),
+    };
+  }
 });

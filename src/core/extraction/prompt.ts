@@ -84,6 +84,50 @@ export function buildExtractionPrompt(chunkText: string): string {
   ].join("\n");
 }
 
+// ─── Grounded judge ────────────────────────────────────────────────────────
+
+/**
+ * Build the groundedness-judge prompt for one chunk: the model answers
+ * yes/no per numbered candidate triple — is it supported by the chunk text?
+ * One verdict per index is mandatory; the judge gate in judge.ts treats a
+ * missing verdict as a reject, but the prompt asks for exactly the set so a
+ * well-behaved model never hits that path.
+ */
+export function buildJudgePrompt(
+  chunkText: string,
+  candidates: readonly ExtractionOutput[]
+): string {
+  const numbered = candidates.map(
+    (c, i) =>
+      `[${i}] ${c.head} -[${c.relationNorm}]-> ${c.tail}: ${c.description} ` +
+      `(evidence: "${c.evidenceSpan}")`
+  );
+  return [
+    "You are a factuality judge. For EVERY numbered candidate triple below,",
+    'answer "yes" or "no": is that triple grounded in the chunk — do the',
+    "chunk's own words support the head-relation-tail statement, without the",
+    "candidate inventing an entity, relation or fact the chunk does not state?",
+    "Judge each candidate independently; a partially supported candidate is a",
+    '"no" with a reason naming what is not stated.',
+    "",
+    "Candidates:",
+    ...(numbered.length > 0 ? numbered : ["(none)"]),
+    "",
+    "Output schema (return this exact JSON shape, nothing else):",
+    "{",
+    '  "verdicts": [ { "index": integer, "grounded": "yes"|"no",',
+    '    "reason": string } ]',
+    "}",
+    "Emit exactly one verdict per candidate index — no extra, no missing.",
+    "reason: one short sentence explaining the verdict.",
+    "",
+    "Return raw JSON only. Do not wrap in markdown fences.",
+    "",
+    "Chunk:",
+    chunkText,
+  ].join("\n");
+}
+
 // ─── T3 (graph-index-standard-fast): standard post-merge enrichment ──────
 
 /**

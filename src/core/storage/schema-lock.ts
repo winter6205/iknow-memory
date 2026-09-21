@@ -32,6 +32,11 @@ const BOOTSTRAP_COLUMNS = [
   ["source_documents", "status"],
   ["source_documents", "failure_code"],
   ["source_documents", "extract_method"],
+  // the judge-failure proposal payload. Deployed
+  // extraction_records tables predate the column, so it rides the probe too.
+  ["extraction_records", "proposed_payload"],
+  // the discard stamp of the review lane.
+  ["extraction_records", "discarded_at"],
   // T4 rollback columns: added by forward-compat ALTERs in
   // createEmbeddingGeneration, so they MUST be probed (bootstrap-columns
   // lockstep) or deployed databases never get them.

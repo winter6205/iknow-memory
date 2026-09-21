@@ -748,6 +748,8 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
         "started_at",
         "finished_at",
         "created_at",
+        "proposed_payload",
+        "discarded_at",
       ];
       for (const col of expected) {
         expect(cols, `extraction_records.${col} missing`).toContain(col);

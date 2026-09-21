@@ -437,7 +437,7 @@ describePg("embedding generation dual-write persist (T2)", () => {
       relationRaw: "works at",
       relationNorm: "MEMBER_OF",
       tail: "Acme Corp",
-      tailType: "system",
+      tailType: "organization",
       description: "Alice Smith works at Acme Corp",
       evidenceSpan: "Alice Smith works at Acme Corp",
       confidence: 0.9,
@@ -667,7 +667,7 @@ describePg("embedding generation rotate cutover/rollback/drop (T4)", () => {
       `INSERT INTO entities (id, canonical_name, type, embedding, metadata, retired)
        VALUES ($1, 'Alice Smith', 'person', $2::vector,
                '{"description":"works at Acme"}'::jsonb, false),
-              ($3, 'Acme Corp', 'system', $4::vector, '{}'::jsonb, false),
+              ($3, 'Acme Corp', 'organization', $4::vector, '{}'::jsonb, false),
               ($5, 'Old Gone', 'person', $6::vector, '{}'::jsonb, true)`,
       [
         randomUUID(),
@@ -1068,7 +1068,7 @@ describePg(
                                metadata, retired)
          VALUES ($1, 'Alice Smith', 'person', $3::vector, $3::vector,
                  '{"description":"Alicia Smith works at Acme Corp"}'::jsonb, false),
-                ($2, 'Acme Corp', 'system', $3::vector, $3::vector,
+                ($2, 'Acme Corp', 'organization', $3::vector, $3::vector,
                  '{}'::jsonb, false)`,
         [survivorId, randomUUID(), unitLiteral]
       );
@@ -1104,7 +1104,7 @@ describePg(
         relationRaw: "works at",
         relationNorm: "MEMBER_OF",
         tail: "Acme Corp",
-        tailType: "system",
+        tailType: "organization",
         description: "Alicia Smith works at Acme Corp",
         evidenceSpan: "Alicia Smith works at Acme Corp",
         confidence: 0.9,

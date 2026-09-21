@@ -33,6 +33,10 @@ import {
   type CandidateEntity,
   type IncomingEntity,
 } from "../entities/merge.js";
+import type {
+  GrayZoneJudge,
+  MergeDecision,
+} from "../entities/types.js";
 import { resolveCanonicalId } from "../entities/resolve.js";
 import { computeEntityEmbeddingText } from "../entities/embedding.js";
 import { GraphragError } from "../errors.js";
@@ -73,11 +77,25 @@ export interface ExtractPersistDeps {
    * pre-T4 merge-on-overlap shape.
    */
   writeTimeSupersede?: boolean;
+  /**
+   * Gray-zone merge judge: consulted by the L3 gate only after a pair would
+   * be rejected into the gray zone. Absent → merge behaves exactly as
+   * without a judge (reject stands, two live entities).
+   */
+  mergeJudge?: GrayZoneJudge;
 }
 
 /** Injectable clock fallback: every log/timestamp site reads the time here. */
 export function depsNow(deps: ExtractPersistDeps): string {
   return deps.now ? deps.now() : new Date().toISOString();
+}
+
+/** One L3 gray pair the judge held for the operator (verdict `human`). */
+export interface MergeHold {
+  incomingName: string;
+  incomingType: string;
+  candidateId: string;
+  observedCosine?: number;
 }
 
 export interface PersistCounts {
@@ -128,6 +146,12 @@ export interface PersistCounts {
    * --only-failed can hide it from "must re-extract" lists.
    */
   allSelfLoop: boolean;
+  /**
+   * Gray pairs the judge held for the operator. Each entry becomes its own
+   * maintenance-lane record (the orchestrator's job); the chunk itself is
+   * NOT failed by a hold — both entities of a held pair stay live.
+   */
+  mergeHolds: MergeHold[];
 }
 
 /** Resolve/create entities and upsert triples for one chunk's outputs. */
@@ -147,6 +171,7 @@ export async function persistOutputs(
   const entityIds = new Set<string>();
   const mergedLoserIds = new Set<string>();
   const survivors: SurvivorRef[] = [];
+  const mergeHolds: MergeHold[] = [];
   for (const out of outputs) {
     // Closed-set gate (entity-type-and-filter T1): a type outside
     // person/organization/place/event normalizes to null. Neither endpoint
@@ -169,7 +194,9 @@ export async function persistOutputs(
       tailId,
       tailName,
       mergedLoserIds: losers,
+      mergeHolds: holds,
     } = await resolveEndpoints(deps, client, out, types);
+    mergeHolds.push(...holds);
     // Both endpoints are projectable nodes even when the triple below is
     // rejected — an entity with no edge is still a node the graph arm can
     // seed on.
@@ -234,6 +261,7 @@ export async function persistOutputs(
     entities: [...entityIds],
     mergedLoserIds: [...mergedLoserIds],
     survivors,
+    mergeHolds,
     allSelfLoop,
   };
 }
@@ -261,6 +289,7 @@ async function resolveEndpoints(
   tailId: string;
   tailName: string;
   mergedLoserIds: string[];
+  mergeHolds: MergeHold[];
 }> {
   // The pair arrives normalized from persistOutputs (CR High #2 plus the T1
   // closed-set gate) so the merge gates and the persisted row agree on the
@@ -280,12 +309,16 @@ async function resolveEndpoints(
     },
     { excludeIds: [head.id] }
   );
+  const mergeHolds: MergeHold[] = [];
+  if (head.hold) mergeHolds.push(head.hold);
+  if (tail.hold) mergeHolds.push(tail.hold);
   return {
     headId: head.id,
     headName: head.canonicalName,
     tailId: tail.id,
     tailName: tail.canonicalName,
     mergedLoserIds: [...head.mergedLoserIds, ...tail.mergedLoserIds],
+    mergeHolds,
   };
 }
 
@@ -465,8 +498,10 @@ async function vetRelationNorm(
 
 /**
  * Resolve the incoming entity via the merge gates, then persist. Merge →
- * reuse the survivor id; created-new / reject → insert a fresh row (the
- * gray-zone log already recorded the rejection via the merge default sink).
+ * reuse the survivor id; created-new / reject / judge hold → insert a fresh
+ * row (the gray-zone log already recorded the rejection via the merge
+ * default sink; a hold additionally reports its pair on the returned
+ * `hold` so the orchestrator can write the maintenance-lane record).
  *
  * A8 first-write-wins: a merge leaves the survivor's embedding, description
  * and canonical name alone. The only write a merge makes is the A11 alias row
@@ -492,6 +527,7 @@ async function resolveEntity(
   id: string;
   canonicalName: string;
   mergedLoserIds: string[];
+  hold?: MergeHold;
 }> {
   const excluded = new Set(opts.excludeIds ?? []);
   // Review repair A: read the generation ledger ONCE per resolution and
@@ -507,6 +543,7 @@ async function resolveEntity(
     live,
     {
       embedder: deps.embedder,
+      judgeGrayZone: deps.mergeJudge,
     }
   );
   if (decision !== "created-new" && decision.kind === "merge") {
@@ -538,6 +575,9 @@ async function resolveEntity(
       mergedLoserIds,
     };
   }
+  // A hold leaves BOTH entities live: the incoming row inserts exactly as
+  // for created-new; only the pair summary differs (no merged_into write).
+  const hold = grayHoldSummary(decision, canonicalId, incoming);
   const id = randomUUID();
   await insertEntity(
     client,
@@ -546,7 +586,28 @@ async function resolveEntity(
     await embedEntityForWrite(deps, client, incoming, state)
   );
   await insertAlias(client, id, incoming.canonicalName, "name");
-  return { id, canonicalName: incoming.canonicalName, mergedLoserIds: [] };
+  return { id, canonicalName: incoming.canonicalName, mergedLoserIds: [], hold };
+}
+
+/**
+ * Pair summary for a judge `human` hold: which incoming row was kept live
+ * next to which candidate, and at what cosine. `undefined` for every other
+ * decision — only the L3 gray-zone hold branch ever produces one.
+ */
+function grayHoldSummary(
+  decision: MergeDecision | "created-new",
+  canonicalId: string,
+  incoming: IncomingEntity
+): MergeHold | undefined {
+  if (decision === "created-new" || decision.kind !== "hold") return undefined;
+  return {
+    incomingName: incoming.canonicalName,
+    incomingType: incoming.type,
+    candidateId: canonicalId,
+    ...(decision.observedCosine !== undefined
+      ? { observedCosine: decision.observedCosine }
+      : {}),
+  };
 }
 
 /**

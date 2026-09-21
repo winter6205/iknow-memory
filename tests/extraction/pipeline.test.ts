@@ -123,6 +123,11 @@ describe("selectPendingChunks (CLI pending scan)", () => {
     const sql = client.queries[0]!;
     expect(sql).toContain("row_number() OVER (PARTITION BY chunk_id");
     expect(sql).toContain("error_code != 'SELF_LOOP_REJECTED'");
+    // A MERGE_GRAY_HOLD row is a pair-level maintenance item, never the
+    // chunk's own latest status: it must leave the rn=1 partition entirely.
+    expect(sql).toContain(
+      "WHERE error_code IS DISTINCT FROM 'MERGE_GRAY_HOLD'"
+    );
     // T2: a discarded review record must not be re-picked by the re-extract
     // scan either (the operator said no to THAT proposal, not to the chunk).
     expect(sql).toContain("discarded_at IS NULL");

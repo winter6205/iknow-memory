@@ -7,7 +7,12 @@ import {
   type Embedder,
   type GrayZoneLog,
 } from "../../src/core/entities/merge.js";
-import { DEFAULT_MERGE_CONFIG } from "../../src/core/entities/types.js";
+import {
+  DEFAULT_MERGE_CONFIG,
+  type GrayZoneJudge,
+  type GrayZoneJudgeInput,
+  type GrayZoneVerdict,
+} from "../../src/core/entities/types.js";
 import { cosineSimilarity } from "../../src/core/cosine.js";
 import { GraphragError } from "../../src/core/errors.js";
 
@@ -260,6 +265,263 @@ describe("mergeEntitiesWithGating — L3 name+description cosine mid threshold",
     if (out.decision.kind !== "reject") return;
     expect(out.decision.level).toBe("L3");
     expect(spy.entries.some((e) => e.level === "L3")).toBe(true);
+  });
+});
+
+/**
+ * Gray-zone three-level judge. The judge fires ONLY on the L3 gray-zone
+ * reject path: the pair below is a shared description (L2 cosine 1) whose
+ * L3 name+desc embedding texts are orthogonal (cosine 0 < 0.50 mid).
+ */
+describe("mergeEntitiesWithGating — gray-zone judge", () => {
+  const GRAY_DESC =
+    "a long shared description for both entities in this test case";
+  const grayIncoming = {
+    canonicalName: "Alice",
+    type: "person",
+    description: GRAY_DESC,
+  };
+  const grayCandidate = candidate({
+    id: "cand-1",
+    canonicalName: "Alicia",
+    type: "person",
+    description: GRAY_DESC,
+  });
+  const grayEmbedder = () =>
+    makeFakeEmbedder({
+      [GRAY_DESC]: basisVector(0),
+      [`Alice | ${GRAY_DESC}`]: basisVector(0),
+      [`Alicia | ${GRAY_DESC}`]: basisVector(1),
+    });
+
+  function recordingJudge(
+    decide: (input: GrayZoneJudgeInput) => GrayZoneVerdict
+  ): { judge: GrayZoneJudge; inputs: GrayZoneJudgeInput[] } {
+    const inputs: GrayZoneJudgeInput[] = [];
+    const judge: GrayZoneJudge = async (input) => {
+      inputs.push(input);
+      return decide(input);
+    };
+    return { judge, inputs };
+  }
+
+  async function runGray(
+    judge: GrayZoneJudge | undefined,
+    ctxExtra: { config?: typeof DEFAULT_MERGE_CONFIG } = {}
+  ) {
+    const spy = graySpy();
+    const out = await mergeEntitiesWithGating(
+      grayIncoming,
+      [grayCandidate],
+      {
+        embedder: grayEmbedder(),
+        config: ctxExtra.config ?? DEFAULT_MERGE_CONFIG,
+        logGrayZone: spy.fn,
+        ...(judge ? { judgeGrayZone: judge } : {}),
+      }
+    );
+    return { out, spy };
+  }
+
+  it("L0 exact name+type still merges with zero judge calls", async () => {
+    const { judge, inputs } = recordingJudge(() => "reject");
+    const out = await mergeEntitiesWithGating(
+      { canonicalName: "alice smith", type: "person", description: "engineer" },
+      [candidate({ id: "cand-1", canonicalName: "Alice Smith", type: "person" })],
+      {
+        embedder: makeFakeEmbedder(),
+        config: DEFAULT_MERGE_CONFIG,
+        judgeGrayZone: judge,
+      }
+    );
+    expect(out.decision).toEqual({
+      kind: "merge",
+      into: "cand-1",
+      via: "L0",
+      observedCosine: 1.0,
+    });
+    expect(inputs).toHaveLength(0);
+  });
+
+  it("verdict merge turns the gray reject into an L3 merge and keeps the gray-zone log", async () => {
+    const { judge, inputs } = recordingJudge(() => "merge");
+    const { out, spy } = await runGray(judge);
+    expect(out.decision).toEqual({
+      kind: "merge",
+      into: "cand-1",
+      via: "L3",
+      observedCosine: 0,
+    });
+    expect(out.canonicalId).toBe("cand-1");
+    expect(spy.entries).toContainEqual({
+      level: "L3",
+      observedCosine: 0,
+      reason: "gray-zone-below-mid",
+    });
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]).toEqual({
+      incoming: {
+        name: "Alice",
+        type: "person",
+        description: GRAY_DESC,
+      },
+      candidate: {
+        name: "Alicia",
+        type: "person",
+        description: GRAY_DESC,
+      },
+      observedCosine: 0,
+    });
+  });
+
+  it("verdict reject keeps the existing gray-zone reject decision unchanged", async () => {
+    const { judge, inputs } = recordingJudge(() => "reject");
+    const { out, spy } = await runGray(judge);
+    expect(out.decision).toEqual({
+      kind: "reject",
+      reason: "gray-zone-below-mid",
+      level: "L3",
+      observedCosine: 0,
+    });
+    expect(inputs).toHaveLength(1);
+    expect(spy.entries).toHaveLength(1);
+  });
+
+  it("verdict human returns a hold decision naming the gray candidate", async () => {
+    const { judge } = recordingJudge(() => "human");
+    const { out } = await runGray(judge);
+    expect(out.decision).toEqual({ kind: "hold", level: "L3", observedCosine: 0 });
+    expect(out.canonicalId).toBe("cand-1");
+  });
+
+  it("judge-down (throw) keeps the reject, logs judge-down, and the gray-zone log still fires first", async () => {
+    const inputs: GrayZoneJudgeInput[] = [];
+    const judge: GrayZoneJudge = async (input) => {
+      inputs.push(input);
+      throw new Error("judge transport exploded");
+    };
+    const { out, spy } = await runGray(judge);
+    expect(out.decision).toEqual({
+      kind: "reject",
+      reason: "gray-zone-below-mid",
+      level: "L3",
+      observedCosine: 0,
+    });
+    expect(inputs).toHaveLength(1);
+    expect(spy.entries.some((e) => e.reason === "gray-zone-below-mid")).toBe(
+      true
+    );
+    // judge-down must be auditable as its own event, not invisible.
+    expect(spy.entries).toContainEqual({
+      level: "L3",
+      observedCosine: 0,
+      reason: "judge-down",
+    });
+  });
+
+  it("never judges a pair the gate would have merged: a later above-floor candidate wins with zero judge calls", async () => {
+    // Alicia is gray (cosine 0); Bob's embedding text is the incoming's own
+    // vector (cosine 1) so the gate clears the L3 floor before ever needing
+    // to take the reject path the judge guards.
+    const embedder = makeFakeEmbedder({
+      [GRAY_DESC]: basisVector(0),
+      [`Alice | ${GRAY_DESC}`]: basisVector(0),
+      [`Alicia | ${GRAY_DESC}`]: basisVector(1),
+      [`Bob | ${GRAY_DESC}`]: basisVector(0),
+    });
+    const { judge, inputs } = recordingJudge(() => "merge");
+    const out = await mergeEntitiesWithGating(
+      grayIncoming,
+      [
+        grayCandidate,
+        candidate({
+          id: "cand-bob",
+          canonicalName: "Bob",
+          type: "person",
+          description: GRAY_DESC,
+        }),
+      ],
+      {
+        embedder,
+        config: DEFAULT_MERGE_CONFIG,
+        logGrayZone: graySpy().fn,
+        judgeGrayZone: judge,
+      }
+    );
+    expect(inputs).toHaveLength(0);
+    expect(out.decision).toEqual({
+      kind: "merge",
+      into: "cand-bob",
+      via: "L3",
+      observedCosine: 1,
+    });
+  });
+
+  it("the judge is consulted once, on the pair the gate finally rejected", async () => {
+    const embedder = makeFakeEmbedder({
+      [GRAY_DESC]: basisVector(0),
+      [`Alice | ${GRAY_DESC}`]: basisVector(0),
+      [`Alicia | ${GRAY_DESC}`]: basisVector(1),
+      [`Alison | ${GRAY_DESC}`]: basisVector(2),
+    });
+    const { judge, inputs } = recordingJudge(() => "reject");
+    const out = await mergeEntitiesWithGating(
+      grayIncoming,
+      [
+        grayCandidate,
+        candidate({
+          id: "cand-2",
+          canonicalName: "Alison",
+          type: "person",
+          description: GRAY_DESC,
+        }),
+      ],
+      {
+        embedder,
+        config: DEFAULT_MERGE_CONFIG,
+        logGrayZone: graySpy().fn,
+        judgeGrayZone: judge,
+      }
+    );
+    // One call total, for the surviving reject pair — not one per gray pair.
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0]!.candidate.name).toBe("Alison");
+    expect(out.decision).toEqual({
+      kind: "reject",
+      reason: "gray-zone-below-mid",
+      level: "L3",
+      observedCosine: 0,
+    });
+    expect(out.canonicalId).toBe("cand-2");
+  });
+
+  it("bandMode below-low-band candidates are judged too", async () => {
+    const config = { ...DEFAULT_MERGE_CONFIG, bandMode: true };
+    const { judge, inputs } = recordingJudge(() => "merge");
+    const spy = graySpy();
+    const out = await mergeEntitiesWithGating(
+      grayIncoming,
+      [grayCandidate],
+      { embedder: grayEmbedder(), config, logGrayZone: spy.fn, judgeGrayZone: judge }
+    );
+    expect(spy.entries).toContainEqual({
+      level: "L3",
+      observedCosine: 0,
+      reason: "below-low-band",
+    });
+    expect(inputs).toHaveLength(1);
+    expect(out.decision).toMatchObject({ kind: "merge", via: "L3" });
+  });
+
+  it("without a configured judge the gray path is byte-for-byte today's reject", async () => {
+    const { out, spy } = await runGray(undefined);
+    expect(out.decision).toEqual({
+      kind: "reject",
+      reason: "gray-zone-below-mid",
+      level: "L3",
+      observedCosine: 0,
+    });
+    expect(spy.entries).toHaveLength(1);
   });
 });
 

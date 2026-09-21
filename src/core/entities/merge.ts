@@ -16,13 +16,22 @@ import { GraphragError } from "../errors.js";
 import { createLogger } from "../../logging.js";
 import {
   DEFAULT_MERGE_CONFIG,
+  type GrayZoneJudge,
   type GrayZoneLog,
+  type GrayZoneVerdict,
   type MergeConfig,
   type MergeDecision,
 } from "./types.js";
 import { computeEntityEmbeddingText } from "./embedding.js";
 
-export type { MergeConfig, MergeDecision, GrayZoneLog } from "./types.js";
+export type {
+  MergeConfig,
+  MergeDecision,
+  GrayZoneLog,
+  GrayZoneJudge,
+  GrayZoneJudgeInput,
+  GrayZoneVerdict,
+} from "./types.js";
 
 /** Alias the spec's `Embedder` name onto the existing embedding contract. */
 export type Embedder = EmbeddingClient;
@@ -46,6 +55,12 @@ export interface MergeContext {
   config?: MergeConfig;
   /** Structured gray-zone sink; defaults to the project logger (stderr). */
   logGrayZone?: (entry: GrayZoneLog) => void;
+  /**
+   * Optional three-level judge consulted ONLY after an L3 gray-zone reject
+   * would be logged. Absent → the gate behaves exactly as before (the
+   * reject stands).
+   */
+  judgeGrayZone?: GrayZoneJudge;
 }
 
 export type MergeOutcome = {
@@ -234,7 +249,7 @@ async function l3NameDescGate(
     ctx.embedder,
     computeEntityEmbeddingText(incoming.canonicalName, incoming.description)
   );
-  let lastReject: GateOutcome | null = null;
+  let lastGray: GrayPair | null = null;
   for (const c of candidates) {
     const observed = await l3Cosine(ctx.embedder, c, incomingVector);
     if (observed === null) {
@@ -258,17 +273,86 @@ async function l3NameDescGate(
         ? "below-low-band"
         : "gray-zone-below-mid";
     log({ level: "L3", observedCosine: observed, reason: gray });
-    lastReject = {
-      id: c.id,
-      decision: {
-        kind: "reject",
-        reason: gray,
-        level: "L3",
-        observedCosine: observed,
+    lastGray = { candidate: c, observedCosine: observed, reason: gray };
+  }
+  if (!lastGray) return null;
+  // The judge guards the gray-zone REJECT PATH, not individual below-floor
+  // pairs: it is consulted once the gate has actually settled on a reject,
+  // so a pair it would have merged is never judged.
+  if (ctx.judgeGrayZone) {
+    const judged = await judgeGrayPair(ctx.judgeGrayZone, log, incoming, lastGray);
+    if (judged) return { id: lastGray.candidate.id, decision: judged };
+  }
+  return grayRejectOutcome(lastGray);
+}
+
+/** The pair an L3 pass ended on when no candidate cleared the floor. */
+interface GrayPair {
+  candidate: CandidateEntity;
+  observedCosine: number;
+  reason: string;
+}
+
+function grayRejectOutcome(pair: GrayPair): GateOutcome {
+  return {
+    id: pair.candidate.id,
+    decision: {
+      kind: "reject",
+      reason: pair.reason,
+      level: "L3",
+      observedCosine: pair.observedCosine,
+    },
+  };
+}
+
+/**
+ * Ask the three-level judge about the pair the L3 gate rejected into the
+ * gray zone. A `merge` / `human` verdict upgrades that reject into an L3
+ * merge or an operator hold; a `reject` verdict — or a judge that is down
+ * (ANY thrown error) — returns null so the gray-zone reject stands. The
+ * gray-zone log is emitted by the caller BEFORE this call, and a judge-down
+ * adds its own `judge-down` entry so an outage is auditable rather than
+ * indistinguishable from a `reject` verdict.
+ */
+async function judgeGrayPair(
+  judge: GrayZoneJudge,
+  log: GrayLogFn,
+  incoming: IncomingEntity,
+  pair: GrayPair
+): Promise<MergeDecision | null> {
+  let verdict: GrayZoneVerdict;
+  try {
+    verdict = await judge({
+      incoming: {
+        name: incoming.canonicalName,
+        type: incoming.type,
+        description: incoming.description,
       },
+      candidate: {
+        name: pair.candidate.canonicalName,
+        type: pair.candidate.type,
+        description: pair.candidate.description,
+      },
+      observedCosine: pair.observedCosine,
+    });
+  } catch {
+    // Judge-down == no opinion: the standing gray reject is the answer,
+    // but the outage itself must leave a trace.
+    log({ level: "L3", observedCosine: pair.observedCosine, reason: JUDGE_DOWN_REASON });
+    return null;
+  }
+  if (verdict === "merge") {
+    return {
+      kind: "merge",
+      into: pair.candidate.id,
+      via: "L3",
+      observedCosine: pair.observedCosine,
     };
   }
-  return lastReject;
+  if (verdict === "human") {
+    return { kind: "hold", level: "L3", observedCosine: pair.observedCosine };
+  }
+  return null;
 }
 
 /**
@@ -335,6 +419,9 @@ async function embedOne(
 
 /** Gray-zone reason logged when the embedder throws (boundary-class fix). */
 const EMBED_FAILURE_REASON = "embed-failure";
+
+/** Gray-zone reason logged when the gray-zone judge itself is down. */
+const JUDGE_DOWN_REASON = "judge-down";
 
 /**
  * Embed two texts and return their cosine similarity, or `null` when the

@@ -179,7 +179,7 @@ _Avoid_: "merge levels" (vague); "thresholds" (L0/L1 are rules, not thresholds)
 **mark-and-continue**: the batch policy where a failed chunk does not abort the extraction batch; the failure is recorded as `extraction_records.status='failed'` and stays visible via `listFailed()`. _Stage: P0._
 _Avoid_: "skip" (implies silent loss; the failure is recorded); "best-effort" (too vague)
 
-**gray zone**: the L3 cosine band where merge-vs-reject is ambiguous; default behavior is reject plus a structured log on every gray-zone rejection (#6 Q5). The LLM-judge escalation is reserved, not implemented (#6 Q3). _Stage: P0._
+**gray zone**: the L3 cosine band where merge-vs-reject is ambiguous; default behavior is reject plus a structured log on every gray-zone rejection (#6 Q5). An optional three-level judge (merge / reject / hold-for-operator) fires only after L0–L3 leave a pair in the band; judge-down keeps the reject as default. _Stage: P0._
 _Avoid_: "uncertain match" (vague); "borderline" (colloquial)
 
 ### Evaluation

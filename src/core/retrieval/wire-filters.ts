@@ -83,6 +83,9 @@ export const ENTITY_TYPE_FILTER_KEY = "entity_type";
 /** Stable host-mappable reason token, aligned with `invalid_search_mode`. */
 export const INVALID_ENTITY_TYPE_REASON = "invalid_entity_type";
 
+/** Closed set rendered for host-facing docs (tool descriptions); SSOT stays in `ENTITY_TYPES`. */
+export const ENTITY_TYPE_FILTER_VALUES = ENTITY_TYPES.join(" | ");
+
 /**
  * Resolution of `filters.entity_type`: missing key = all types (today's
  * behavior), a closed-set value = that type only, anything else = typed

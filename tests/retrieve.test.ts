@@ -1036,6 +1036,16 @@ describe("retrieveTool", () => {
     expect(typeof tool.handler).toBe("function");
   });
 
+  it("advertises the entity_type values derived from the ENTITY_TYPES SSOT", () => {
+    // The description must track the closed set forever: if ENTITY_TYPES
+    // grows, a hardcoded description silently misleads hosts (review M2).
+    const tool = retrieveTool({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    expect(tool.description).toContain(ENTITY_TYPES.join(" | "));
+  });
+
   it("input schema rejects an empty query", () => {
     const tool = retrieveTool({
       embedder: new FakeEmbedder(TEST_DIM),

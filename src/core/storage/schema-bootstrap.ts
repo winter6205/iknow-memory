@@ -17,6 +17,7 @@
  * no connection lifecycle.
  */
 import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
+import { writeStderr } from "../../logging.js";
 import { GraphragError } from "../errors.js";
 import { ENTITY_TYPES } from "../extraction/entity-type.js";
 import {
@@ -132,7 +133,7 @@ async function createEntities(
  */
 async function upgradeEntitiesTypeCheck(
   client: SchemaBootstrapClient
-): Promise<void> {
+): Promise<{ deletedTriples: number; deletedEntities: number } | undefined> {
   const closed = sqlTextList(ENTITY_TYPES);
   const { rows } = await client.query(
     `SELECT k.conname
@@ -148,14 +149,23 @@ async function upgradeEntitiesTypeCheck(
   );
   // Fresh CREATE already pinned the closed set; an upgraded store carries
   // the new name — either way there is nothing to migrate.
-  if (names.has("entities_type_closed_check")) return;
+  if (names.has("entities_type_closed_check")) return undefined;
+  let deletedTriples = 0;
+  let deletedEntities = 0;
   if (names.has("entities_type_check")) {
-    await client.query(`
+    // RETURNING ids keep the destructive leg auditable: the caller logs the
+    // row counts after COMMIT (audit-trail rule for data deletion).
+    deletedTriples = (
+      await client.query(`
       DELETE FROM triples
        WHERE head_id IN (SELECT id FROM entities WHERE type NOT IN (${closed}))
-          OR tail_id IN (SELECT id FROM entities WHERE type NOT IN (${closed}))`);
-    await client.query(`
-      DELETE FROM entities WHERE type NOT IN (${closed})`);
+          OR tail_id IN (SELECT id FROM entities WHERE type NOT IN (${closed}))
+      RETURNING id`)
+    ).rows.length;
+    deletedEntities = (
+      await client.query(`
+      DELETE FROM entities WHERE type NOT IN (${closed}) RETURNING id`)
+    ).rows.length;
     // The legacy inline CHECK carries Postgres' auto-generated name.
     await client.query(`
       ALTER TABLE entities DROP CONSTRAINT IF EXISTS entities_type_check`);
@@ -169,6 +179,7 @@ async function upgradeEntitiesTypeCheck(
     EXCEPTION
       WHEN duplicate_object THEN NULL;
     END $$`);
+  return { deletedTriples, deletedEntities };
 }
 
 /** entity_aliases: surface forms pointing at a canonical entity (CASCADE). */
@@ -574,7 +585,7 @@ export async function upSchemaBootstrap(
     await createEntityAliases(client);
     await createTriples(client);
     // After createTriples: the upgrade's edge cleanup names `triples`.
-    await upgradeEntitiesTypeCheck(client);
+    const typeCheckAudit = await upgradeEntitiesTypeCheck(client);
     await createClaims(client);
     await createExtractionRecords(client);
     await createCommunitySummaries(client, dimensions);
@@ -587,6 +598,18 @@ export async function upSchemaBootstrap(
     // `PgvectorBackend.ensureTable` creates it before invoking us).
     await alterChunksBackPointers(client);
     await client.query("COMMIT");
+    if (
+      typeCheckAudit !== undefined &&
+      (typeCheckAudit.deletedTriples > 0 || typeCheckAudit.deletedEntities > 0)
+    ) {
+      // Audit trail for the operator-approved destructive upgrade, written
+      // only after COMMIT so a rolled-back attempt cannot fake a deletion.
+      writeStderr(
+        `WARN schema-bootstrap entities-type-closed-check upgrade deleted ` +
+          `triples=${typeCheckAudit.deletedTriples} ` +
+          `entities=${typeCheckAudit.deletedEntities}\n`
+      );
+    }
   } catch (err) {
     await client.query("ROLLBACK");
     if (err instanceof ConfigError || err instanceof GraphragError) {

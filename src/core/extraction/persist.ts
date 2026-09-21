@@ -153,16 +153,12 @@ export async function persistOutputs(
     // may become an entity row, and an edge dangling off a skipped entity
     // would break the triple FK — so the whole output is typed-skipped
     // (mark-and-continue, never a fallback bucket).
-    const headType = normalizeEntityType(out.headType);
-    const tailType = normalizeEntityType(out.tailType);
-    if (headType === null || tailType === null) {
-      logUnknownTypeSkip(deps, chunkId, out, headType === null, tailType === null);
+    const types = resolveClosedSetTypes(out);
+    if (types === null) {
+      logUnknownTypeSkip(deps, chunkId, out);
       continue;
     }
-    if (
-      normalizeAlias(out.head) === normalizeAlias(out.tail) &&
-      headType === tailType
-    ) {
+    if (isAliasSelfLoop(out, types)) {
       logSelfLoopRejection(deps, chunkId, out);
       selfLoopCount += 1;
       continue;
@@ -173,7 +169,7 @@ export async function persistOutputs(
       tailId,
       tailName,
       mergedLoserIds: losers,
-    } = await resolveEndpoints(deps, client, out, headType, tailType);
+    } = await resolveEndpoints(deps, client, out, types);
     // Both endpoints are projectable nodes even when the triple below is
     // rejected — an entity with no edge is still a node the graph arm can
     // seed on.
@@ -258,8 +254,7 @@ async function resolveEndpoints(
   deps: ExtractPersistDeps,
   client: Queryable,
   out: ExtractionOutput,
-  headType: EntityType,
-  tailType: EntityType
+  types: ClosedSetTypes
 ): Promise<{
   headId: string;
   headName: string;
@@ -267,12 +262,12 @@ async function resolveEndpoints(
   tailName: string;
   mergedLoserIds: string[];
 }> {
-  // `headType`/`tailType` arrive normalized from persistOutputs (CR High #2
-  // plus the T1 closed-set gate) so the merge gates and the persisted row
-  // agree on the same CHECK-safe type value.
+  // The pair arrives normalized from persistOutputs (CR High #2 plus the T1
+  // closed-set gate) so the merge gates and the persisted row agree on the
+  // same CHECK-safe type value.
   const head = await resolveEntity(deps, client, {
     canonicalName: out.head,
-    type: headType,
+    type: types.headType,
     description: out.description,
   });
   const tail = await resolveEntity(
@@ -280,7 +275,7 @@ async function resolveEndpoints(
     client,
     {
       canonicalName: out.tail,
-      type: tailType,
+      type: types.tailType,
       description: out.description,
     },
     { excludeIds: [head.id] }
@@ -294,14 +289,38 @@ async function resolveEndpoints(
   };
 }
 
+/** One output's endpoint types after the closed-set normalization (T1). */
+interface ClosedSetTypes {
+  headType: EntityType;
+  tailType: EntityType;
+}
+
+/**
+ * Normalize both endpoint types at once; `null` is the typed-skip signal —
+ * either endpoint outside the closed set makes the whole output
+ * unprojectable, so the pair is only ever handed on as a unit.
+ */
+function resolveClosedSetTypes(out: ExtractionOutput): ClosedSetTypes | null {
+  const headType = normalizeEntityType(out.headType);
+  const tailType = normalizeEntityType(out.tailType);
+  return headType !== null && tailType !== null ? { headType, tailType } : null;
+}
+
+/** Alias-level self-loop: same surface form AND same closed-set type. */
+function isAliasSelfLoop(out: ExtractionOutput, types: ClosedSetTypes): boolean {
+  return (
+    normalizeAlias(out.head) === normalizeAlias(out.tail) &&
+    types.headType === types.tailType
+  );
+}
+
 /**
  * Backstop for the SC6 exclusion above: a triple whose two ends resolved to
  * the same entity asserts nothing, so it is rejected. Only THAT triple is
  * skipped — the chunk's remaining outputs and the rest of the batch continue,
  * same mark-and-continue posture the merge gates take on a gray-zone reject.
  */
-function logSelfLoopRejection(
-  deps: ExtractPersistDeps,
+function logSelfLoopRejection(  deps: ExtractPersistDeps,
   chunkId: string,
   out: ExtractionOutput,
   entityId?: string
@@ -325,9 +344,7 @@ function logSelfLoopRejection(
 function logUnknownTypeSkip(
   deps: ExtractPersistDeps,
   chunkId: string,
-  out: ExtractionOutput,
-  headUnknown: boolean,
-  tailUnknown: boolean
+  out: ExtractionOutput
 ): void {
   deps.logger.warn("entity-type-unknown-skip", {
     chunkId,
@@ -337,8 +354,14 @@ function logUnknownTypeSkip(
     // Cap the raw type: it is unbounded provider output, and one pathological
     // response must not blow up the log line's size (64 chars is well past any
     // realistic type word, so the skip stays diagnosable).
-    headType: headUnknown ? out.headType.slice(0, 64) : null,
-    tailType: tailUnknown ? out.tailType.slice(0, 64) : null,
+    headType:
+      normalizeEntityType(out.headType) === null
+        ? out.headType.slice(0, 64)
+        : null,
+    tailType:
+      normalizeEntityType(out.tailType) === null
+        ? out.tailType.slice(0, 64)
+        : null,
     reason: "type-outside-closed-set",
   });
 }

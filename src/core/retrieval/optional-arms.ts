@@ -127,6 +127,25 @@ function withSeedEntityType<T extends { entityType?: EntityType }>(
 }
 
 /**
+ * Start the node-embedding arm only when both the query vector and the
+ * configured deps exist; absent either one keeps today's all-types no-op.
+ */
+function startNodeEmbeddingIfConfigured(
+  queryEmbedding: number[] | undefined,
+  deps: NodeEmbeddingArmDeps | undefined,
+  query: { validAt: string; entityType?: EntityType }
+): Promise<ArmResult> | undefined {
+  if (queryEmbedding === undefined || deps === undefined) {
+    return undefined;
+  }
+  return startNodeEmbeddingArm(
+    queryEmbedding,
+    withSeedEntityType(deps, query.entityType),
+    query.validAt
+  );
+}
+
+/**
  * Start all configured optional arms before awaiting any result, preserving
  * the retrieve latency contract that vector, lexical, graph, and embedding
  * reads overlap.
@@ -163,16 +182,11 @@ export async function runOptionalArms(
           query.validAt,
           query.query
         );
-  const nodeEmbedding =
-    queryEmbedding === undefined
-      ? undefined
-      : startNodeEmbeddingArm(
-          queryEmbedding,
-          arms.nodeEmbedding === undefined
-            ? undefined
-            : withSeedEntityType(arms.nodeEmbedding, query.entityType),
-          query.validAt
-        );
+  const nodeEmbedding = startNodeEmbeddingIfConfigured(
+    queryEmbedding,
+    arms.nodeEmbedding,
+    query
+  );
   const communitySummary =
     arms.communitySummaries === undefined || queryEmbedding === undefined
       ? undefined

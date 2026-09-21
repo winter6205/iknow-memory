@@ -11,12 +11,18 @@ import { randomUUID } from "node:crypto";
 
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { GraphragError } from "../../src/core/errors.js";
-import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
+import {
+  PgvectorBackend,
+  type PgvectorPoolStats,
+} from "../../src/core/storage/pgvector-backend.js";
 import { createIngestHandler } from "../../src/tools/ingest.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
 
 const DIM = 32;
 const BATCH_LIMIT = 3;
+const POOL_MAX = 2;
+/** Enough concurrent searches that the cap must bind and queue. */
+const CONCURRENT_SEARCHES = POOL_MAX * 8;
 const pgHarness = await createPgIntegrationHarness({
   label: "t7-batch-pool-pg",
   testPath: "tests/integration/ingest-batch-pool-pg.test.ts",
@@ -31,18 +37,6 @@ const {
   schemaConnectionString: SCHEMA_URL,
   describePg,
 } = pgHarness;
-
-type PoolOptions = {
-  max: number;
-  connectionWaitTimeoutMs: number;
-};
-
-const Backend = PgvectorBackend as unknown as new (
-  dbUrl: string,
-  dimensions: number,
-  annMaxDimensions: number,
-  poolOptions: PoolOptions
-) => PgvectorBackend;
 
 function chunkIds(result: { content: unknown }): string[] {
   const text = (result.content as Array<{ type: string; text?: string }>)
@@ -61,9 +55,11 @@ describePg("T7 batch ingest and pool: live PostgreSQL", () => {
     client = pgHarness.createClient(SCHEMA_URL);
     await client.connect();
     await pgHarness.resetSchema(client);
-    backend = new Backend(SCHEMA_URL, DIM, 2000, {
-      max: 2,
-      connectionWaitTimeoutMs: 5_000,
+    backend = new PgvectorBackend(SCHEMA_URL, DIM, {
+      annMaxDimensions: 2000,
+      // The cap under test: CONCURRENT_SEARCHES queries must queue behind it,
+      // so POOL_MAX has to stay below that count (see the constant above).
+      poolOptions: { max: POOL_MAX, connectionWaitTimeoutMs: 5_000 },
     });
     await backend.upsert([
       {
@@ -153,7 +149,7 @@ describePg("T7 batch ingest and pool: live PostgreSQL", () => {
     const [queryEmbedding] = await embedder.embed(["pool observation"]);
 
     await Promise.all(
-      Array.from({ length: 16 }, () =>
+      Array.from({ length: CONCURRENT_SEARCHES }, () =>
         backend.search(queryEmbedding!, {
           limit: 5,
           validAt: "2099-01-01T00:00:00.000Z",
@@ -161,20 +157,12 @@ describePg("T7 batch ingest and pool: live PostgreSQL", () => {
       )
     );
 
-    const stats = (
-      backend as unknown as {
-        getPoolStats: () => {
-          configuredMax: number;
-          observedConcurrentConnections: number;
-          peakConcurrentConnections: number;
-          connectionWaitTimeouts: number;
-        };
-      }
-    ).getPoolStats();
-    expect(stats.configuredMax).toBe(2);
-    expect(stats.peakConcurrentConnections).toBeLessThanOrEqual(
-      stats.configuredMax
-    );
+    const stats: PgvectorPoolStats = backend.getPoolStats();
+    // Pinning configuredMax is what keeps the bound below meaningful: a
+    // silently dropped poolOptions falls back to DEFAULT_PGVECTOR_POOL_MAX (10)
+    // and `peak <= configuredMax` then passes without the cap ever binding.
+    expect(stats.configuredMax).toBe(POOL_MAX);
+    expect(stats.peakConcurrentConnections).toBeLessThanOrEqual(POOL_MAX);
     expect(stats.observedConcurrentConnections).toBe(0);
     expect(stats.connectionWaitTimeouts).toBe(0);
   });

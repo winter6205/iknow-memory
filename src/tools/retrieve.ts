@@ -58,6 +58,7 @@ import {
   type SearchModeControl,
 } from "../core/retrieval/search-mode.js";
 import {
+  ENTITY_TYPE_FILTER_VALUES,
   invalidEntityTypeMessage,
   parseEntityTypeFilter,
   stripEntityTypeFilter,
@@ -321,8 +322,8 @@ export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
   description:
     "Ranked chunk search over the knowledge memory store, filtered by " +
     "temporal validity. filters.search_mode (A | B | C | D) selects the " +
-    "retrieval tier; missing defaults to B. filters.entity_type (person | " +
-    "organization | place | event) optionally restricts graph/entity " +
+    "retrieval tier; missing defaults to B. filters.entity_type (" +
+    ENTITY_TYPE_FILTER_VALUES + ") optionally restricts graph/entity " +
     "seeding; missing recalls all types.",
   inputSchema:
     deps.inputValidationFailureCounter === undefined

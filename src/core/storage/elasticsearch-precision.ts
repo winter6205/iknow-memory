@@ -169,6 +169,62 @@ function hasCjk(text: string): boolean {
   return /\p{Script=Han}/u.test(text);
 }
 
+/** Query analyzer chosen by the CJK-segmentation switch. */
+function precisionQueryAnalyzer(
+  precision: PrecisionSearchOptions
+): string {
+  return precision.cjkSegmentation === false ? "standard" : IK_QUERY_ANALYZER;
+}
+
+/**
+ * Seed-visible posture for entities: not retired, not a merge loser, and —
+ * when a resolved `filters.entity_type` exists (T3) — narrowed to that one
+ * closed-set type.
+ */
+function entitySeedFilter(
+  entityType: EntityType | undefined
+): Record<string, unknown>[] {
+  const filter: Record<string, unknown>[] = [
+    { term: { retired: false } },
+    { bool: { must_not: { exists: { field: "merged_into" } } } },
+  ];
+  if (entityType !== undefined) {
+    filter.push({ term: { type: entityType } });
+  }
+  return filter;
+}
+
+/** Name+alias lexical match set for entity seeds: multi_match plus optional phrase boost. */
+function entityLexicalShould(
+  query: string,
+  precision: PrecisionSearchOptions
+): Record<string, unknown>[] {
+  const analyzer = precisionQueryAnalyzer(precision);
+  const fields = lexicalFields(precision.fieldBoost ?? true, precision.fieldBoosts ?? {
+    canonical_name: 2,
+    aliases: 1.5,
+  });
+  const should: Record<string, unknown>[] = [
+    {
+      multi_match: {
+        query,
+        fields,
+        type: "best_fields",
+        operator: "or",
+        analyzer,
+      },
+    },
+  ];
+  if (precision.phrase ?? true) {
+    should.push({
+      match_phrase: {
+        canonical_name: { query, boost: 2, analyzer },
+      },
+    });
+  }
+  return should;
+}
+
 function responseBody<T>(response: unknown): T {
   if (typeof response === "object" && response !== null && "body" in response) {
     return (response as { body: T }).body;
@@ -413,52 +469,12 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
     limit: number,
     precision: PrecisionSearchOptions = {},
     entityType?: EntityType
-  ): Promise<Array<{ id: string; canonical_name: string; score?: number }>> {
+  ): Promise<EntitySeedHit[]> {
     if (limit <= 0 || query.trim() === "") return [];
     if (precision.cjkSegmentation === false && hasCjk(query)) return [];
     await this.ensureIndex(this.config.entityIndex, "entity");
-    const entityFilter: Record<string, unknown>[] = [
-      { term: { retired: false } },
-      { bool: { must_not: { exists: { field: "merged_into" } } } },
-    ];
-    if (entityType !== undefined) {
-      entityFilter.push({ term: { type: entityType } });
-    }
-    const fields = lexicalFields(
-      precision.fieldBoost ?? true,
-      precision.fieldBoosts ?? {
-        canonical_name: 2,
-        aliases: 1.5,
-      }
-    );
-    const should: Record<string, unknown>[] = [
-      {
-        multi_match: {
-          query,
-          fields,
-          type: "best_fields",
-          operator: "or",
-          analyzer:
-            precision.cjkSegmentation === false
-              ? "standard"
-              : IK_QUERY_ANALYZER,
-        },
-      },
-    ];
-    if (precision.phrase ?? true) {
-      should.push({
-        match_phrase: {
-          canonical_name: {
-            query,
-            boost: 2,
-            analyzer:
-              precision.cjkSegmentation === false
-                ? "standard"
-                : IK_QUERY_ANALYZER,
-          },
-        },
-      });
-    }
+    const entityFilter = entitySeedFilter(entityType);
+    const should = entityLexicalShould(query, precision);
     try {
       const response = await this.client.search({
         index: this.config.entityIndex,
@@ -473,19 +489,9 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
         _source: ["id", "canonical_name"],
       });
       const body = responseBody<SearchResponse>(response);
-      return body.hits.hits.flatMap((hit) => {
-        const source = sourceRecord(hit._source);
-        const id = stringValue(source.id) ?? hit._id;
-        const canonicalName = stringValue(source.canonical_name);
-        if (id === undefined || canonicalName === undefined) return [];
-        return [
-          {
-            id,
-            canonical_name: canonicalName,
-            ...(typeof hit._score === "number" ? { score: hit._score } : {}),
-          },
-        ];
-      });
+      return body.hits.hits
+        .map((hit) => toEntitySeedHit(hit))
+        .filter((hit): hit is EntitySeedHit => hit !== undefined);
     } catch (error) {
       throw new PrecisionLayerError(
         "Elasticsearch entity search failed",
@@ -594,6 +600,21 @@ interface BulkResponse {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
+}
+
+/** Entity-seed row shape shared by `searchEntities` and its hit mapper. */
+type EntitySeedHit = { id: string; canonical_name: string; score?: number };
+
+function toEntitySeedHit(hit: SearchHit): EntitySeedHit | undefined {
+  const source = sourceRecord(hit._source);
+  const id = stringValue(source.id) ?? hit._id;
+  const canonicalName = stringValue(source.canonical_name);
+  if (id === undefined || canonicalName === undefined) return undefined;
+  return {
+    id,
+    canonical_name: canonicalName,
+    ...(typeof hit._score === "number" ? { score: hit._score } : {}),
+  };
 }
 
 function toRetrievedChunk(hit: SearchHit): RetrievedChunk | undefined {

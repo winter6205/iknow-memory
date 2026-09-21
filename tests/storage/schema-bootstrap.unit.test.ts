@@ -267,3 +267,73 @@ describe("upSchemaBootstrap community_index_state (T5 C-ready ledger)", () => {
     ).toBe(false);
   });
 });
+
+describe("upgradeEntitiesTypeCheck destructive-leg audit (review M3)", () => {
+  function upgradingClient(deletedTriples: number, deletedEntities: number): {
+    client: PoolClient;
+    queries: string[];
+  } {
+    const queries: string[] = [];
+    const ids = (count: number) =>
+      Array.from({ length: count }, (_, i) => ({ id: `row-${i}` }));
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (/k\.conname/.test(sql)) {
+          return { rows: [{ conname: "entities_type_check" }] };
+        }
+        if (/DELETE FROM triples/.test(sql)) {
+          return { rows: ids(deletedTriples) };
+        }
+        if (/DELETE FROM entities/.test(sql)) {
+          return { rows: ids(deletedEntities) };
+        }
+        if (/AS ready/.test(sql)) return { rows: [{ ready: false }] };
+        if (/AS schema_name/.test(sql)) {
+          return { rows: [{ schema_name: "public" }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as PoolClient;
+    return { client, queries };
+  }
+
+  it("audits deleted row counts to stderr after the destructive upgrade", async () => {
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      const { client, queries } = upgradingClient(3, 2);
+      await upSchemaBootstrap(client, 1536, 2000);
+      // RETURNING keeps the counts real, not inferred.
+      expect(
+        queries.find((q) => /DELETE FROM entities/.test(q))
+      ).toContain("RETURNING id");
+      expect(
+        queries.find((q) => /DELETE FROM triples/.test(q))
+      ).toContain("RETURNING id");
+      expect(stderr).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "entities-type-closed-check upgrade deleted triples=3 entities=2"
+        )
+      );
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("stays silent when the upgrade deleted nothing", async () => {
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      const { client } = upgradingClient(0, 0);
+      await upSchemaBootstrap(client, 1536, 2000);
+      expect(stderr).not.toHaveBeenCalledWith(
+        expect.stringContaining("upgrade deleted")
+      );
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+});

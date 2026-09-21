@@ -8,12 +8,14 @@
  * only the optional `degraded` and `degraded_reasons` fields; internal debug
  * diagnostics are not serialized.
  *
- * `filters.search_mode` (检索档 A|B|C|D, specs/search-mode-retrieve.md) is
- * resolved and dispatched in this handler before the arms run: missing →
- * B, invalid → typed INVALID_INPUT, A → the lexical child-hit/parent-body
- * arm (plans T2), C → the report-first community-summary arm (plans T3),
- * D → the typed `real_db_not_wired` refusal (plans T4; see
- * src/core/retrieval/search-mode.ts).
+ * `filters.search_mode` (检索档 A|graph|global|D,
+ * specs/search-mode-graph-global.md) is resolved and dispatched in this
+ * handler before the arms run: missing → `graph`, invalid → typed
+ * INVALID_INPUT, A → the lexical child-hit/parent-body arm (plans T2),
+ * `global` → the report-first community-summary arm (plans T3), D → the
+ * typed `real_db_not_wired` refusal (plans T4; see
+ * src/core/retrieval/search-mode.ts). The retired letters `B`/`C` still
+ * resolve, to `graph`/`global`, while hosts migrate.
  *
  * `filters.entity_type` (plans/entity-type-and-filter.md T3) is resolved
  * and stripped the same way: missing → all types, one of the closed set →
@@ -54,6 +56,7 @@ import {
 } from "../core/retrieval/types.js";
 import {
   SEARCH_MODE_ARMS,
+  SEARCH_MODE_WIRE_COPY,
   cDropWindowsEnabled,
   invalidSearchModeMessage,
   parseSearchMode,
@@ -199,7 +202,8 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     // Routing keys are resolved and stripped HERE, once, for every 档
     // (review I2): each backend applies `filters` as exact-match term
     // clauses, so a left-over control key silently zeros the arm that
-    // consumes it — `c_drop_windows` included. 档 C still sees its switch:
+    // consumes it — `c_drop_windows` included. The report-first 档
+    // (`global`) still sees its switch:
     // as the typed control value below, never as a filter key.
     const control: SearchModeControl = {
       cDropWindows: cDropWindowsEnabled(input.filters),
@@ -349,8 +353,10 @@ export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
   name: "retrieve",
   description:
     "Ranked chunk search over the knowledge memory store, filtered by " +
-    "temporal validity. filters.search_mode (A | B | C | D) selects the " +
-    "retrieval tier; missing defaults to B. filters.entity_type (" +
+    "temporal validity. filters.search_mode selects the retrieval tier from " +
+    "the closed set " +
+    SEARCH_MODE_WIRE_COPY +
+    "; missing defaults to graph. filters.entity_type (" +
     ENTITY_TYPE_FILTER_VALUES +
     ") optionally restricts graph/entity " +
     "seeding; missing recalls all types. filters.community_level (positive " +

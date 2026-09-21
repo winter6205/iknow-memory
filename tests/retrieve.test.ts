@@ -3,7 +3,11 @@ import { createRetrieveHandler, retrieveTool } from "../src/tools/retrieve.js";
 import { FakeEmbedder } from "../src/core/embedder.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import { GraphragError } from "../src/core/errors.js";
-import { REAL_DB_NOT_WIRED_REASON } from "../src/core/retrieval/search-mode.js";
+import {
+  REAL_DB_NOT_WIRED_REASON,
+  SEARCH_MODE_ALIASES,
+  SEARCH_MODE_WIRE_COPY,
+} from "../src/core/retrieval/search-mode.js";
 import { ENTITY_TYPES } from "../src/core/extraction/entity-type.js";
 import {
   COMMUNITY_INDEX_STATUS,
@@ -314,13 +318,13 @@ describe("createRetrieveHandler", () => {
       // The message is the wire surface (the MCP adapter serializes it into
       // an isError result), so the host maps on this stable token.
       expect(error.message).toContain("invalid_search_mode");
-      expect(error.message).toContain("A | B | C | D");
+      expect(error.message).toContain(SEARCH_MODE_WIRE_COPY);
     });
 
     it("a rejected mode does not fall through to a healthy empty envelope", async () => {
       // The negative path must not be reachable as a `{ chunks: [] }`
       // success either way of spelling the invalid value.
-      for (const bad of ["", "b", "graph"]) {
+      for (const bad of ["", "b", "local"]) {
         await expect(
           handler({ query: "anything", filters: { search_mode: bad } })
         ).rejects.toBeInstanceOf(GraphragError);
@@ -393,6 +397,141 @@ describe("createRetrieveHandler", () => {
       }
       // B answers through the hybrid pipeline, un-degraded.
       expect(parseResultBody(result).chunks.map((c) => c.id)).toEqual(["x"]);
+    });
+  });
+
+  // specs/search-mode-graph-global.md: the lasting wire tokens are `graph`
+  // (the knowledge-QA arm) and `global` (the report-first arm). The retired
+  // letters B/C stay accepted while a host migrates, and must land on the
+  // SAME arm as their lasting token — same envelope, no second behavior.
+  describe("search_mode graph/global routing", () => {
+    beforeEach(async () => {
+      await backend.upsert([
+        makeChunk({ id: "x", source_ref: "docs/x.md" }),
+        makeChunk({ id: "y", source_ref: "docs/y.md" }),
+      ]);
+    });
+
+    /** Ready community ledger with one report row plus one citable window. */
+    async function readyReportHandler() {
+      const ready = new MemoryBackend(TEST_DIM);
+      await ready.setCommunityIndexState({
+        status: COMMUNITY_INDEX_STATUS.READY,
+        failure_code: null,
+      });
+      await ready.upsert([
+        makeChunk({ id: "win-1", source_ref: "docs/win.md" }),
+      ]);
+      const storage = Object.create(ready, {
+        communitySummaries: {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: {
+            getCommunitySummaryByCommunityId: async () => undefined,
+            searchCommunitySummaries: async () => [
+              {
+                id: "sum-1",
+                communityId: "com-1",
+                summary: "the one report row",
+                score: 0.9,
+              },
+            ],
+          },
+        },
+      }) as MemoryBackend;
+      return createRetrieveHandler({
+        embedder: new FakeEmbedder(TEST_DIM),
+        storage,
+      });
+    }
+
+    it("graph runs the knowledge-QA arm and answers byte-for-byte like B", async () => {
+      const graph = await handler({
+        query: "anything",
+        filters: { search_mode: "graph" },
+      });
+      const letter = await handler({
+        query: "anything",
+        filters: { search_mode: "B" },
+      });
+      expect(parseResultBody(graph)).toEqual(parseResultBody(letter));
+      // It really ran the vector/graph-priority assembler, not an empty pass.
+      expect(
+        parseResultBody(graph)
+          .chunks.map((c) => c.id)
+          .sort()
+      ).toEqual(["x", "y"]);
+    });
+
+    it("an omitted search_mode answers through the graph arm", async () => {
+      const omitted = await handler({ query: "anything" });
+      const graph = await handler({
+        query: "anything",
+        filters: { search_mode: "graph" },
+      });
+      expect(parseResultBody(omitted)).toEqual(parseResultBody(graph));
+    });
+
+    it("global runs the report-first arm and answers byte-for-byte like C", async () => {
+      const reportHandler = await readyReportHandler();
+      const lasting = await reportHandler({
+        query: "anything",
+        filters: { search_mode: "global", c_drop_windows: "0" },
+      });
+      const letter = await reportHandler({
+        query: "anything",
+        filters: { search_mode: "C", c_drop_windows: "0" },
+      });
+      const body = parseResultBody(lasting);
+      expect(body).toEqual(parseResultBody(letter));
+      expect(body.chunks.map((c) => c.id)).toEqual(["sum-1"]);
+      expect(body.chunks[0]!.metadata?.kind).toBe("community-summary");
+      expect(body).not.toHaveProperty("degraded");
+    });
+
+    it("global on a not-ready ledger keeps the typed report-first failure instead of falling through to graph", async () => {
+      // `backend` has no READY community_index_state row, so the report arm
+      // must type out — and must NOT silently answer like the graph arm does
+      // on the same corpus.
+      await expect(
+        handler({ query: "anything", filters: { search_mode: "global" } })
+      ).rejects.toBeInstanceOf(GraphragError);
+      let thrown: unknown;
+      let thrownLetter: unknown;
+      try {
+        await handler({
+          query: "anything",
+          filters: { search_mode: "global" },
+        });
+      } catch (err) {
+        thrown = err;
+      }
+      try {
+        await handler({ query: "anything", filters: { search_mode: "C" } });
+      } catch (err) {
+        thrownLetter = err;
+      }
+      const error = thrown as GraphragError;
+      // Same typed fact either way it is spelled: the copy names the CANONICAL
+      // token, so a host that sent the `C` alias is not handed a different
+      // string to map on.
+      expect(error.message).toContain(COMMUNITY_SUMMARY_INDEX_FAILURE);
+      expect(error.message).toContain("search_mode=global");
+      expect((thrownLetter as GraphragError).message).toBe(error.message);
+      expect(
+        parseResultBody(await handler({ query: "anything" })).chunks.length
+      ).toBeGreaterThan(0);
+    });
+
+    it("A and D keep their own arms under the widened token set", async () => {
+      const aBody = parseResultBody(
+        await handler({ query: "anything", filters: { search_mode: "A" } })
+      );
+      expect(aBody.chunks).toEqual([]);
+      await expect(
+        handler({ query: "anything", filters: { search_mode: "D" } })
+      ).rejects.toBeInstanceOf(GraphragError);
     });
   });
 
@@ -1034,6 +1173,24 @@ describe("retrieveTool", () => {
     expect(tool.description.length).toBeGreaterThan(0);
     expect(tool.inputSchema).toBeDefined();
     expect(typeof tool.handler).toBe("function");
+  });
+
+  it("advertises the search_mode closed set and names B/C as accepted aliases", () => {
+    // The description is the operator-visible contract: a host reading it
+    // must learn both the lasting tokens and that the retired letters still
+    // work during migration — and must not be told the default is a letter.
+    // It quotes the SAME derived sentence the invalid-value refusal uses
+    // (review M1), so a widen or contract step cannot leave one half stale.
+    const tool = retrieveTool({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    expect(tool.description).toContain(SEARCH_MODE_WIRE_COPY);
+    for (const [letter, mode] of Object.entries(SEARCH_MODE_ALIASES)) {
+      expect(tool.description).toContain(`${letter}=${mode}`);
+    }
+    expect(tool.description).toContain("defaults to graph");
+    expect(tool.description).not.toMatch(/A \| B \| C \| D/);
   });
 
   it("advertises the entity_type values derived from the ENTITY_TYPES SSOT", () => {

@@ -19,8 +19,9 @@
  *     community-summary.test.ts — NOT weakened here; this file adds the
  *     B-vs-C contrast on ONE dead-ledger backend.
  * What is NEW here: D's typed `real_db_not_wired` exit (empty/corpus-full/
- * limit variants, zero backend contact), four-档 concurrency isolation, and
- * the fail-open-vs-typed exception contrast. No duplicated healthy-miss.
+ * limit variants, zero backend contact), the letter-vs-alias concurrency
+ * isolation across every 档 in flight, and the fail-open-vs-typed exception
+ * contrast. No duplicated healthy-miss.
  */
 import { describe, it, expect } from "vitest";
 import { createRetrieveHandler } from "../../src/tools/retrieve.js";
@@ -125,6 +126,23 @@ const SUMMARY_ON_CONFIG: RetrieveConfig = {
 // ======================================================================
 
 describe("search-mode empty boundary", () => {
+  it("an omitted search_mode and an explicit graph answer an empty corpus identically", async () => {
+    // Omission is the default route, so on an empty corpus it must look
+    // exactly like the token it defaults to: a plain `{ chunks: [] }` with
+    // no degradation flag and no rejection.
+    const handler = createRetrieveHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+    });
+    const omitted = parseBody(await handler({ query: "anything" }));
+    const lasting = parseBody(
+      await handler({ query: "anything", filters: { search_mode: "graph" } })
+    );
+    expect(omitted).toEqual(lasting);
+    expect(omitted.chunks).toEqual([]);
+    expect(omitted).not.toHaveProperty("degraded");
+  });
+
   it("an empty corpus keeps A a healthy miss but D still typed (emptiness never masks 未接)", async () => {
     // The C-side empty contrast — READY generation, zero summaries — is
     // pinned in mode-c-arm.test.ts; not re-run here. What must be pinned
@@ -245,7 +263,7 @@ describe("search-mode overflow boundary (limit)", () => {
 // ======================================================================
 
 describe("search-mode concurrent boundary", () => {
-  it("A/B/C/D dispatched in parallel answer only their own 档; D rejects independently", async () => {
+  it("every 档 in flight at once answers only its own arm; aliases never cross; D rejects independently", async () => {
     const base = new MemoryBackend(TEST_DIM);
     await base.upsert([chunkRecord("b-1")]);
     await base.setCommunityIndexState({
@@ -274,12 +292,17 @@ describe("search-mode concurrent boundary", () => {
       embedder: new FakeEmbedder(TEST_DIM),
       storage,
     });
-    const [a, b, c, d, dAgain] = await Promise.allSettled([
+    const [a, b, graph, c, global, d, dAgain] = await Promise.allSettled([
       handler({ query: "anything", filters: { search_mode: "A" } }),
       handler({ query: "anything", filters: { search_mode: "B" } }),
+      handler({ query: "anything", filters: { search_mode: "graph" } }),
       handler({
         query: "anything",
         filters: { search_mode: "C", c_drop_windows: "0" },
+      }),
+      handler({
+        query: "anything",
+        filters: { search_mode: "global", c_drop_windows: "0" },
       }),
       handler({ query: "anything", filters: { search_mode: "D" } }),
       handler({ query: "anything", filters: { search_mode: "D" } }),
@@ -287,11 +310,15 @@ describe("search-mode concurrent boundary", () => {
 
     expect(a.status).toBe("fulfilled");
     expect(b.status).toBe("fulfilled");
+    expect(graph.status).toBe("fulfilled");
     expect(c.status).toBe("fulfilled");
+    expect(global.status).toBe("fulfilled");
     if (
       a.status !== "fulfilled" ||
       b.status !== "fulfilled" ||
-      c.status !== "fulfilled"
+      graph.status !== "fulfilled" ||
+      c.status !== "fulfilled" ||
+      global.status !== "fulfilled"
     )
       throw new Error("unexpected rejection in concurrent batch");
 
@@ -303,6 +330,10 @@ describe("search-mode concurrent boundary", () => {
     expect(parseBody(c.value).chunks.map((chunk) => chunk.id)).toEqual([
       "sum-1",
     ]);
+    // The lasting token and the retired letter are the same arm: an alias may
+    // not pick up a behavior of its own while a host migrates.
+    expect(parseBody(graph.value)).toEqual(parseBody(b.value));
+    expect(parseBody(global.value)).toEqual(parseBody(c.value));
     // D rejects — twice, the same typed way: the refusal is stateless and
     // never poisons the concurrent siblings.
     for (const attempt of [d, dAgain]) {

@@ -121,6 +121,13 @@ export interface AssembleArgs {
    * typed value, never the filter key. Absent → all types.
    */
   entityType?: EntityType;
+  /**
+   * Resolved `filters.community_level` fineness bound
+   * (specs/community-level.md): every summary read in this request caps at
+   * `level <= communityLevel`. Routing control like `entity_type`, never a
+   * chunk filter. Absent → the default cap, so omit ≡ 2 on every path.
+   */
+  communityLevel?: number;
 }
 
 /**

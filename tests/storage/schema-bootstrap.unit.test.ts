@@ -193,7 +193,9 @@ describe("upSchemaBootstrap embedding_generation (T1 generation ledger)", () => 
         `'${mode}'`
       );
     }
-    expect(create).toMatch(/updated_at\s+timestamptz NOT NULL DEFAULT now\(\)/i);
+    expect(create).toMatch(
+      /updated_at\s+timestamptz NOT NULL DEFAULT now\(\)/i
+    );
   });
 
   it("names embedding_generation in the readiness probe so deployed DBs get it", async () => {
@@ -230,7 +232,10 @@ describe("upSchemaBootstrap community_index_state (T5 C-ready ledger)", () => {
     const create = queries.find((query) =>
       /CREATE TABLE IF NOT EXISTS community_index_state/i.test(query)
     );
-    expect(create, "community_index_state CREATE TABLE not emitted").toBeDefined();
+    expect(
+      create,
+      "community_index_state CREATE TABLE not emitted"
+    ).toBeDefined();
     expect(create).toMatch(/CHECK \(id = 1\)/);
     expect(create).toMatch(/failure_code text NULL/);
     for (const value of Object.values(COMMUNITY_INDEX_STATUS)) {
@@ -268,8 +273,112 @@ describe("upSchemaBootstrap community_index_state (T5 C-ready ledger)", () => {
   });
 });
 
+// community-level T1: product-scale `level` (larger integer = finer
+// community) must be NOT NULL on fresh AND upgraded stores, so an INSERT
+// without it fails on both (specs/community-level.md SC1).
+describe("upSchemaBootstrap community_summaries.level (community-level T1)", () => {
+  it("declares level integer NOT NULL on the fresh CREATE TABLE", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    const create = queries.find((query) =>
+      /CREATE TABLE IF NOT EXISTS community_summaries/i.test(query)
+    );
+    expect(
+      create,
+      "community_summaries CREATE TABLE not emitted"
+    ).toBeDefined();
+    expect(create).toMatch(/level\s+integer NOT NULL/i);
+  });
+
+  it("wipes level-less legacy rows on an existing store, then SET NOT NULL, audited", async () => {
+    const queries: string[] = [];
+    const client = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (/SELECT 1 FROM community_summaries WHERE level IS NULL/.test(sql)) {
+          return { rows: [{ "?column?": 1 }] };
+        }
+        if (/DELETE FROM community_summaries WHERE level IS NULL/.test(sql)) {
+          return { rows: [{ id: "legacy-1" }, { id: "legacy-2" }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as PoolClient;
+    const stderr = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation(() => true);
+    try {
+      await upSchemaBootstrap(client, 1536, 2000);
+      expect(
+        queries.some((query) =>
+          /ALTER TABLE community_summaries\s+ADD COLUMN IF NOT EXISTS level/i.test(
+            query
+          )
+        ),
+        "forward-compat ADD COLUMN level not emitted"
+      ).toBe(true);
+      const wipe = queries.find((query) =>
+        /DELETE FROM community_summaries WHERE level IS NULL/i.test(query)
+      );
+      expect(
+        wipe,
+        "legacy level-less rows must be wiped before SET NOT NULL (spec assumption 2: wipe/rebuild)"
+      ).toBeDefined();
+      expect(wipe).toContain("RETURNING id");
+      expect(
+        queries.some((query) =>
+          /ALTER TABLE community_summaries ALTER COLUMN level SET NOT NULL/i.test(
+            query
+          )
+        ),
+        "SET NOT NULL not emitted"
+      ).toBe(true);
+      expect(stderr).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "community_summaries level upgrade wiped level-less legacy rows=2"
+        )
+      );
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+
+  it("emits no data-level write when no level-less rows exist (dry-run contract)", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    expect(
+      queries.filter((query) =>
+        /^\s*DELETE FROM community_summaries/i.test(query)
+      )
+    ).toEqual([]);
+  });
+
+  it("names community_summaries.level in the readiness probe", async () => {
+    const records: { sql: string; values?: unknown[] }[] = [];
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        records.push({ sql, values });
+        if (/AS ready/.test(sql)) return { rows: [{ ready: true }] };
+        if (/current_schema\(\)/.test(sql)) {
+          return { rows: [{ schema_name: "public" }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as PoolClient;
+    await upSchemaBootstrap(client, 1536, 2000);
+
+    const probe = records.find(({ sql }) => /AS ready/.test(sql));
+    expect(probe, "readiness probe not emitted").toBeDefined();
+    expect(probe!.values?.[2]).toContain("community_summaries");
+    expect(probe!.values?.[3]).toContain("level");
+  });
+});
+
 describe("upgradeEntitiesTypeCheck destructive-leg audit (review M3)", () => {
-  function upgradingClient(deletedTriples: number, deletedEntities: number): {
+  function upgradingClient(
+    deletedTriples: number,
+    deletedEntities: number
+  ): {
     client: PoolClient;
     queries: string[];
   } {
@@ -306,12 +415,12 @@ describe("upgradeEntitiesTypeCheck destructive-leg audit (review M3)", () => {
       const { client, queries } = upgradingClient(3, 2);
       await upSchemaBootstrap(client, 1536, 2000);
       // RETURNING keeps the counts real, not inferred.
-      expect(
-        queries.find((q) => /DELETE FROM entities/.test(q))
-      ).toContain("RETURNING id");
-      expect(
-        queries.find((q) => /DELETE FROM triples/.test(q))
-      ).toContain("RETURNING id");
+      expect(queries.find((q) => /DELETE FROM entities/.test(q))).toContain(
+        "RETURNING id"
+      );
+      expect(queries.find((q) => /DELETE FROM triples/.test(q))).toContain(
+        "RETURNING id"
+      );
       expect(stderr).toHaveBeenCalledWith(
         expect.stringContaining(
           "entities-type-closed-check upgrade deleted triples=3 entities=2"

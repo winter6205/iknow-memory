@@ -162,10 +162,19 @@ interface Query {
   values: unknown[];
 }
 
+/**
+ * The swap's whole-table DELETE, exactly as swapCommunitySummaries emits it.
+ * Anchored so the bootstrap's forward-compat
+ * `DELETE FROM community_summaries WHERE level IS NULL RETURNING id`
+ * (run over the same FakeClient by upSchemaBootstrap) is not miscounted.
+ */
+const SWAP_DELETE_RE = /^\s*DELETE FROM community_summaries\s*$/i;
+
 interface FakeSummaryRow {
   community_id: string;
   summary: string;
   entity_ids: string[];
+  level: number;
   embedding: string;
 }
 
@@ -239,7 +248,8 @@ class FakeClient {
         community_id: String(values[1]),
         summary: String(values[2]),
         entity_ids: values[3] as string[],
-        embedding: String(values[4]),
+        level: Number(values[4]),
+        embedding: String(values[5]),
       };
       if (this.inTransaction) this.onSwapInsert?.(row);
       if (this.failSwapInsertId === row.community_id) {
@@ -249,7 +259,7 @@ class FakeClient {
       else this.committed.push(row);
       return { rows: [] };
     }
-    if (/DELETE FROM community_summaries/.test(text)) {
+    if (SWAP_DELETE_RE.test(text)) {
       if (this.inTransaction) this.pendingDelete = true;
       else this.committed = [];
       return { rows: [] };
@@ -290,6 +300,7 @@ function oldGeneration(): FakeSummaryRow[] {
       community_id: "99",
       summary: "stale community summary",
       entity_ids: [ENTITY_A],
+      level: 1,
       embedding: "[1]",
     },
   ];
@@ -302,7 +313,7 @@ function tagged(client: FakeClient): string[] {
     if (/^\s*BEGIN\s*$/i.test(text)) tags.push("BEGIN");
     else if (/^\s*COMMIT\s*$/i.test(text)) tags.push("COMMIT");
     else if (/^\s*ROLLBACK\s*$/i.test(text)) tags.push("ROLLBACK");
-    else if (/DELETE FROM community_summaries/.test(text)) tags.push("DELETE");
+    else if (SWAP_DELETE_RE.test(text)) tags.push("DELETE");
     else if (/INSERT INTO community_summaries/.test(text))
       tags.push(`INSERT(${values[1]})`);
     else if (/INSERT INTO community_index_state/.test(text))
@@ -458,6 +469,7 @@ describe("community summary index CLI", () => {
         community_id: "7",
         summary: "Postgres storage community summary",
         entity_ids: [ENTITY_A],
+        level: 1,
         embedding: "[1]",
       },
     ]);
@@ -516,13 +528,12 @@ describe("community summary index CLI", () => {
         community_id: "7",
         summary: "Postgres storage community summary",
         entity_ids: [ENTITY_A],
+        level: 1,
         embedding: "[1]",
       },
     ]);
     expect(
-      client.queries.filter((query) =>
-        /DELETE FROM community_summaries/.test(query.text)
-      )
+      client.queries.filter((query) => SWAP_DELETE_RE.test(query.text))
     ).toHaveLength(2);
   });
 
@@ -710,6 +721,83 @@ describe("community summary index CLI", () => {
     ]);
   });
 
+  // community-level T1: the detector numbers 1 = finest; the ledger column
+  // uses the PRODUCT scale where a LARGER integer = FINER community, so the
+  // renumber happens at persist (specs/community-level.md assumption 1).
+  it("stores the finest detector community with a LARGER level than its coarser siblings", async () => {
+    const h = deps({
+      detector: {
+        async detect() {
+          return [
+            { id: "7", entityIds: [ENTITY_A], level: 1 },
+            { id: "12", entityIds: [ENTITY_A, ENTITY_B], level: 2 },
+            { id: "20", entityIds: [ENTITY_A, ENTITY_B], level: 3 },
+          ];
+        },
+        async close() {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    const levelById = Object.fromEntries(
+      h.client
+        .readSummaryRows()
+        .map((row) => [row.community_id, row.level] as const)
+    );
+    expect(levelById).toEqual({ "7": 3, "12": 2, "20": 1 });
+  });
+
+  it("the swap INSERT names level and binds it at position 5", async () => {
+    const h = deps({
+      detector: {
+        async detect() {
+          return [
+            { id: "7", entityIds: [ENTITY_A], level: 1 },
+            { id: "12", entityIds: [ENTITY_A, ENTITY_B], level: 2 },
+          ];
+        },
+        async close() {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    const inserts = h.client.queries.filter((query) =>
+      /INSERT INTO community_summaries/.test(query.text)
+    );
+    expect(inserts).toHaveLength(2);
+    expect(inserts[0]!.text).toMatch(
+      /\(id, community_id, summary, entity_ids, level,/
+    );
+    expect(inserts[0]!.text).toMatch(/VALUES \(\$1, \$2, \$3, \$4, \$5/);
+    expect(inserts[0]!.values[4]).toBe(2);
+    expect(inserts[1]!.values[4]).toBe(1);
+  });
+
+  it("persists a community without a detector level as the coarsest (product level 1)", async () => {
+    const h = deps({
+      detector: {
+        async detect() {
+          return [
+            { id: "7", entityIds: [ENTITY_A], level: 1 },
+            { id: "12", entityIds: [ENTITY_A, ENTITY_B], level: 2 },
+            { id: "8", entityIds: [ENTITY_B] },
+          ];
+        },
+        async close() {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    const levelById = Object.fromEntries(
+      h.client
+        .readSummaryRows()
+        .map((row) => [row.community_id, row.level] as const)
+    );
+    // A level-less Community cannot claim a finer grain than the run's
+    // coarsest, so it shares product level 1 with the coarsest sibling.
+    expect(levelById).toEqual({ "7": 2, "12": 1, "8": 1 });
+  });
+
   it("skips a community whose entities are all retired without failing the job", async () => {
     const h = deps({
       detector: {
@@ -787,9 +875,7 @@ describe("community summary index CLI", () => {
     await expect(runCli([], h.deps)).resolves.toBe(0);
     expect(client.readSummaryRows()).toEqual([]);
     expect(
-      client.queries.some((query) =>
-        /DELETE FROM community_summaries/.test(query.text)
-      )
+      client.queries.some((query) => SWAP_DELETE_RE.test(query.text))
     ).toBe(true);
   });
 
@@ -812,9 +898,7 @@ describe("community summary index CLI", () => {
     });
     expect(client.readSummaryRows()).toEqual(oldGeneration());
     expect(
-      client.queries.some((query) =>
-        /DELETE FROM community_summaries/.test(query.text)
-      )
+      client.queries.some((query) => SWAP_DELETE_RE.test(query.text))
     ).toBe(false);
   });
 
@@ -830,9 +914,9 @@ describe("community summary index CLI", () => {
         /CREATE TABLE|CREATE EXTENSION/.test(query.text)
       )
     ).toBe(false);
-    expect(h.client.queries.some((query) => /INSERT INTO/.test(query.text))).toBe(
-      false
-    );
+    expect(
+      h.client.queries.some((query) => /INSERT INTO/.test(query.text))
+    ).toBe(false);
     expect(h.client.readState()).toBeNull();
   });
 

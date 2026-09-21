@@ -20,6 +20,10 @@
  * typed seed restriction for the graph/entity-embedding arms, anything
  * else → typed INVALID_INPUT. It is a routing control, never a chunk
  * exact-match key; `tools/list` still exposes the single `retrieve`.
+ *
+ * `filters.community_level` (specs/community-level.md) is a routing control
+ * too: missing → cap 2, positive integer string → that cap on every
+ * community-summary read, anything else → typed INVALID_INPUT.
  */
 import { z } from "zod";
 import {
@@ -59,8 +63,11 @@ import {
 } from "../core/retrieval/search-mode.js";
 import {
   ENTITY_TYPE_FILTER_VALUES,
+  invalidCommunityLevelMessage,
   invalidEntityTypeMessage,
+  parseCommunityLevelFilter,
   parseEntityTypeFilter,
+  stripCommunityLevelFilter,
   stripEntityTypeFilter,
 } from "../core/retrieval/wire-filters.js";
 import { GraphragError } from "../core/errors.js";
@@ -185,6 +192,10 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         "INVALID_INPUT"
       );
     }
+    // Same contract for `filters.community_level` (specs/community-level
+    // .md): resolve once per request, refuse typed otherwise — never a
+    // silent all-level mix — and hand the arms only the number below.
+    const communityLevel = resolveCommunityLevel(input.filters);
     // Routing keys are resolved and stripped HERE, once, for every 档
     // (review I2): each backend applies `filters` as exact-match term
     // clauses, so a left-over control key silently zeros the arm that
@@ -193,8 +204,10 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     const control: SearchModeControl = {
       cDropWindows: cDropWindowsEnabled(input.filters),
     };
-    const matchFilters = stripEntityTypeFilter(
-      stripCDropWindowsFilter(stripSearchModeFilter(input.filters))
+    const matchFilters = stripCommunityLevelFilter(
+      stripEntityTypeFilter(
+        stripCDropWindowsFilter(stripSearchModeFilter(input.filters))
+      )
     );
     const retrieveConfig = applyPreset(
       deps.retrieveConfig,
@@ -219,6 +232,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         ...(entityTypeFilter.entityType !== undefined
           ? { entityType: entityTypeFilter.entityType }
           : {}),
+        communityLevel,
       },
       {
         embedder: deps.embedder,
@@ -257,6 +271,20 @@ function validateRetrieveQuery(
     "retrieve query must contain at least one non-whitespace character",
     "INVALID_INPUT"
   );
+}
+
+/** Resolve the summary fineness bound; invalid input is a typed refusal. */
+function resolveCommunityLevel(
+  filters: Record<string, string> | undefined
+): number {
+  const resolution = parseCommunityLevelFilter(filters);
+  if (resolution.kind === "invalid") {
+    throw new GraphragError(
+      invalidCommunityLevelMessage(resolution.value),
+      "INVALID_INPUT"
+    );
+  }
+  return resolution.level;
 }
 
 /**
@@ -323,8 +351,11 @@ export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
     "Ranked chunk search over the knowledge memory store, filtered by " +
     "temporal validity. filters.search_mode (A | B | C | D) selects the " +
     "retrieval tier; missing defaults to B. filters.entity_type (" +
-    ENTITY_TYPE_FILTER_VALUES + ") optionally restricts graph/entity " +
-    "seeding; missing recalls all types.",
+    ENTITY_TYPE_FILTER_VALUES +
+    ") optionally restricts graph/entity " +
+    "seeding; missing recalls all types. filters.community_level (positive " +
+    "integer string) bounds community-summary reads to level <= N; missing " +
+    "defaults to 2.",
   inputSchema:
     deps.inputValidationFailureCounter === undefined
       ? RetrieveInputSchema

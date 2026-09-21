@@ -49,6 +49,7 @@ import { communitySummaryArmHit } from "./optional-arms.js";
 import { rrfFuse } from "./rrf.js";
 import type { SearchModeArm, SearchModeControl } from "./search-mode.js";
 import {
+  DEFAULT_COMMUNITY_LEVEL_CAP,
   SEARCH_MODE_FILTER_KEY,
   cDropWindowsEnabled,
   stripCDropWindowsFilter,
@@ -90,77 +91,84 @@ interface ReportArmRun {
 
 const NOT_RAN: ReportArmRun = { rows: [], ran: false, failed: false };
 
-export const modeCReportFirstArm: SearchModeArm = async function assembleModeCReports(
-  args: AssembleArgs,
-  deps: AssembleDeps,
-  control?: SearchModeControl
-): Promise<RetrieveOutputEnvelope> {
-  // EXIT (typed): readiness first — nothing below may run on an unproven
-  // report generation, and no embedding cost is spent before the gate.
-  await requireCommunityIndexReady(deps.storage);
+export const modeCReportFirstArm: SearchModeArm =
+  async function assembleModeCReports(
+    args: AssembleArgs,
+    deps: AssembleDeps,
+    control?: SearchModeControl
+  ): Promise<RetrieveOutputEnvelope> {
+    // EXIT (typed): readiness first — nothing below may run on an unproven
+    // report generation, and no embedding cost is spent before the gate.
+    await requireCommunityIndexReady(deps.storage);
 
-  // The wire path delivers the drop switch as the typed control value —
-  // the dispatcher is the single strip point for every 档 (review I2),
-  // so args.filters arriving through it never carries the key. Direct
-  // arm callers still hand it in filters, exactly as the B assembler and
-  // the A arm are called directly in tests; parsing it here through the
-  // same wire-filters function keeps ONE meaning for the key.
-  const dropWindows =
-    control?.cDropWindows ?? cDropWindowsEnabled(args.filters);
+    // The wire path delivers the drop switch as the typed control value —
+    // the dispatcher is the single strip point for every 档 (review I2),
+    // so args.filters arriving through it never carries the key. Direct
+    // arm callers still hand it in filters, exactly as the B assembler and
+    // the A arm are called directly in tests; parsing it here through the
+    // same wire-filters function keeps ONE meaning for the key.
+    const dropWindows =
+      control?.cDropWindows ?? cDropWindowsEnabled(args.filters);
 
-  // One embed per retrieve (the assembler's standing contract): the memo
-  // lets the drop call reuse the vector the report arm already produced.
-  // T3: that one vector belongs to the ledger's ACTIVE generation — the
-  // same binding the B assembler applies to its own query embed.
-  const embedder = memoizeQueryEmbedder(
-    activeQueryEmbedder({
-      embedder: deps.embedder,
-      slotEmbedding: deps.slotEmbedding,
-      state: deps.storage.getGenerationState?.() ?? null,
-    }),
-    args.query
-  );
-  const pool = Math.max(args.limit, ARM_CANDIDATE_POOL);
+    // ONE cap for every summary read in this request (both report arms and
+    // the window drop below, whose B assembly sees the same args).
+    const maxLevel = args.communityLevel ?? DEFAULT_COMMUNITY_LEVEL_CAP;
 
-  // Parallel by construction: the ES arm starts before the embedding is
-  // awaited, so neither report arm waits on the other's provider.
-  const lexicalStarted = runReportLexical(
-    pickReportLexical(deps),
-    args.query,
-    pool
-  );
-  const embedding = await resolveQueryVector(embedder, args.query);
-  const vectorRun = await runReportVectors(
-    supportsCommunitySummaries(deps.storage)
-      ? deps.storage.communitySummaries
-      : undefined,
-    embedding,
-    pool
-  );
-  const outcome = collectReportArms(
-    await lexicalStarted,
-    vectorRun,
-    deps.retrieveConfig,
-    args.limit
-  );
-  if (outcome.reports.length === 0) {
-    // Either the arms found no report (healthy C stay — READY vouches the
-    // generation is complete) or none could run (named unattempted). The
-    // observations say which; only readiness itself is the typed exit.
-    return buildEnvelope([], outcome.observations, undefined);
-  }
+    // One embed per retrieve (the assembler's standing contract): the memo
+    // lets the drop call reuse the vector the report arm already produced.
+    // T3: that one vector belongs to the ledger's ACTIVE generation — the
+    // same binding the B assembler applies to its own query embed.
+    const embedder = memoizeQueryEmbedder(
+      activeQueryEmbedder({
+        embedder: deps.embedder,
+        slotEmbedding: deps.slotEmbedding,
+        state: deps.storage.getGenerationState?.() ?? null,
+      }),
+      args.query
+    );
+    const pool = Math.max(args.limit, ARM_CANDIDATE_POOL);
 
-  if (!dropWindows) {
-    return buildEnvelope(outcome.reports, outcome.observations, undefined);
-  }
+    // Parallel by construction: the ES arm starts before the embedding is
+    // awaited, so neither report arm waits on the other's provider.
+    const lexicalStarted = runReportLexical(
+      pickReportLexical(deps),
+      args.query,
+      pool,
+      maxLevel
+    );
+    const embedding = await resolveQueryVector(embedder, args.query);
+    const vectorRun = await runReportVectors(
+      supportsCommunitySummaries(deps.storage)
+        ? deps.storage.communitySummaries
+        : undefined,
+      embedding,
+      pool,
+      maxLevel
+    );
+    const outcome = collectReportArms(
+      await lexicalStarted,
+      vectorRun,
+      deps.retrieveConfig,
+      args.limit
+    );
+    if (outcome.reports.length === 0) {
+      // Either the arms found no report (healthy C stay — READY vouches the
+      // generation is complete) or none could run (named unattempted). The
+      // observations say which; only readiness itself is the typed exit.
+      return buildEnvelope([], outcome.observations, undefined);
+    }
 
-  const dropped = await fillWindows(args, deps, embedder);
-  return buildEnvelope(
-    mergeLeadReports(outcome.reports, dropped.hits, args.limit),
-    [...outcome.observations, ...dropped.observations],
-    undefined
-  );
-};
+    if (!dropWindows) {
+      return buildEnvelope(outcome.reports, outcome.observations, undefined);
+    }
+
+    const dropped = await fillWindows(args, deps, embedder);
+    return buildEnvelope(
+      mergeLeadReports(outcome.reports, dropped.hits, args.limit),
+      [...outcome.observations, ...dropped.observations],
+      undefined
+    );
+  };
 
 /** Fused report hits plus the observations the two arms earned. */
 interface ReportOutcome {
@@ -249,11 +257,27 @@ function pickReportLexical(
 async function runReportLexical(
   seam: CommunityReportLexicalStorage | undefined,
   query: string,
-  pool: number
+  pool: number,
+  maxLevel: number
 ): Promise<ReportArmRun> {
   if (seam === undefined) return NOT_RAN;
   try {
-    return { rows: await seam.searchCommunitySummariesLexical(query, pool), ran: true, failed: false };
+    const rows = await seam.searchCommunitySummariesLexical(
+      query,
+      pool,
+      maxLevel
+    );
+    // The seam is probed by shape, so a stale external implementation can
+    // answer the method while ignoring maxLevel. Never let an uncapped row
+    // (or a legacy row with no level at all) reach the fuse: the cap
+    // contract is enforced post-hoc here too (specs/community-level.md).
+    return {
+      rows: rows.filter(
+        (row) => typeof row.level === "number" && row.level <= maxLevel
+      ),
+      ran: true,
+      failed: false,
+    };
   } catch {
     return { rows: [], ran: true, failed: true };
   }
@@ -276,8 +300,7 @@ async function resolveQueryVector(
   if (embedder.available === false) return { failed: false };
   try {
     const [vector] = await embedder.embed([query]);
-    if (vector === undefined || vector.length === 0)
-      return { failed: true };
+    if (vector === undefined || vector.length === 0) return { failed: true };
     return { vector, failed: false };
   } catch {
     return { failed: true };
@@ -289,12 +312,14 @@ async function runReportVectors(
     | {
         searchCommunitySummaries(
           embedding: number[],
-          limit: number
+          limit: number,
+          maxLevel: number
         ): Promise<CommunitySummaryRow[]>;
       }
     | undefined,
   embedding: EmbeddingOutcome,
-  pool: number
+  pool: number,
+  maxLevel: number
 ): Promise<ReportArmRun> {
   if (seam === undefined) return NOT_RAN;
   if (embedding.vector === undefined) {
@@ -304,7 +329,11 @@ async function runReportVectors(
   }
   try {
     return {
-      rows: await seam.searchCommunitySummaries(embedding.vector, pool),
+      rows: await seam.searchCommunitySummaries(
+        embedding.vector,
+        pool,
+        maxLevel
+      ),
       ran: true,
       failed: false,
     };
@@ -427,9 +456,7 @@ function memoizeQueryEmbedder(
     ...(embedder.available === undefined
       ? {}
       : { available: embedder.available }),
-    ...(embedder.modelId === undefined
-      ? {}
-      : { modelId: embedder.modelId }),
+    ...(embedder.modelId === undefined ? {} : { modelId: embedder.modelId }),
     async embed(texts: string[]): Promise<number[][]> {
       if (texts.length === 1 && texts[0] === query) {
         pending ??= embedder.embed(texts);

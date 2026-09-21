@@ -729,7 +729,7 @@ describe("PgvectorBackend downtime read refuse (T4)", () => {
       () =>
         backend.search(unit8(), { limit: 5, validAt: "2026-06-01T00:00:00Z" }),
       () => backend.graphArmSeed.seedEntitiesByEmbedding(unit8(), 5),
-      () => backend.communitySummaries.searchCommunitySummaries(unit8(), 5),
+      () => backend.communitySummaries.searchCommunitySummaries(unit8(), 5, 2),
     ]) {
       const error = await read().catch((caught: unknown) => caught);
       expect(error).toBeInstanceOf(GraphragError);

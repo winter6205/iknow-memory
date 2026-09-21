@@ -51,6 +51,7 @@ import {
   markFailed,
   markFailedWithProposal,
   newRecordId,
+  MERGE_GRAY_HOLD_CODE,
   SELF_LOOP_REJECTED_CODE,
   type Queryable,
 } from "./records.js";
@@ -123,12 +124,17 @@ export async function selectPendingChunks(
     // is a permanent reject — re-extraction would only reproduce the same
     // self-loop. `listFailed()` (records.ts) applies the same exclusion; the
     // chunk scan must mirror it or operators see "must re-extract" rows that
-    // no re-extract path can actually advance.
+    // no re-extract path can actually advance. MERGE_GRAY_HOLD rows are
+    // filtered out BEFORE the rn=1 partition: a hold describes one gray pair
+    // the operator must decide, not the chunk's own status, and it must never
+    // stand in as the chunk's latest record (same-transaction `created_at`
+    // ties would otherwise make the rn=1 winner non-deterministic).
     where.push(
       `c.id IN (SELECT chunk_id FROM (
          SELECT chunk_id, status, error_code, discarded_at,
            row_number() OVER (PARTITION BY chunk_id ORDER BY created_at DESC) rn
          FROM extraction_records
+         WHERE error_code IS DISTINCT FROM '${MERGE_GRAY_HOLD_CODE}'
        ) t WHERE rn = 1 AND status = 'failed' AND error_code != 'SELF_LOOP_REJECTED' AND discarded_at IS NULL)`
     );
   }
@@ -463,6 +469,14 @@ async function processChunk(
       outcome.outputs,
       startedAt
     );
+    // Gray pairs the judge held for the operator get one independent
+    // failed record each (MERGE_GRAY_HOLD) in the SAME chunk transaction.
+    // Recorded BEFORE the allSelfLoop branch so no path can drop a hold on
+    // the floor: the chunk itself stays succeeded — a hold is a visible
+    // maintenance item, not an extraction failure — and listFailed() shows
+    // the pair next to extract failures for the operator to review or
+    // discard.
+    await recordMergeHolds(client, batchId, chunk.id, startedAt, counts);
     if (counts.allSelfLoop) {
       // SC5: every output was a self-loop, so the chunk produced zero graph
       // edges and zero entities. Record the chunk as a permanent reject — the
@@ -590,6 +604,34 @@ export async function commitSelfLoopRejection(
   });
   await client.query("COMMIT", []);
   logger.info(event.name, event.fields);
+}
+
+/**
+ * One failed extraction_records row per judge-held gray pair: the row rides
+ * the same maintenance lane as extract failures (`MERGE_GRAY_HOLD` is not
+ * excluded by `listFailed()`) while the chunk's own record still succeeds —
+ * a hold needs an operator decision, not a re-extract of the whole chunk.
+ */
+async function recordMergeHolds(
+  client: Queryable,
+  batchId: string,
+  chunkId: string,
+  startedAt: string,
+  counts: PersistCounts
+): Promise<void> {
+  for (const hold of counts.mergeHolds) {
+    const id = newRecordId();
+    await insertRecord(client, { id, batchId, chunkId, startedAt });
+    await markFailed(client, id, {
+      code: MERGE_GRAY_HOLD_CODE,
+      msg:
+        `merge gray-zone hold: incoming "${hold.incomingName}" ` +
+        `(${hold.incomingType}) vs candidate ${hold.candidateId}` +
+        (hold.observedCosine !== undefined
+          ? ` cosine=${hold.observedCosine}`
+          : ""),
+    });
+  }
 }
 
 /**

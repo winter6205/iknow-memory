@@ -6,6 +6,7 @@ import {
   markFailedWithProposal,
   listFailed,
   SELF_LOOP_REJECTED_CODE,
+  MERGE_GRAY_HOLD_CODE,
   type Queryable,
 } from "../../src/core/extraction/records.js";
 import {
@@ -332,6 +333,24 @@ describe("extraction_records", () => {
       c.text.includes("SELECT * FROM extraction_records")
     );
     expect(listCall?.text).toContain("SELF_LOOP_REJECTED");
+  });
+
+  it("listFailed keeps MERGE_GRAY_HOLD rows visible (maintenance lane)", async () => {
+    const f = makeFakeClient();
+    await insertRecord(f.client, {
+      id: "r1",
+      batchId: "b1",
+      chunkId: "chunk-1",
+      startedAt: "2026-01-01T00:00:00Z",
+    });
+    // A human-held gray pair is advanceable by the operator (promote /
+    // re-extract), so — unlike SELF_LOOP_REJECTED — it must stay listed.
+    await markFailed(f.client, "r1", {
+      code: MERGE_GRAY_HOLD_CODE,
+      msg: "merge gray-zone hold",
+    });
+    const failed = await listFailed(f.client);
+    expect(failed.map((r) => r.id)).toEqual(["r1"]);
   });
 
   it("batch_id aggregation: two records in the same batch are both retrievable", async () => {

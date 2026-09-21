@@ -8,6 +8,28 @@
 
 export type GateLevel = "L0" | "L1" | "L2" | "L3";
 
+/**
+ * Verdict of the three-level gray-zone judge: merge the pair, keep today's
+ * reject, or hold the pair for the operator (maintenance-lane record).
+ */
+export type GrayZoneVerdict = "merge" | "reject" | "human";
+
+/**
+ * What the judge sees for one L3 gray-zone pair. The structural name/type/
+ * description fields live here (not as imports of `IncomingEntity` /
+ * `CandidateEntity`) so the entities types module never imports merge.ts —
+ * merge.ts imports types.ts, not the other way round.
+ */
+export interface GrayZoneJudgeInput {
+  incoming: { name: string; type: string; description: string };
+  candidate: { name: string; type: string; description: string };
+  observedCosine: number;
+}
+
+export type GrayZoneJudge = (
+  input: GrayZoneJudgeInput
+) => Promise<GrayZoneVerdict>;
+
 export type MergeDecision =
   | { kind: "merge"; into: string; via: GateLevel; observedCosine: number }
   | {
@@ -15,7 +37,12 @@ export type MergeDecision =
       reason: string;
       level: GateLevel;
       observedCosine?: number;
-    };
+    }
+  /**
+   * The judge left an L3 gray pair unresolved for the operator: neither
+   * entity is merged and both stay live; only `L3` gray rejects can hold.
+   */
+  | { kind: "hold"; level: "L3"; observedCosine?: number };
 
 /**
  * Tunable thresholds for the hierarchical merge gates.

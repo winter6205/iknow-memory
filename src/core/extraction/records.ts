@@ -30,6 +30,15 @@ import type { ProposalPayload } from "./judge.js";
 /** SC5: error_code for an all-self-loop chunk; hidden from listFailed(). */
 export const SELF_LOOP_REJECTED_CODE = "SELF_LOOP_REJECTED";
 
+/**
+ * error_code for a merge gray-zone pair the judge held for the operator.
+ * Deliberately NOT excluded by `listFailed()`: the pair awaits an operator
+ * decision. The hold carries no `proposed_payload`, so the lane's exit is
+ * discard (or resolving the merge out of band), not promote-replay like a
+ * judge-sealed extract failure.
+ */
+export const MERGE_GRAY_HOLD_CODE = "MERGE_GRAY_HOLD";
+
 /** Graph-query contract accepted by both `pg.Pool` and `pg.PoolClient`. */
 export interface Queryable {
   query: (text: string, values: unknown[]) => Promise<{ rows: any[] }>;

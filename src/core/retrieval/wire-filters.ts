@@ -16,10 +16,7 @@
  * (ESM cyclic TDZ crash). The arms import this leaf instead, and
  * `search-mode.ts` re-exports it for wire-side callers.
  */
-import {
-  ENTITY_TYPES,
-  type EntityType,
-} from "../extraction/entity-type.js";
+import { ENTITY_TYPES, type EntityType } from "../extraction/entity-type.js";
 
 /** The `filters` key carrying the 档; single source of truth. */
 export const SEARCH_MODE_FILTER_KEY = "search_mode";
@@ -125,4 +122,60 @@ export function stripEntityTypeFilter(
   filters: Record<string, string> | undefined
 ): Record<string, string> | undefined {
   return stripFilterKey(filters, ENTITY_TYPE_FILTER_KEY);
+}
+
+/**
+ * The `filters` key bounding community-summary reads to `level <= N`
+ * (specs/community-level.md). Same routing contract as `search_mode`: the
+ * exact-match backends must never see it; the arms receive the resolved
+ * number instead.
+ */
+export const COMMUNITY_LEVEL_FILTER_KEY = "community_level";
+
+/** Reference cap on the product scale: missing filter reads as 2. */
+export const DEFAULT_COMMUNITY_LEVEL_CAP = 2;
+
+/** Stable host-mappable reason token, aligned with the other routing keys. */
+export const INVALID_COMMUNITY_LEVEL_REASON = "invalid_community_level";
+
+/**
+ * Resolution of `filters.community_level`: missing key = the default cap, a
+ * positive integer string = that cap, anything else (non-integer, zero,
+ * negative, empty, overflow) = typed invalid — the handler turns it into an
+ * INVALID_INPUT refusal, never a silent all-level mix.
+ */
+export type CommunityLevelResolution =
+  { kind: "resolved"; level: number } | { kind: "invalid"; value: string };
+
+const POSITIVE_INTEGER = /^[1-9][0-9]*$/;
+
+/** Resolve the requested fineness bound without mutating the caller's filters. */
+export function parseCommunityLevelFilter(
+  filters: Record<string, string> | undefined
+): CommunityLevelResolution {
+  const value = filters?.[COMMUNITY_LEVEL_FILTER_KEY];
+  if (value === undefined) {
+    return { kind: "resolved", level: DEFAULT_COMMUNITY_LEVEL_CAP };
+  }
+  // The regex bounds the shape; the safe-integer guard bounds the width,
+  // so an overflow string is refused rather than silently saturating.
+  if (POSITIVE_INTEGER.test(value) && Number.isSafeInteger(Number(value))) {
+    return { kind: "resolved", level: Number(value) };
+  }
+  return { kind: "invalid", value };
+}
+
+/** Build the thrown-error message; keeps the reason token out of magic strings. */
+export function invalidCommunityLevelMessage(value: string): string {
+  return (
+    `retrieve ${COMMUNITY_LEVEL_FILTER_KEY} must be a positive integer string, ` +
+    `got "${value}" (${INVALID_COMMUNITY_LEVEL_REASON})`
+  );
+}
+
+/** Strip the summary cap control from the exact-match filters (same contract as `stripSearchModeFilter`). */
+export function stripCommunityLevelFilter(
+  filters: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  return stripFilterKey(filters, COMMUNITY_LEVEL_FILTER_KEY);
 }

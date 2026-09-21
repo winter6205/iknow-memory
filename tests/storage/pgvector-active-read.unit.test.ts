@@ -148,7 +148,7 @@ describe("PgvectorBackend reads — active slot while a rotate is open (T3)", ()
     const { backend, queries } = makeBackend(ledgerRow());
     await booted(backend);
 
-    await backend.communitySummaries.searchCommunitySummaries(unit8(), 5);
+    await backend.communitySummaries.searchCommunitySummaries(unit8(), 5, 2);
 
     const selects = communitySelects(queries);
     expect(selects).toHaveLength(1);
@@ -175,7 +175,7 @@ describe("PgvectorBackend reads — post-cutover pointer", () => {
 
     await backend.search(unit8(), SEARCH_OPTS);
     await backend.graphArmSeed.seedEntitiesByEmbedding(unit8(), 5);
-    await backend.communitySummaries.searchCommunitySummaries(unit8(), 5);
+    await backend.communitySummaries.searchCommunitySummaries(unit8(), 5, 2);
 
     const sqls = [
       chunkSelects(queries)[0]!.sql,
@@ -226,7 +226,7 @@ describe("PgvectorBackend reads — slot resolution guardrails", () => {
     expect(seed).toBeInstanceOf(GraphragError);
 
     const community = await backend.communitySummaries
-      .searchCommunitySummaries(unit8(), 5)
+      .searchCommunitySummaries(unit8(), 5, 2)
       .catch((e: unknown) => e);
     expect(community).toBeInstanceOf(GraphragError);
 

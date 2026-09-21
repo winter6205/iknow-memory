@@ -115,9 +115,7 @@ export class CommunitySummarySkipError extends Error {
  * swap transaction itself.
  */
 export type CommunitySummaryJobFailurePhase =
-  | "detection"
-  | "summary"
-  | "persist";
+  "detection" | "summary" | "persist";
 
 export class CommunitySummaryJobError extends Error {
   readonly code = "COMMUNITY_SUMMARY_JOB_FAILED" as const;
@@ -163,10 +161,7 @@ export async function runCli(
     // EXIT: a typed job failure moves C off `ready` before the process
     // exits non-zero; the state write is best-effort so it never masks the
     // primary error. Dry-run reports only — it must not move C state.
-    if (
-      !parsed.flags.dryRun &&
-      err instanceof CommunitySummaryJobError
-    ) {
+    if (!parsed.flags.dryRun && err instanceof CommunitySummaryJobError) {
       await markStateBestEffort(
         client,
         deps.logger,
@@ -269,9 +264,41 @@ interface PendingSummary {
   communityId: string;
   entityIds: string[];
   summary: string;
+  /** Product scale (larger integer = finer community), see `toProductLevel`. */
+  level: number;
   embedding: number[];
   /** Incoming-slot vector; present only while a dual-write rotate is open. */
   incomingEmbedding?: number[];
+}
+
+/**
+ * Translate the detector's finest-first scale (Leiden level 1 = finest,
+ * ADR-0011) into the product scale the ledger stores, where a LARGER
+ * integer means a FINER community: within one generation run,
+ * `product = maxDetectorLevel + 1 − detectorLevel`, so the run's coarsest
+ * level maps to 1 and the finest to the maximum.
+ *
+ * why=coarsest fallback: a Community without a level carries no hierarchy
+ * position, and claiming 1 (the coarsest product grain) is the only value
+ * that never overstates how fine a summary's coverage is.
+ */
+function toProductLevel(
+  detectorLevel: number | undefined,
+  maxDetectorLevel: number
+): number {
+  if (detectorLevel === undefined) return 1;
+  return maxDetectorLevel + 1 - detectorLevel;
+}
+
+/** Highest detector level present in one generation run; 1 when none carry one. */
+function maxDetectorLevel(communities: readonly Community[]): number {
+  let max = 1;
+  for (const community of communities) {
+    if (community.level !== undefined && community.level > max) {
+      max = community.level;
+    }
+  }
+  return max;
 }
 
 async function generatePendingSummaries(
@@ -281,6 +308,7 @@ async function generatePendingSummaries(
   generation: EmbeddingGenerationState | null
 ): Promise<PendingSummary[]> {
   const pending: PendingSummary[] = [];
+  const runMaxDetectorLevel = maxDetectorLevel(communities);
   for (const community of communities) {
     try {
       const names = await loadEntityNames(client, community.entityIds);
@@ -293,8 +321,7 @@ async function generatePendingSummaries(
         continue;
       }
       const summary = (await deps.summarizer.summarize(names)).trim();
-      if (summary === "")
-        throw new Error("summary client returned empty text");
+      if (summary === "") throw new Error("summary client returned empty text");
       // T6 class 3 through the shared SC10 embed-log contract
       // (embed-log.ts is the one home for every embedder.embed call site).
       // T2 dual-write: each touched slot's batch is embedded with its OWN
@@ -325,6 +352,7 @@ async function generatePendingSummaries(
         communityId: community.id,
         entityIds: [...community.entityIds],
         summary,
+        level: toProductLevel(community.level, runMaxDetectorLevel),
         embedding,
         ...(incomingEmbedding === undefined ? {} : { incomingEmbedding }),
       });
@@ -375,23 +403,24 @@ async function swapCommunitySummaries(
     await client.query("DELETE FROM community_summaries", []);
     // Review repair B: the slot column/placeholder pair comes from the
     // shared fragments SSOT (slots stay last in the column list, so the
-    // bind positions 5/6 match the values array below).
+    // bind positions 6/7 match the values array below).
     const { columns, valuePlaceholders } = slotWriteFragments({
       activeSlot,
       incomingSlot,
-      activeParam: 5,
-      incomingParam: 6,
+      activeParam: 6,
+      incomingParam: 7,
     });
     for (const row of pending) {
       await client.query(
         `INSERT INTO community_summaries
-           (id, community_id, summary, entity_ids, ${columns})
-         VALUES ($1, $2, $3, $4, ${valuePlaceholders})`,
+           (id, community_id, summary, entity_ids, level, ${columns})
+         VALUES ($1, $2, $3, $4, $5, ${valuePlaceholders})`,
         [
           randomUUID(),
           row.communityId,
           row.summary,
           row.entityIds,
+          row.level,
           toVectorLiteral(row.embedding),
           ...(incomingSlot === null
             ? []
@@ -399,11 +428,7 @@ async function swapCommunitySummaries(
         ]
       );
     }
-    await markCommunityIndexState(
-      client,
-      COMMUNITY_INDEX_STATUS.READY,
-      null
-    );
+    await markCommunityIndexState(client, COMMUNITY_INDEX_STATUS.READY, null);
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");

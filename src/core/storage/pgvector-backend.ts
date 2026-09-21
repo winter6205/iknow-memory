@@ -244,20 +244,31 @@ const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_re
     ORDER BY array_position($1::uuid[], ranked.entity_id), c.id
     LIMIT $3`;
 
+/**
+ * The ONE `level <= N` predicate every `community_summaries` read applies
+ * (specs/community-level.md). Each site interpolates its own parameter
+ * index; the meaning lives here only.
+ */
+function communityLevelCapSql(paramIndex: number): string {
+  return `level <= $${paramIndex}`;
+}
+
 /** Community-summary cosine read; slot bound per T3 (see seedEntitiesSql). */
 function communitySummariesSql(slot: string): string {
   assertEmbeddingSlotIdentifier(slot);
-  return `SELECT id, community_id, summary,
+  return `SELECT id, community_id, summary, level,
     1 - (${slot} <=> $1::vector) AS score
   FROM community_summaries
  WHERE ${slot} IS NOT NULL
+   AND ${communityLevelCapSql(3)}
  ORDER BY ${slot} <=> $1::vector ASC, id ASC
  LIMIT $2`;
 }
 
-const COMMUNITY_SUMMARY_BY_ID_SQL = `SELECT id, community_id, summary
+const COMMUNITY_SUMMARY_BY_ID_SQL = `SELECT id, community_id, summary, level
   FROM community_summaries
- WHERE community_id = $1`;
+ WHERE community_id = $1
+   AND ${communityLevelCapSql(2)}`;
 
 /**
  * The 档 C readiness singleton (schema-bootstrap `community_index_state`,
@@ -813,7 +824,12 @@ export class PgvectorBackend
     }
     const targets = slotWriteTargets(state);
     const widths = slotWriteWidths(state, this.dimensions);
-    this.validateUpsertVectors(chunks, targets.activeSlot, widths, targets.incomingSlot);
+    this.validateUpsertVectors(
+      chunks,
+      targets.activeSlot,
+      widths,
+      targets.incomingSlot
+    );
 
     // Review repair B: the slot column/placeholder/SET triplet comes from
     // the shared fragments SSOT. The incoming vector stays LAST in the
@@ -1371,15 +1387,12 @@ export class PgvectorBackend
    * must not read as "no row", because the arm fails closed either way
    * and the operator needs the storage error named in logs.
    */
-  async getCommunityIndexState(): Promise<
-    CommunityIndexStateRow | undefined
-  > {
+  async getCommunityIndexState(): Promise<CommunityIndexStateRow | undefined> {
     try {
       const pool = await this.ensureReady();
       const result = await pool.query(COMMUNITY_INDEX_STATE_SQL, []);
       const row = result.rows[0] as
-        | { status: string; failure_code: string | null }
-        | undefined;
+        { status: string; failure_code: string | null } | undefined;
       if (row === undefined) return undefined;
       return { status: row.status, failure_code: row.failure_code };
     } catch (err) {
@@ -1798,19 +1811,22 @@ export class PgvectorBackend
    */
   readonly communitySummaries = {
     getCommunitySummaryByCommunityId: async (
-      communityId: string
+      communityId: string,
+      maxLevel: number
     ): Promise<CommunitySummaryRow | undefined> => {
       if (communityId === "") return undefined;
       try {
         const pool = await this.ensureReady();
         const result = await pool.query(COMMUNITY_SUMMARY_BY_ID_SQL, [
           communityId,
+          maxLevel,
         ]);
         const row = result.rows[0] as
           | {
               id: string;
               community_id: string;
               summary: string;
+              level: number;
             }
           | undefined;
         if (row === undefined) return undefined;
@@ -1818,6 +1834,7 @@ export class PgvectorBackend
           id: row.id,
           communityId: row.community_id,
           summary: row.summary,
+          level: Number(row.level),
         };
       } catch (err) {
         throw new GraphragError(
@@ -1828,7 +1845,8 @@ export class PgvectorBackend
     },
     searchCommunitySummaries: async (
       embedding: number[],
-      limit: number
+      limit: number,
+      maxLevel: number
     ): Promise<CommunitySummaryRow[]> => {
       // Same T3 binding as the entity seed: active slot only.
       const slot = this.activeReadSlot();
@@ -1837,18 +1855,21 @@ export class PgvectorBackend
         const result = await pool.query(communitySummariesSql(slot), [
           toVectorLiteral(embedding),
           limit,
+          maxLevel,
         ]);
         return result.rows.map((r) => {
           const row = r as {
             id: string;
             community_id: string;
             summary: string;
+            level: number;
             score: number;
           };
           return {
             id: row.id,
             communityId: row.community_id,
             summary: row.summary,
+            level: Number(row.level),
             score: Number(row.score),
           };
         });

@@ -598,9 +598,9 @@ describePg("embedding generation active-slot read binding (T3)", () => {
       const sumQ = randomUUID();
       await c.query(
         `INSERT INTO community_summaries (id, community_id, summary, entity_ids,
-                                          embedding, embedding_g2)
-         VALUES ($1, 'com-p', 'near active', '{}', $2::vector, $3::vector),
-                ($4, 'com-q', 'near incoming', '{}', $5::vector, $6::vector)`,
+                                          level, embedding, embedding_g2)
+         VALUES ($1, 'com-p', 'near active', '{}', 1, $2::vector, $3::vector),
+                ($4, 'com-q', 'near incoming', '{}', 1, $5::vector, $6::vector)`,
         [
           sumP,
           vectorText(axis(0)),
@@ -611,7 +611,11 @@ describePg("embedding generation active-slot read binding (T3)", () => {
         ]
       );
       const summaries =
-        await backend.communitySummaries.searchCommunitySummaries(axis(0), 5);
+        await backend.communitySummaries.searchCommunitySummaries(
+          axis(0),
+          5,
+          2
+        );
       expect(summaries.map((row) => row.id)).toEqual([sumP, sumQ]);
 
       // And the emitted SQL never names both slots (no mixed-generation
@@ -678,8 +682,8 @@ describePg("embedding generation rotate cutover/rollback/drop (T4)", () => {
       `SELECT id FROM entities WHERE canonical_name = 'Old Gone'`
     );
     await c.query(
-      `INSERT INTO community_summaries (id, community_id, summary, entity_ids, embedding)
-       VALUES ($1, 'com-t4', 'cluster about Acme', '{}', $2::vector)`,
+      `INSERT INTO community_summaries (id, community_id, summary, entity_ids, level, embedding)
+       VALUES ($1, 'com-t4', 'cluster about Acme', '{}', 1, $2::vector)`,
       [randomUUID(), vectorText(axis(0))]
     );
     return { chunkA, chunkB, retiredId: retired.rows[0]!.id };
@@ -893,7 +897,8 @@ describePg("embedding generation rotate cutover/rollback/drop (T4)", () => {
             validAt: "2026-06-01T00:00:00Z",
           }),
         () => backend.graphArmSeed.seedEntitiesByEmbedding(axis(0), 5),
-        () => backend.communitySummaries.searchCommunitySummaries(axis(0), 5),
+        () =>
+          backend.communitySummaries.searchCommunitySummaries(axis(0), 5, 2),
       ]) {
         const error = await read().catch((caught: unknown) => caught);
         expect(error).toBeInstanceOf(GraphragError);

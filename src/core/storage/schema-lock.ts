@@ -38,6 +38,10 @@ const BOOTSTRAP_COLUMNS = [
   ["embedding_generation", "rollback_slot"],
   ["embedding_generation", "rollback_model"],
   ["embedding_generation", "rollback_dimensions"],
+  // community-level T1: added by the forward-compat ALTER in
+  // createCommunitySummaries, so it MUST be probed or deployed databases
+  // never get the column (bootstrap-columns lockstep).
+  ["community_summaries", "level"],
 ] as const;
 const BOOTSTRAP_TABLES = [
   "entities",

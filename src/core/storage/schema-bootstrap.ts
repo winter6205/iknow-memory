@@ -367,20 +367,48 @@ export function assertPgvectorAnnDimensions(
 async function createCommunitySummaries(
   client: SchemaBootstrapClient,
   dimensions: number
-): Promise<void> {
+): Promise<{ deletedLegacyRows: number }> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS community_summaries (
       id           uuid PRIMARY KEY,
       community_id text NOT NULL UNIQUE,
       summary      text NOT NULL,
       entity_ids   uuid[] NOT NULL,
+      level        integer NOT NULL,
       embedding    vector(${dimensions}) NOT NULL,
       created_at   timestamptz NOT NULL DEFAULT now(),
       updated_at   timestamptz NOT NULL DEFAULT now()
     )`);
+  // Forward-compat for deployed stores (specs/community-level.md): a
+  // "larger = finer" product-scale level the retrieve cap filters on.
+  // Legacy rows carry no level and are derived data the community-summary
+  // CLI rebuilds wholesale, so the upgrade wipes them (spec assumption 2,
+  // operator-approved) instead of guessing a grain. The destructive leg is
+  // gated on a live probe so a fresh or already-upgraded store (and the
+  // recording fakes, whose reads come back empty) emits no data-level
+  // write at all — the same contract as upgradeEntitiesTypeCheck.
+  await client.query(`
+    ALTER TABLE community_summaries
+      ADD COLUMN IF NOT EXISTS level integer`);
+  let deletedLegacyRows = 0;
+  const legacy = await client.query(
+    `SELECT 1 FROM community_summaries WHERE level IS NULL LIMIT 1`
+  );
+  if (legacy.rows.length > 0) {
+    // RETURNING keeps the wipe auditable: the caller logs the count after
+    // COMMIT, so a rolled-back attempt cannot fake a deletion.
+    const wiped = await client.query(`
+      DELETE FROM community_summaries WHERE level IS NULL RETURNING id`);
+    deletedLegacyRows = wiped.rows.length;
+  }
+  // No-op when the column already carries the constraint (fresh CREATE or
+  // an upgraded store), so this stays idempotent like the ADD above.
+  await client.query(`
+    ALTER TABLE community_summaries ALTER COLUMN level SET NOT NULL`);
   await client.query(`
     CREATE INDEX IF NOT EXISTS community_summaries_embedding_idx
       ON community_summaries USING hnsw (embedding vector_cosine_ops)`);
+  return { deletedLegacyRows };
 }
 
 /**
@@ -557,6 +585,34 @@ async function alterChunksBackPointers(
 }
 
 /**
+ * Audit trail for the operator-approved destructive upgrade paths, written
+ * only after COMMIT so a rolled-back attempt cannot fake a deletion.
+ */
+function logDestructiveUpgradeAudits(
+  typeCheckAudit:
+    { deletedTriples: number; deletedEntities: number } | undefined,
+  deletedSummaryLegacyRows: number
+): void {
+  if (
+    typeCheckAudit !== undefined &&
+    (typeCheckAudit.deletedTriples > 0 || typeCheckAudit.deletedEntities > 0)
+  ) {
+    writeStderr(
+      `WARN schema-bootstrap entities-type-closed-check upgrade deleted ` +
+        `triples=${typeCheckAudit.deletedTriples} ` +
+        `entities=${typeCheckAudit.deletedEntities}\n`
+    );
+  }
+  if (deletedSummaryLegacyRows > 0) {
+    writeStderr(
+      `WARN schema-bootstrap community_summaries level upgrade wiped ` +
+        `level-less legacy rows=${deletedSummaryLegacyRows} ` +
+        `(rebuild with the community-summary CLI)\n`
+    );
+  }
+}
+
+/**
  * Create all four ledger tables + indexes (plus the projection outbox that rides
  * the same bootstrap — see schema-projection.ts), atomically. Idempotent: safe
  * to call repeatedly (each statement is IF NOT EXISTS). On any failure the
@@ -588,7 +644,10 @@ export async function upSchemaBootstrap(
     const typeCheckAudit = await upgradeEntitiesTypeCheck(client);
     await createClaims(client);
     await createExtractionRecords(client);
-    await createCommunitySummaries(client, dimensions);
+    const summaryLevelAudit = await createCommunitySummaries(
+      client,
+      dimensions
+    );
     await createCommunityIndexState(client);
     await createEmbeddingGeneration(client);
     await createSourceDocuments(client);
@@ -598,18 +657,10 @@ export async function upSchemaBootstrap(
     // `PgvectorBackend.ensureTable` creates it before invoking us).
     await alterChunksBackPointers(client);
     await client.query("COMMIT");
-    if (
-      typeCheckAudit !== undefined &&
-      (typeCheckAudit.deletedTriples > 0 || typeCheckAudit.deletedEntities > 0)
-    ) {
-      // Audit trail for the operator-approved destructive upgrade, written
-      // only after COMMIT so a rolled-back attempt cannot fake a deletion.
-      writeStderr(
-        `WARN schema-bootstrap entities-type-closed-check upgrade deleted ` +
-          `triples=${typeCheckAudit.deletedTriples} ` +
-          `entities=${typeCheckAudit.deletedEntities}\n`
-      );
-    }
+    logDestructiveUpgradeAudits(
+      typeCheckAudit,
+      summaryLevelAudit.deletedLegacyRows
+    );
   } catch (err) {
     await client.query("ROLLBACK");
     if (err instanceof ConfigError || err instanceof GraphragError) {

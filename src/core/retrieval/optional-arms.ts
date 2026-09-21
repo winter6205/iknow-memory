@@ -12,6 +12,7 @@ import {
   type NodeEmbeddingArmDeps,
 } from "./node-embedding-arm.js";
 import { runNeo4jGraphArm, type Neo4jGraphArmDeps } from "./neo4j-graph-arm.js";
+import { DEFAULT_COMMUNITY_LEVEL_CAP } from "./wire-filters.js";
 import type {
   ArmHit,
   ArmName,
@@ -152,7 +153,12 @@ function startNodeEmbeddingIfConfigured(
  */
 export async function runOptionalArms(
   queryEmbedding: number[] | undefined,
-  query: { query: string; validAt: string; entityType?: EntityType },
+  query: {
+    query: string;
+    validAt: string;
+    entityType?: EntityType;
+    communityLevel?: number;
+  },
   searchOpts: SearchOptions,
   arms: OptionalArmSet
 ): Promise<OptionalArmResults> {
@@ -193,7 +199,8 @@ export async function runOptionalArms(
       : runCommunitySummarySafe(
           queryEmbedding,
           arms.communitySummaries,
-          searchOpts.limit
+          searchOpts.limit,
+          query.communityLevel ?? DEFAULT_COMMUNITY_LEVEL_CAP
         );
   const [
     weightedResults,
@@ -310,10 +317,15 @@ export function communitySummaryArmHit(
 async function runCommunitySummarySafe(
   queryEmbedding: number[],
   storage: CommunitySummaryStorage,
-  limit: number
+  limit: number,
+  maxLevel: number
 ): Promise<ArmResult> {
   try {
-    const rows = await storage.searchCommunitySummaries(queryEmbedding, limit);
+    const rows = await storage.searchCommunitySummaries(
+      queryEmbedding,
+      limit,
+      maxLevel
+    );
     return {
       arm: "community-summary",
       hits: rows.map((row, i) =>

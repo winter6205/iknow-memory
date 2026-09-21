@@ -39,9 +39,12 @@ class FixedEmbedder implements EmbeddingClient {
 
 class SummaryBackend implements StorageBackend {
   readonly communitySummaries: CommunitySummaryStorage = {
-    getCommunitySummaryByCommunityId: async (communityId) =>
-      this.rows.find((row) => row.communityId === communityId),
-    searchCommunitySummaries: async () => this.rows,
+    getCommunitySummaryByCommunityId: async (communityId, maxLevel) =>
+      this.rows.find(
+        (row) => row.communityId === communityId && row.level <= maxLevel
+      ),
+    searchCommunitySummaries: async (_embedding, _limit, maxLevel) =>
+      this.rows.filter((row) => row.level <= maxLevel),
   };
   readonly neo4jArmSeed: Neo4jArmStorage = {
     seedEntitiesByEmbedding: async () => [
@@ -93,11 +96,16 @@ class SummaryBackend implements StorageBackend {
   async close(): Promise<void> {}
 }
 
-function summaryRow(communityId: string, summary: string): CommunitySummaryRow {
+function summaryRow(
+  communityId: string,
+  summary: string,
+  level = 1
+): CommunitySummaryRow {
   return {
     id: `community-summary:${communityId}`,
     communityId,
     summary,
+    level,
     score: 0.99,
   };
 }

@@ -45,46 +45,59 @@ function reportRows(): CommunitySummaryRow[] {
       id: "sum-1",
       communityId: "com-1",
       summary: "alpha community report",
+      level: 1,
       score: 0.9,
     },
     {
       id: "sum-2",
       communityId: "com-2",
       summary: "beta community report",
+      level: 2,
       score: 0.8,
     },
   ];
 }
 
-/** The report-embedding (vectors) arm double. */
+/**
+ * The report-embedding (vectors) arm double. Honours the cap contract
+ * (specs/community-level.md): rows with level > maxLevel never come back,
+ * and every N handed in is recorded.
+ */
 function vectorSeam(
   rows: CommunitySummaryRow[],
-  error?: Error
+  error?: Error,
+  calls?: number[]
 ): CommunitySummaryStorage {
   return {
-    getCommunitySummaryByCommunityId: async (communityId) =>
-      rows.find((row) => row.communityId === communityId),
-    searchCommunitySummaries: async () => {
+    getCommunitySummaryByCommunityId: async (communityId, maxLevel) => {
+      calls?.push(maxLevel);
+      return rows.find(
+        (row) => row.communityId === communityId && row.level <= maxLevel
+      );
+    },
+    searchCommunitySummaries: async (_embedding, _limit, maxLevel) => {
+      calls?.push(maxLevel);
       if (error !== undefined) throw error;
-      return rows;
+      return rows.filter((row) => row.level <= maxLevel);
     },
   };
 }
 
-/** The report-text lexical (ES) arm double. */
+/** The report-text lexical (ES) arm double; records and honours the cap. */
 class FakeReportLexical {
-  calls: Array<{ query: string; limit: number }> = [];
+  calls: Array<{ query: string; limit: number; maxLevel: number }> = [];
   constructor(
     private readonly rows: CommunitySummaryRow[],
     private readonly error?: Error
   ) {}
   async searchCommunitySummariesLexical(
     query: string,
-    limit: number
+    limit: number,
+    maxLevel: number
   ): Promise<CommunitySummaryRow[]> {
     if (this.error !== undefined) throw this.error;
-    this.calls.push({ query, limit });
-    return this.rows;
+    this.calls.push({ query, limit, maxLevel });
+    return this.rows.filter((row) => row.level <= maxLevel);
   }
 }
 
@@ -134,10 +147,7 @@ describe("modeCReportFirstArm readiness gate (typed community_summary_index_fail
       failure_code: COMMUNITY_SUMMARY_INDEX_FAILURE,
     });
     await expect(
-      modeCReportFirstArm(
-        baseArgs(),
-        baseDeps({ storage: backend })
-      )
+      modeCReportFirstArm(baseArgs(), baseDeps({ storage: backend }))
     ).rejects.toThrow(RegExp(COMMUNITY_SUMMARY_INDEX_FAILURE));
   });
 
@@ -261,13 +271,16 @@ describe("modeCReportFirstArm report-first (C-ready)", () => {
         return reportRows();
       },
     };
-    const originalLexical = lexical.searchCommunitySummariesLexical.bind(
-      lexical
-    );
+    const originalLexical =
+      lexical.searchCommunitySummariesLexical.bind(lexical);
     const racingLexical = {
-      searchCommunitySummariesLexical: async (q: string, l: number) => {
+      searchCommunitySummariesLexical: async (
+        q: string,
+        l: number,
+        m: number
+      ) => {
         lexicalStarted = true;
-        return originalLexical(q, l);
+        return originalLexical(q, l, m);
       },
     };
     const envelope = await modeCReportFirstArm(
@@ -359,9 +372,7 @@ describe("modeCReportFirstArm report-first (C-ready)", () => {
     );
     expect(envelope.chunks).toEqual([]);
     expect(envelope.degraded).toBe(true);
-    expect(envelope.degraded_reasons).toContain(
-      "community_report:unattempted"
-    );
+    expect(envelope.degraded_reasons).toContain("community_report:unattempted");
   });
 
   it("treats a ready generation with zero summaries as a healthy miss", async () => {
@@ -387,7 +398,9 @@ describe("modeCReportFirstArm drop to citable windows", () => {
     const chunk = (id: string, content: string): ChunkRecord => ({
       id,
       content,
-      embedding: new Array<number>(TEST_DIM).fill(0).map((_, i) => (i === 0 ? 1 : 0)),
+      embedding: new Array<number>(TEST_DIM)
+        .fill(0)
+        .map((_, i) => (i === 0 ? 1 : 0)),
       source_ref: `src/${id}`,
       metadata: {},
       valid_from: "2024-01-01T00:00:00Z",
@@ -457,7 +470,10 @@ describe("modeCReportFirstArm drop to citable windows", () => {
         enumerable: true,
         configurable: true,
         writable: true,
-        value: async (embedding: number[], opts: { filters?: Record<string, string> }) => {
+        value: async (
+          embedding: number[],
+          opts: { filters?: Record<string, string> }
+        ) => {
           seen.push(opts.filters);
           return [];
         },
@@ -541,5 +557,81 @@ describe("modeCReportFirstArm drop to citable windows", () => {
       })
     );
     expect(embedCalls).toBe(1);
+  });
+});
+
+describe("modeCReportFirstArm community-level cap (T2)", () => {
+  it("hands the SAME N to both report arms in one request", async () => {
+    const backend = await readyBackend();
+    const lexical = new FakeReportLexical(reportRows());
+    const vectorCalls: number[] = [];
+    const envelope = await modeCReportFirstArm(
+      baseArgs({ communityLevel: 1 }),
+      baseDeps({
+        storage: withVectorSeam(
+          backend,
+          vectorSeam(reportRows(), undefined, vectorCalls)
+        ),
+        lexical: lexical as unknown as AssembleDeps["lexical"],
+      })
+    );
+    expect(vectorCalls).toEqual([1]);
+    expect(lexical.calls.map((call) => call.maxLevel)).toEqual([1]);
+    // The level-2 report is outside the cap on BOTH arms, not just one.
+    expect(envelope.chunks.map((c) => c.id)).toEqual(["sum-1"]);
+  });
+
+  it("omitting communityLevel reads with the default cap 2", async () => {
+    const backend = await readyBackend();
+    const vectorCalls: number[] = [];
+    const envelope = await modeCReportFirstArm(
+      baseArgs(),
+      baseDeps({
+        storage: withVectorSeam(
+          backend,
+          vectorSeam(reportRows(), undefined, vectorCalls)
+        ),
+      })
+    );
+    expect(vectorCalls).toEqual([2]);
+    expect(envelope.chunks.map((c) => c.id)).toEqual(["sum-1", "sum-2"]);
+  });
+
+  it("a finer-only fixture is a healthy empty answer under the cap", async () => {
+    const backend = await readyBackend();
+    const finer = reportRows().map((row) => ({ ...row, level: 3 }));
+    const envelope = await modeCReportFirstArm(
+      baseArgs(),
+      baseDeps({
+        storage: withVectorSeam(backend, vectorSeam(finer)),
+      })
+    );
+    expect(envelope.chunks).toEqual([]);
+    expect(envelope.degraded).toBeUndefined();
+  });
+
+  it("post-filters lexical rows when a stale external impl ignores maxLevel", async () => {
+    const backend = await readyBackend();
+    // A pre-cap external implementation: it answers the probed method name
+    // but ignores maxLevel, returning uncapped and level-less rows. The
+    // consumer must never leak them (specs/community-level.md: no silent
+    // all-level mix).
+    const staleLexical = {
+      searchCommunitySummariesLexical: async () => [
+        { id: "sum-1", communityId: "com-1", summary: "level one", level: 1 },
+        { id: "sum-2", communityId: "com-2", summary: "level two", level: 2 },
+        { id: "sum-3", communityId: "com-3", summary: "level three", level: 3 },
+        { id: "sum-4", communityId: "com-4", summary: "legacy unlevelled" },
+      ],
+    };
+    const envelope = await modeCReportFirstArm(
+      baseArgs({ communityLevel: 2, filters: { c_drop_windows: "0" } }),
+      baseDeps({
+        storage: backend,
+        lexical: staleLexical as unknown as AssembleDeps["lexical"],
+      })
+    );
+    expect(envelope.chunks.map((c) => c.id)).toEqual(["sum-1", "sum-2"]);
+    expect(envelope.degraded).toBeUndefined();
   });
 });

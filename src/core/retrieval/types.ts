@@ -420,7 +420,9 @@ const RETRIEVE_BASE_LEVERS: Omit<RetrieveConfig, keyof RetrievePresetBundle> = {
 };
 
 /** A preset bundle's levers over the single-source base defaults. */
-export function retrieveConfigForPreset(preset: RetrievePreset): RetrieveConfig {
+export function retrieveConfigForPreset(
+  preset: RetrievePreset
+): RetrieveConfig {
   return { ...RETRIEVE_PRESET_BUNDLES[preset], ...RETRIEVE_BASE_LEVERS };
 }
 
@@ -606,17 +608,26 @@ export interface CommunitySummaryRow {
   id: string;
   communityId: string;
   summary: string;
+  /** Product-scale grain (larger = finer); the retrieve cap bounds it. */
+  level: number;
   score?: number;
 }
 
-/** Postgres seam for optional topic-level summary recall. */
+/**
+ * Postgres seam for optional topic-level summary recall. Every read is
+ * capped to `level <= maxLevel` (specs/community-level.md): the caller
+ * hands the request's resolved bound to each read, so one request never
+ * mixes grains.
+ */
 export interface CommunitySummaryStorage {
   getCommunitySummaryByCommunityId(
-    communityId: string
+    communityId: string,
+    maxLevel: number
   ): Promise<CommunitySummaryRow | undefined>;
   searchCommunitySummaries(
     embedding: number[],
-    limit: number
+    limit: number,
+    maxLevel: number
   ): Promise<CommunitySummaryRow[]>;
 }
 
@@ -659,7 +670,8 @@ export interface CommunityIndexStateStorage {
 export interface CommunityReportLexicalStorage {
   searchCommunitySummariesLexical(
     query: string,
-    limit: number
+    limit: number,
+    maxLevel: number
   ): Promise<CommunitySummaryRow[]>;
 }
 

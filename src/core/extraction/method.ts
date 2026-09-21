@@ -7,7 +7,9 @@
  * `runExtractMethod` is the single dispatch seam: `standard` delegates to
  * the existing `extractChunk` path; `fast` delegates to `extractFastChunk`
  * (fast.ts) — a pure function over the chunk text that never even receives
- * the LLM client, so a fast run cannot dial a model.
+ * the LLM client, so a fast run dials no model during extraction. The
+ * pipeline's post-extract judge gate is the one place a fast chunk can
+ * still bill a call, and it applies to every method (judge.ts).
  *
  * The version columns ride the `source_documents` ledger (SoR):
  * `findChunkMethodConflict` is the pre-flight guard — it runs BEFORE any LLM
@@ -61,9 +63,11 @@ export function parseExtractMethod(raw: string): ExtractMethod {
  * Dispatch one chunk through its version's extract method.
  *
  * `fast` runs the pure NLP extractor (T4): the `ctx` — whose only member is
- * the LLM client — is dropped at the branch, so the leg cannot bill a call;
- * its failures stay sealed outcomes (mark-and-continue stays the caller's
- * contract, and the code lands in extraction_records for operators).
+ * the LLM client — is dropped at the branch, so the leg cannot bill a call
+ * from inside extraction (the downstream judge gate is separate and does
+ * dial); its failures stay sealed outcomes (mark-and-continue stays the
+ * caller's contract, and the code lands in extraction_records for
+ * operators).
  * A value outside the vocabulary is a caller-contract violation, not a
  * chunk outcome: it throws `InvalidExtractMethodError`.
  */

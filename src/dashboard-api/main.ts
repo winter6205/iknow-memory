@@ -162,6 +162,15 @@ export async function main(): Promise<void> {
             ...(precision !== undefined ? { precision } : {}),
             logger,
           },
+          // extract-verify T3 maintenance lane: promote embeds resolved
+          // entities during the replay, so it shares extract's guard
+          // (Postgres pool + embedding credentials).
+          maintenance: {
+            pool: pgPool,
+            embedder,
+            slotEmbedding,
+            logger,
+          },
         }
       : {}),
     ...(pgPool !== undefined && env.neo4j !== undefined

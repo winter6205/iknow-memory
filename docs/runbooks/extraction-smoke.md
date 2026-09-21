@@ -132,6 +132,10 @@ fast method gets its own typed-node scheme (follow-up).
 
 - **401 unauthorized** → `ANTHROPIC_AUTH_TOKEN` is missing or
   wrong. Re-check the key in `.env.local` / env.
+- **4xx-failed records only on one path** → the extract CLI expects a bare
+  `ANTHROPIC_AUTH_TOKEN`, while the MCP host path may resolve the key via the
+  `GRAPHRAG_MEMORY_RERANK_API_KEY_ENV` pointer; this asymmetric config produces
+  4xx failed records on the CLI side.
 - **Wrong base URL** → request fails to reach the endpoint. Confirm
   `GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL` matches the provider (default:
   `https://api.minimaxi.com/anthropic`).

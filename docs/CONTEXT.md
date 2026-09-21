@@ -144,7 +144,7 @@ _Avoid_: "search" (too broad); "three-arm retrieve" (retired ranking); "recall" 
 **read_source**: the MCP tool that returns one stored **资料** full body. Caller passes `source_ref` or `id` (exactly one). Success envelope `{ id, source_ref, title?, content }`. Miss is a named not-found, not an empty string. Not for local files; not a substitute for **retrieve**.
 _Avoid_: get_page; merging this with the host local-file read tool
 
-**extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. Exposed as MCP tool `extract` (`chunk_ids` xor `source_ref`, synchronous, **mark-and-continue**) and as the extract CLI. CLI-only: `--dry-run`, `--list-failed`, `--list-unmapped`, `--backfill-embeddings`. Not folded into **ingest** or **push**. _Stage: CLI on main; MCP `extract` is `specs/mcp-tool-surface.md`._
+**extract_triples**: the P0 extraction pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → grounded judge verdict (**unverified-not-authoritative**) → canonical entity resolution → store. Exposed as MCP tool `extract` (`chunk_ids` xor `source_ref`, synchronous, **mark-and-continue**) and as the extract CLI. CLI-only: `--dry-run`, `--list-failed`, `--list-unmapped`, `--backfill-embeddings`. Not folded into **ingest** or **push**. _Stage: CLI on main; MCP `extract` is `specs/mcp-tool-surface.md`; judge-before-persist per `specs/extract-verify.md`._
 _Avoid_: "parse" (implies deterministic grammar, extraction is LLM-based); "NER" (NER is one sub-step, not the whole pipeline)
 
 **embedding backfill**: the idempotent NULL-embedding repair mode (CLI flag `--backfill-embeddings`) that embeds and UPDATEs every live entity row `WHERE embedding IS NULL` using the stored description; an immediate second run updates 0 rows. Never runs automatically inside a normal extraction run. _Stage: P0 (implemented per `specs/p0-wiring-closure.md`)._
@@ -163,6 +163,12 @@ _Avoid_: "ontology" (implies formal class hierarchy); "taxonomy" (implies tree s
 
 **extraction_records**: the per-chunk extraction status table (`pending → succeeded | failed`) carrying `error_code`, `error_msg`, `triples_count`, `unmapped_count`, and `batch_id` for aggregation. The visibility surface for mark-and-continue, queried via `listFailed()`. _Stage: P0._
 _Avoid_: "log table" (records are queryable state, not append-only logs); "audit table" (audit is a side benefit, not the purpose)
+
+**maintenance lane**: the operator review path over failed `extraction_records`: `listFailed()` → promote (replay the record's held `proposed_payload`), discard (`discarded_at` stamp; row stays readable), re-extract (`--only-failed`, judge dialed again). Same core runners for CLI and dashboard. `SELF_LOOP_REJECTED` and discarded rows are excluded — the lane lists only what an action can advance. _Stage: named (`specs/extract-verify.md`); not on main._
+_Avoid_: "retry queue" (promote replays without re-dialing the extractor); "delete" (discard stamps, never removes)
+
+**unverified-not-authoritative**: a proposed triple becomes ledger fact only when the grounded judge answers yes for it (yes/no verdicts against the chunk text, before persist). A no, a silent candidate, or a judge that is down seals a failed record carrying the FULL proposal — the graph sees nothing until a later pass (re-extract or operator promote) verifies it. _Stage: named (`specs/extract-verify.md`); not on main._
+_Avoid_: "fact-checking" (the judge grounds against the chunk, not the world); "confidence gate" (confidence scores are a separate, pre-judge step)
 
 **merged_into**: the soft-merge pointer on `entities` (nullable FK → `entities.id`, `ON DELETE SET NULL`) from a losing entity to its survivor. Roll-backable — deleting the survivor nulls the pointer; `resolveCanonicalId` walks the chain with cycle detection (maxChainDepth 16). Extract **must write** the pointer in production (`specs/retrieve-graph-quality.md` slice 4). _Stage: schema+resolver on main; persist on extract not yet implemented._
 _Avoid_: "parent" (implies hierarchy); "redirect" (web terminology); "tombstone" (the loser row is not deleted)

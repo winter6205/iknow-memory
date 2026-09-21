@@ -671,3 +671,174 @@ describe("AnthropicLLMClient enrichment methods (T3)", () => {
     expect(result).toEqual({ kind: "ok", claims: [] });
   });
 });
+
+// ─── extract-verify T1: grounded judge leg ───────────────────────────────
+
+describe("FakeLLMClient judge capabilities", () => {
+  const candidates = [
+    {
+      head: "Alice",
+      headType: "person",
+      relationRaw: "works at",
+      relationNorm: "MEMBER_OF",
+      tail: "Acme",
+      tailType: "organization",
+      description: "Alice works at Acme",
+      evidenceSpan: "Alice works at Acme",
+      confidence: 0.9,
+    },
+  ];
+
+  it("auto-accepts every candidate when no judge script is configured", async () => {
+    const client = new FakeLLMClient({ queue: [{ kind: "ok", outputs: [] }] });
+    const response = await client.judgeGrounding!({
+      chunkText: "Alice works at Acme",
+      candidates,
+    });
+    expect(response).toEqual({
+      kind: "ok",
+      verdicts: [{ index: 0, grounded: true, reason: "fake: auto-accept" }],
+    });
+  });
+
+  it("judgeQueue is consumed FIFO and throws on exhaustion", async () => {
+    const client = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [] }],
+      judgeQueue: [
+        { kind: "ok", verdicts: [{ index: 0, grounded: false, reason: "no" }] },
+      ],
+    });
+    const first = await client.judgeGrounding!({
+      chunkText: "x",
+      candidates,
+    });
+    expect(first).toMatchObject({ kind: "ok" });
+    await expect(
+      client.judgeGrounding!({ chunkText: "x", candidates })
+    ).rejects.toThrow(/judge queue exhausted/i);
+  });
+
+  it("scriptedJudge overrides the auto-accept default", async () => {
+    const client = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [] }],
+      scriptedJudge: async () => ({
+        kind: "failed",
+        errorCode: "format",
+        errorMsg: "bad verdict json",
+      }),
+    });
+    const response = await client.judgeGrounding!({
+      chunkText: "x",
+      candidates,
+    });
+    expect(response).toMatchObject({ kind: "failed", errorCode: "format" });
+  });
+});
+
+describe("AnthropicLLMClient judgeGrounding", () => {
+  function makeFakeAnthropic(impl: (params: unknown) => Promise<unknown>) {
+    return {
+      messages: {
+        create: vi.fn(async (params: unknown) => impl(params)),
+      },
+    };
+  }
+
+  function makeClient(fake: ReturnType<typeof makeFakeAnthropic>) {
+    return new AnthropicLLMClient({
+      model: "test-model",
+      apiKey: "sk-test",
+      baseUrl: "https://api.test/v1",
+      anthropic: fake as never,
+      sleep: async () => {},
+    });
+  }
+
+  function textMessage(text: string) {
+    return { content: [{ type: "text", text }] };
+  }
+
+  const input = {
+    chunkText: "Alice works at Acme.",
+    candidates: [
+      {
+        head: "Alice",
+        headType: "person",
+        relationRaw: "works at",
+        relationNorm: "MEMBER_OF",
+        tail: "Acme",
+        tailType: "organization",
+        description: "Alice works at Acme",
+        evidenceSpan: "Alice works at Acme",
+        confidence: 0.9,
+      },
+    ],
+  };
+
+  it('parses the {"verdicts": [...]} envelope and maps "yes"/"no" to booleans', async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(
+        JSON.stringify({
+          verdicts: [
+            { index: 0, grounded: "yes", reason: "stated" },
+            { index: 1, grounded: "no", reason: "invented" },
+          ],
+        })
+      )
+    );
+    const result = await makeClient(fake).judgeGrounding(input);
+    expect(result).toEqual({
+      kind: "ok",
+      verdicts: [
+        { index: 0, grounded: true, reason: "stated" },
+        { index: 1, grounded: false, reason: "invented" },
+      ],
+    });
+  });
+
+  it("accepts the bare-array verdict shape smaller models return", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(
+        JSON.stringify([{ index: 0, grounded: "yes", reason: "stated" }])
+      )
+    );
+    const result = await makeClient(fake).judgeGrounding(input);
+    expect(result).toEqual({
+      kind: "ok",
+      verdicts: [{ index: 0, grounded: true, reason: "stated" }],
+    });
+  });
+
+  it("a verdict outside the yes/no vocabulary is a sealed format failure", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(
+        JSON.stringify({ verdicts: [{ index: 0, grounded: "maybe" }] })
+      )
+    );
+    const result = await makeClient(fake).judgeGrounding(input);
+    expect(result).toMatchObject({ kind: "failed", errorCode: "format" });
+  });
+
+  it("5xx keeps the transport retry posture and surfaces as a sealed failure", async () => {
+    const fake = makeFakeAnthropic(async () => {
+      throw Object.assign(new Error("upstream 500"), { status: 500 });
+    });
+    const result = await makeClient(fake).judgeGrounding(input);
+    expect(result).toMatchObject({ kind: "failed", errorCode: "5xx" });
+    expect(fake.messages.create).toHaveBeenCalledTimes(3);
+  });
+
+  it("sends the judge prompt with the numbered candidates and the chunk", async () => {
+    const fake = makeFakeAnthropic(async () =>
+      textMessage(JSON.stringify({ verdicts: [] }))
+    );
+    await makeClient(fake).judgeGrounding(input);
+    const params = fake.messages.create.mock.calls[0]?.[0] as {
+      messages?: Array<{ content: unknown }>;
+    };
+    const prompt = params.messages?.[0]?.content as string;
+    expect(prompt).toContain("[0] Alice -[MEMBER_OF]-> Acme");
+    expect(prompt).toContain('"grounded": "yes"|"no"');
+    expect(prompt).toContain(input.chunkText);
+  });
+});

@@ -72,8 +72,11 @@ interface ToolResultContent {
  * 400 — every thin write is POST and must carry a JSON payload (the
  * schema's strict object guarantees it; a missing body is always a bug
  * or a curl typo, never a normal path).
+ *
+ * Exported for the maintenance lane: its actions ride
+ * the exact same body-parse contract as the thin writes.
  */
-function parseBodyOrFail(
+export function parseBodyOrFail(
   raw: unknown
 ):
   | { ok: true; value: unknown }
@@ -119,8 +122,12 @@ function parseBodyOrFail(
  *     503 — the operator's env is missing the credentials the runner
  *     needs. Keeps the existing envelope shape.
  *  4. Anything else → 500 INTERNAL.
+ *
+ * Exported for the maintenance lane: the core review
+ * actions throw the same `GraphragError` taxonomy, so the status map is
+ * shared rather than restated.
  */
-function mapRunnerError(err: unknown): { status: number; body: unknown } {
+export function mapRunnerError(err: unknown): { status: number; body: unknown } {
   if (
     err !== null &&
     typeof err === "object" &&

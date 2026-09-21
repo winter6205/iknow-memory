@@ -15,8 +15,11 @@
  * the CLI maps `writeFailures > 0` to exit 2).
  *
  * Transaction shape per chunk (SC3): BEGIN → insertRecord(pending) →
- * method-conflict check (T1) → runExtractMethod → persistOutputs (canonical
- * merge) → enrichStandardChunk (T3, standard only: survivor descriptions +
+ * method-conflict check (T1) → runExtractMethod → judgeProposals
+ * (a reject / judge-down leg persists NOTHING and seals
+ * the chunk as a failed record carrying the proposal payload) →
+ * persistOutputs (canonical merge) → enrichStandardChunk (standard only:
+ * survivor descriptions +
  * claims) → emitProjectionIntents (same transaction as the ledger rows it
  * describes) → recordChunkExtractMethod (T1 version claim) → C-state READY →
  * STALE demotion when the chunk wrote graph rows (T5 gap) → markSucceeded →
@@ -24,7 +27,7 @@
  * ES precision layer mirrors AFTER commit, fail-open, never aborting the
  * chunk.
  */
-import { writeStderr } from "../../logging.js";
+import { writeStderr, type Logger } from "../../logging.js";
 import type { PrecisionIndexer } from "../storage/elasticsearch-precision.js";
 import { emitProjectionIntents } from "../storage/projection-outbox.js";
 import { fetchEntityProjection } from "../storage/entity-projection.js";
@@ -46,10 +49,12 @@ import {
   insertRecord,
   markSucceeded,
   markFailed,
+  markFailedWithProposal,
   newRecordId,
   SELF_LOOP_REJECTED_CODE,
   type Queryable,
 } from "./records.js";
+import { judgeProposals } from "./judge.js";
 import {
   persistOutputs,
   depsNow,
@@ -121,10 +126,10 @@ export async function selectPendingChunks(
     // no re-extract path can actually advance.
     where.push(
       `c.id IN (SELECT chunk_id FROM (
-         SELECT chunk_id, status, error_code,
+         SELECT chunk_id, status, error_code, discarded_at,
            row_number() OVER (PARTITION BY chunk_id ORDER BY created_at DESC) rn
          FROM extraction_records
-       ) t WHERE rn = 1 AND status = 'failed' AND error_code != 'SELF_LOOP_REJECTED')`
+       ) t WHERE rn = 1 AND status = 'failed' AND error_code != 'SELF_LOOP_REJECTED' AND discarded_at IS NULL)`
     );
   }
   const { rows } = await client.query(
@@ -425,6 +430,31 @@ async function processChunk(
         errorMsg: outcome.errorMsg,
       };
     }
+    const judged = await judgeProposals(deps.llm, chunk, outcome.outputs);
+    if (judged.kind === "failed") {
+      // nothing becomes graph fact without a grounded
+      // yes. The sealed leg writes NO triples, NO projection intents and NO
+      // Neo4j touch — it commits only the failed record plus the reviewable
+      // proposal payload the maintenance lane replays later.
+      await markFailedWithProposal(
+        client,
+        recordId,
+        { code: judged.errorCode, msg: judged.errorMsg },
+        { triples: outcome.outputs, verdicts: judged.verdicts }
+      );
+      await client.query("COMMIT", []);
+      deps.logger.info("chunk-failed", {
+        ...chunkLogFields(deps, chunk.id, latencyStart),
+        code: judged.errorCode,
+        outcome: "failed",
+      });
+      return {
+        kind: "failed",
+        ungrounded: 0,
+        errorCode: judged.errorCode,
+        errorMsg: judged.errorMsg,
+      };
+    }
     const counts = await persistOutputs(
       deps,
       client,
@@ -439,16 +469,14 @@ async function processChunk(
       // SELF_LOOP_REJECTED sentinel keeps it visible in extraction_records
       // while excluding it from --list-failed / --only-failed (no re-extract
       // path can produce anything but the same self-loop again).
-      await markFailed(client, recordId, {
-        code: SELF_LOOP_REJECTED_CODE,
-        msg: "all outputs were self-loops",
-      });
-      await client.query("COMMIT", []);
-      deps.logger.info("chunk-rejected", {
-        ...chunkLogFields(deps, chunk.id, latencyStart),
-        code: SELF_LOOP_REJECTED_CODE,
-        reason: "all-outputs-self-loop",
-        outcome: "failed",
+      await commitSelfLoopRejection(client, recordId, deps.logger, {
+        name: "chunk-rejected",
+        fields: {
+          ...chunkLogFields(deps, chunk.id, latencyStart),
+          code: SELF_LOOP_REJECTED_CODE,
+          reason: "all-outputs-self-loop",
+          outcome: "failed",
+        },
       });
       return {
         kind: "failed",
@@ -544,13 +572,38 @@ async function processChunk(
 }
 
 /**
+ * The one posture of a SELF_LOOP_REJECTED leg across every write path (the
+ * batch and the promote replay): seal the record, COMMIT the rejection
+ * inside the caller's transaction, then log with the caller's event fields.
+ * Exported for actions.ts so the two paths cannot drift on how a permanent
+ * reject settles.
+ */
+export async function commitSelfLoopRejection(
+  client: Queryable,
+  recordId: string,
+  logger: Logger,
+  event: { name: string; fields: Record<string, unknown> }
+): Promise<void> {
+  await markFailed(client, recordId, {
+    code: SELF_LOOP_REJECTED_CODE,
+    msg: "all outputs were self-loops",
+  });
+  await client.query("COMMIT", []);
+  logger.info(event.name, event.fields);
+}
+
+/**
  * Move the singleton C-ready row READY → STALE (see the call site in
  * `processChunk` and `COMMUNITY_INDEX_STATUS` in core/types). Both literals
  * ride as binds so the vocabulary keeps its SSOT in the constant; the
  * `WHERE id = 1 AND status = <ready>` guard is the whole precedence rule —
  * no INSERT, so the state row only ever exists via a community-summary run.
+ * Exported for the review lane (actions.ts promote replays graph rows and
+ * must demote the same way a committed chunk does).
  */
-async function demoteCommunityIndexState(client: Queryable): Promise<void> {
+export async function demoteCommunityIndexState(
+  client: Queryable
+): Promise<void> {
   await client.query(
     `UPDATE community_index_state
         SET status = $1, updated_at = now()

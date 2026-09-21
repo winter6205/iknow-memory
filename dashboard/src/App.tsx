@@ -5,6 +5,7 @@ import { ChunkDetailPage } from "./pages/ChunkDetailPage";
 import { EntityDetailPage } from "./pages/EntityDetailPage";
 import { GraphPage } from "./pages/GraphPage";
 import { ImportPage } from "./pages/ImportPage";
+import { MaintenancePage } from "./pages/MaintenancePage";
 import { NeighborhoodPage } from "./pages/NeighborhoodPage";
 import { SourceDetailPage } from "./pages/SourceDetailPage";
 import { SourcesPage } from "./pages/SourcesPage";
@@ -38,6 +39,7 @@ export function App() {
           />
           <Route path="/browse/entities/:id" element={<EntityDetailPage />} />
           <Route path="/timeline" element={<TimelinePage />} />
+          <Route path="/maintenance" element={<MaintenancePage />} />
           <Route
             path="/graph"
             element={<GraphPage onSelectNode={onSelectNode} />}

@@ -7,4 +7,5 @@ export const NAV_ITEMS = [
   { path: "/browse", label: "浏览" },
   { path: "/timeline", label: "时间线" },
   { path: "/graph", label: "图谱" },
+  { path: "/maintenance", label: "维护" },
 ] as const;

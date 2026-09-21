@@ -40,6 +40,7 @@ import { createLogger, writeStderr, type Logger } from "../logging.js";
 import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
 import { listFailed } from "../core/extraction/records.js";
+import { discardRecord, promoteRecord } from "../core/extraction/actions.js";
 import type { ChunkInput } from "../core/extraction/extract.js";
 import { runExtractMethod } from "../core/extraction/method.js";
 import {
@@ -75,6 +76,13 @@ export interface CliFlags {
   /** `--list-failed` batch filter; null means "every batch". */
   batchId: string | null;
   /**
+   * Review lane: `--promote UUID` replays that failed record's held
+   * proposal into the graph. null = flag absent.
+   */
+  promote: string | null;
+  /** `--discard UUID` retires that failed record from the review lane. */
+  discard: string | null;
+  /**
    * T1 version spine: `--method standard|fast`. null = flag absent, which
    * the pipeline reads as its "standard" default (spec SC3: the default job
    * is standard; Fast never runs unasked).
@@ -94,12 +102,14 @@ const DEFAULT_FLAGS: CliFlags = {
   listUnmapped: false,
   listFailed: false,
   batchId: null,
+  promote: null,
+  discard: null,
   method: null,
   sourceRef: null,
   backfillEmbeddings: false,
 };
 
-const USAGE = `usage: extract [--batch-size N] [--dry-run] [--since ISO8601] [--only-failed] [--method standard|fast] [--source-ref REF] [--list-unmapped] [--list-failed [--batch-id UUID]] [--backfill-embeddings]`;
+const USAGE = `usage: extract [--batch-size N] [--dry-run] [--since ISO8601] [--only-failed] [--method standard|fast] [--source-ref REF] [--list-unmapped] [--list-failed [--batch-id UUID]] [--promote UUID] [--discard UUID] [--backfill-embeddings]`;
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -200,6 +210,34 @@ const FLAG_SPECS: ReadonlyMap<string, FlagSpec> = new Map([
           return `--batch-id requires a UUID`;
         }
         f.batchId = raw;
+        return null;
+      },
+    },
+  ],
+  [
+    "--promote",
+    {
+      // Same UUID pre-validation doctrine as --batch-id: a malformed
+      // record id is a usage error (exit 2), not a Postgres fatal.
+      kind: "value",
+      parse: (f, raw) => {
+        if (raw === undefined || !UUID_RE.test(raw)) {
+          return `--promote requires a UUID`;
+        }
+        f.promote = raw;
+        return null;
+      },
+    },
+  ],
+  [
+    "--discard",
+    {
+      kind: "value",
+      parse: (f, raw) => {
+        if (raw === undefined || !UUID_RE.test(raw)) {
+          return `--discard requires a UUID`;
+        }
+        f.discard = raw;
         return null;
       },
     },
@@ -327,13 +365,23 @@ const EXCLUSION_RULES: ReadonlyArray<ExclusionRule> = [
     message: () => `--dry-run and --backfill-embeddings are mutually exclusive`,
   },
   {
+    // The review actions write through their own paths; a --dry-run
+    // contract ("writes nothing") cannot coexist with either.
+    when: (flags) => flags.dryRun && flags.promote !== null,
+    message: () => `--dry-run and --promote are mutually exclusive`,
+  },
+  {
+    when: (flags) => flags.dryRun && flags.discard !== null,
+    message: () => `--dry-run and --discard are mutually exclusive`,
+  },
+  {
     // `--batch-id` only filters the `--list-failed` report; accepting it on
     // any other path would silently ignore it instead of naming the mistake.
     when: (flags) => flags.batchId !== null && !flags.listFailed,
     message: () => `--batch-id is only valid with --list-failed`,
   },
   {
-    // T1: `--method` steers the extraction run only; on a report/repair mode
+    // `--method` steers the extraction run only; on a report/repair mode
     // it would be silently dropped, so name the mistake (same doctrine as
     // --batch-id above).
     when: (flags, selected) => selected.length === 1 && flags.method !== null,
@@ -341,7 +389,7 @@ const EXCLUSION_RULES: ReadonlyArray<ExclusionRule> = [
       `--method is only valid for extraction runs, not with ${selected[0]}`,
   },
   {
-    // T1: same doctrine for `--source-ref`.
+    // same doctrine for `--source-ref`.
     when: (flags, selected) =>
       selected.length === 1 && flags.sourceRef !== null,
     message: (_flags, selected) =>
@@ -364,6 +412,8 @@ function flagConflict(flags: CliFlags): string | null {
   const modes: Array<[string, boolean]> = [
     ["--list-unmapped", flags.listUnmapped],
     ["--list-failed", flags.listFailed],
+    ["--promote", flags.promote !== null],
+    ["--discard", flags.discard !== null],
     ["--backfill-embeddings", flags.backfillEmbeddings],
   ];
   const selected = modes.filter(([, on]) => on).map(([name]) => name);
@@ -384,6 +434,12 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
     if (parsed.flags.listUnmapped) return await listUnmapped(deps);
     if (parsed.flags.listFailed) {
       return await listFailedReport(deps, parsed.flags);
+    }
+    if (parsed.flags.promote !== null) {
+      return await promoteRecordAction(deps, parsed.flags.promote);
+    }
+    if (parsed.flags.discard !== null) {
+      return await discardRecordAction(deps, parsed.flags.discard);
     }
     if (parsed.flags.backfillEmbeddings) {
       return await backfillEmbeddings(deps);
@@ -536,6 +592,43 @@ async function listFailedReport(
 }
 
 /**
+ * `--promote UUID` (review lane): replay that failed record's held
+ * proposal through the shared persist + outbox code (actions.ts owns the
+ * transaction). A typed refusal lands in runCli's catch → reportFatal → 1.
+ */
+async function promoteRecordAction(
+  deps: CliDeps,
+  recordId: string
+): Promise<number> {
+  const client = await deps.pool.connect();
+  try {
+    await upSchemaBootstrap(client, deps.dims);
+    await promoteRecord(deps, client, recordId);
+    return 0;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * `--discard UUID` (review lane): stamp the failed record out of
+ * `listFailed()` — idempotent, graph untouched (actions.ts owns the guards).
+ */
+async function discardRecordAction(
+  deps: CliDeps,
+  recordId: string
+): Promise<number> {
+  const client = await deps.pool.connect();
+  try {
+    await upSchemaBootstrap(client, deps.dims);
+    await discardRecord(client, recordId);
+    return 0;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * `--backfill-embeddings` (A9): the idempotent NULL-embedding repair mode.
  * Every live entity whose `embedding` is NULL is embedded from its stored
  * `metadata.description` (empty string when the key is absent) through the
@@ -643,11 +736,13 @@ async function dryRunPlan(
 
 /**
  * True when the invocation runs the LLM extraction write path. Anything else
- * (`--dry-run`, `--list-unmapped`, `--list-failed`, `--backfill-embeddings`)
- * makes no use of LLM output, so keyless operation may fall back to the
- * scripted fake (`buildLlmClient`'s guard). Nor does a `--method fast` run
- * (T4): the fast leg is pure NLP and dials no LLM at all, so it must not
- * require LLM credentials either.
+ * (`--dry-run`, `--list-unmapped`, `--list-failed`, `--promote`, `--discard`,
+ * `--backfill-embeddings`) makes no use of LLM output, so keyless operation
+ * may fall back to the scripted fake (`buildLlmClient`'s guard). Nor does a
+ * `--method fast` run (T4): the fast leg is pure NLP and dials no LLM at
+ * all, so it must not require LLM credentials either. The review actions
+ * replay or stamp a HELD proposal — the extractor is by definition never
+ * dialed, so they are not "real extraction" either.
  *
  * Exported for tests — it is the credential-guard predicate.
  */
@@ -657,13 +752,21 @@ export function isRealExtraction(flags: CliFlags): boolean {
     flags.dryRun ||
     flags.listUnmapped ||
     flags.listFailed ||
+    flags.promote !== null ||
+    flags.discard !== null ||
     flags.backfillEmbeddings
   );
 }
 
-/** True when the invocation writes a vector into `entities.embedding`. */
-function persistsEmbeddings(flags: CliFlags): boolean {
+/**
+ * True when the invocation writes a vector into `entities.embedding`.
+ * Exported for tests — it is the embedder-credential guard; `--promote`
+ * counts because the replayed `persistOutputs` embeds every resolved entity.
+ */
+export function persistsEmbeddings(flags: CliFlags): boolean {
   if (flags.backfillEmbeddings) return true;
+  if (flags.promote !== null) return true;
+  if (flags.discard !== null) return false;
   return !(flags.dryRun || flags.listUnmapped || flags.listFailed);
 }
 

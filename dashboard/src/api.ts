@@ -114,6 +114,28 @@ export type EntityDetail = {
   aliases?: string[];
 };
 
+/**
+ * One failed extraction on the maintenance lane (extract-verify T3) — the
+ * review fields of an `extraction_records` row as GET /api/maintenance/failed
+ * sends them. The held proposal never travels; `has_proposal` says whether
+ * promote can advance this row.
+ */
+export type FailedRecordItem = {
+  id: string;
+  batch_id: string | null;
+  chunk_id: string | null;
+  error_code: string | null;
+  error_msg: string | null;
+  has_proposal: boolean;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  source_ref: string | null;
+  source_doc_id: string | null;
+};
+
+export type FailedListBody = { items: FailedRecordItem[] };
+
 export type NeighborhoodNeighbor = {
   id: string;
   name: string;

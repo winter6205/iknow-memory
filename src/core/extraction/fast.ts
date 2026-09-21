@@ -1,5 +1,8 @@
 /**
- * Fast extract method (graph-index-standard-fast T4) — pure NLP, zero LLM.
+ * Fast extract method (graph-index-standard-fast T4) — the extraction step
+ * itself is pure NLP and dials no LLM. (The pipeline's post-extract judge
+ * gate still may call the model for a fast chunk's proposals: grounding
+ * applies to every method, see judge.ts.)
  *
  * The three steps the joint spec names for the Fast leg
  * (specs/graph-index-standard-fast.md assumptions 4–6; ADR 0076/0077/0073):
@@ -30,7 +33,8 @@
  *
  * Determinism: every function is pure over its text input — no clock, no
  * randomness, no network — and the module takes no LLM client at all, so
- * the fast dispatch leg in method.ts cannot dial a model even by accident.
+ * the fast dispatch leg in method.ts cannot dial a model from inside
+ * extraction.
  *
  * Confidence mapping: `weight / (weight + 1)` keeps the [0,1] contract of
  * `ExtractionOutput.confidence` while the count stays monotone in it.

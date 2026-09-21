@@ -15,6 +15,7 @@ import {
   buildClaimsPrompt,
   buildDescribePrompt,
   buildExtractionPrompt,
+  buildJudgePrompt,
 } from "./prompt.js";
 import {
   type ClaimOutput,
@@ -25,6 +26,9 @@ import {
   type EntityDescriptionDraft,
   type ExtractionOutput,
   type ExtractionResponse,
+  type JudgeInput,
+  type JudgeResponse,
+  type TripleVerdict,
 } from "./types.js";
 
 /** Public contract — every adapter implements `extract`; the T3 enrichment
@@ -45,6 +49,16 @@ export interface LLMClient {
    * chunk (ADR 0071, T3). Same sealed-failure posture as describeEntities.
    */
   extractClaims?(input: ClaimsInput): Promise<ClaimsResponse>;
+  /**
+   * Groundedness judge: answer yes/no whether each
+   * candidate triple is grounded in the chunk text. OPTIONAL on the
+   * interface like the enrichment methods, but unlike them the pipeline
+   * FAIL-CLOSES without it — a client carrying no judge never persists a
+   * proposal (see judge.ts `judgeProposals`). Sealed-failure posture: the
+   * adapter returns `{kind:"failed"}` on transport/format misses and may
+   * throw; both are judge-down, not a crash.
+   */
+  judgeGrounding?(input: JudgeInput): Promise<JudgeResponse>;
   /**
    * Model id surfaced for process logs (SC10). Optional so test doubles and
    * unwired stubs stay source-compatible; production adapters set it.
@@ -82,8 +96,21 @@ const CLAIMS_SYSTEM = [
   "Emit raw JSON only — no prose, no markdown fences.",
 ].join(" ");
 
-/** Zod schema mirrors ExtractionOutput; runtime parse step before returning ok. */
-const ExtractionOutputSchema = z.object({
+/** Role line for the groundedness judge call. */
+const JUDGE_SYSTEM = [
+  "You judge whether each candidate triple is grounded in the chunk given in the user message.",
+  "Follow the output schema stated there exactly.",
+  "Emit raw JSON only — no prose, no markdown fences.",
+].join(" ");
+
+/**
+ * Zod schema mirrors ExtractionOutput; runtime parse step before returning ok.
+ * Exported so the review lane (judge.ts ProposalPayloadSchema) replays a
+ * stored proposal through the SAME field contract. `extractor` is optional:
+ * the fast method stamps its provenance onto outputs, and a payload replay
+ * must preserve rather than strip it.
+ */
+export const ExtractionOutputSchema = z.object({
   head: z.string().min(1),
   headType: z.string().min(1),
   relationRaw: z.string().min(1),
@@ -93,6 +120,7 @@ const ExtractionOutputSchema = z.object({
   description: z.string().min(1),
   evidenceSpan: z.string().min(1),
   confidence: z.number().min(0).max(1),
+  extractor: z.string().optional(),
 });
 
 /** One describe item: `{entity, description}` — `entity` is the survivor name. */
@@ -114,6 +142,16 @@ const ClaimItemSchema = z.object({
   validTo: z.string().nullable().optional(),
   confidence: z.number().min(0).max(1),
   evidenceSpan: z.string().optional(),
+});
+
+/**
+ * One judge verdict. `grounded` rides the wire as the
+ * literal "yes"/"no" the spec's judge answers, mapped to a boolean below.
+ */
+const JudgeItemSchema = z.object({
+  index: z.number().int().min(0),
+  grounded: z.enum(["yes", "no"]),
+  reason: z.string(),
 });
 
 interface MessageLike {
@@ -324,6 +362,33 @@ export class AnthropicLLMClient implements LLMClient {
     }));
     return { kind: "ok", claims };
   }
+
+  /**
+   * Groundedness judge call. Same #4 D4 transport
+   * posture as the other surfaces (5xx retried, 4xx fast-fail); a format
+   * miss is NOT retried here — the gate fail-closes a judge that cannot
+   * answer cleanly, so a second billable call would only delay the sealed
+   * failure.
+   */
+  async judgeGrounding(input: JudgeInput): Promise<JudgeResponse> {
+    const http = await this.callWithHttpRetries(
+      buildJudgePrompt(input.chunkText, input.candidates),
+      JUDGE_SYSTEM
+    );
+    if (http.kind !== "ok") {
+      return { kind: "failed", errorCode: http.kind, errorMsg: http.message };
+    }
+    const parsed = tryParseEnvelope(http.message, "verdicts", JudgeItemSchema);
+    if (!parsed.ok) {
+      return { kind: "failed", errorCode: "format", errorMsg: parsed.error };
+    }
+    const verdicts: TripleVerdict[] = parsed.items.map((item) => ({
+      index: item.index,
+      grounded: item.grounded === "yes",
+      reason: item.reason,
+    }));
+    return { kind: "ok", verdicts };
+  }
 }
 
 /**
@@ -405,6 +470,13 @@ function defaultSleep(ms: number): Promise<void> {
  * methods. Unconfigured → the method property stays ABSENT, so the pipeline
  * sees a client without the capability (exactly what the plain-fake tests
  * assert); configured but drained → throws "… queue exhausted".
+ *
+ * The judge gate: `judgeQueue` / `scriptedJudge` configure `judgeGrounding`;
+ * UNCONFIGURED the fake AUTO-ACCEPTS every candidate. That is deliberate and
+ * safe because the fake never reaches production: the pipeline's fail-closed
+ * posture for an ABSENT adapter is pinned with a bare-object client, not
+ * with this fake (the enrichment-style "absent" default would make every
+ * pre-existing persist-path test dial a judge with no answer).
  */
 export interface FakeLLMClientOpts {
   queue?: ExtractionResponse[];
@@ -415,6 +487,8 @@ export interface FakeLLMClientOpts {
   scriptedDescribe?: (input: DescribeInput) => Promise<DescribeResponse>;
   claimsQueue?: ClaimsResponse[];
   scriptedClaims?: (input: ClaimsInput) => Promise<ClaimsResponse>;
+  judgeQueue?: JudgeResponse[];
+  scriptedJudge?: (input: JudgeInput) => Promise<JudgeResponse>;
 }
 
 export class FakeLLMClient implements LLMClient {
@@ -430,6 +504,10 @@ export class FakeLLMClient implements LLMClient {
   private claimsHead = 0;
   private readonly scriptedClaims:
     ((input: ClaimsInput) => Promise<ClaimsResponse>) | undefined;
+  private readonly judgeQueue: JudgeResponse[] | undefined;
+  private judgeHead = 0;
+  private readonly scriptedJudge:
+    ((input: JudgeInput) => Promise<JudgeResponse>) | undefined;
 
   /** Surfaced for the SC10 process-log field whitelist. */
   readonly modelId: string | undefined;
@@ -442,6 +520,12 @@ export class FakeLLMClient implements LLMClient {
   readonly describeEntities?: (input: DescribeInput) => Promise<DescribeResponse>;
   readonly extractClaims?: (input: ClaimsInput) => Promise<ClaimsResponse>;
 
+  /**
+   * Judge leg — ALWAYS present on the fake (auto-accept when neither
+   * `judgeQueue` nor `scriptedJudge` is configured; see the opts doc).
+   */
+  readonly judgeGrounding: (input: JudgeInput) => Promise<JudgeResponse>;
+
   constructor(opts: FakeLLMClientOpts) {
     if (!opts.queue && !opts.scripted) {
       throw new Error("FakeLLMClient requires queue or scripted");
@@ -453,6 +537,8 @@ export class FakeLLMClient implements LLMClient {
     this.scriptedDescribe = opts.scriptedDescribe;
     this.claimsQueue = opts.claimsQueue;
     this.scriptedClaims = opts.scriptedClaims;
+    this.judgeQueue = opts.judgeQueue;
+    this.scriptedJudge = opts.scriptedJudge;
     if (opts.describeQueue || opts.scriptedDescribe) {
       this.describeEntities = async (input) => {
         if (this.scriptedDescribe) return this.scriptedDescribe(input);
@@ -465,6 +551,20 @@ export class FakeLLMClient implements LLMClient {
         return this.take(this.claimsQueue!, this.claimsHead++, "claims");
       };
     }
+    this.judgeGrounding = async (input) => {
+      if (this.scriptedJudge) return this.scriptedJudge(input);
+      if (this.judgeQueue) {
+        return this.take(this.judgeQueue, this.judgeHead++, "judge");
+      }
+      return {
+        kind: "ok",
+        verdicts: input.candidates.map((_, index) => ({
+          index,
+          grounded: true,
+          reason: "fake: auto-accept",
+        })),
+      };
+    };
   }
 
   async extract(chunkText: string): Promise<ExtractionResponse> {

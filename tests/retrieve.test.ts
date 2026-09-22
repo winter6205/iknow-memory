@@ -4,8 +4,8 @@ import { FakeEmbedder } from "../src/core/embedder.js";
 import { MemoryBackend } from "../src/core/storage/memory-backend.js";
 import { GraphragError } from "../src/core/errors.js";
 import {
+  INVALID_SEARCH_MODE_REASON,
   REAL_DB_NOT_WIRED_REASON,
-  SEARCH_MODE_ALIASES,
   SEARCH_MODE_WIRE_COPY,
 } from "../src/core/retrieval/search-mode.js";
 import { ENTITY_TYPES } from "../src/core/extraction/entity-type.js";
@@ -263,11 +263,11 @@ describe("createRetrieveHandler", () => {
 
   // plans/search-mode-retrieve.md T1: `filters.search_mode` is a routing
   // control, not a chunk-matching filter. Missing → today's graph-priority
-  // B; outside the closed set → typed INVALID_INPUT carrying a stable
-  // host-mappable reason token (never a healthy empty `chunks` with no
-  // reason). T2 opened A as the lexical child-hit → parent-body arm
-  // (ADR-0060); T3 opened C report-first; T4 replaced D's provisional row
-  // with the typed `real_db_not_wired` refusal.
+  // route; outside the closed word-form set (single letters included) → typed
+  // INVALID_INPUT carrying a stable host-mappable reason token (never a
+  // healthy empty `chunks` with no reason). T2 opened `lexical` as the child
+  // hit → parent-body arm (ADR-0060); T3 opened `global` report-first; T4
+  // opened `sql` with the typed `real_db_not_wired` refusal.
   describe("filters.search_mode (T1)", () => {
     const HYBRID_CONFIG = {
       w_vec: 0.7,
@@ -288,14 +288,14 @@ describe("createRetrieveHandler", () => {
       ]);
     });
 
-    it("missing key keeps the exact B behavior of an explicit B", async () => {
+    it("missing key keeps the exact behavior of an explicit graph", async () => {
       const withoutMode = await handler({
         query: "anything",
         filters: { source_ref: "docs/x.md" },
       });
       const withMode = await handler({
         query: "anything",
-        filters: { source_ref: "docs/x.md", search_mode: "B" },
+        filters: { source_ref: "docs/x.md", search_mode: "graph" },
       });
       expect(parseResultBody(withMode)).toEqual(parseResultBody(withoutMode));
       expect(parseResultBody(withoutMode).chunks.map((c) => c.id)).toEqual([
@@ -323,62 +323,77 @@ describe("createRetrieveHandler", () => {
 
     it("a rejected mode does not fall through to a healthy empty envelope", async () => {
       // The negative path must not be reachable as a `{ chunks: [] }`
-      // success either way of spelling the invalid value.
-      for (const bad of ["", "b", "local"]) {
+      // success either way of spelling the invalid value — single letters
+      // included: the wire is word-form only.
+      for (const bad of ["", "b", "local", "A", "B", "C", "D"]) {
         await expect(
           handler({ query: "anything", filters: { search_mode: bad } })
         ).rejects.toBeInstanceOf(GraphragError);
       }
+      let letterThrown: unknown;
+      try {
+        await handler({ query: "anything", filters: { search_mode: "B" } });
+      } catch (err) {
+        letterThrown = err;
+      }
+      const error = letterThrown as GraphragError;
+      expect(error.code).toBe("INVALID_INPUT");
+      expect(error.message).toContain(INVALID_SEARCH_MODE_REASON);
     });
 
-    it("valid A/C/D parse; C types not-ready, D types unwired, A runs its own", async () => {
+    it("lexical, global and sql each run their own arm: not-ready and unwired type out", async () => {
       const baseline = await handler({ query: "anything" });
-      // T4 opened D's row: the closed 档 whose SQL path does not exist yet
-      // is the typed `real_db_not_wired` refusal — never a provisional B
-      // answer over chunks (spec SC5: not fake SQL over document chunks).
-      let thrownD: unknown;
+      // T4 opened the `sql` row: the closed 档 whose SQL path does not exist
+      // yet is the typed `real_db_not_wired` refusal — never a provisional
+      // graph answer over chunks (spec SC5: not fake SQL over document chunks).
+      let thrownSql: unknown;
       try {
-        await handler({ query: "anything", filters: { search_mode: "D" } });
+        await handler({ query: "anything", filters: { search_mode: "sql" } });
       } catch (err) {
-        thrownD = err;
+        thrownSql = err;
       }
-      expect(thrownD).toBeInstanceOf(GraphragError);
-      expect((thrownD as GraphragError).message).toContain(
+      expect(thrownSql).toBeInstanceOf(GraphragError);
+      expect((thrownSql as GraphragError).message).toContain(
         REAL_DB_NOT_WIRED_REASON
       );
-      // T3 opened C: a backend without a READY `community_index_state`
-      // row is the typed `community_summary_index_failure` exit — it
-      // neither answers like B nor degrades into a healthy empty.
-      let thrownC: unknown;
+      // T3 opened `global`: a backend without a READY `community_index_state`
+      // row is the typed `community_summary_index_failure` exit — it neither
+      // answers like graph nor degrades into a healthy empty.
+      let thrownGlobal: unknown;
       try {
-        await handler({ query: "anything", filters: { search_mode: "C" } });
+        await handler({
+          query: "anything",
+          filters: { search_mode: "global" },
+        });
       } catch (err) {
-        thrownC = err;
+        thrownGlobal = err;
       }
-      expect(thrownC).toBeInstanceOf(GraphragError);
-      expect((thrownC as GraphragError).message).toContain(
+      expect(thrownGlobal).toBeInstanceOf(GraphragError);
+      expect((thrownGlobal as GraphragError).message).toContain(
         COMMUNITY_SUMMARY_INDEX_FAILURE
       );
-      // T2: A is no longer the B arm. The fixture's chunks carry no parent
-      // back-pointers, and the query terms match no chunk content, so the
-      // lexical-first A finds nothing: a healthy empty answer, visibly NOT
-      // the B arm's vector result of [x, y].
-      const aResult = await handler({
-        query: "anything",
-        filters: { search_mode: "A" },
-      });
-      const aBody = parseResultBody(aResult);
-      expect(aBody.chunks).toEqual([]);
-      expect(aBody).not.toHaveProperty("degraded");
+      // T2: `lexical` is not the graph arm. The fixture's chunks carry no
+      // parent back-pointers, and the query terms match no chunk content, so
+      // the lexical-first route finds nothing: a healthy empty answer,
+      // visibly NOT the graph arm's vector result of [x, y].
+      const lexicalBody = parseResultBody(
+        await handler({
+          query: "anything",
+          filters: { search_mode: "lexical" },
+        })
+      );
+      expect(lexicalBody.chunks).toEqual([]);
+      expect(lexicalBody).not.toHaveProperty("degraded");
       expect(parseResultBody(baseline).chunks).toHaveLength(2);
     });
 
     it("search_mode never reaches the lexical arm's exact-match filters", async () => {
       // Regression guard for the ES precision layer, which turns every
       // filter key into a term clause: a leaked `search_mode` would match
-      // no indexed field and silently zero the BM25 arm. Explicit B is the
-      // probe — it runs the B pipeline end to end. (T4 made D type out
-      // before any arm reads filters, so it can no longer serve as one.)
+      // no indexed field and silently zero the BM25 arm. An explicit
+      // `graph` is the probe — it runs that pipeline end to end. (T4 made
+      // `sql` type out before any arm reads filters, so it can no longer
+      // serve as one.)
       const lexical = new RecordingLexicalBackend(TEST_DIM);
       const hybridHandler = createRetrieveHandler({
         embedder: new FakeEmbedder(TEST_DIM),
@@ -388,22 +403,22 @@ describe("createRetrieveHandler", () => {
       });
       const result = await hybridHandler({
         query: "anything",
-        filters: { source_ref: "docs/x.md", search_mode: "B" },
+        filters: { source_ref: "docs/x.md", search_mode: "graph" },
       });
       expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
       for (const filters of lexical.lexicalFilterCalls) {
         expect(filters).not.toHaveProperty("search_mode");
         expect(filters?.source_ref).toBe("docs/x.md");
       }
-      // B answers through the hybrid pipeline, un-degraded.
+      // The graph route answers through the hybrid pipeline, un-degraded.
       expect(parseResultBody(result).chunks.map((c) => c.id)).toEqual(["x"]);
     });
   });
 
-  // specs/search-mode-graph-global.md: the lasting wire tokens are `graph`
-  // (the knowledge-QA arm) and `global` (the report-first arm). The retired
-  // letters B/C stay accepted while a host migrates, and must land on the
-  // SAME arm as their lasting token — same envelope, no second behavior.
+  // specs/search-mode-graph-global.md: `graph` (the knowledge-QA arm) and
+  // `global` (the report-first arm) are distinct wire tokens with distinct
+  // arms — an omitted mode answers through `graph`, and a letter never
+  // stands in for either.
   describe("search_mode graph/global routing", () => {
     beforeEach(async () => {
       await backend.upsert([
@@ -446,16 +461,11 @@ describe("createRetrieveHandler", () => {
       });
     }
 
-    it("graph runs the knowledge-QA arm and answers byte-for-byte like B", async () => {
+    it("graph runs the knowledge-QA arm", async () => {
       const graph = await handler({
         query: "anything",
         filters: { search_mode: "graph" },
       });
-      const letter = await handler({
-        query: "anything",
-        filters: { search_mode: "B" },
-      });
-      expect(parseResultBody(graph)).toEqual(parseResultBody(letter));
       // It really ran the vector/graph-priority assembler, not an empty pass.
       expect(
         parseResultBody(graph)
@@ -473,18 +483,14 @@ describe("createRetrieveHandler", () => {
       expect(parseResultBody(omitted)).toEqual(parseResultBody(graph));
     });
 
-    it("global runs the report-first arm and answers byte-for-byte like C", async () => {
+    it("global runs the report-first arm on a ready ledger", async () => {
       const reportHandler = await readyReportHandler();
-      const lasting = await reportHandler({
-        query: "anything",
-        filters: { search_mode: "global", c_drop_windows: "0" },
-      });
-      const letter = await reportHandler({
-        query: "anything",
-        filters: { search_mode: "C", c_drop_windows: "0" },
-      });
-      const body = parseResultBody(lasting);
-      expect(body).toEqual(parseResultBody(letter));
+      const body = parseResultBody(
+        await reportHandler({
+          query: "anything",
+          filters: { search_mode: "global", c_drop_windows: "0" },
+        })
+      );
       expect(body.chunks.map((c) => c.id)).toEqual(["sum-1"]);
       expect(body.chunks[0]!.metadata?.kind).toBe("community-summary");
       expect(body).not.toHaveProperty("degraded");
@@ -513,24 +519,32 @@ describe("createRetrieveHandler", () => {
         thrownLetter = err;
       }
       const error = thrown as GraphragError;
-      // Same typed fact either way it is spelled: the copy names the CANONICAL
-      // token, so a host that sent the `C` alias is not handed a different
-      // string to map on.
+      // The refusal copy names the CANONICAL token it was routed from.
       expect(error.message).toContain(COMMUNITY_SUMMARY_INDEX_FAILURE);
       expect(error.message).toContain("search_mode=global");
-      expect((thrownLetter as GraphragError).message).toBe(error.message);
+      // A letter never reaches this arm at all: it is refused earlier with
+      // the invalid token, and its message never borrows the not-ready one.
+      const letterError = thrownLetter as GraphragError;
+      expect(letterError).toBeInstanceOf(GraphragError);
+      expect(letterError.message).toContain(INVALID_SEARCH_MODE_REASON);
+      expect(letterError.message).not.toContain(
+        COMMUNITY_SUMMARY_INDEX_FAILURE
+      );
       expect(
         parseResultBody(await handler({ query: "anything" })).chunks.length
       ).toBeGreaterThan(0);
     });
 
-    it("A and D keep their own arms under the widened token set", async () => {
-      const aBody = parseResultBody(
-        await handler({ query: "anything", filters: { search_mode: "A" } })
+    it("lexical and sql keep their own arms", async () => {
+      const lexicalBody = parseResultBody(
+        await handler({
+          query: "anything",
+          filters: { search_mode: "lexical" },
+        })
       );
-      expect(aBody.chunks).toEqual([]);
+      expect(lexicalBody.chunks).toEqual([]);
       await expect(
-        handler({ query: "anything", filters: { search_mode: "D" } })
+        handler({ query: "anything", filters: { search_mode: "sql" } })
       ).rejects.toBeInstanceOf(GraphragError);
     });
   });
@@ -660,12 +674,12 @@ describe("createRetrieveHandler", () => {
     });
   });
 
-  // plans/search-mode-retrieve.md T3 (fin ADR-0070): 档 C report-first over
-  // the community summaries. Handler-level acceptance on the fake fixture:
-  // a C-ready ledger answers with summary rows on the wire, and the
+  // plans/search-mode-retrieve.md T3 (fin ADR-0070): the `global` report-first
+  // arm over the community summaries. Handler-level acceptance on the fake
+  // fixture: a ready ledger answers with summary rows on the wire, and the
   // `c_drop_windows` routing key never becomes an exact-match filter.
-  describe("search_mode=C report-first (T3)", () => {
-    it("answers summary-row hits through the wire when C is ready", async () => {
+  describe("search_mode=global report-first (T3)", () => {
+    it("answers summary-row hits through the wire when the ledger is ready", async () => {
       const ready = new MemoryBackend(TEST_DIM);
       await ready.setCommunityIndexState({
         status: COMMUNITY_INDEX_STATUS.READY,
@@ -689,13 +703,13 @@ describe("createRetrieveHandler", () => {
           },
         },
       }) as MemoryBackend;
-      const cHandler = createRetrieveHandler({
+      const globalHandler = createRetrieveHandler({
         embedder: new FakeEmbedder(TEST_DIM),
         storage,
       });
-      const result = await cHandler({
+      const result = await globalHandler({
         query: "anything",
-        filters: { search_mode: "C", c_drop_windows: "0" },
+        filters: { search_mode: "global", c_drop_windows: "0" },
       });
       const body = parseResultBody(result);
       expect(body.chunks).toHaveLength(1);
@@ -706,10 +720,10 @@ describe("createRetrieveHandler", () => {
     });
   });
 
-  // plans/search-mode-retrieve.md T2 (ADR-0060): 档 A ranks in-window
-  // children lexically and cites the PARENT 抽图窗 body. Acceptance fixture
-  // below: an A query that hits the child returns the parent text.
-  describe("search_mode=A child hit returns parent text (T2)", () => {
+  // plans/search-mode-retrieve.md T2 (ADR-0060): the `lexical` 档 ranks
+  // in-window children and cites the PARENT 抽图窗 body. Acceptance fixture
+  // below: a lexical query that hits the child returns the parent text.
+  describe("search_mode=lexical child hit returns parent text (T2)", () => {
     const PARENT_BODY =
       "the whole extract window body about quantum tunneling with extra context";
 
@@ -734,10 +748,10 @@ describe("createRetrieveHandler", () => {
       ]);
     });
 
-    it("A query hitting the child puts the parent body in chunks[] text", async () => {
+    it("a lexical query hitting the child puts the parent body in chunks[] text", async () => {
       const result = await handler({
         query: "quantum tunneling",
-        filters: { search_mode: "A" },
+        filters: { search_mode: "lexical" },
       });
       const body = parseResultBody(result);
       expect(body.chunks).toHaveLength(1);
@@ -753,30 +767,31 @@ describe("createRetrieveHandler", () => {
       expect(body).not.toHaveProperty("degraded");
     });
 
-    it("A never routes through the B vector arm for the same query", async () => {
-      // A graph-priority-B-shaped answer would cite the child id with the
-      // child slice text; assert the A envelope is categorically different.
-      const aBody = parseResultBody(
+    it("lexical never routes through the graph vector arm", async () => {
+      // A graph-priority-shaped answer would cite the child id with the
+      // child slice text; assert the lexical envelope is categorically
+      // different.
+      const lexicalBody = parseResultBody(
         await handler({
           query: "quantum tunneling",
-          filters: { search_mode: "A" },
+          filters: { search_mode: "lexical" },
         })
       );
-      expect(aBody.chunks.map((c) => c.id)).toEqual(["doc-parent"]);
+      expect(lexicalBody.chunks.map((c) => c.id)).toEqual(["doc-parent"]);
     });
 
-    it("A strips search_mode before the lexical seam sees the filters", async () => {
-      // Same leak guard the C test gives the provisional row, now pinned
-      // for the arm that actually consumes the lexical seam directly.
+    it("lexical strips search_mode before the lexical seam sees the filters", async () => {
+      // Same leak guard the global path gets, now pinned for the arm that
+      // actually consumes the lexical seam directly.
       const lexical = new RecordingLexicalBackend(TEST_DIM);
-      const aHandler = createRetrieveHandler({
+      const lexicalHandler = createRetrieveHandler({
         embedder: new FakeEmbedder(TEST_DIM),
         storage: backend,
         lexical,
       });
-      await aHandler({
+      await lexicalHandler({
         query: "quantum tunneling",
-        filters: { source_ref: "docs/parent.md", search_mode: "A" },
+        filters: { source_ref: "docs/parent.md", search_mode: "lexical" },
       });
       expect(lexical.lexicalFilterCalls.length).toBeGreaterThan(0);
       for (const filters of lexical.lexicalFilterCalls) {
@@ -786,11 +801,11 @@ describe("createRetrieveHandler", () => {
     });
   });
 
-  // Review repair I2: `c_drop_windows` is 档 C's ROUTING switch, not chunk
-  // metadata — in A/B/D it must be stripped by the dispatcher like
-  // `search_mode`, because the ES precision layer turns every key in the
-  // exact-match filters into a term clause and silently zeros the arm
-  // (the failure mode wire-filters.ts exists to prevent).
+  // Review repair I2: `c_drop_windows` is the `global` 档's ROUTING switch,
+  // not chunk metadata — in `lexical`/`graph`/`sql` it must be stripped by
+  // the dispatcher like `search_mode`, because the ES precision layer turns
+  // every key in the exact-match filters into a term clause and silently
+  // zeros the arm (the failure mode wire-filters.ts exists to prevent).
   describe("c_drop_windows routing strip (I2)", () => {
     /**
      * Lexical double with the ES precision layer's exact-match contract:
@@ -816,7 +831,7 @@ describe("createRetrieveHandler", () => {
       }
     }
 
-    it("档 A: the switch never reaches the lexical arm and never zeroes it", async () => {
+    it("档 lexical: the switch never reaches the lexical arm and never zeroes it", async () => {
       await backend.upsertSourceDoc({
         id: "doc-parent",
         source_ref: "docs/parent.md",
@@ -855,7 +870,7 @@ describe("createRetrieveHandler", () => {
           query: "quantum tunneling",
           filters: {
             source_ref: "docs/parent.md",
-            search_mode: "A",
+            search_mode: "lexical",
             c_drop_windows: "0",
           },
         })
@@ -868,7 +883,7 @@ describe("createRetrieveHandler", () => {
       expect(body.chunks.map((c) => c.id)).toEqual(["doc-parent"]);
     });
 
-    it("档 B: the hybrid lexical arm never sees the routing key", async () => {
+    it("档 graph: the hybrid lexical arm never sees the routing key", async () => {
       await backend.upsert([
         makeChunk({ id: "x", source_ref: "docs/x.md" }),
         makeChunk({ id: "y", source_ref: "docs/y.md" }),
@@ -880,7 +895,7 @@ describe("createRetrieveHandler", () => {
         makeChunk({ id: "x", source_ref: "docs/x.md" }),
         makeChunk({ id: "y", source_ref: "docs/y.md" }),
       ]);
-      const bHandler = createRetrieveHandler({
+      const graphHandler = createRetrieveHandler({
         embedder: new FakeEmbedder(TEST_DIM),
         storage: backend,
         lexical,
@@ -899,18 +914,18 @@ describe("createRetrieveHandler", () => {
         },
       });
       const baseline = parseResultBody(
-        await bHandler({
+        await graphHandler({
           query: "anything",
-          filters: { source_ref: "docs/x.md", search_mode: "B" },
+          filters: { source_ref: "docs/x.md", search_mode: "graph" },
         })
       );
       lexical.lexicalFilterCalls.length = 0;
       const withSwitch = parseResultBody(
-        await bHandler({
+        await graphHandler({
           query: "anything",
           filters: {
             source_ref: "docs/x.md",
-            search_mode: "B",
+            search_mode: "graph",
             c_drop_windows: "0",
           },
         })
@@ -923,11 +938,11 @@ describe("createRetrieveHandler", () => {
       expect(withSwitch).toEqual(baseline);
     });
 
-    it("档 C wire: the dispatcher strip keeps c_drop_windows=0 switching the drop off", async () => {
-      // Regression guard for the C path across the dispatcher-side strip:
-      // the switch is resolved from the raw filters, so the off-value
-      // still reaches the arm as a typed control, and a request without
-      // it still fills windows.
+    it("档 global wire: the dispatcher strip keeps c_drop_windows=0 switching the drop off", async () => {
+      // Regression guard for the global path across the dispatcher-side
+      // strip: the switch is resolved from the raw filters, so the
+      // off-value still reaches the arm as a typed control, and a request
+      // without it still fills windows.
       const ready = new MemoryBackend(TEST_DIM);
       await ready.setCommunityIndexState({
         status: COMMUNITY_INDEX_STATUS.READY,
@@ -952,19 +967,22 @@ describe("createRetrieveHandler", () => {
           },
         },
       }) as MemoryBackend;
-      const cHandler = createRetrieveHandler({
+      const globalHandler = createRetrieveHandler({
         embedder: new FakeEmbedder(TEST_DIM),
         storage,
       });
       const off = parseResultBody(
-        await cHandler({
+        await globalHandler({
           query: "anything",
-          filters: { search_mode: "C", c_drop_windows: "0" },
+          filters: { search_mode: "global", c_drop_windows: "0" },
         })
       );
       expect(off.chunks.map((c) => c.id)).toEqual(["sum-1"]);
       const on = parseResultBody(
-        await cHandler({ query: "anything", filters: { search_mode: "C" } })
+        await globalHandler({
+          query: "anything",
+          filters: { search_mode: "global" },
+        })
       );
       expect(on.chunks.map((c) => c.id)).toEqual(["sum-1", "win-1"]);
     });
@@ -1175,10 +1193,10 @@ describe("retrieveTool", () => {
     expect(typeof tool.handler).toBe("function");
   });
 
-  it("advertises the search_mode closed set and names B/C as accepted aliases", () => {
+  it("advertises the search_mode closed set and no letters", () => {
     // The description is the operator-visible contract: a host reading it
-    // must learn both the lasting tokens and that the retired letters still
-    // work during migration — and must not be told the default is a letter.
+    // must learn the four word-form tokens and nothing else — no letter
+    // routes, and the default is named as a token, not a letter.
     // It quotes the SAME derived sentence the invalid-value refusal uses
     // (review M1), so a widen or contract step cannot leave one half stale.
     const tool = retrieveTool({
@@ -1186,11 +1204,14 @@ describe("retrieveTool", () => {
       storage: new MemoryBackend(TEST_DIM),
     });
     expect(tool.description).toContain(SEARCH_MODE_WIRE_COPY);
-    for (const [letter, mode] of Object.entries(SEARCH_MODE_ALIASES)) {
-      expect(tool.description).toContain(`${letter}=${mode}`);
-    }
+    // Deliberate SECOND, non-derived assertion (review L3): SEARCH_MODE_WIRE_COPY
+    // is `SEARCH_MODES.join(" | ")`, so the line above cannot see the SSOT's
+    // ORDER or spelling change — a reorder or a renamed token would keep the
+    // derived copy and the description in perfect agreement while the wire
+    // contract silently moved. This literal is the canary for exactly that.
+    expect(tool.description).toContain("lexical | graph | global | sql");
+    expect(tool.description).not.toMatch(/\b[ABCD]\b/);
     expect(tool.description).toContain("defaults to graph");
-    expect(tool.description).not.toMatch(/A \| B \| C \| D/);
   });
 
   it("advertises the entity_type values derived from the ENTITY_TYPES SSOT", () => {

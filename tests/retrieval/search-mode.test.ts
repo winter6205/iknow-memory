@@ -2,20 +2,18 @@
  * search-mode unit tests (plans/search-mode-retrieve.md T1).
  *
  * Pins the three contracts the seam owns:
- *   1. the closed set A|graph|global|D — missing key resolves to `graph`,
- *      anything else is an INVALID (never a silent fallback);
+ *   1. the closed set lexical|graph|global|sql — word-form tokens matched
+ *      verbatim, missing key resolves to `graph`, anything else (single
+ *      letters included) is an INVALID (never a silent fallback);
  *   2. `search_mode` is a routing control and must be stripped before the
  *      filters reach exact-match backends (the ES precision layer turns every
  *      filter key into a term clause, so an unstripped key would silently
  *      zero the lexical arm);
  *   3. the dispatch table exists for all four modes: `graph` is the
- *      graph-priority assembler, A the lexical child→parent arm, `global`
- *      the report-first arm, D the typed unwired refusal (the closed 档 whose
- *      product fact is `real_db_not_wired`, never a provisional `graph`
- *      answer);
- *   4. the retired letters `B`/`C` resolve to their lasting token instead of
- *      becoming extra dispatch rows, so a host mid-migration keeps answering
- *      (specs/search-mode-graph-global.md confirmed assumption 2).
+ *      graph-priority assembler, `lexical` the child→parent arm, `global`
+ *      the report-first arm, `sql` the typed unwired refusal (the closed 档
+ *      whose product fact is `real_db_not_wired`, never a provisional
+ *      `graph` answer).
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -23,7 +21,6 @@ import {
   INVALID_SEARCH_MODE_REASON,
   REAL_DB_NOT_WIRED_REASON,
   SEARCH_MODES,
-  SEARCH_MODE_ALIASES,
   SEARCH_MODE_ARMS,
   SEARCH_MODE_FILTER_KEY,
   SEARCH_MODE_WIRE_COPY,
@@ -41,7 +38,7 @@ import { modeCReportFirstArm } from "../../src/core/retrieval/mode-c-arm.js";
 
 describe("parseSearchMode", () => {
   it("names the closed set exactly, so the wire has one authoritative token list", () => {
-    expect([...SEARCH_MODES]).toEqual(["A", "graph", "global", "D"]);
+    expect([...SEARCH_MODES]).toEqual(["lexical", "graph", "global", "sql"]);
   });
 
   it("defaults to graph when filters are absent", () => {
@@ -58,7 +55,7 @@ describe("parseSearchMode", () => {
     });
   });
 
-  it("reports the lasting default token, not the retired letter it replaced", () => {
+  it("reports the default token, and the default is a member of the set", () => {
     expect(DEFAULT_SEARCH_MODE).toBe("graph");
     expect(SEARCH_MODES).toContain(DEFAULT_SEARCH_MODE);
   });
@@ -72,38 +69,30 @@ describe("parseSearchMode", () => {
     }
   });
 
-  it("accepts B and C as aliases and reports the lasting token", () => {
-    // The retired letters stay routable only while hosts migrate; what
-    // downstream sees is always the lasting token, never the letter.
-    expect(parseSearchMode({ search_mode: "B" })).toEqual({
-      kind: "resolved",
-      mode: "graph",
-    });
-    expect(parseSearchMode({ search_mode: "C" })).toEqual({
-      kind: "resolved",
-      mode: "global",
-    });
-  });
-
-  it("derives the alias targets from the lasting closed set", () => {
-    for (const [letter, mode] of Object.entries(SEARCH_MODE_ALIASES)) {
-      expect(SEARCH_MODES).toContain(mode);
-      expect(letter).not.toBe(mode);
+  it("types every single letter invalid, resolving nothing", () => {
+    // The wire is word-form only: no letter, however spelled, may stand in
+    // for a token or pick up a route of its own.
+    for (const letter of ["A", "B", "C", "D"]) {
+      expect(parseSearchMode({ search_mode: letter })).toEqual({
+        kind: "invalid",
+        value: letter,
+      });
     }
   });
 
-  it("reports invalid for a value outside the closed set and outside the aliases", () => {
+  it("matches the tokens verbatim: casing and stray whitespace are invalid", () => {
     for (const bad of [
       "E",
       "b",
       "",
       "  ",
-      "A ",
       "local",
       "Graph",
       "Global",
+      "Lexical",
+      "SQL",
       "graph ",
-      "B ",
+      " lexical",
     ]) {
       expect(parseSearchMode({ search_mode: bad })).toEqual({
         kind: "invalid",
@@ -112,9 +101,9 @@ describe("parseSearchMode", () => {
     }
   });
 
-  it("reports invalid for an object-inherited key name, not an alias hit", () => {
-    // Alias lookup on a plain object literal would otherwise resolve
-    // inherited members like `toString` to a non-token value.
+  it("reports invalid for an object-inherited key name, not a token hit", () => {
+    // Membership is a fixed-list check, so inherited members like
+    // `toString` can never be called a 档.
     for (const bad of ["toString", "constructor", "__proto__"]) {
       expect(parseSearchMode({ search_mode: bad })).toEqual({
         kind: "invalid",
@@ -124,8 +113,8 @@ describe("parseSearchMode", () => {
   });
 
   it("keeps other filter keys untouched (a rejected mode must not look like a parse-side mutation)", () => {
-    const filters = { source_ref: "docs/a.md", search_mode: "E" };
-    expect(parseSearchMode(filters)).toEqual({ kind: "invalid", value: "E" });
+    const filters = { source_ref: "docs/a.md", search_mode: "B" };
+    expect(parseSearchMode(filters)).toEqual({ kind: "invalid", value: "B" });
     expect(filters.source_ref).toBe("docs/a.md");
   });
 });
@@ -142,7 +131,7 @@ describe("stripSearchModeFilter", () => {
 
   it("removes only the search_mode key", () => {
     expect(
-      stripSearchModeFilter({ search_mode: "C", source_ref: "docs/a.md" })
+      stripSearchModeFilter({ search_mode: "sql", source_ref: "docs/a.md" })
     ).toEqual({ source_ref: "docs/a.md" });
     expect(
       stripSearchModeFilter({ search_mode: "global", source_ref: "docs/a.md" })
@@ -150,30 +139,23 @@ describe("stripSearchModeFilter", () => {
   });
 
   it("yields undefined when search_mode was the only key", () => {
-    expect(stripSearchModeFilter({ search_mode: "D" })).toBeUndefined();
+    expect(stripSearchModeFilter({ search_mode: "lexical" })).toBeUndefined();
   });
 
   it("does not mutate the caller's object", () => {
-    const filters = { search_mode: "A", source_ref: "docs/a.md" };
+    const filters = { search_mode: "lexical", source_ref: "docs/a.md" };
     stripSearchModeFilter(filters);
-    expect(filters).toEqual({ search_mode: "A", source_ref: "docs/a.md" });
+    expect(filters).toEqual({ search_mode: "lexical", source_ref: "docs/a.md" });
   });
 });
 
 describe("SEARCH_MODE_WIRE_COPY", () => {
-  it("reads as the closed set first, then every alias pair", () => {
+  it("renders exactly the closed set of word-form tokens", () => {
     // One derived sentence feeds both the tool description and the refusal
-    // (review M1), so IT has to carry the whole contract a host needs: the
-    // lasting tokens and each retired letter mapped to its target.
-    expect(SEARCH_MODE_WIRE_COPY).toContain(SEARCH_MODES.join(" | "));
-    const setAt = SEARCH_MODE_WIRE_COPY.indexOf(SEARCH_MODES.join(" | "));
-    for (const [letter, mode] of Object.entries(SEARCH_MODE_ALIASES)) {
-      const pair = `${letter}=${mode}`;
-      expect(SEARCH_MODE_WIRE_COPY).toContain(pair);
-      // Set first, aliases after — the copy must not bury the lasting tokens.
-      expect(SEARCH_MODE_WIRE_COPY.indexOf(pair)).toBeGreaterThan(setAt);
-    }
-    expect(SEARCH_MODE_WIRE_COPY).toMatch(/alias/i);
+    // (review M1), so IT has to carry the whole contract a host needs — and
+    // nothing else: no letters, no second spelling of any token.
+    expect(SEARCH_MODE_WIRE_COPY).toBe(SEARCH_MODES.join(" | "));
+    expect(SEARCH_MODE_WIRE_COPY).not.toMatch(/\b[ABCD]\b/);
   });
 });
 
@@ -185,28 +167,29 @@ describe("invalidSearchModeMessage", () => {
     expect(message).toContain("E");
   });
 
-  it("points at the alias targets so a migrating host learns the new token", () => {
-    const message = invalidSearchModeMessage("local");
-    for (const [letter, mode] of Object.entries(SEARCH_MODE_ALIASES)) {
-      expect(message).toContain(`${letter}=${mode}`);
+  it("names the closed set when a letter arrives, so the host learns the token", () => {
+    const message = invalidSearchModeMessage("B");
+    expect(message).toContain(INVALID_SEARCH_MODE_REASON);
+    for (const mode of SEARCH_MODES) {
+      expect(message).toContain(mode);
     }
+    expect(message).toContain("B");
   });
 });
 
 describe("SEARCH_MODE_ARMS dispatch table", () => {
-  it("has one row per closed-set token and no row for an alias", () => {
-    // `B`/`C` normalize in parseSearchMode; a second row per letter would
-    // let the aliases drift away from the arm they are supposed to share.
+  it("has one row per wire token and no row for a letter", () => {
     expect(Object.keys(SEARCH_MODE_ARMS).sort()).toEqual(
       [...SEARCH_MODES].sort()
     );
-    expect(SEARCH_MODE_ARMS).not.toHaveProperty("B");
-    expect(SEARCH_MODE_ARMS).not.toHaveProperty("C");
+    for (const letter of ["A", "B", "C", "D"]) {
+      expect(SEARCH_MODE_ARMS).not.toHaveProperty(letter);
+    }
   });
 
-  it("routes A to the mode-A arm (child lexical → parent body)", () => {
-    expect(SEARCH_MODE_ARMS.A).toBe(modeAParentWindowArm);
-    expect(SEARCH_MODE_ARMS.A).not.toBe(assembleRetrievalResult);
+  it("routes lexical to the child→parent arm", () => {
+    expect(SEARCH_MODE_ARMS.lexical).toBe(modeAParentWindowArm);
+    expect(SEARCH_MODE_ARMS.lexical).not.toBe(assembleRetrievalResult);
   });
 
   it("routes global to the report-first arm (ES ∥ summary vectors, ADR-0070)", () => {
@@ -214,10 +197,10 @@ describe("SEARCH_MODE_ARMS dispatch table", () => {
     expect(SEARCH_MODE_ARMS.global).not.toBe(assembleRetrievalResult);
   });
 
-  it("routes D to the typed unwired refusal (not a provisional graph answer)", () => {
-    // D is a closed 档 whose product fact is 真库未接 — answering it through
-    // the graph assembler would pretend the SQL path exists.
-    expect(SEARCH_MODE_ARMS.D).not.toBe(assembleRetrievalResult);
+  it("routes sql to the typed unwired refusal (not a provisional graph answer)", () => {
+    // `sql` is a closed 档 whose product fact is 真库未接 — answering it
+    // through the graph assembler would pretend the SQL path exists.
+    expect(SEARCH_MODE_ARMS.sql).not.toBe(assembleRetrievalResult);
   });
 
   it("routes graph to the graph-priority assembler", () => {
@@ -226,17 +209,15 @@ describe("SEARCH_MODE_ARMS dispatch table", () => {
 });
 
 describe("realDbNotWiredMessage", () => {
-  it("carries the stable token, the routing key and the 档 letter", () => {
+  it("carries the stable token, the routing key and the 档 token", () => {
     const message = realDbNotWiredMessage();
     expect(message).toContain(REAL_DB_NOT_WIRED_REASON);
     expect(message).toContain(SEARCH_MODE_FILTER_KEY);
-    expect(message).toContain("D");
+    expect(message).toContain("sql");
   });
 
-  it("names the lasting token for the document tables, not a retired letter", () => {
-    const message = realDbNotWiredMessage();
-    expect(message).toContain("graph");
-    expect(message).not.toMatch(/档 B\b/);
+  it("names the token the document tables stay on", () => {
+    expect(realDbNotWiredMessage()).toContain("graph");
   });
 });
 

@@ -19,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { ElasticsearchPrecisionLayer } from "../../src/core/storage/elasticsearch-precision.js";
 import type { ChunkRecord } from "../../src/core/types.js";
+import { probeElasticsearch, type EsProbeResult } from "./es-test-harness.js";
 
 const ES_URL_ENV = "GRAPHRAG_MEMORY_ES_URL";
 const ES_NODE_ENV = "GRAPHRAG_MEMORY_ES_NODE";
@@ -27,46 +28,6 @@ const TEST_PATH = "tests/integration/bm25-pg.test.ts";
 const EXPECTED_COMMAND = `npx vitest run ${TEST_PATH}`;
 const CHUNK_INDEX = "iknow-memory-test-chunks";
 const ENTITY_INDEX = "iknow-memory-test-entities";
-
-interface EsProbeResult {
-  available: boolean;
-  url: string;
-  error?: unknown;
-}
-
-/**
- * undici collapses every connection failure into a bare `TypeError: fetch
- * failed`; the actionable code (ECONNREFUSED / ENOTFOUND / ECONNRESET)
- * lives on `cause`. Without it a red CI probe says only "fetch failed",
- * which cannot distinguish "nothing is listening" from "the name resolved
- * to the wrong family" — the two failures this suite exists to surface.
- */
-function describeFetchFailure(caught: unknown): Error {
-  if (!(caught instanceof Error)) return new Error(String(caught));
-  const cause = (caught as { cause?: unknown }).cause;
-  if (cause instanceof Error && cause.message.length > 0) {
-    const code = (cause as { code?: unknown }).code;
-    const suffix = typeof code === "string" ? ` (${code})` : "";
-    return new Error(`${caught.message}: ${cause.message}${suffix}`);
-  }
-  return caught;
-}
-
-async function probeElasticsearch(url: string): Promise<EsProbeResult> {
-  try {
-    const response = await fetch(url, { method: "GET" });
-    if (!response.ok) {
-      return {
-        available: false,
-        url,
-        error: new Error(`HTTP ${response.status} ${response.statusText}`),
-      };
-    }
-    return { available: true, url };
-  } catch (caught: unknown) {
-    return { available: false, url, error: describeFetchFailure(caught) };
-  }
-}
 
 function warnEsUnavailable(probe: EsProbeResult): void {
   const safeError =

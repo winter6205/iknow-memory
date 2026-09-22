@@ -28,8 +28,8 @@ Fin CONTEXT **检索档** / **抽图窗** / **具名失败** apply as joint prod
 
 ## Confirmed assumptions (gate)
 
-1. Parent [`search-mode-retrieve.md`](search-mode-retrieve.md) still owns 档 **A** (parent 抽图窗 cite) and 档 **D** (typed 真库未接). This file does not reopen those arms.
-2. Closed `filters.search_mode` set is `A | graph | global | D`. One retrieve tool. Invalid value is a typed refuse (`invalid_search_mode` class). Missing key → **`graph`**. Tokens `B` and `C` are not lasting wire values.
+1. Parent [`search-mode-retrieve.md`](search-mode-retrieve.md) still owns 档 **`lexical`** (retired letter `A`; parent 抽图窗 cite) and 档 **`sql`** (retired letter `D`; typed 真库未接). This file does not reopen those arms.
+2. Closed `filters.search_mode` set is `lexical | graph | global | sql`. One retrieve tool. Invalid value is a typed refuse (`invalid_search_mode` class). Missing key → **`graph`**. Tokens `B` and `C` are not lasting wire values. *(Formerly-letters note, 2026-09-22: `A`/`B`/`C`/`D` left the wire in one step with zero coexistence — no alias window remains, so a letter is now an `invalid_search_mode` refusal; owner [`search-mode-lexical-sql-tokens.md`](search-mode-lexical-sql-tokens.md).)*
 3. **`graph` path:** entity seed → **PPR** → **chunk** slices lead; vector ∥ BM25 fill remainder (parent graph-priority). Community mix is **not** a corpus-wide summary **vector search** arm.
 4. **Mix** = join ledger `community_summaries` whose `entity_ids` contain this request’s seed and/or **PPR** hit **entity** ids, **and** `level <=` the **community level** cap (cap column/filter: [`community-level.md`](community-level.md)). Mix occupies `limit`. Mix does not reorder the **Neo4j graph arm** slice ranking. A judge does **not** decide whether to mix.
 5. Mix skip (slices still return, fail-open, not a Host throw): no seed/hit **entity**; community index not ready; ledger mix **read** throw. Empty join is identity for mix (not `degraded` solely from “no matching summaries”).
@@ -42,7 +42,7 @@ Fin CONTEXT **检索档** / **抽图窗** / **具名失败** apply as joint prod
 ## Boundaries
 
 - **Does:**
-  - Parse/strip `filters.search_mode`; route **A** / **`graph`** / **`global`** / **D** on the existing dispatcher; reuse parent A/D arms and the report-first assembler for **`global`**.
+  - Parse/strip `filters.search_mode`; route **`lexical`** / **`graph`** / **`global`** / **`sql`** on the existing dispatcher; reuse the parent 抽图窗 / 真库未接 arms (the retired `A`/`D` arms) and the report-first assembler for **`global`**.
   - **`graph`:** keep **Neo4j graph arm** prefix + remainder **RRF fusion (k=60)**; replace corpus-wide community-summary vector recall with the entity-id join mix; place mix on the list **before** `maybeRerank`; mix skip paths above.
   - **`global`:** report ES ∥ report vectors; typed not-ready; report-lead then optional 抽图窗 fill; no window-only 综述.
   - Tests covering empty (no entities / empty summary ledger / ready-but-zero reports); negative (invalid `search_mode`; **`global`** not-ready; `c_drop_windows=0`; mix skip); overflow (`limit` holds; mix does not drop the graph prefix); concurrent retrieve (no shared mutable mix buffer); exception (mix read throw fail-open vs **`global`** state-read not-ready typed).
@@ -85,7 +85,7 @@ Fin CONTEXT **检索档** / **抽图窗** / **具名失败** apply as joint prod
 
 ## 待写入 (persist after ACR)
 
-- CONTEXT **retrieve** / **hybrid retrieval** / **community**: lasting `filters.search_mode` values are `A | graph | global | D`; mix = entity-id join on **`graph`**, not a third equal vector arm over all summaries; community hits enter the list **before** **rerank**.
+- CONTEXT **retrieve** / **hybrid retrieval** / **community**: lasting `filters.search_mode` values are `lexical | graph | global | sql` (the former letters `A | graph | global | D` are retired, not aliased); mix = entity-id join on **`graph`**, not a third equal vector arm over all summaries; community hits enter the list **before** **rerank**.
 - CONTEXT **rerank**: already forbids splicing community hits after permute — keep that sentence; drop any remaining “prepend after ranker” wording if a persist still describes `prependCommunityPriority` after `maybeRerank`.
 
 ## architecture-change-reviewer

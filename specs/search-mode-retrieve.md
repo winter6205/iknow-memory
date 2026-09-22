@@ -2,9 +2,15 @@
 
 > **Superseded in part (2026-09-21) by** [`search-mode-graph-global.md`](search-mode-graph-global.md):
 > the wire **token set** and its **default** are owned there —
-> `filters.search_mode` ∈ `A|graph|global|D`, missing key → **`graph`**, and
-> `B`/`C` are migration aliases only. What each 档 **consumes** (below) stays
-> authoritative here and is deliberately not restated there.
+> `filters.search_mode` ∈ `lexical|graph|global|sql`, missing key → **`graph`**, and
+> `B`/`C` were migration aliases only (retired, see below). What each 档 **consumes**
+> (below) stays authoritative here and is deliberately not restated there.
+>
+> **Formerly-letters note (2026-09-22):** the letters `A`/`B`/`C`/`D` no longer
+> route at all — `lexical` and `sql` replaced `A` and `D`, the alias map is gone, and a
+> letter is now an `invalid_search_mode` refusal. Owner:
+> [`search-mode-lexical-sql-tokens.md`](search-mode-lexical-sql-tokens.md). The 档
+> **behaviour** described below is unchanged by that retokenizing.
 >
 > **Status:** assumption gate confirmed 2026-09-17 (two-repo sync with fin spec 3 of 4).
 > **Sibling spec (fin):** [`../../fin/specs/search-mode-retrieve.md`](../../fin/specs/search-mode-retrieve.md)
@@ -51,16 +57,16 @@ Fin CONTEXT **检索档** / **抽图窗** / **父子分块** / **具名失败** 
 ## Success Criteria
 
 1. `npm run typecheck` and `npm test` exit 0.
-2. 档 B on a graph-priority fixture still prefixes non-empty graph-arm hits (parent retrieve-graph-priority contract).
-3. 档 A: a child lexical hit contributes the **parent** window/body to `chunks[]`, not the child as the sole citable body.
-4. 档 C: hits are community **summary** rows when C-ready; ES and summary vectors are both eligible; C not-ready is a typed miss, not silent empty with `degraded` unset solely from “no reports.”
-5. 档 D: unwired SQL → typed 真库未接 (or documented equivalent), not fake SQL over document chunks.
+2. 档 `graph` on a graph-priority fixture still prefixes non-empty graph-arm hits (parent retrieve-graph-priority contract).
+3. 档 `lexical`: a child lexical hit contributes the **parent** window/body to `chunks[]`, not the child as the sole citable body.
+4. 档 `global`: hits are community **summary** rows when `global`-ready; ES and summary vectors are both eligible; `global` not-ready is a typed miss, not silent empty with `degraded` unset solely from “no reports.”
+5. 档 `sql`: unwired SQL → typed 真库未接 (or documented equivalent), not fake SQL over document chunks.
 6. No second ranker in the dashboard; MCP retrieve and dashboard query share `assembleRetrievalResult` (existing corpus-ready contract).
-7. Host still generates the user-visible answer; this server does not map-reduce C.
+7. Host still generates the user-visible answer; this server does not map-reduce `global`.
 
 ## Open Questions
 
-(none — `filters.search_mode`; C drop default on after a report hit, `filters.c_drop_windows=0` to skip; A cite = parent body + optional child span metadata; codes aligned with fin `named_failures` + `community_summary_index_failure`.)
+(none — `filters.search_mode`; the `global` report-hit drop is default on, `filters.c_drop_windows=0` to skip; a `lexical` cite = parent body + optional child span metadata; codes aligned with fin `named_failures` + `community_summary_index_failure`.)
 
 ## Inherits / Changes
 

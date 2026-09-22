@@ -5,23 +5,25 @@
  * against pure fake seams — no live Postgres/ES/Neo4j. Format follows
  * tests/defensive/retrieval-defensive.test.ts.
  *
- * Coverage policy (the 档 A/C arms already own their arm-level detail):
- *   - A healthy-miss vs typed:  tests/retrieval/mode-a-arm.test.ts
+ * Coverage policy (the `lexical`/`global` arms already own their arm-level
+ * detail):
+ *   - a healthy lexical miss vs typed: tests/retrieval/mode-a-arm.test.ts
  *     ("leaves a lexical miss an un-degraded empty answer");
- *   - C ready-zero-summaries healthy miss: tests/retrieval/mode-c-arm.test.ts
- *     ("treats a ready generation with zero summaries as a healthy miss");
- *   - A limit-after-dedup:      mode-a-arm.test.ts (overflow class);
- *   - C report cap at limit:    mode-c-arm.test.ts (drop section);
- *   - invalid mode typed:       tests/retrieve.test.ts (T1 block);
- *   - C not-ready typed:        tests/retrieve.test.ts + mode-c-arm.test.ts
- *     readiness-gate block;
- *   - B summary-ledger fail-open (alone): tests/retrieval/
+ *   - global ready-zero-summaries healthy miss:
+ *     tests/retrieval/mode-c-arm.test.ts ("treats a ready generation with
+ *     zero summaries as a healthy miss");
+ *   - lexical limit-after-dedup:        mode-a-arm.test.ts (overflow class);
+ *   - global report cap at limit:       mode-c-arm.test.ts (drop section);
+ *   - invalid mode typed:               tests/retrieve.test.ts (T1 block);
+ *   - global not-ready typed:           tests/retrieve.test.ts +
+ *     mode-c-arm.test.ts readiness-gate block;
+ *   - graph summary-ledger fail-open (alone): tests/retrieval/
  *     community-summary.test.ts — NOT weakened here; this file adds the
- *     B-vs-C contrast on ONE dead-ledger backend.
- * What is NEW here: D's typed `real_db_not_wired` exit (empty/corpus-full/
- * limit variants, zero backend contact), the letter-vs-alias concurrency
- * isolation across every 档 in flight, and the fail-open-vs-typed exception
- * contrast. No duplicated healthy-miss.
+ *     graph-vs-global contrast on ONE dead-ledger backend.
+ * What is NEW here: the `sql` 档's typed `real_db_not_wired` exit (empty/
+ * corpus-full/limit variants, zero backend contact), the per-档 isolation
+ * when every route plus single-letter rejections are in flight, and the
+ * fail-open-vs-typed exception contrast. No duplicated healthy-miss.
  */
 import { describe, it, expect } from "vitest";
 import { createRetrieveHandler } from "../../src/tools/retrieve.js";
@@ -34,7 +36,10 @@ import {
   COMMUNITY_SUMMARY_INDEX_FAILURE,
 } from "../../src/core/types.js";
 import type { ChunkRecord, StorageBackend } from "../../src/core/types.js";
-import { REAL_DB_NOT_WIRED_REASON } from "../../src/core/retrieval/search-mode.js";
+import {
+  INVALID_SEARCH_MODE_REASON,
+  REAL_DB_NOT_WIRED_REASON,
+} from "../../src/core/retrieval/search-mode.js";
 import type { RetrieveConfig } from "../../src/core/retrieval/types.js";
 import type { ToolResult } from "../../src/tools/registry.js";
 
@@ -72,7 +77,7 @@ function parseBody(result: ToolResult): {
   return JSON.parse(text);
 }
 
-/** Embedder double that counts provider calls — proves D never embeds. */
+/** Embedder double that counts provider calls — proves sql never embeds. */
 class CountingEmbedder implements EmbeddingClient {
   readonly available = true;
   calls = 0;
@@ -86,9 +91,9 @@ class CountingEmbedder implements EmbeddingClient {
 }
 
 /**
- * Storage proxy that records every property the dispatch touched. D must
- * leave the list empty: typed before a single read, i.e. no SQL (fake or
- * real) runs over chunks on this 档.
+ * Storage proxy that records every property the dispatch touched. The `sql`
+ * 档 must leave the list empty: typed before a single read, i.e. no SQL
+ * (fake or real) runs over chunks on this route.
  */
 function storageProbe(target: StorageBackend): {
   storage: StorageBackend;
@@ -105,7 +110,7 @@ function storageProbe(target: StorageBackend): {
   return { storage, touched };
 }
 
-/** The minimal config that turns on B's optional community-summary read. */
+/** The minimal config that turns on the graph 档's optional community-summary read. */
 const SUMMARY_ON_CONFIG: RetrieveConfig = {
   preset: "balanced",
   w_vec: 1,
@@ -135,47 +140,48 @@ describe("search-mode empty boundary", () => {
       storage: new MemoryBackend(TEST_DIM),
     });
     const omitted = parseBody(await handler({ query: "anything" }));
-    const lasting = parseBody(
+    const explicitGraph = parseBody(
       await handler({ query: "anything", filters: { search_mode: "graph" } })
     );
-    expect(omitted).toEqual(lasting);
+    expect(omitted).toEqual(explicitGraph);
     expect(omitted.chunks).toEqual([]);
     expect(omitted).not.toHaveProperty("degraded");
   });
 
-  it("an empty corpus keeps A a healthy miss but D still typed (emptiness never masks 未接)", async () => {
-    // The C-side empty contrast — READY generation, zero summaries — is
-    // pinned in mode-c-arm.test.ts; not re-run here. What must be pinned
-    // at the seam: D's refusal is a property of the 档, not of the data,
-    // so a `{ chunks: [] }` success is unreachable for D on ANY corpus.
+  it("an empty corpus keeps lexical a healthy miss but sql still typed (emptiness never masks 未接)", async () => {
+    // The global-side empty contrast — READY generation, zero summaries —
+    // is pinned in mode-c-arm.test.ts; not re-run here. What must be pinned
+    // at the seam: the `sql` refusal is a property of the 档, not of the
+    // data, so a `{ chunks: [] }` success is unreachable for it on ANY
+    // corpus.
     const handler = createRetrieveHandler({
       embedder: new FakeEmbedder(TEST_DIM),
       storage: new MemoryBackend(TEST_DIM),
     });
-    const aBody = parseBody(
-      await handler({ query: "anything", filters: { search_mode: "A" } })
+    const lexicalBody = parseBody(
+      await handler({ query: "anything", filters: { search_mode: "lexical" } })
     );
-    expect(aBody.chunks).toEqual([]);
-    expect(aBody).not.toHaveProperty("degraded");
+    expect(lexicalBody.chunks).toEqual([]);
+    expect(lexicalBody).not.toHaveProperty("degraded");
     await expect(
-      handler({ query: "anything", filters: { search_mode: "D" } })
+      handler({ query: "anything", filters: { search_mode: "sql" } })
     ).rejects.toBeInstanceOf(GraphragError);
   });
 });
 
 // ======================================================================
-// negative — D unwired (new); C not-ready / invalid mode referenced
+// negative — sql unwired (new); global not-ready / invalid mode referenced
 // ======================================================================
 
 describe("search-mode negative boundary", () => {
-  // Invalid mode → typed INVALID_INPUT and C-not-ready → typed
+  // Invalid mode → typed INVALID_INPUT and global-not-ready → typed
   // community_summary_index_failure are pinned end-to-end in
   // tests/retrieve.test.ts (T1 block) — confirmed, not duplicated.
 
-  it("D types real_db_not_wired even when every other 档's seam could answer", async () => {
+  it("sql types real_db_not_wired even when every other 档's seam could answer", async () => {
     // A full fixture: vector rows, a ready community index with a summary.
-    // D must still refuse — it cannot borrow another 档's seams to fake a
-    // document-table answer (spec SC5: document tables stay B).
+    // `sql` must still refuse — it cannot borrow another 档's seams to fake
+    // a document-table answer (spec SC5: document tables stay on `graph`).
     const base = new MemoryBackend(TEST_DIM);
     await base.upsert([chunkRecord("b-1")]);
     await base.setCommunityIndexState({
@@ -206,7 +212,7 @@ describe("search-mode negative boundary", () => {
     });
     let thrown: unknown;
     try {
-      await handler({ query: "anything", filters: { search_mode: "D" } });
+      await handler({ query: "anything", filters: { search_mode: "sql" } });
     } catch (err) {
       thrown = err;
     }
@@ -222,15 +228,16 @@ describe("search-mode negative boundary", () => {
 });
 
 // ======================================================================
-// overflow — limit behaviour across A/C/D
+// overflow — limit behaviour across lexical/global/sql
 // ======================================================================
 
 describe("search-mode overflow boundary (limit)", () => {
-  // A's limit-applies-after-parent-dedup and C's hard cap at limit are
-  // pinned in mode-a-arm.test.ts / mode-c-arm.test.ts (overflow/drop
-  // sections). D is limit-INDEPENDENT: it types out before any arm reads
-  // the request, so the schema bounds must not change the exit.
-  it("D answers identically at limit=1 and limit=100 with zero embedder and storage contact", async () => {
+  // The lexical limit-applies-after-parent-dedup and the global hard cap at
+  // limit are pinned in mode-a-arm.test.ts / mode-c-arm.test.ts
+  // (overflow/drop sections). `sql` is limit-INDEPENDENT: it types out
+  // before any arm reads the request, so the schema bounds must not change
+  // the exit.
+  it("sql answers identically at limit=1 and limit=100 with zero embedder and storage contact", async () => {
     for (const limit of [1, 100]) {
       const embedder = new CountingEmbedder(new FakeEmbedder(TEST_DIM));
       const { storage, touched } = storageProbe(new MemoryBackend(TEST_DIM));
@@ -242,7 +249,7 @@ describe("search-mode overflow boundary (limit)", () => {
       try {
         await handler({
           query: "anything",
-          filters: { search_mode: "D" },
+          filters: { search_mode: "sql" },
           limit,
         });
       } catch (err) {
@@ -259,11 +266,11 @@ describe("search-mode overflow boundary (limit)", () => {
 });
 
 // ======================================================================
-// concurrent — one handler, four 档 in flight, no crossed answers
+// concurrent — one handler, every route plus letter rejections in flight
 // ======================================================================
 
 describe("search-mode concurrent boundary", () => {
-  it("every 档 in flight at once answers only its own arm; aliases never cross; D rejects independently", async () => {
+  it("every 档 in flight answers only its own arm; letters reject without poisoning siblings", async () => {
     const base = new MemoryBackend(TEST_DIM);
     await base.upsert([chunkRecord("b-1")]);
     await base.setCommunityIndexState({
@@ -292,70 +299,71 @@ describe("search-mode concurrent boundary", () => {
       embedder: new FakeEmbedder(TEST_DIM),
       storage,
     });
-    const [a, b, graph, c, global, d, dAgain] = await Promise.allSettled([
-      handler({ query: "anything", filters: { search_mode: "A" } }),
-      handler({ query: "anything", filters: { search_mode: "B" } }),
-      handler({ query: "anything", filters: { search_mode: "graph" } }),
-      handler({
-        query: "anything",
-        filters: { search_mode: "C", c_drop_windows: "0" },
-      }),
-      handler({
-        query: "anything",
-        filters: { search_mode: "global", c_drop_windows: "0" },
-      }),
-      handler({ query: "anything", filters: { search_mode: "D" } }),
-      handler({ query: "anything", filters: { search_mode: "D" } }),
-    ]);
+    const [lexical, graph, global, sql, sqlAgain, letterB, letterC] =
+      await Promise.allSettled([
+        handler({ query: "anything", filters: { search_mode: "lexical" } }),
+        handler({ query: "anything", filters: { search_mode: "graph" } }),
+        handler({
+          query: "anything",
+          filters: { search_mode: "global", c_drop_windows: "0" },
+        }),
+        handler({ query: "anything", filters: { search_mode: "sql" } }),
+        handler({ query: "anything", filters: { search_mode: "sql" } }),
+        handler({ query: "anything", filters: { search_mode: "B" } }),
+        handler({ query: "anything", filters: { search_mode: "C" } }),
+      ]);
 
-    expect(a.status).toBe("fulfilled");
-    expect(b.status).toBe("fulfilled");
+    expect(lexical.status).toBe("fulfilled");
     expect(graph.status).toBe("fulfilled");
-    expect(c.status).toBe("fulfilled");
     expect(global.status).toBe("fulfilled");
     if (
-      a.status !== "fulfilled" ||
-      b.status !== "fulfilled" ||
+      lexical.status !== "fulfilled" ||
       graph.status !== "fulfilled" ||
-      c.status !== "fulfilled" ||
       global.status !== "fulfilled"
     )
       throw new Error("unexpected rejection in concurrent batch");
 
     // Each 档 cites only its own artifact; no answer crosses.
-    expect(parseBody(a.value).chunks.map((chunk) => chunk.id)).toEqual([]);
-    expect(parseBody(b.value).chunks.map((chunk) => chunk.id)).toEqual([
+    expect(parseBody(lexical.value).chunks.map((chunk) => chunk.id)).toEqual(
+      []
+    );
+    expect(parseBody(graph.value).chunks.map((chunk) => chunk.id)).toEqual([
       "b-1",
     ]);
-    expect(parseBody(c.value).chunks.map((chunk) => chunk.id)).toEqual([
+    expect(parseBody(global.value).chunks.map((chunk) => chunk.id)).toEqual([
       "sum-1",
     ]);
-    // The lasting token and the retired letter are the same arm: an alias may
-    // not pick up a behavior of its own while a host migrates.
-    expect(parseBody(graph.value)).toEqual(parseBody(b.value));
-    expect(parseBody(global.value)).toEqual(parseBody(c.value));
-    // D rejects — twice, the same typed way: the refusal is stateless and
-    // never poisons the concurrent siblings.
-    for (const attempt of [d, dAgain]) {
+    // `sql` rejects — twice, the same typed way: the refusal is stateless
+    // and never poisons the concurrent siblings.
+    for (const attempt of [sql, sqlAgain]) {
       expect(attempt.status).toBe("rejected");
       const reason = (attempt as PromiseRejectedResult).reason as GraphragError;
       expect(reason).toBeInstanceOf(GraphragError);
       expect(reason.message).toContain(REAL_DB_NOT_WIRED_REASON);
     }
+    // A single letter rejects the same isolated way, typed invalid with its
+    // own stable token, never borrowing a neighbouring 档's route.
+    for (const attempt of [letterB, letterC]) {
+      expect(attempt.status).toBe("rejected");
+      const reason = (attempt as PromiseRejectedResult).reason as GraphragError;
+      expect(reason).toBeInstanceOf(GraphragError);
+      expect(reason.code).toBe("INVALID_INPUT");
+      expect(reason.message).toContain(INVALID_SEARCH_MODE_REASON);
+    }
   });
 });
 
 // ======================================================================
-// exception — fail-open (B) vs typed (C) on ONE dead-ledger backend
+// exception — fail-open (graph) vs typed (global) on ONE dead-ledger backend
 // ======================================================================
 
 describe("search-mode exception boundary", () => {
-  it("every community read throwing keeps B fail-open but C and D typed, each with its own token", async () => {
+  it("every community read throwing keeps graph fail-open but global and sql typed, each with its own token", async () => {
     // The contrast the spec pins (specs/retrieve-community.md read
-    // fail-open vs specs/search-mode-retrieve.md C must not look like a
-    // healthy miss). The B-side alone stays covered by
+    // fail-open vs specs/search-mode-retrieve.md global must not look like
+    // a healthy miss). The graph-side alone stays covered by
     // tests/retrieval/community-summary.test.ts; here it must HOLD while
-    // the same backend makes C type out.
+    // the same backend makes global type out.
     const base = new MemoryBackend(TEST_DIM);
     await base.upsert([chunkRecord("b-1")]);
     const storage = Object.create(base, {
@@ -387,36 +395,36 @@ describe("search-mode exception boundary", () => {
       retrieveConfig: SUMMARY_ON_CONFIG,
     });
 
-    // B: the ledger throw costs the optional summary arm only — the
+    // graph: the ledger throw costs the optional summary arm only — the
     // vector rows still answer, marked degraded, never a rejection.
-    const bBody = parseBody(await handler({ query: "anything" }));
-    expect(bBody.chunks.map((chunk) => chunk.id)).toEqual(["b-1"]);
-    expect(bBody.degraded).toBe(true);
+    const graphBody = parseBody(await handler({ query: "anything" }));
+    expect(graphBody.chunks.map((chunk) => chunk.id)).toEqual(["b-1"]);
+    expect(graphBody.degraded).toBe(true);
 
-    // C: the same broken backend is the TYPED readiness failure, not a
+    // global: the same broken backend is the TYPED readiness failure, not a
     // degraded envelope and not an empty answer.
-    let thrownC: unknown;
+    let thrownGlobal: unknown;
     try {
-      await handler({ query: "anything", filters: { search_mode: "C" } });
+      await handler({ query: "anything", filters: { search_mode: "global" } });
     } catch (err) {
-      thrownC = err;
+      thrownGlobal = err;
     }
-    expect(thrownC).toBeInstanceOf(GraphragError);
-    expect((thrownC as GraphragError).message).toContain(
+    expect(thrownGlobal).toBeInstanceOf(GraphragError);
+    expect((thrownGlobal as GraphragError).message).toContain(
       COMMUNITY_SUMMARY_INDEX_FAILURE
     );
 
-    // D: typed 未接 — a THIRD distinct fact on the same backend, and its
-    // message never borrows C's token.
-    let thrownD: unknown;
+    // sql: typed 未接 — a THIRD distinct fact on the same backend, and its
+    // message never borrows global's token.
+    let thrownSql: unknown;
     try {
-      await handler({ query: "anything", filters: { search_mode: "D" } });
+      await handler({ query: "anything", filters: { search_mode: "sql" } });
     } catch (err) {
-      thrownD = err;
+      thrownSql = err;
     }
-    expect(thrownD).toBeInstanceOf(GraphragError);
-    const dMessage = (thrownD as GraphragError).message;
-    expect(dMessage).toContain(REAL_DB_NOT_WIRED_REASON);
-    expect(dMessage).not.toContain(COMMUNITY_SUMMARY_INDEX_FAILURE);
+    expect(thrownSql).toBeInstanceOf(GraphragError);
+    const sqlMessage = (thrownSql as GraphragError).message;
+    expect(sqlMessage).toContain(REAL_DB_NOT_WIRED_REASON);
+    expect(sqlMessage).not.toContain(COMMUNITY_SUMMARY_INDEX_FAILURE);
   });
 });

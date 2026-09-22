@@ -742,3 +742,204 @@ describe("ElasticsearchPrecisionLayer.deleteSummaryIndex", () => {
     expect(client.indices.create).toHaveBeenCalledTimes(2);
   });
 });
+
+/**
+ * The PRODUCTION global report-TEXT read seam. A read must never assume the
+ * derived summary index into existence: an absent index is a not-ready fact
+ * (typed with the community_summary_index_failure token), while an erroring
+ * cluster is a transient arm failure (a plain PrecisionLayerError, no token).
+ */
+describe("ElasticsearchPrecisionLayer.searchCommunitySummariesLexical", () => {
+  function summaryHit(
+    overrides: Partial<{
+      id: string;
+      community_id: string;
+      content: string;
+      level: number;
+    }> = {}
+  ) {
+    return {
+      _id: "7",
+      _score: 1.5,
+      _source: {
+        id: "ledger-uuid-7",
+        community_id: "7",
+        content: "community report text",
+        level: 2,
+        ...overrides,
+      },
+    };
+  }
+
+  /** A client whose summary index EXISTS and returns the given hits. */
+  function presentClient(
+    hits: unknown[],
+    searchBehavior?: (req: Record<string, unknown>) => Promise<unknown>
+  ): ElasticsearchClientLike {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => true);
+    client.search =
+      searchBehavior ??
+      vi.fn(async () => ({ hits: { hits } }));
+    return client;
+  }
+
+  it("maps a present-index hit to a CommunitySummaryRow keyed by ledger identity", async () => {
+    const client = presentClient([summaryHit()]);
+    const layer = summaryLayer(client);
+
+    const rows = await layer.searchCommunitySummariesLexical("报告", 5, 2);
+
+    expect(rows).toEqual([
+      {
+        id: "ledger-uuid-7",
+        communityId: "7",
+        summary: "community report text",
+        level: 2,
+        score: 1.5,
+      },
+    ]);
+  });
+
+  it("applies the level cap IN THE QUERY and honors limit as size, using the IK query analyzer", async () => {
+    const client = presentClient([]);
+    const layer = summaryLayer(client);
+
+    await layer.searchCommunitySummariesLexical("报告 text", 3, 2);
+
+    const request = client.search.mock.calls[0]?.[0] as {
+      index: string;
+      size: number;
+      _source: string[];
+      query: Record<string, unknown>;
+    };
+    expect(request.index).toBe("summaries");
+    expect(request.size).toBe(3);
+    expect(request._source).toEqual(["id", "community_id", "content", "level"]);
+    const query = JSON.stringify(request.query);
+    // The cap is a filter clause, so an over-grain report never re-enters
+    // ranking regardless of its score.
+    expect(query).toContain('"range":{"level":{"lte":2}}');
+    expect(query).toContain("multi_match");
+    expect(query).toContain("ik_query");
+  });
+
+  it("legitimately returns [] when the index exists but nothing matches", async () => {
+    const client = presentClient([]);
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 5, 2)
+    ).resolves.toEqual([]);
+  });
+
+  it("short-circuits an empty query or a non-positive limit without touching ES", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("   ", 5, 2)
+    ).resolves.toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 0, 2)
+    ).resolves.toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", -3, 2)
+    ).resolves.toEqual([]);
+
+    expect(client.indices.exists).not.toHaveBeenCalled();
+    expect(client.search).not.toHaveBeenCalled();
+  });
+
+  it("fails CLOSED (typed not-ready) when the summary index is absent, never a healthy empty", async () => {
+    const client = fakeClient(); // indices.exists -> false by default
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 5, 2)
+    ).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining("community_summary_index_failure"),
+    });
+    // A not-ready read must never assume the index into existence.
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(client.search).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an erroring cluster (search) as a transient PrecisionLayerError, WITHOUT the not-ready token", async () => {
+    const client = presentClient([], vi.fn(async () => {
+      throw new Error("cluster down");
+    }));
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 5, 2)
+    ).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining("cluster down"),
+    });
+    // Distinct from the refusal path: a transient failure carries NO token.
+    const err = await layer
+      .searchCommunitySummariesLexical("报告", 5, 2)
+      .catch((e: unknown) => e as Error);
+    expect((err as Error).message).not.toContain(
+      "community_summary_index_failure"
+    );
+  });
+
+  it("surfaces an availability probe that throws as a transient error, WITHOUT the token", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => {
+      throw new Error("connection refused");
+    });
+    const layer = summaryLayer(client);
+
+    const err = await layer
+      .searchCommunitySummariesLexical("报告", 5, 2)
+      .catch((e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as { name?: string }).name).toBe("PrecisionLayerError");
+    expect((err as Error).message).toContain("availability check failed");
+    expect((err as Error).message).not.toContain(
+      "community_summary_index_failure"
+    );
+    expect(client.indices.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps concurrent reads independent: no shared buffer, no index creation", async () => {
+    const client = fakeClient();
+    let existsCalls = 0;
+    client.indices.exists = vi.fn(async () => {
+      existsCalls += 1;
+      return true;
+    });
+    client.search = vi.fn(
+      async (req: Record<string, unknown>) => {
+        const size = typeof req.size === "number" ? req.size : 0;
+        return {
+          hits: {
+            hits: Array.from({ length: size }, (_, i) =>
+              summaryHit({ id: `ledger-${i}`, community_id: String(i) })
+            ),
+          },
+        };
+      }
+    );
+    const layer = summaryLayer(client);
+
+    const [a, b] = await Promise.all([
+      layer.searchCommunitySummariesLexical("first report", 2, 2),
+      layer.searchCommunitySummariesLexical("second report", 3, 2),
+    ]);
+
+    // Each read re-probes presence (the readiness memo is the WRITE path's,
+    // never populated or consumed by a read), and neither created an index.
+    expect(existsCalls).toBe(2);
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(a).toHaveLength(2);
+    expect(b).toHaveLength(3);
+    expect(a.map((r) => r.id)).toEqual(["ledger-0", "ledger-1"]);
+  });
+});

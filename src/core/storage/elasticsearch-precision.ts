@@ -16,13 +16,18 @@ import { Client } from "@elastic/elasticsearch";
 import type { ElasticsearchConfig } from "../../config.js";
 import { redactDiagnostic } from "../../logging.js";
 import { GraphragError } from "../errors.js";
+import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../types.js";
 import type {
   ChunkRecord,
   PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
 } from "../types.js";
-import type { EntityLexicalStorage } from "../retrieval/types.js";
+import type {
+  CommunityReportLexicalStorage,
+  CommunitySummaryRow,
+  EntityLexicalStorage,
+} from "../retrieval/types.js";
 import type { EntityType } from "../extraction/entity-type.js";
 
 /** Minimal ES API used by this bounded context. */
@@ -184,6 +189,34 @@ export function buildPrecisionChunkQuery(
   };
 }
 
+/**
+ * Community-report lexical query: the same IK best_fields multi_match shape as
+ * a chunk search over the report text, narrowed by a `level` range so the
+ * community-level cap is applied at recall. The range is a filter clause (not
+ * a score adjustment), so an over-grain report cannot re-enter the ranking.
+ */
+export function buildSummaryReportQuery(
+  query: string,
+  maxLevel: number
+): Record<string, unknown> {
+  return {
+    bool: {
+      must: [
+        {
+          multi_match: {
+            query,
+            fields: ["content"],
+            type: "best_fields",
+            operator: "or",
+            analyzer: IK_QUERY_ANALYZER,
+          },
+        },
+      ],
+      filter: [{ range: { level: { lte: maxLevel } } }],
+    },
+  };
+}
+
 function lexicalFields(
   enabled: boolean,
   overrides: Record<string, number> | undefined
@@ -280,7 +313,9 @@ function sourceRecord(source: unknown): Record<string, unknown> {
  * creation per index and is cleared after a failed attempt so a transient
  * cluster outage can recover on the next call.
  */
-export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
+export class ElasticsearchPrecisionLayer
+  implements PrecisionIndexer, CommunityReportLexicalStorage
+{
   private readonly client: ElasticsearchClientLike;
   private readonly k1: number;
   private readonly b: number;
@@ -554,8 +589,79 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
     }
   }
 
+  /**
+   * Lexical search over community REPORT text — the ES half of 档 C's two
+   * parallel arms (specs/search-mode-graph-global.md assumption 6). It mirrors
+   * `searchLexical`'s IK multi_match shape, but caps the grain IN THE QUERY
+   * (`level <= maxLevel`) so an over-grain report is never recalled even when
+   * it would score highest (specs/community-level.md).
+   *
+   * Fail-closed on readiness, and only that failure is typed: the read checks
+   * presence with `indices.exists` and NEVER `ensureIndex` — a derived index
+   * the read assumes into existence would turn "not built yet" into a silently
+   * empty answer. An absent index is a not-ready fact, surfaced as the
+   * `community_summary_index_failure` token so it routes to the 档 C refusal
+   * rather than a healthy `{ rows: [] }`. A present index whose query then
+   * errors is a transient arm failure (no token), which the caller may still
+   * fuse around with its partner arm.
+   */
+  async searchCommunitySummariesLexical(
+    query: string,
+    limit: number,
+    maxLevel: number
+  ): Promise<CommunitySummaryRow[]> {
+    if (limit <= 0 || query.trim() === "") return [];
+    if (!(await this.summaryIndexPresent())) {
+      throw new PrecisionLayerError(
+        `Elasticsearch summary index "${this.config.summaryIndex}" is not ready: ` +
+          `${COMMUNITY_SUMMARY_INDEX_FAILURE}`
+      );
+    }
+    try {
+      const response = await this.client.search({
+        index: this.config.summaryIndex,
+        size: limit,
+        track_total_hits: false,
+        query: buildSummaryReportQuery(query, maxLevel),
+        _source: ["id", "community_id", "content", "level"],
+      });
+      const body = responseBody<SearchResponse>(response);
+      return body.hits.hits
+        .map((hit) => toCommunitySummaryRow(hit))
+        .filter((row): row is CommunitySummaryRow => row !== undefined);
+    } catch (error) {
+      throw new PrecisionLayerError(
+        "Elasticsearch community report search failed",
+        errorMessage(error)
+      );
+    }
+  }
+
   async close(): Promise<void> {
     await this.client.close();
+  }
+
+  /**
+   * Presence-only check on the summary index. Deliberately does not consult
+   * or populate the `ready` memoization map — that map is the WRITE path's
+   * buffer for index creation, and a read must stay free of shared mutable
+   * state so concurrent reads cannot race a creation it never wanted.
+   */
+  private async summaryIndexPresent(): Promise<boolean> {
+    try {
+      const exists = await this.client.indices.exists({
+        index: this.config.summaryIndex,
+      });
+      return isIndexPresent(exists);
+    } catch (error) {
+      // A cluster that cannot answer the existence probe is an erroring
+      // dependency, not a not-ready fact: no token, so the caller treats it
+      // as a transient arm failure rather than the typed refusal.
+      throw new PrecisionLayerError(
+        "Elasticsearch summary index availability check failed",
+        errorMessage(error)
+      );
+    }
   }
 
   private async ensureIndex(
@@ -667,6 +773,29 @@ function toEntitySeedHit(hit: SearchHit): EntitySeedHit | undefined {
   return {
     id,
     canonical_name: canonicalName,
+    ...(typeof hit._score === "number" ? { score: hit._score } : {}),
+  };
+}
+
+/** Project one report hit into a `CommunitySummaryRow` (id keeps ledger identity). */
+function toCommunitySummaryRow(hit: SearchHit): CommunitySummaryRow | undefined {
+  const source = sourceRecord(hit._source);
+  const id = stringValue(source.id) ?? hit._id;
+  const communityId = stringValue(source.community_id);
+  const summary = stringValue(source.content);
+  if (
+    id === undefined ||
+    communityId === undefined ||
+    summary === undefined ||
+    typeof source.level !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    id,
+    communityId,
+    summary,
+    level: source.level,
     ...(typeof hit._score === "number" ? { score: hit._score } : {}),
   };
 }

@@ -22,9 +22,11 @@ import { ENTITY_TYPES, type EntityType } from "../extraction/entity-type.js";
 export const SEARCH_MODE_FILTER_KEY = "search_mode";
 
 /**
- * The 档 C drop switch (specs/search-mode-retrieve.md Open Question
+ * The `global` 档 drop switch (specs/search-mode-retrieve.md Open Question
  * resolution): the drop after a report hit is default ON; exactly the
- * value "0" turns it off.
+ * value "0" turns it off. The KEY keeps its retired-letter name — the
+ * 2026-09-22 ruling was values-only, so identifiers move in their own
+ * ticket (specs/search-mode-lexical-sql-tokens.md assumption 6).
  */
 export const C_DROP_WINDOWS_FILTER_KEY = "c_drop_windows";
 
@@ -56,14 +58,14 @@ export function stripSearchModeFilter(
   return stripFilterKey(filters, SEARCH_MODE_FILTER_KEY);
 }
 
-/** Whether the C answer may drop to citable windows after a report hit. */
+/** Whether the `global` answer may drop to citable windows after a report hit. */
 export function cDropWindowsEnabled(
   filters: Record<string, string> | undefined
 ): boolean {
   return filters?.[C_DROP_WINDOWS_FILTER_KEY] !== C_DROP_WINDOWS_OFF;
 }
 
-/** Strip the C drop switch from the exact-match filters (same contract as `stripSearchModeFilter`). */
+/** Strip the `global` drop switch from the exact-match filters (same contract as `stripSearchModeFilter`). */
 export function stripCDropWindowsFilter(
   filters: Record<string, string> | undefined
 ): Record<string, string> | undefined {

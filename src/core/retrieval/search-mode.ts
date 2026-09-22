@@ -2,7 +2,7 @@
  * Search-mode (检索档) wire control for retrieve — plans/search-mode-retrieve.md T1.
  *
  * The host (fin) assigns the 档 and passes it as `filters.search_mode`
- * ∈ A|graph|global|D (specs/search-mode-graph-global.md confirmed
+ * ∈ lexical|graph|global|sql (specs/search-mode-graph-global.md confirmed
  * assumption 2). It rides the `filters` map because the input schema stays a
  * `z.strictObject` with
  * `filters: z.record(z.string(), z.string())` and no fourth MCP tool is
@@ -14,10 +14,10 @@
  *     reaches the arms or it silently zeros every arm.
  *   - Missing key → `graph`, the existing graph-priority contract
  *     (specs/retrieve-graph-priority.md), byte-for-byte unchanged.
- *   - The retired letters `B`/`C` stay accepted as aliases of `graph`/
- *     `global` and are normalized HERE, so no arm, table row, or downstream
- *     reader ever branches on a letter. Dropping the aliases is a later
- *     contract step, once every host sends the lasting tokens.
+ *   - The wire carries word-form tokens only, matched verbatim (casing is
+ *     part of the token). Nothing but the four `SEARCH_MODES` entries
+ *     resolves, so every arm, table row, and downstream reader sees exactly
+ *     one of them.
  *   - A value outside the closed set → `kind: "invalid"`. The handler maps
  *     it to a typed `GraphragError("INVALID_INPUT")` whose message carries
  *     the stable `invalid_search_mode` token, because the MCP adapter
@@ -52,27 +52,18 @@ export {
 } from "./wire-filters.js";
 
 /** The closed set from specs/search-mode-graph-global.md; never widen it silently. */
-export const SEARCH_MODES = ["A", "graph", "global", "D"] as const;
+export const SEARCH_MODES = ["lexical", "graph", "global", "sql"] as const;
 
 export type SearchMode = (typeof SEARCH_MODES)[number];
 
 /** Missing key defaults to `graph` (confirmed assumption 2). */
 export const DEFAULT_SEARCH_MODE: SearchMode = "graph";
 
-/**
- * The letters this wire carried before specs/search-mode-graph-global.md,
- * kept accepted while a live host still sends them mid-migration. This is
- * the only place they exist: `parseSearchMode` rewrites them to the lasting
- * token, so the dispatch table, the arms and the envelope never see a letter.
- */
-export const SEARCH_MODE_ALIASES: Readonly<Record<string, SearchMode>> =
-  Object.freeze({ B: "graph", C: "global" });
-
 /** Stable host-mappable reason token, aligned with fin `named_failures` style. */
 export const INVALID_SEARCH_MODE_REASON = "invalid_search_mode";
 
 /**
- * Stable host-mappable token for 档 D, aligned with fin
+ * Stable host-mappable token for the `sql` 档, aligned with fin
  * `named_failures.REAL_DB_NOT_WIRED` (specs/search-mode-retrieve.md Open
  * Question: codes shared with fin `named_failures`). It lives HERE, beside
  * the other wire-side reason token, not beside `COMMUNITY_SUMMARY_INDEX_
@@ -95,34 +86,18 @@ export function parseSearchMode(
   if ((SEARCH_MODES as readonly string[]).includes(value)) {
     return { kind: "resolved", mode: value as SearchMode };
   }
-  // `hasOwn` first: a bare index read would resolve an inherited member
-  // such as "toString" to a function and call it a 档.
-  const alias = Object.hasOwn(SEARCH_MODE_ALIASES, value)
-    ? SEARCH_MODE_ALIASES[value]
-    : undefined;
-  if (alias !== undefined) return { kind: "resolved", mode: alias };
   return { kind: "invalid", value };
-}
-
-/** Alias pairs rendered for host-facing copy; keeps the map the only source. */
-function searchModeAliasHints(): string {
-  return Object.entries(SEARCH_MODE_ALIASES)
-    .map(([letter, mode]) => `${letter}=${mode}`)
-    .join(", ");
 }
 
 /**
  * The single operator-visible sentence for `filters.search_mode`: the closed
- * set, then the letters a migrating host may still send. Derived from
- * `SEARCH_MODES` + `SEARCH_MODE_ALIASES` and quoted verbatim by BOTH the MCP
- * tool description and `invalidSearchModeMessage` below, so a widen or
- * contract step moves the host-facing prose and the refusal together instead
- * of leaving a hardcoded description silently wrong — the rule this repo
- * already recorded for `entity_type` (tests/retrieve.test.ts, "review M2").
+ * set of word-form tokens, quoted verbatim by BOTH the MCP tool description
+ * and `invalidSearchModeMessage` below, so a widen or contract step moves
+ * the host-facing prose and the refusal together instead of leaving a
+ * hardcoded description silently wrong — the rule this repo already recorded
+ * for `entity_type` (tests/retrieve.test.ts, "review M2").
  */
-export const SEARCH_MODE_WIRE_COPY =
-  `${SEARCH_MODES.join(" | ")} (retired letters accepted as aliases: ` +
-  `${searchModeAliasHints()})`;
+export const SEARCH_MODE_WIRE_COPY = SEARCH_MODES.join(" | ");
 
 /** Build the thrown-error message; keeps the reason token out of magic strings. */
 export function invalidSearchModeMessage(value: string): string {
@@ -133,10 +108,10 @@ export function invalidSearchModeMessage(value: string): string {
   );
 }
 
-/** Same constant pattern as `invalidSearchModeMessage`, for 档 D's refusal. */
+/** Same constant pattern as `invalidSearchModeMessage`, for the `sql` 档's refusal. */
 export function realDbNotWiredMessage(): string {
   return (
-    `retrieve ${SEARCH_MODE_FILTER_KEY}=D is not wired: ` +
+    `retrieve ${SEARCH_MODE_FILTER_KEY}=sql is not wired: ` +
     `${REAL_DB_NOT_WIRED_REASON} (document tables stay on 档 graph until a ` +
     `business SQL path exists)`
   );
@@ -146,7 +121,7 @@ export function realDbNotWiredMessage(): string {
  * Routing controls the dispatcher resolves from `filters` before any arm
  * runs, so an arm never re-reads a control key out of the exact-match map
  * it hands to backends (review I2: the dispatcher is the single strip
- * point for EVERY 档, C included).
+ * point for EVERY 档, `global` included).
  */
 export interface SearchModeControl {
   /**
@@ -171,11 +146,12 @@ export type SearchModeArm = (
 ) => Promise<RetrieveOutputEnvelope>;
 
 /**
- * 档 D (plans/search-mode-retrieve.md T4, spec assumption 5 + SC5): the
- * business-SQL path is a plan slot, not implemented, so the honest answer
- * is a typed refusal — reading `args`/`deps` at all would mean running SQL
- * (fake or real) over chunks, exactly what the spec forbids; document
- * tables stay on `graph`. Same exit chain as T1's invalid mode and T3's not-ready
+ * The `sql` 档 (plans/search-mode-retrieve.md T4, spec assumption 5 + SC5):
+ * the business-SQL path is a plan slot, not implemented, so the honest
+ * answer is a typed refusal — reading `args`/`deps` at all would mean
+ * running SQL (fake or real) over chunks, exactly what the spec forbids;
+ * document tables stay on `graph`. Same exit chain as T1's invalid mode and
+ * T3's not-ready
  * gate: throw a `GraphragError` whose message carries the stable fin-pinned
  * token, because the MCP adapter serializes only thrown Error messages
  * into the `isError` result. Code `INVALID_INPUT` mirrors fin's
@@ -188,23 +164,23 @@ async function modeDNotWiredArm(): Promise<RetrieveOutputEnvelope> {
 
 /**
  * specs/search-mode-retrieve.md confirms each 档 gets its own arm: T2 opened
- * A (mode-a-arm.ts, ADR-0060), T3 opened the report-first arm
- * (mode-c-arm.ts, ADR-0070), each replacing exactly ONE row of this table —
- * the handler parsing, stripping and envelope stay as they are. T4 opened D's
- * row below.
+ * the lexical child→parent arm (mode-a-arm.ts, ADR-0060), T3 opened the
+ * report-first arm (mode-c-arm.ts, ADR-0070), each replacing exactly ONE row
+ * of this table — the handler parsing, stripping and envelope stay as they
+ * are. T4 opened the `sql` row below. Arm identifiers keep their plan-side
+ * names; renaming them is a separate step from the wire contract.
  *
- * The keys are the lasting tokens of specs/search-mode-graph-global.md. The
- * `B`/`C` aliases are normalized by `parseSearchMode` before this lookup, so
- * a migrating host never needs a row of its own — and an alias can never
- * drift from the arm it is supposed to share.
+ * The keys are the wire tokens of specs/search-mode-graph-global.md — the
+ * same `SEARCH_MODES` values `parseSearchMode` resolves, so a value can
+ * never route to an arm its token does not name.
  */
 export const SEARCH_MODE_ARMS: Readonly<Record<SearchMode, SearchModeArm>> = {
   // T2: child lexical hits cite the parent 抽图窗 body (ADR-0060).
-  A: modeAParentWindowArm,
+  lexical: modeAParentWindowArm,
   // The knowledge-QA arm: graph-priority prefix, vector ∥ BM25 remainder.
   graph: assembleRetrievalResult,
   // T3: report-first community summaries, ES ∥ report vectors (ADR-0070).
   global: modeCReportFirstArm,
   // T4: typed 真库未接 refusal, never a provisional graph answer over chunks.
-  D: modeDNotWiredArm,
+  sql: modeDNotWiredArm,
 };

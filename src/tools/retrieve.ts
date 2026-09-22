@@ -8,14 +8,13 @@
  * only the optional `degraded` and `degraded_reasons` fields; internal debug
  * diagnostics are not serialized.
  *
- * `filters.search_mode` (检索档 A|graph|global|D,
+ * `filters.search_mode` (检索档 lexical|graph|global|sql,
  * specs/search-mode-graph-global.md) is resolved and dispatched in this
- * handler before the arms run: missing → `graph`, invalid → typed
- * INVALID_INPUT, A → the lexical child-hit/parent-body arm (plans T2),
- * `global` → the report-first community-summary arm (plans T3), D → the
- * typed `real_db_not_wired` refusal (plans T4; see
- * src/core/retrieval/search-mode.ts). The retired letters `B`/`C` still
- * resolve, to `graph`/`global`, while hosts migrate.
+ * handler before the arms run: missing → `graph`, outside the closed set →
+ * typed INVALID_INPUT, `lexical` → the lexical child-hit/parent-body arm
+ * (plans T2), `global` → the report-first community-summary arm (plans T3),
+ * `sql` → the typed `real_db_not_wired` refusal (plans T4; see
+ * src/core/retrieval/search-mode.ts).
  *
  * `filters.entity_type` (plans/entity-type-and-filter.md T3) is resolved
  * and stripped the same way: missing → all types, one of the closed set →

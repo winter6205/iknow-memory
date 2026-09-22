@@ -73,6 +73,34 @@ function chunk(): ChunkRecord {
   };
 }
 
+/**
+ * The third derived index: community REPORT text, whose `level` is the
+ * queryable column the retrieve-side read cap filters on.
+ */
+function summaryLayer(
+  client: ElasticsearchClientLike,
+  options: { k1?: number; b?: number } = {}
+): ElasticsearchPrecisionLayer {
+  return new ElasticsearchPrecisionLayer(
+    {
+      node: "http://localhost:9200",
+      chunkIndex: "chunks",
+      entityIndex: "entities",
+      summaryIndex: "summaries",
+    },
+    { k1: options.k1 ?? 1.4, b: options.b ?? 0.65, client }
+  );
+}
+
+function summaryRow(id = "ledger-uuid-7", communityId = "7") {
+  return {
+    id,
+    community_id: communityId,
+    content: "community report text",
+    level: 3,
+  };
+}
+
 describe("ElasticsearchPrecisionLayer", () => {
   it("creates IK/BM25 mappings and indexes chunk documents", async () => {
     const client = fakeClient();
@@ -523,5 +551,194 @@ describe("ElasticsearchPrecisionLayer.invalidateSourceRef", () => {
       name: "PrecisionLayerError",
       message: expect.stringContaining("does not support source invalidation"),
     });
+  });
+});
+
+/**
+ * The production summary-index WRITE side: the only place a summary index is
+ * ever created, because a read must never assume a derived index into
+ * existence (that assumption is what would turn an unbuilt index into a
+ * silently empty answer instead of a not-ready fact).
+ */
+describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
+  it("creates the summary index with IK analyzers and a queryable level, then bulk-indexes the reports", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([
+      summaryRow(),
+      summaryRow("ledger-uuid-8", "8"),
+    ]);
+
+    expect(client.indices.create).toHaveBeenCalledTimes(1);
+    const create = client.indices.create.mock.calls[0]?.[0] as {
+      index: string;
+      settings: Record<string, unknown>;
+      mappings: { properties: Record<string, Record<string, unknown>> };
+    };
+    expect(create.index).toBe("summaries");
+    expect(JSON.stringify(create)).toContain("ik_max_word");
+    expect(JSON.stringify(create)).toContain("ik_smart");
+    expect(JSON.stringify(create)).toContain('"k1":1.4');
+    expect(JSON.stringify(create)).toContain('"b":0.65');
+    expect(create.mappings.properties.content).toEqual({
+      type: "text",
+      analyzer: "ik_index",
+      search_analyzer: "ik_query",
+      similarity: "iknow_bm25",
+    });
+    // The read cap filters on level, so it must be a numeric field.
+    expect(create.mappings.properties.level).toEqual({ type: "integer" });
+    expect(create.mappings.properties.id).toEqual({ type: "keyword" });
+    expect(create.mappings.properties.community_id).toEqual({
+      type: "keyword",
+    });
+
+    // Document identity is the community: a re-run overwrites that
+    // community's current report instead of appending a second one.
+    expect(client.bulk).toHaveBeenCalledTimes(1);
+    const bulk = client.bulk.mock.calls[0]?.[0] as {
+      index: string;
+      operations: unknown[];
+    };
+    expect(bulk.index).toBe("summaries");
+    expect(bulk.operations).toEqual([
+      { index: { _index: "summaries", _id: "7" } },
+      {
+        id: "ledger-uuid-7",
+        community_id: "7",
+        content: "community report text",
+        level: 3,
+      },
+      { index: { _index: "summaries", _id: "8" } },
+      {
+        id: "ledger-uuid-8",
+        community_id: "8",
+        content: "community report text",
+        level: 3,
+      },
+    ]);
+  });
+
+  it("skips creation when the summary index already exists and still writes", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => true);
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+
+    expect(client.indices.exists).toHaveBeenCalledWith({ index: "summaries" });
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(client.bulk).toHaveBeenCalledTimes(1);
+  });
+
+  it("memoizes readiness so a second write does not re-create the index", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+    await layer.indexCommunitySummaries([summaryRow("ledger-uuid-8", "8")]);
+
+    expect(client.indices.create).toHaveBeenCalledTimes(1);
+    expect(client.bulk).toHaveBeenCalledTimes(2);
+  });
+
+  it("short-circuits an empty row list without touching ES at all", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([]);
+
+    expect(client.indices.exists).not.toHaveBeenCalled();
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(client.bulk).not.toHaveBeenCalled();
+  });
+
+  it("is the only path that creates the summary index; every read and lifecycle call leaves it alone", async () => {
+    const client = fakeClientWithInvalidation({ kind: "ok" });
+    const layer = summaryLayer(client);
+
+    await layer.searchLexical("query text", { limit: 5, validAt: NOW });
+    await layer.searchEntities("query text", 5);
+    await layer.analyze("query text");
+    await layer.invalidateSourceRef("docs/x.md", NOW);
+    await layer.deleteEntities(["loser-1"]);
+    await layer.deleteChunkIndex();
+    await layer.deleteEntityIndex();
+    await layer.indexChunks([chunk()]);
+    await layer.indexEntities([
+      { id: "entity-1", canonical_name: "n", aliases: [], type: "person" },
+    ]);
+
+    const created: string[] = [];
+    const inspected: string[] = [];
+    for (const call of client.indices.create.mock.calls) {
+      created.push((call[0] as { index: string }).index);
+    }
+    for (const call of client.indices.exists.mock.calls) {
+      inspected.push((call[0] as { index: string }).index);
+    }
+    // `chunks` may legitimately be created twice (the two delete calls clear
+    // the readiness memo); what must never appear is the summary index.
+    expect(new Set(created)).toEqual(new Set(["chunks", "entities"]));
+    expect(inspected).not.toContain("summaries");
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+    expect(client.indices.create.mock.calls.map(
+      (call) => (call[0] as { index: string }).index
+    )).toContain("summaries");
+  });
+
+  it("surfaces a failing summary bulk as a typed PrecisionLayerError", async () => {
+    const client = fakeClient();
+    client.bulk = vi.fn(async () => {
+      throw new Error("summary bulk exploded");
+    });
+    const layer = summaryLayer(client);
+
+    await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining("summaries"),
+    });
+  });
+
+  it("surfaces a summary index that cannot be created as a typed PrecisionLayerError", async () => {
+    const client = fakeClient();
+    client.indices.create = vi.fn(async () => {
+      throw new Error("resource_already_exists");
+    });
+    const layer = summaryLayer(client);
+
+    await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      message: expect.stringContaining('summary index "summaries"'),
+    });
+  });
+});
+
+describe("ElasticsearchPrecisionLayer.deleteSummaryIndex", () => {
+  it("removes only the summary index, and is a no-op when it is absent", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.deleteSummaryIndex();
+    expect(client.indices.delete).not.toHaveBeenCalled();
+
+    client.indices.exists = vi.fn(async () => true);
+    await layer.deleteSummaryIndex();
+    expect(client.indices.delete).toHaveBeenCalledTimes(1);
+    expect(client.indices.delete).toHaveBeenCalledWith({ index: "summaries" });
+  });
+
+  it("re-creates the index on the next write after a delete (readiness memo cleared)", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+    await layer.deleteSummaryIndex();
+    await layer.indexCommunitySummaries([summaryRow()]);
+
+    expect(client.indices.create).toHaveBeenCalledTimes(2);
   });
 });

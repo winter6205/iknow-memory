@@ -662,10 +662,13 @@ export interface CommunityIndexStateStorage {
  * rows out) while that seam is the ledger's vector read.
  *
  * Stays separate from the write side: the C arm discovers this seam
- * structurally on whatever object is wired as `deps.lexical`, so a deployment
- * with no summary index simply has one report arm fewer. Its counterpart is
- * `PrecisionIndexer.indexCommunitySummaries`, the only entry point that
- * creates the index this seam reads.
+ * structurally across `deps.lexical`, `deps.entityLexical` and the ledger, so
+ * a deployment that wires none of them simply has one report arm fewer. Once
+ * the seam is wired it fails closed: an absent or unpopulated report index
+ * raises the typed `community_summary_index_failure` rather than degrading to
+ * an empty, so the read path never hides a not-ready 档 global. Its
+ * counterpart is `PrecisionIndexer.indexCommunitySummaries`, the only entry
+ * point that creates the index this seam reads.
  */
 export interface CommunityReportLexicalStorage {
   searchCommunitySummariesLexical(

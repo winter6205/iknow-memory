@@ -4,7 +4,8 @@
  * Postgres remains authoritative for chunks, entities, aliases, and their
  * validity. This module owns only the derived lexical indexes and the
  * analysis/query shape used to read them. The same IK analyzers are installed
- * on both indexes: `ik_max_word` at index time and `ik_smart` at query time.
+ * on every derived index: `ik_max_word` at index time and `ik_smart` at query
+ * time.
  *
  * The client is injected as a small structural port so unit tests can prove
  * request bodies without a running cluster. Production construction happens
@@ -48,16 +49,45 @@ export interface EntityIndexRecord {
   merged_into?: string | null;
 }
 
+/** The derived indexes this module owns; one kind per index. */
+export type PrecisionIndexKind = "chunk" | "entity" | "summary";
+
+/**
+ * One community report projected into the derived summary index.
+ *
+ * `community_id` is the document identity: a rebuild overwrites that
+ * community's current report instead of appending a second one. `id` is the
+ * ledger row's own id, so a report ranked by both this index and the
+ * ledger's vector arm fuses as ONE hit (cross-arm identity is the hit id).
+ * `level` is the product grain the read side caps on.
+ */
+export interface CommunitySummaryIndexRecord {
+  id: string;
+  community_id: string;
+  content: string;
+  level: number;
+}
+
 /** Write + lookup port used by ingestion, extraction, and retrieve wiring. */
 export interface PrecisionIndexer extends EntityLexicalStorage {
   searchLexical(query: string, opts: SearchOptions): Promise<RetrievedChunk[]>;
   indexChunks(chunks: readonly ChunkRecord[]): Promise<void>;
   indexEntities(entities: readonly EntityIndexRecord[]): Promise<void>;
+  /**
+   * Write the published community-report generation. This is the ONLY entry
+   * point that creates the summary index: a read must never assume a derived
+   * index into existence, because a summary index that is not there yet is a
+   * not-ready fact, not an empty answer.
+   */
+  indexCommunitySummaries(
+    rows: readonly CommunitySummaryIndexRecord[]
+  ): Promise<void>;
   rebuildChunks(chunks: readonly ChunkRecord[]): Promise<void>;
   rebuildEntities(entities: readonly EntityIndexRecord[]): Promise<void>;
   invalidateSourceRef(sourceRef: string, invalidatedAt: string): Promise<void>;
   deleteChunkIndex(): Promise<void>;
   deleteEntityIndex(): Promise<void>;
+  deleteSummaryIndex(): Promise<void>;
   /**
    * Remove a set of entity ids from the entity index. Soft-merges and
    * retirements call this so the lexical entity seed layer does not keep
@@ -246,7 +276,7 @@ function sourceRecord(source: unknown): Record<string, unknown> {
 }
 
 /**
- * One Elasticsearch client and two derived indexes. `ready` memoizes index
+ * One Elasticsearch client and three derived indexes. `ready` memoizes index
  * creation per index and is cleared after a failed attempt so a transient
  * cluster outage can recover on the next call.
  */
@@ -320,6 +350,26 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
     await this.bulk(this.config.entityIndex, operations);
   }
 
+  async indexCommunitySummaries(
+    rows: readonly CommunitySummaryIndexRecord[]
+  ): Promise<void> {
+    if (rows.length === 0) return;
+    await this.ensureIndex(this.config.summaryIndex, "summary");
+    const operations: unknown[] = [];
+    for (const row of rows) {
+      operations.push({
+        index: { _index: this.config.summaryIndex, _id: row.community_id },
+      });
+      operations.push({
+        id: row.id,
+        community_id: row.community_id,
+        content: row.content,
+        level: row.level,
+      });
+    }
+    await this.bulk(this.config.summaryIndex, operations);
+  }
+
   async rebuildChunks(chunks: readonly ChunkRecord[]): Promise<void> {
     await this.deleteChunkIndex();
     await this.indexChunks(chunks);
@@ -368,6 +418,10 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
 
   async deleteEntityIndex(): Promise<void> {
     await this.deleteIndex(this.config.entityIndex);
+  }
+
+  async deleteSummaryIndex(): Promise<void> {
+    await this.deleteIndex(this.config.summaryIndex);
   }
 
   async deleteEntities(ids: readonly string[]): Promise<void> {
@@ -506,7 +560,7 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
 
   private async ensureIndex(
     index: string,
-    kind: "chunk" | "entity"
+    kind: PrecisionIndexKind
   ): Promise<void> {
     const existing = this.ready.get(index);
     if (existing !== undefined) {
@@ -525,7 +579,7 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
 
   private async createIndexIfMissing(
     index: string,
-    kind: "chunk" | "entity"
+    kind: PrecisionIndexKind
   ): Promise<void> {
     try {
       const exists = await this.client.indices.exists({ index });
@@ -533,7 +587,7 @@ export class ElasticsearchPrecisionLayer implements PrecisionIndexer {
       await this.client.indices.create({
         index,
         settings: precisionSettings(this.k1, this.b),
-        mappings: kind === "chunk" ? chunkMappings() : entityMappings(),
+        mappings: indexMappings(kind),
       });
     } catch (error) {
       throw new PrecisionLayerError(
@@ -718,6 +772,32 @@ function entityMappings(): Record<string, unknown> {
       type: { type: "keyword" },
       retired: { type: "boolean" },
       merged_into: { type: "keyword" },
+    },
+  };
+}
+
+/** The one mapping per derived index kind. */
+function indexMappings(kind: PrecisionIndexKind): Record<string, unknown> {
+  if (kind === "chunk") return chunkMappings();
+  if (kind === "entity") return entityMappings();
+  return summaryMappings();
+}
+
+function summaryMappings(): Record<string, unknown> {
+  return {
+    properties: {
+      id: { type: "keyword" },
+      community_id: { type: "keyword" },
+      content: {
+        type: "text",
+        analyzer: IK_INDEX_ANALYZER,
+        search_analyzer: IK_QUERY_ANALYZER,
+        similarity: BM25_SIMILARITY,
+      },
+      // Queryable, not just stored: a reader applying the community-level cap
+      // must be able to bound `level <= N` in the query itself, so an
+      // over-grain report is filtered at recall rather than after ranking.
+      level: { type: "integer" },
     },
   };
 }

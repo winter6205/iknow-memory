@@ -661,11 +661,11 @@ export interface CommunityIndexStateStorage {
  * because it is the derived precision-index read (query text in, ranked
  * rows out) while that seam is the ledger's vector read.
  *
- * Deliberately NOT part of `PrecisionIndexer` in this ticket: the live
- * summary-index write side belongs to the graph-index plan T5 wave, and
- * an uncallable index method would be dead code. The C arm discovers this
- * port structurally on whatever object is wired as `deps.lexical`, so the
- * later ES-side ticket only has to add the method.
+ * Stays separate from the write side: the C arm discovers this seam
+ * structurally on whatever object is wired as `deps.lexical`, so a deployment
+ * with no summary index simply has one report arm fewer. Its counterpart is
+ * `PrecisionIndexer.indexCommunitySummaries`, the only entry point that
+ * creates the index this seam reads.
  */
 export interface CommunityReportLexicalStorage {
   searchCommunitySummariesLexical(

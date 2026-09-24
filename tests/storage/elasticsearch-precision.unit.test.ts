@@ -5,6 +5,7 @@ import {
   type ElasticsearchClientLike,
 } from "../../src/core/storage/elasticsearch-precision.js";
 import type { ChunkRecord } from "../../src/core/types.js";
+import { FakeEsCluster } from "./es-fake-cluster.js";
 
 const NOW = "2026-01-01T00:00:00.000Z";
 
@@ -17,6 +18,8 @@ function fakeClient(): ElasticsearchClientLike {
         tokens: [{ token: "����" }, { token: "�ִ�" }],
       })),
       delete: vi.fn(async () => ({})),
+      getAlias: vi.fn(async () => ({})),
+      updateAliases: vi.fn(async () => ({ acknowledged: true })),
     },
     bulk: vi.fn(async () => ({ errors: false, items: [] })),
     search: vi.fn(async () => ({
@@ -70,6 +73,34 @@ function chunk(): ChunkRecord {
     valid_from: NOW,
     valid_until: null,
     created_at: NOW,
+  };
+}
+
+/**
+ * The third derived index: community REPORT text, whose `level` is the
+ * queryable column the retrieve-side read cap filters on.
+ */
+function summaryLayer(
+  client: ElasticsearchClientLike,
+  options: { k1?: number; b?: number } = {}
+): ElasticsearchPrecisionLayer {
+  return new ElasticsearchPrecisionLayer(
+    {
+      node: "http://localhost:9200",
+      chunkIndex: "chunks",
+      entityIndex: "entities",
+      summaryIndex: "summaries",
+    },
+    { k1: options.k1 ?? 1.4, b: options.b ?? 0.65, client }
+  );
+}
+
+function summaryRow(id = "ledger-uuid-7", communityId = "7") {
+  return {
+    id,
+    community_id: communityId,
+    content: "community report text",
+    level: 3,
   };
 }
 
@@ -523,5 +554,568 @@ describe("ElasticsearchPrecisionLayer.invalidateSourceRef", () => {
       name: "PrecisionLayerError",
       message: expect.stringContaining("does not support source invalidation"),
     });
+  });
+});
+
+/**
+ * The production summary-index WRITE side: the only place a summary index is
+ * ever created, because a read must never assume a derived index into
+ * existence (that assumption is what would turn an unbuilt index into a
+ * silently empty answer instead of a not-ready fact).
+ */
+describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
+  it("creates the summary index with IK analyzers and a queryable level, then bulk-indexes the reports", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([
+      summaryRow(),
+      summaryRow("ledger-uuid-8", "8"),
+    ]);
+
+    expect(client.indices.create).toHaveBeenCalledTimes(1);
+    const create = client.indices.create.mock.calls[0]?.[0] as {
+      index: string;
+      settings: Record<string, unknown>;
+      mappings: { properties: Record<string, Record<string, unknown>> };
+    };
+    // The presence probe reports nothing live, so gen-0 is the only slot this
+    // projection could stage — the name is deterministic, not pattern-matched.
+    expect(create.index).toBe("summaries-gen-0");
+    expect(JSON.stringify(create)).toContain("ik_max_word");
+    expect(JSON.stringify(create)).toContain("ik_smart");
+    expect(JSON.stringify(create)).toContain('"k1":1.4');
+    expect(JSON.stringify(create)).toContain('"b":0.65');
+    expect(create.mappings.properties.content).toEqual({
+      type: "text",
+      analyzer: "ik_index",
+      search_analyzer: "ik_query",
+      similarity: "iknow_bm25",
+    });
+    // The read cap filters on level, so it must be a numeric field.
+    expect(create.mappings.properties.level).toEqual({ type: "integer" });
+    expect(create.mappings.properties.id).toEqual({ type: "keyword" });
+    expect(create.mappings.properties.community_id).toEqual({
+      type: "keyword",
+    });
+
+    // The whole generation goes to the slot that was just created — never to
+    // the name readers aim at, which is what keeps it unpublished until the
+    // alias swap.
+    expect(client.bulk).toHaveBeenCalledTimes(1);
+    const bulk = client.bulk.mock.calls[0]?.[0] as {
+      index: string;
+      operations: unknown[];
+    };
+    expect(bulk.index).toBe(create.index);
+    expect(bulk.operations).toEqual([
+      { index: { _index: create.index, _id: "7" } },
+      {
+        id: "ledger-uuid-7",
+        community_id: "7",
+        content: "community report text",
+        level: 3,
+      },
+      { index: { _index: create.index, _id: "8" } },
+      {
+        id: "ledger-uuid-8",
+        community_id: "8",
+        content: "community report text",
+        level: 3,
+      },
+    ]);
+  });
+
+  it("fills the slot the live alias does not point at and repoints the alias", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(
+      async (request: Record<string, unknown>) => request.index === "summaries"
+    );
+    client.indices.getAlias = vi.fn(async () => ({
+      "summaries-gen-1": { aliases: { summaries: {} } },
+    }));
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+
+    expect(client.indices.create).toHaveBeenCalledTimes(1);
+    expect(
+      (client.indices.create.mock.calls[0]?.[0] as { index: string }).index
+    ).toBe("summaries-gen-0");
+    const swap = client.indices.updateAliases.mock.calls[0]?.[0] as {
+      actions: unknown[];
+    };
+    // One atomic body: the previous generation stops being readable exactly
+    // when the new one starts.
+    expect(swap.actions).toEqual([
+      { remove: { index: "*", alias: "summaries" } },
+      { add: { index: "summaries-gen-0", alias: "summaries" } },
+    ]);
+  });
+
+  it("retires a pre-alias physical index of the alias name in the same swap", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => true);
+    // A physical index is not an alias, so a real cluster REJECTS the lookup
+    // with a 404 rather than answering with an empty mapping: only that branch
+    // may treat the alias name itself as the live generation.
+    client.indices.getAlias = vi.fn(async () => {
+      throw Object.assign(new Error("alias_not_found_exception"), {
+        meta: { statusCode: 404 },
+      });
+    });
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+
+    expect(client.indices.getAlias).toHaveBeenCalledTimes(1);
+    const swap = client.indices.updateAliases.mock.calls[0]?.[0] as {
+      actions: unknown[];
+    };
+    // An index and an alias cannot share a name, so the old build's index has
+    // to go in the same call that publishes the slot.
+    expect(swap.actions).toEqual([
+      { remove_index: { index: "summaries" } },
+      { add: { index: "summaries-gen-0", alias: "summaries" } },
+    ]);
+  });
+
+  it("fails closed when the alias lookup rejects for anything but a missing alias", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => true);
+    client.indices.getAlias = vi.fn(async () => {
+      throw new Error("cluster down: alias lookup rejected");
+    });
+    const layer = summaryLayer(client);
+
+    // Guessing a slot from a lookup that merely failed would build a
+    // generation beside the live one and publish over it.
+    await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining('summary alias "summaries" lookup failed'),
+    });
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(client.bulk).not.toHaveBeenCalled();
+    expect(client.indices.updateAliases).not.toHaveBeenCalled();
+  });
+
+  it("rebuilds the generation slot from scratch on every projection", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+    await layer.indexCommunitySummaries([summaryRow("ledger-uuid-8", "8")]);
+
+    // Readiness memoization cannot skip a generation build: a slot that is
+    // reused starts empty, or the previous generation would still be readable.
+    expect(client.indices.create).toHaveBeenCalledTimes(2);
+    expect(client.bulk).toHaveBeenCalledTimes(2);
+  });
+
+  it("short-circuits an empty row list without touching ES at all", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([]);
+
+    expect(client.indices.exists).not.toHaveBeenCalled();
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(client.bulk).not.toHaveBeenCalled();
+  });
+
+  it("is the only path that creates the summary index; every read and lifecycle call leaves it alone", async () => {
+    const client = fakeClientWithInvalidation({ kind: "ok" });
+    const layer = summaryLayer(client);
+
+    await layer.searchLexical("query text", { limit: 5, validAt: NOW });
+    await layer.searchEntities("query text", 5);
+    await layer.analyze("query text");
+    await layer.invalidateSourceRef("docs/x.md", NOW);
+    await layer.deleteEntities(["loser-1"]);
+    await layer.deleteChunkIndex();
+    await layer.deleteEntityIndex();
+    await layer.indexChunks([chunk()]);
+    await layer.indexEntities([
+      { id: "entity-1", canonical_name: "n", aliases: [], type: "person" },
+    ]);
+
+    const created: string[] = [];
+    const inspected: string[] = [];
+    for (const call of client.indices.create.mock.calls) {
+      created.push((call[0] as { index: string }).index);
+    }
+    for (const call of client.indices.exists.mock.calls) {
+      inspected.push((call[0] as { index: string }).index);
+    }
+    // `chunks` may legitimately be created twice (the two delete calls clear
+    // the readiness memo); what must never appear is the summary index.
+    expect(new Set(created)).toEqual(new Set(["chunks", "entities"]));
+    expect(inspected).not.toContain("summaries");
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+    const afterWrite: string[] = [];
+    for (const call of client.indices.create.mock.calls.slice(created.length)) {
+      afterWrite.push((call[0] as { index: string }).index);
+    }
+    expect(afterWrite).toEqual(["summaries-gen-0"]);
+  });
+
+  it("surfaces a failing summary bulk as a typed PrecisionLayerError", async () => {
+    const client = fakeClient();
+    client.bulk = vi.fn(async () => {
+      throw new Error("summary bulk exploded");
+    });
+    const layer = summaryLayer(client);
+
+    await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining("summaries"),
+    });
+  });
+
+  it("surfaces a summary index that cannot be created as a typed PrecisionLayerError", async () => {
+    const client = fakeClient();
+    client.indices.create = vi.fn(async () => {
+      throw new Error("resource_already_exists");
+    });
+    const layer = summaryLayer(client);
+
+    await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      message: expect.stringContaining(
+        'summary index "summaries-gen-0" is unavailable'
+      ),
+    });
+  });
+});
+
+/**
+ * Issue #272: the write path must REPLACE the published generation, not upsert
+ * into it. A community that dropped out of the generation stops being readable,
+ * and a write that dies midway must leave readers on the previous COMPLETE
+ * generation — never a half-old/half-new mix, which is what a per-community
+ * upsert into the live index allows.
+ */
+describe("ElasticsearchPrecisionLayer summary generation replacement", () => {
+  // Bulk batching is 1_000 documents per request, so a generation above that
+  // size is written in several bulks: exactly the window where a midway
+  // failure used to publish a partial generation.
+  const OVER_TWO_BATCHES = Array.from({ length: 1_001 }, (_, i) => `c${i}`);
+
+  function generation(communityIds: readonly string[]) {
+    return communityIds.map((communityId) => ({
+      id: `ledger-${communityId}`,
+      community_id: communityId,
+      content: "community report text",
+      level: 1,
+    }));
+  }
+
+  it("retires a community's document when it is absent from the new generation", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+
+    await layer.indexCommunitySummaries(generation(["7", "99"]));
+    expect(cluster.liveCommunityIds("summaries")).toEqual(["7", "99"]);
+
+    await layer.indexCommunitySummaries(generation(["7"]));
+
+    expect(cluster.liveCommunityIds("summaries")).toEqual(["7"]);
+    // The read seam targets the same name readers do, so what is stored live
+    // and what a report search answers can never drift apart.
+    await expect(
+      layer.searchCommunitySummariesLexical("community report", 5, 3)
+    ).resolves.toEqual([
+      {
+        id: "ledger-7",
+        communityId: "7",
+        summary: "community report text",
+        level: 1,
+        score: 1,
+      },
+    ]);
+  });
+
+  it("keeps the previous complete generation readable when a bulk dies midway", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+    await layer.indexCommunitySummaries(generation(OVER_TWO_BATCHES));
+    // Two bulks published the first generation; of the next projection the
+    // third bulk lands and the fourth dies.
+    cluster.failNthBulk = 4;
+
+    await expect(
+      layer.indexCommunitySummaries(
+        generation(OVER_TWO_BATCHES.map((id) => `fresh-${id}`))
+      )
+    ).rejects.toMatchObject({ name: "PrecisionLayerError" });
+
+    // Readers still resolve exactly the old generation: none of the fresh
+    // communities — which share no id with it — leaked into the live set.
+    const readable = cluster.liveCommunityIds("summaries");
+    expect(readable.filter((id) => id.startsWith("fresh-"))).toEqual([]);
+    expect(readable).toHaveLength(OVER_TWO_BATCHES.length);
+    expect(cluster.orphanIndices("summaries")).toEqual([]);
+  });
+
+  it("keeps the previous complete generation readable when the alias swap fails", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+    await layer.indexCommunitySummaries(generation(["7", "8"]));
+    cluster.failNextAliasUpdate = true;
+
+    await expect(
+      layer.indexCommunitySummaries(generation(["fresh"]))
+    ).rejects.toMatchObject({ name: "PrecisionLayerError" });
+
+    expect(cluster.liveCommunityIds("summaries")).toEqual(["7", "8"]);
+    expect(cluster.orphanIndices("summaries")).toEqual([]);
+  });
+
+  it("leaves reads typed not-ready once the index is cleared", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+
+    await layer.indexCommunitySummaries(generation(["7"]));
+    await layer.deleteSummaryIndex();
+
+    expect(cluster.indexNames()).toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("community report", 5, 3)
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("community_summary_index_failure"),
+    });
+  });
+});
+
+describe("ElasticsearchPrecisionLayer.deleteSummaryIndex", () => {
+  it("removes every generation slot and the alias name itself, no-op when absent", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.deleteSummaryIndex();
+    expect(client.indices.delete).not.toHaveBeenCalled();
+
+    client.indices.exists = vi.fn(async () => true);
+    await layer.deleteSummaryIndex();
+    expect(
+      client.indices.delete.mock.calls.map(
+        (call) => (call[0] as { index: string }).index
+      )
+    ).toEqual(["summaries-gen-0", "summaries-gen-1", "summaries"]);
+  });
+
+  it("re-creates the index on the next write after a delete (readiness memo cleared)", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+    await layer.deleteSummaryIndex();
+    await layer.indexCommunitySummaries([summaryRow()]);
+
+    expect(client.indices.create).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The PRODUCTION global report-TEXT read seam. A read must never assume the
+ * derived summary index into existence: an absent index is a not-ready fact
+ * (typed with the community_summary_index_failure token), while an erroring
+ * cluster is a transient arm failure (a plain PrecisionLayerError, no token).
+ */
+describe("ElasticsearchPrecisionLayer.searchCommunitySummariesLexical", () => {
+  function summaryHit(
+    overrides: Partial<{
+      id: string;
+      community_id: string;
+      content: string;
+      level: number;
+    }> = {}
+  ) {
+    return {
+      _id: "7",
+      _score: 1.5,
+      _source: {
+        id: "ledger-uuid-7",
+        community_id: "7",
+        content: "community report text",
+        level: 2,
+        ...overrides,
+      },
+    };
+  }
+
+  /** A client whose summary index EXISTS and returns the given hits. */
+  function presentClient(
+    hits: unknown[],
+    searchBehavior?: (req: Record<string, unknown>) => Promise<unknown>
+  ): ElasticsearchClientLike {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => true);
+    client.search =
+      searchBehavior ??
+      vi.fn(async () => ({ hits: { hits } }));
+    return client;
+  }
+
+  it("maps a present-index hit to a CommunitySummaryRow keyed by ledger identity", async () => {
+    const client = presentClient([summaryHit()]);
+    const layer = summaryLayer(client);
+
+    const rows = await layer.searchCommunitySummariesLexical("报告", 5, 2);
+
+    expect(rows).toEqual([
+      {
+        id: "ledger-uuid-7",
+        communityId: "7",
+        summary: "community report text",
+        level: 2,
+        score: 1.5,
+      },
+    ]);
+  });
+
+  it("applies the level cap IN THE QUERY and honors limit as size, using the IK query analyzer", async () => {
+    const client = presentClient([]);
+    const layer = summaryLayer(client);
+
+    await layer.searchCommunitySummariesLexical("报告 text", 3, 2);
+
+    const request = client.search.mock.calls[0]?.[0] as {
+      index: string;
+      size: number;
+      _source: string[];
+      query: Record<string, unknown>;
+    };
+    expect(request.index).toBe("summaries");
+    expect(request.size).toBe(3);
+    expect(request._source).toEqual(["id", "community_id", "content", "level"]);
+    const query = JSON.stringify(request.query);
+    // The cap is a filter clause, so an over-grain report never re-enters
+    // ranking regardless of its score.
+    expect(query).toContain('"range":{"level":{"lte":2}}');
+    expect(query).toContain("multi_match");
+    expect(query).toContain("ik_query");
+  });
+
+  it("legitimately returns [] when the index exists but nothing matches", async () => {
+    const client = presentClient([]);
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 5, 2)
+    ).resolves.toEqual([]);
+  });
+
+  it("short-circuits an empty query or a non-positive limit without touching ES", async () => {
+    const client = fakeClient();
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("   ", 5, 2)
+    ).resolves.toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 0, 2)
+    ).resolves.toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", -3, 2)
+    ).resolves.toEqual([]);
+
+    expect(client.indices.exists).not.toHaveBeenCalled();
+    expect(client.search).not.toHaveBeenCalled();
+  });
+
+  it("fails CLOSED (typed not-ready) when the summary index is absent, never a healthy empty", async () => {
+    const client = fakeClient(); // indices.exists -> false by default
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 5, 2)
+    ).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining("community_summary_index_failure"),
+    });
+    // A not-ready read must never assume the index into existence.
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(client.search).not.toHaveBeenCalled();
+  });
+
+  it("surfaces an erroring cluster (search) as a transient PrecisionLayerError, WITHOUT the not-ready token", async () => {
+    const client = presentClient([], vi.fn(async () => {
+      throw new Error("cluster down");
+    }));
+    const layer = summaryLayer(client);
+
+    await expect(
+      layer.searchCommunitySummariesLexical("报告", 5, 2)
+    ).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining("cluster down"),
+    });
+    // Distinct from the refusal path: a transient failure carries NO token.
+    const err = await layer
+      .searchCommunitySummariesLexical("报告", 5, 2)
+      .catch((e: unknown) => e as Error);
+    expect((err as Error).message).not.toContain(
+      "community_summary_index_failure"
+    );
+  });
+
+  it("surfaces an availability probe that throws as a transient error, WITHOUT the token", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => {
+      throw new Error("connection refused");
+    });
+    const layer = summaryLayer(client);
+
+    const err = await layer
+      .searchCommunitySummariesLexical("报告", 5, 2)
+      .catch((e: unknown) => e as Error);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as { name?: string }).name).toBe("PrecisionLayerError");
+    expect((err as Error).message).toContain("availability check failed");
+    expect((err as Error).message).not.toContain(
+      "community_summary_index_failure"
+    );
+    expect(client.indices.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps concurrent reads independent: no shared buffer, no index creation", async () => {
+    const client = fakeClient();
+    let existsCalls = 0;
+    client.indices.exists = vi.fn(async () => {
+      existsCalls += 1;
+      return true;
+    });
+    client.search = vi.fn(
+      async (req: Record<string, unknown>) => {
+        const size = typeof req.size === "number" ? req.size : 0;
+        return {
+          hits: {
+            hits: Array.from({ length: size }, (_, i) =>
+              summaryHit({ id: `ledger-${i}`, community_id: String(i) })
+            ),
+          },
+        };
+      }
+    );
+    const layer = summaryLayer(client);
+
+    const [a, b] = await Promise.all([
+      layer.searchCommunitySummariesLexical("first report", 2, 2),
+      layer.searchCommunitySummariesLexical("second report", 3, 2),
+    ]);
+
+    // Each read re-probes presence (the readiness memo is the WRITE path's,
+    // never populated or consumed by a read), and neither created an index.
+    expect(existsCalls).toBe(2);
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(a).toHaveLength(2);
+    expect(b).toHaveLength(3);
+    expect(a.map((r) => r.id)).toEqual(["ledger-0", "ledger-1"]);
   });
 });

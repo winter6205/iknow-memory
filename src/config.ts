@@ -120,10 +120,13 @@ export const ELASTICSEARCH_PASSWORD_VAR = "GRAPHRAG_MEMORY_ES_PASSWORD";
 export const ELASTICSEARCH_API_KEY_VAR = "GRAPHRAG_MEMORY_ES_API_KEY";
 export const ELASTICSEARCH_CHUNK_INDEX_VAR = "GRAPHRAG_MEMORY_ES_CHUNK_INDEX";
 export const ELASTICSEARCH_ENTITY_INDEX_VAR = "GRAPHRAG_MEMORY_ES_ENTITY_INDEX";
+export const ELASTICSEARCH_SUMMARY_INDEX_VAR =
+  "GRAPHRAG_MEMORY_ES_SUMMARY_INDEX";
 export const ELASTICSEARCH_REQUEST_TIMEOUT_MS_VAR =
   "GRAPHRAG_MEMORY_ES_REQUEST_TIMEOUT_MS";
 export const DEFAULT_ELASTICSEARCH_CHUNK_INDEX = "iknow-memory-chunks";
 export const DEFAULT_ELASTICSEARCH_ENTITY_INDEX = "iknow-memory-entities";
+export const DEFAULT_ELASTICSEARCH_SUMMARY_INDEX = "iknow-memory-summaries";
 export const DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT_MS = 5_000;
 
 /**
@@ -280,6 +283,17 @@ export interface ElasticsearchConfig {
   chunkIndex: string;
   /** Derived entity + alias index used during graph seed finding. */
   entityIndex: string;
+  /**
+   * ALIAS for the derived community-REPORT index (lexical arm of a
+   * report-first retrieve). The precision layer publishes a generation by
+   * repointing this alias at one of two physical slots it derives from the
+   * configured name, `<name>-gen-0` and `<name>-gen-1`, so an operator's ILM
+   * policy, index template, or privileges must target the `<name>-gen-*`
+   * pattern — pinning them to this single literal name silently misses every
+   * index that actually holds documents. The community-summary CLI is its
+   * only writer.
+   */
+  summaryIndex: string;
   /** Per-request client timeout. */
   requestTimeoutMs: number;
 }
@@ -1023,6 +1037,17 @@ function isElasticsearchIndexName(value: string): boolean {
  * attempted configuration are rejected early so a typo cannot silently
  * select a different deployment.
  */
+/** Resolve one derived ES index name from its env var, else the default, then validate. */
+function resolveElasticsearchIndex(name: string, fallback: string): string {
+  const index = readTrimmed(name) ?? fallback;
+  if (!isElasticsearchIndexName(index)) {
+    throw new ConfigError(
+      `${name} must be a lowercase Elasticsearch index name`
+    );
+  }
+  return index;
+}
+
 function parseElasticsearchConfig(): ElasticsearchConfig | undefined {
   const node =
     readTrimmed(ELASTICSEARCH_URL_VAR) ?? readTrimmed(ELASTICSEARCH_NODE_VAR);
@@ -1075,30 +1100,27 @@ function parseElasticsearchConfig(): ElasticsearchConfig | undefined {
     );
   }
 
-  const chunkIndex =
-    readTrimmed(ELASTICSEARCH_CHUNK_INDEX_VAR) ??
-    DEFAULT_ELASTICSEARCH_CHUNK_INDEX;
-  const entityIndex =
-    readTrimmed(ELASTICSEARCH_ENTITY_INDEX_VAR) ??
-    DEFAULT_ELASTICSEARCH_ENTITY_INDEX;
-  for (const [name, index] of [
-    [ELASTICSEARCH_CHUNK_INDEX_VAR, chunkIndex],
-    [ELASTICSEARCH_ENTITY_INDEX_VAR, entityIndex],
-  ] as const) {
-    if (!isElasticsearchIndexName(index)) {
-      throw new ConfigError(
-        `${name} must be a lowercase Elasticsearch index name`
-      );
-    }
-  }
+  const indexNames = {
+    chunkIndex: resolveElasticsearchIndex(
+      ELASTICSEARCH_CHUNK_INDEX_VAR,
+      DEFAULT_ELASTICSEARCH_CHUNK_INDEX
+    ),
+    entityIndex: resolveElasticsearchIndex(
+      ELASTICSEARCH_ENTITY_INDEX_VAR,
+      DEFAULT_ELASTICSEARCH_ENTITY_INDEX
+    ),
+    summaryIndex: resolveElasticsearchIndex(
+      ELASTICSEARCH_SUMMARY_INDEX_VAR,
+      DEFAULT_ELASTICSEARCH_SUMMARY_INDEX
+    ),
+  };
 
   return {
     node: node.replace(/\/$/, ""),
     username,
     password,
     apiKey,
-    chunkIndex,
-    entityIndex,
+    ...indexNames,
     requestTimeoutMs: parseConfiguredPositiveInt(
       ELASTICSEARCH_REQUEST_TIMEOUT_MS_VAR,
       readRawEnv(ELASTICSEARCH_REQUEST_TIMEOUT_MS_VAR),

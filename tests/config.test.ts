@@ -2109,6 +2109,47 @@ describe("loadEnv — ES precision-layer fail-start (ADR-0007)", () => {
     });
   });
 
+  // The derived community-summary report index is the third name in the same
+  // block, so it takes the same default / explicit / invalid-name contract.
+  it("defaults the community-summary index name with no env var (empty/missing)", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_SUMMARY_INDEX: "" }, () => {
+      expect(loadEnv().elasticsearch?.summaryIndex).toBe(
+        "iknow-memory-summaries"
+      );
+    });
+  });
+
+  it("honors an explicit community-summary index name", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_SUMMARY_INDEX: "tenant-summaries" }, () => {
+      expect(loadEnv().elasticsearch?.summaryIndex).toBe("tenant-summaries");
+    });
+  });
+
+  it("rejects a non-lowercase community-summary index name by naming the var (invalid)", () => {
+    withEnv({ GRAPHRAG_MEMORY_ES_SUMMARY_INDEX: "Tenant Summaries" }, () => {
+      expect(() => loadEnv()).toThrow(ConfigError);
+      expect(() => loadEnv()).toThrow(
+        /GRAPHRAG_MEMORY_ES_SUMMARY_INDEX must be a lowercase Elasticsearch index name/
+      );
+    });
+  });
+
+  it("keeps the three derived index names independent (boundary)", () => {
+    withEnv(
+      {
+        GRAPHRAG_MEMORY_ES_CHUNK_INDEX: "a-chunks",
+        GRAPHRAG_MEMORY_ES_ENTITY_INDEX: "a-entities",
+        GRAPHRAG_MEMORY_ES_SUMMARY_INDEX: "a-summaries",
+      },
+      () => {
+        const es = loadEnv().elasticsearch;
+        expect(es?.chunkIndex).toBe("a-chunks");
+        expect(es?.entityIndex).toBe("a-entities");
+        expect(es?.summaryIndex).toBe("a-summaries");
+      }
+    );
+  });
+
   it("credentials without an address are still rejected (existing parse, no switch needed)", () => {
     withEnv(
       {

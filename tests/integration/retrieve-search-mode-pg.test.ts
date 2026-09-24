@@ -28,7 +28,8 @@
  * the exact command to re-run), never a silent green.
  */
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { Client as PgClient } from "pg";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT_MS,
@@ -36,6 +37,8 @@ import {
   ELASTICSEARCH_URL_VAR,
 } from "../../src/config.js";
 import { buildRetrieveDeps } from "../../src/index.js";
+import { slotWriteFragments, slotWriteTargets } from "../../src/core/embed-slots.js";
+import { toVectorLiteral } from "../../src/core/extraction/persist.js";
 import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
 import { modeAParentWindowArm } from "../../src/core/retrieval/mode-a-arm.js";
 import {
@@ -49,8 +52,17 @@ import type { RetrieveConfig } from "../../src/core/retrieval/types.js";
 import { GraphragError } from "../../src/core/errors.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
 import { ElasticsearchPrecisionLayer } from "../../src/core/storage/elasticsearch-precision.js";
+import type { CommunitySummaryIndexRecord } from "../../src/core/storage/elasticsearch-precision.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
-import type { ChunkRecord, SourceDocRecord } from "../../src/core/types.js";
+import type {
+  ChunkRecord,
+  EmbeddingGenerationState,
+  SourceDocRecord,
+} from "../../src/core/types.js";
+import {
+  COMMUNITY_INDEX_STATUS,
+  COMMUNITY_SUMMARY_INDEX_FAILURE,
+} from "../../src/core/types.js";
 import { createRetrieveHandler } from "../../src/tools/retrieve.js";
 import type { ToolResult } from "../../src/tools/registry.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
@@ -62,6 +74,7 @@ const DEFAULT_ES_URL = "http://localhost:9200";
 /** Test-only indices: never the operator's `iknow-memory-chunks` corpus. */
 const CHUNK_INDEX = "iknow-memory-test-search-mode-chunks";
 const ENTITY_INDEX = "iknow-memory-test-search-mode-entities";
+const SUMMARY_INDEX = "iknow-memory-test-search-mode-summaries";
 
 const DIM = 8;
 
@@ -186,6 +199,13 @@ const CFG: RetrieveConfig = {
   graphArmFloor: 3,
 };
 
+/**
+ * The operator config the `global` LIVE case runs with: the community-report
+ * capability ON (T5b) while every other knob keeps the CFG shape, so report
+ * rows in the answer can only come from the 档 C arms.
+ */
+const GLOBAL_CFG: RetrieveConfig = { ...CFG, communitySummaryEnabled: true };
+
 interface ParentWindowMeta {
   kind: "parent-window";
   sourceDocId: string;
@@ -228,6 +248,122 @@ function childRecord(ordinal: number, content: string): ChunkRecord {
   };
 }
 
+// ---------------------------------------------------------------------------
+// T5b LIVE report fixture — built THROUGH the production write path
+// ---------------------------------------------------------------------------
+
+/** Distinct English token for the report corpus: IK keeps it as one term. */
+const SUMMARY_TOKEN = "heliosurvey";
+
+interface ReportFixtureRow {
+  id: string;
+  communityId: string;
+  summary: string;
+  entityIds: string[];
+  level: number;
+  embedding: number[];
+}
+
+/**
+ * One report inside the default `level <= 2` cap and one deliberately above
+ * it: both match the token and both sit nearest the query vector, so the ONLY
+ * thing that may keep gamma out of the answer is the cap the reads apply.
+ */
+const REPORT_ROWS: ReportFixtureRow[] = [
+  {
+    id: randomUUID(),
+    communityId: "community-helios-alpha",
+    summary: `community report alpha: the ${SUMMARY_TOKEN} digest of orbital findings.`,
+    entityIds: [],
+    level: 1,
+    embedding: unit(0),
+  },
+  {
+    id: randomUUID(),
+    communityId: "community-helios-gamma",
+    summary: `community report gamma: another ${SUMMARY_TOKEN} text above the level cap.`,
+    entityIds: [],
+    level: 3,
+    embedding: unit(0),
+  },
+];
+
+/**
+ * The production swap (src/cli/community-summary.ts
+ * `swapCommunitySummaries`) drives its slot columns from the exported
+ * `slotWriteTargets`/`slotWriteFragments` SSOT and closes with the
+ * `markCommunityIndexState(ready)` singleton upsert; both CLI functions are
+ * module-private, so this mirrors their exact statements through the same
+ * exported builders: BEGIN, DELETE, per-row INSERT with the slot fragment at
+ * bind position 6, the verbatim `ON CONFLICT (id)` state write, COMMIT.
+ */
+async function seedCommunityReports(
+  client: PgClient,
+  rows: readonly ReportFixtureRow[],
+  generation: EmbeddingGenerationState | null
+): Promise<void> {
+  const { activeSlot, incomingSlot } = slotWriteTargets(generation);
+  if (incomingSlot !== null) {
+    throw new Error("report fixture expects no open dual-write rotate");
+  }
+  const { columns, valuePlaceholders } = slotWriteFragments({
+    activeSlot,
+    incomingSlot,
+    activeParam: 6,
+    incomingParam: 7,
+  });
+  await client.query("BEGIN");
+  try {
+    await client.query("DELETE FROM community_summaries", []);
+    for (const row of rows) {
+      await client.query(
+        `INSERT INTO community_summaries
+           (id, community_id, summary, entity_ids, level, ${columns})
+         VALUES ($1, $2, $3, $4, $5, ${valuePlaceholders})`,
+        [
+          row.id,
+          row.communityId,
+          row.summary,
+          row.entityIds,
+          row.level,
+          toVectorLiteral(row.embedding),
+        ]
+      );
+    }
+    await client.query(
+      `INSERT INTO community_index_state (id, status, failure_code, updated_at)
+       VALUES (1, $1, $2, now())
+       ON CONFLICT (id) DO UPDATE SET
+         status = EXCLUDED.status,
+         failure_code = EXCLUDED.failure_code,
+         updated_at = now()`,
+      [COMMUNITY_INDEX_STATUS.READY, null]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  }
+}
+
+/**
+ * The CLI's `loadPublishedSummaries` read-back: the ES projection indexes
+ * what the ledger answers for, never the in-memory fixture.
+ */
+async function loadPublishedSummaryRecords(
+  client: PgClient
+): Promise<CommunitySummaryIndexRecord[]> {
+  const result = await client.query(
+    `SELECT id, community_id, summary, level FROM community_summaries`
+  );
+  return result.rows.map((row) => ({
+    id: String(row.id),
+    community_id: String(row.community_id),
+    content: String(row.summary),
+    level: Number(row.level),
+  }));
+}
+
 describeLive(
   "retrieve search_mode over live Postgres + Elasticsearch (SC9)",
   () => {
@@ -260,10 +396,12 @@ describeLive(
         apiKey: undefined,
         chunkIndex: CHUNK_INDEX,
         entityIndex: ENTITY_INDEX,
+        summaryIndex: SUMMARY_INDEX,
         requestTimeoutMs: DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT_MS,
       });
       await esLayer.deleteChunkIndex();
       await esLayer.deleteEntityIndex();
+      await esLayer.deleteSummaryIndex();
       // Derived index carries the CHILD text only — parent-blind by design
       // (ADR-0060), which is what makes the parent body a Postgres read and
       // not an ES echo.
@@ -278,6 +416,7 @@ describeLive(
         try {
           await esLayer.deleteChunkIndex();
           await esLayer.deleteEntityIndex();
+          await esLayer.deleteSummaryIndex();
         } finally {
           await esLayer.close();
         }
@@ -290,7 +429,9 @@ describeLive(
     });
 
     /** The production deps builder, so no seam is hand-stubbed here. */
-    function handlerFor(): ReturnType<typeof createRetrieveHandler> {
+    function handlerFor(
+      retrieval: RetrieveConfig = CFG
+    ): ReturnType<typeof createRetrieveHandler> {
       // `buildRetrieveDeps` is what `createServer` calls, so the lexical seam
       // arrives through the same precision-layer adapter as in production.
       const deps = buildRetrieveDeps(
@@ -298,7 +439,7 @@ describeLive(
           embedder,
           storage: backend!,
           ...(esLayer !== undefined ? { precision: esLayer } : {}),
-          retrieval: CFG,
+          retrieval,
         },
         false
       );
@@ -412,6 +553,86 @@ describeLive(
         expect(error.message).toContain(SEARCH_MODE_WIRE_COPY);
         expect(error.message).toContain(`"${letter}"`);
       }
+    });
+
+    describe("search_mode=global over the live report seams (T5b)", () => {
+      // Every case seeds through the PRODUCTION write path: the ledger swap
+      // + READY state mirror above, then the ES leg via the real
+      // `indexCommunitySummaries` indexer — never a hand-written `bulk`, so
+      // what the read seam proves is exactly what the CLI job leaves behind.
+      beforeEach(async () => {
+        await seedCommunityReports(
+          admin!,
+          REPORT_ROWS,
+          backend!.getGenerationState() ?? null
+        );
+        await esLayer!.indexCommunitySummaries(
+          await loadPublishedSummaryRecords(admin!)
+        );
+      });
+
+      it("READY generation answers with the capped report row from the live ES read", async () => {
+        const body = parseBody(
+          await handlerFor(GLOBAL_CFG)({
+            query: SUMMARY_TOKEN,
+            // `c_drop_windows=0` keeps the answer report-only: a window in
+            // the list could otherwise mask whether the report arms ran.
+            filters: { search_mode: "global", c_drop_windows: "0" },
+            limit: 5,
+          })
+        );
+        // Only alpha is citable: the ES arm caps `level <= 2` IN THE QUERY
+        // and the PG vector arm applies the same predicate, so gamma — same
+        // token, same query vector — never reaches the fuse.
+        expect(body.chunks).toHaveLength(1);
+        const hit = body.chunks[0]!;
+        expect(hit.id).toBe(REPORT_ROWS[0]!.id);
+        expect(hit.content).toBe(REPORT_ROWS[0]!.summary);
+        expect(hit.source_ref).toBe(
+          `community/${REPORT_ROWS[0]!.communityId}`
+        );
+        const metadata = hit.metadata as {
+          kind: string;
+          communityId: string;
+        };
+        expect(metadata.kind).toBe("community-summary");
+        expect(metadata.communityId).toBe(REPORT_ROWS[0]!.communityId);
+        expect(hit.score).toBeGreaterThan(0);
+        expect(body).not.toHaveProperty("degraded");
+      });
+
+      it("an absent ES summary index types community_summary_index_failure, not an empty global answer", async () => {
+        // The crux: PG still vouches READY and still holds both reports —
+        // only the derived ES read index is gone. The vector arm that COULD
+        // answer and the window fall-through that COULD fill must not mask
+        // that readiness fact (specs/search-mode-graph-global.md 假设 6).
+        await esLayer!.deleteSummaryIndex();
+        const state = await admin!.query(
+          "SELECT status, failure_code FROM community_index_state WHERE id = 1"
+        );
+        expect(state.rows[0]?.status).toBe(COMMUNITY_INDEX_STATUS.READY);
+        expect(state.rows[0]?.failure_code).toBeNull();
+
+        const thrown = await handlerFor(GLOBAL_CFG)({
+          query: SUMMARY_TOKEN,
+          filters: { search_mode: "global", c_drop_windows: "0" },
+          limit: 5,
+        }).then(
+          () => undefined,
+          (err: unknown) => err
+        );
+        expect(thrown).toBeInstanceOf(GraphragError);
+        const error = thrown as GraphragError;
+        expect(error.code).toBe("STORAGE_ERROR");
+        expect(error.message).toContain("search_mode=global is not ready");
+        expect(error.message).toContain(COMMUNITY_SUMMARY_INDEX_FAILURE);
+        // The named detail pins WHERE the not-ready fact came from: the
+        // report-ES seam, not the PG state gate the assertions above already
+        // showed READY.
+        expect(error.message).toContain("community report ES index is absent");
+        // A refusal is never an answer: no report text rides along.
+        expect(error.message).not.toContain(SUMMARY_TOKEN);
+      });
     });
   }
 );

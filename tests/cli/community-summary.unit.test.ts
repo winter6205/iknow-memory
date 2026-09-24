@@ -45,6 +45,12 @@ import type {
   CommunitySummaryRow,
   RetrieveConfig,
 } from "../../src/core/retrieval/types.js";
+import {
+  ElasticsearchPrecisionLayer,
+  type CommunitySummaryIndexRecord,
+} from "../../src/core/storage/elasticsearch-precision.js";
+import { FakeEsCluster } from "../storage/es-fake-cluster.js";
+import type { Logger } from "../../src/logging.js";
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../../src/core/types.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
 import { GraphragError } from "../../src/core/errors.js";
@@ -276,6 +282,22 @@ class FakeClient {
       else this.publishedState = state;
       return { rows: [] };
     }
+    if (
+      /SELECT id, community_id, summary, level FROM community_summaries/.test(
+        text
+      )
+    ) {
+      // The post-swap projection read: only the PUBLISHED generation is
+      // visible, so the ES leg can never index an uncommitted report.
+      return {
+        rows: this.committed.map((row) => ({
+          id: `ledger-${row.community_id}`,
+          community_id: row.community_id,
+          summary: row.summary,
+          level: row.level,
+        })),
+      };
+    }
     if (/FROM entities/.test(text)) {
       const ids = values[0] as string[];
       return {
@@ -339,6 +361,20 @@ function swapWindow(client: FakeClient): string[] {
   return tags.slice(beginIdx, endIdx === -1 ? undefined : endIdx + 1);
 }
 
+function warnRecorder(): { warnings: string[]; logger: Logger } {
+  const warnings: string[] = [];
+  const logger: Logger = {
+    level: "warn",
+    debug() {},
+    info() {},
+    warn(msg) {
+      warnings.push(msg);
+    },
+    error() {},
+  };
+  return { warnings, logger };
+}
+
 const RETRIEVE_CONFIG: RetrieveConfig = {
   preset: "tokenmax",
   w_vec: 1,
@@ -389,12 +425,22 @@ class LedgerBackedStorage implements StorageBackend {
   async close(): Promise<void> {}
 }
 
+const NOOP_LOGGER: Logger = {
+  level: "error",
+  debug() {},
+  info() {},
+  warn() {},
+  error() {},
+};
+
 function deps(
   over: {
     detector?: CommunityDetector;
     summarizer?: CommunitySummaryClient;
     client?: FakeClient;
     embedder?: EmbeddingClient;
+    summaryIndexer?: CommunitySummaryDeps["summaryIndexer"];
+    logger?: Logger;
   } = {}
 ): {
   deps: CommunitySummaryDeps;
@@ -428,13 +474,8 @@ function deps(
       summarizer,
       embedder: over.embedder ?? embedder,
       dimensions: 1,
-      logger: {
-        level: "error",
-        debug() {},
-        info() {},
-        warn() {},
-        error() {},
-      },
+      logger: over.logger ?? NOOP_LOGGER,
+      summaryIndexer: over.summaryIndexer,
     },
     client,
     summaries,
@@ -978,5 +1019,287 @@ describe("community summary index CLI", () => {
       status: "failed",
       failure_code: COMMUNITY_SUMMARY_INDEX_FAILURE,
     });
+  });
+});
+
+/**
+ * The ES write leg (T5a): after a SUCCESSFUL swap, the published generation
+ * is projected into the derived community-summary index. Postgres stays
+ * authoritative and the swap semantics are unchanged — no ES (or a failing
+ * ES) never blocks, delays, or un-readies a published generation.
+ */
+describe("community summary ES write leg", () => {
+  interface EsWriteCall {
+    rows: CommunitySummaryIndexRecord[];
+    publishedCommunityIds: string[];
+    lastLedgerTag: string | undefined;
+  }
+
+  function fakeIndexer(client: FakeClient) {
+    const calls: EsWriteCall[] = [];
+    let deletes = 0;
+    const indexer = {
+      async indexCommunitySummaries(
+        rows: readonly CommunitySummaryIndexRecord[]
+      ): Promise<void> {
+        const tags = tagged(client);
+        calls.push({
+          rows: [...rows],
+          publishedCommunityIds: client
+            .readSummaryRows()
+            .map((row) => row.community_id),
+          lastLedgerTag: tags[tags.length - 1],
+        });
+      },
+      async deleteSummaryIndex(): Promise<void> {
+        deletes += 1;
+      },
+    };
+    return { indexer, calls, deletes: () => deletes };
+  }
+
+  it("indexes the published generation only after the swap transaction committed", async () => {
+    const client = new FakeClient(oldGeneration());
+    const es = fakeIndexer(client);
+    const h = deps({ client, summaryIndexer: es.indexer });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(es.calls).toHaveLength(1);
+    expect(es.calls[0]!.rows).toEqual([
+      {
+        id: "ledger-7",
+        community_id: "7",
+        content: "Postgres storage community summary",
+        level: 1,
+      },
+    ]);
+    // Ordering proof: at write time the swap's COMMIT is already the last
+    // ledger statement, and the NEW generation (not the stale "99" one) is
+    // the published one the read sees.
+    expect(es.calls[0]!.lastLedgerTag).toBe("COMMIT");
+    expect(es.calls[0]!.publishedCommunityIds).toEqual(["7"]);
+    expect(es.deletes()).toBe(0);
+  });
+
+  it("projects the PRODUCT level the ledger stores, per community", async () => {
+    const client = new FakeClient();
+    const es = fakeIndexer(client);
+    const h = deps({
+      client,
+      summaryIndexer: es.indexer,
+      detector: {
+        async detect() {
+          return [
+            { id: "7", entityIds: [ENTITY_A], level: 1 },
+            { id: "12", entityIds: [ENTITY_A, ENTITY_B], level: 2 },
+          ];
+        },
+        async close() {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    const levelById = Object.fromEntries(
+      es.calls[0]!.rows.map((row) => [row.community_id, row.level] as const)
+    );
+    expect(levelById).toEqual({ "7": 2, "12": 1 });
+  });
+
+  it("skips the whole leg when no ES indexer is configured (Postgres-only run)", async () => {
+    const h = deps();
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(h.client.readState()).toEqual({
+      status: "ready",
+      failure_code: null,
+    });
+    // Not merely "no writes": the projection read is never issued either.
+    // Matches the leg's own read exactly, so schema-bootstrap's legacy-level
+    // probe cannot satisfy it.
+    expect(
+      h.client.queries.some((query) =>
+        /SELECT id, community_id, summary, level FROM community_summaries/.test(
+          query.text
+        )
+      )
+    ).toBe(false);
+  });
+
+  it("an ES write failure after READY is logged and never fails the run", async () => {
+    const recorder = warnRecorder();
+    const h = deps({
+      logger: recorder.logger,
+      summaryIndexer: {
+        async indexCommunitySummaries(): Promise<void> {
+          throw new Error("es unavailable");
+        },
+        async deleteSummaryIndex(): Promise<void> {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    // The published generation and its READY fact are untouched by the
+    // derived-index failure; the next run's write is the repair path.
+    expect(h.client.readState()).toEqual({
+      status: "ready",
+      failure_code: null,
+    });
+    expect(h.client.readSummaryRows().map((row) => row.community_id)).toEqual([
+      "7",
+    ]);
+    expect(recorder.warnings).toContain("community-summary-es-write-failed");
+  });
+
+  it("clears the summary index when the published generation is empty", async () => {
+    const client = new FakeClient(oldGeneration());
+    const es = fakeIndexer(client);
+    const h = deps({
+      client,
+      summaryIndexer: es.indexer,
+      detector: {
+        async detect() {
+          return [];
+        },
+        async close() {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(es.calls).toEqual([]);
+    expect(es.deletes()).toBe(1);
+  });
+
+  it("a projection read failure is logged and never fails the run", async () => {
+    const recorder = warnRecorder();
+    const client = new FakeClient();
+    const base = fakeIndexer(client);
+    const h = deps({
+      client,
+      logger: recorder.logger,
+      summaryIndexer: base.indexer,
+    });
+    const original = client.query.bind(client);
+    client.query = async (text: string, values: unknown[] = []) => {
+      if (/SELECT id, community_id, summary, level FROM community_summaries/.test(
+        text
+      )) {
+        throw new Error("ledger read failed");
+      }
+      return original(text, values);
+    };
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(base.calls).toEqual([]);
+    expect(recorder.warnings).toContain("community-summary-es-write-failed");
+  });
+
+  it("--dry-run never touches the summary index", async () => {
+    const client = new FakeClient();
+    const es = fakeIndexer(client);
+    const h = deps({ client, summaryIndexer: es.indexer });
+
+    await expect(runCli(["--dry-run"], h.deps)).resolves.toBe(0);
+    expect(es.calls).toEqual([]);
+    expect(es.deletes()).toBe(0);
+  });
+});
+
+/**
+ * Issue #272 through the PRODUCTION writer: the leg runs against a real
+ * `ElasticsearchPrecisionLayer` over an in-memory cluster, so what is asserted
+ * is which documents a reader can actually resolve after the run — including
+ * after a run whose ES write died before publishing.
+ */
+describe("community summary ES leg with the production writer", () => {
+  const SUMMARY_ALIAS = "summaries";
+
+  function writer(cluster: FakeEsCluster): ElasticsearchPrecisionLayer {
+    return new ElasticsearchPrecisionLayer(
+      {
+        node: "http://localhost:9200",
+        chunkIndex: "chunks",
+        entityIndex: "entities",
+        summaryIndex: SUMMARY_ALIAS,
+      },
+      { client: cluster.client() }
+    );
+  }
+
+  function esRecord(communityId: string): CommunitySummaryIndexRecord {
+    return {
+      id: `ledger-${communityId}`,
+      community_id: communityId,
+      content: "community report text",
+      level: 1,
+    };
+  }
+
+  it("retires a community's report once it leaves the published generation", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = writer(cluster);
+    // A previous run published both reports into the derived index.
+    await layer.indexCommunitySummaries([
+      esRecord("7"),
+      esRecord("99"),
+    ]);
+
+    // This run publishes community 7 only: 99's entities are all retired.
+    const h = deps({ client: new FakeClient(), summaryIndexer: layer });
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+
+    expect(cluster.liveCommunityIds(SUMMARY_ALIAS)).toEqual(["7"]);
+    // A published swap leaves the previous generation on disk only until the
+    // next projection reclaims that slot: the derived index set stays bounded
+    // by the two slots, it never accumulates generations.
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(cluster.indexNames()).toHaveLength(2);
+    expect(cluster.liveCommunityIds(SUMMARY_ALIAS)).toEqual(["7"]);
+  });
+
+  it("keeps the previous complete generation readable when the write cannot publish", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = writer(cluster);
+    await layer.indexCommunitySummaries([esRecord("a"), esRecord("b")]);
+    // The new generation is fully written but never becomes readable.
+    cluster.failNextAliasUpdate = true;
+    const recorder = warnRecorder();
+    const h = deps({
+      client: new FakeClient(),
+      summaryIndexer: layer,
+      logger: recorder.logger,
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(cluster.liveCommunityIds(SUMMARY_ALIAS)).toEqual(["a", "b"]);
+    expect(cluster.orphanIndices(SUMMARY_ALIAS)).toEqual([]);
+    // The documented EXIT: Postgres is authoritative, so the run reports 0
+    // and the failed leg stays observable through the warn.
+    expect(h.client.readState()).toEqual({
+      status: "ready",
+      failure_code: null,
+    });
+    expect(recorder.warnings).toContain("community-summary-es-write-failed");
+  });
+
+  it("clears the derived index when the published generation is empty", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = writer(cluster);
+    await layer.indexCommunitySummaries([esRecord("7")]);
+    const h = deps({
+      client: new FakeClient(),
+      summaryIndexer: layer,
+      detector: {
+        async detect() {
+          return [];
+        },
+        async close() {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(cluster.indexNames()).toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("community report", 5, 3)
+    ).rejects.toThrow(RegExp(COMMUNITY_SUMMARY_INDEX_FAILURE));
   });
 });

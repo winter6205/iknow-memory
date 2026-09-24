@@ -23,6 +23,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 
 import { ConfigError, loadEnv, type GraphragEnv } from "./config.js";
 import { createLogger, redactDiagnostic, writeStderr } from "./logging.js";
+import { failureTokenOf } from "./core/errors.js";
 import { parseStdioEntry } from "./cli/stdio-entry.js";
 import {
   buildRegistry,
@@ -531,6 +532,18 @@ function registerOne(
           err instanceof Error ? err.message : err
         );
         logger.error("handler threw", { tool: tool.name, error: message });
+        // A failure that declares a stable token publishes it as the JSON
+        // body's `error` field, matching the read_source error results, so a
+        // host classifies from structure rather than from prose. Only such a
+        // failure changes shape; every other isError result keeps the plain
+        // text block above.
+        const failureToken = failureTokenOf(err);
+        if (failureToken !== undefined) {
+          return textResult(
+            JSON.stringify({ error: failureToken, message }),
+            true
+          );
+        }
         return textResult(message, true);
       }
     }

@@ -5,6 +5,7 @@ import {
   type ElasticsearchClientLike,
 } from "../../src/core/storage/elasticsearch-precision.js";
 import type { ChunkRecord } from "../../src/core/types.js";
+import { FakeEsCluster } from "./es-fake-cluster.js";
 
 const NOW = "2026-01-01T00:00:00.000Z";
 
@@ -17,6 +18,8 @@ function fakeClient(): ElasticsearchClientLike {
         tokens: [{ token: "����" }, { token: "�ִ�" }],
       })),
       delete: vi.fn(async () => ({})),
+      getAlias: vi.fn(async () => ({})),
+      updateAliases: vi.fn(async () => ({ acknowledged: true })),
     },
     bulk: vi.fn(async () => ({ errors: false, items: [] })),
     search: vi.fn(async () => ({
@@ -576,7 +579,7 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
       settings: Record<string, unknown>;
       mappings: { properties: Record<string, Record<string, unknown>> };
     };
-    expect(create.index).toBe("summaries");
+    expect(create.index).toMatch(/^summaries-gen-\d$/);
     expect(JSON.stringify(create)).toContain("ik_max_word");
     expect(JSON.stringify(create)).toContain("ik_smart");
     expect(JSON.stringify(create)).toContain('"k1":1.4');
@@ -594,23 +597,24 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
       type: "keyword",
     });
 
-    // Document identity is the community: a re-run overwrites that
-    // community's current report instead of appending a second one.
+    // The whole generation goes to the slot that was just created — never to
+    // the name readers aim at, which is what keeps it unpublished until the
+    // alias swap.
     expect(client.bulk).toHaveBeenCalledTimes(1);
     const bulk = client.bulk.mock.calls[0]?.[0] as {
       index: string;
       operations: unknown[];
     };
-    expect(bulk.index).toBe("summaries");
+    expect(bulk.index).toBe(create.index);
     expect(bulk.operations).toEqual([
-      { index: { _index: "summaries", _id: "7" } },
+      { index: { _index: create.index, _id: "7" } },
       {
         id: "ledger-uuid-7",
         community_id: "7",
         content: "community report text",
         level: 3,
       },
-      { index: { _index: "summaries", _id: "8" } },
+      { index: { _index: create.index, _id: "8" } },
       {
         id: "ledger-uuid-8",
         community_id: "8",
@@ -620,26 +624,61 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
     ]);
   });
 
-  it("skips creation when the summary index already exists and still writes", async () => {
+  it("fills the slot the live alias does not point at and repoints the alias", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(
+      async (request: Record<string, unknown>) => request.index === "summaries"
+    );
+    client.indices.getAlias = vi.fn(async () => ({
+      "summaries-gen-1": { aliases: { summaries: {} } },
+    }));
+    const layer = summaryLayer(client);
+
+    await layer.indexCommunitySummaries([summaryRow()]);
+
+    expect(client.indices.create).toHaveBeenCalledTimes(1);
+    expect(
+      (client.indices.create.mock.calls[0]?.[0] as { index: string }).index
+    ).toBe("summaries-gen-0");
+    const swap = client.indices.updateAliases.mock.calls[0]?.[0] as {
+      actions: unknown[];
+    };
+    // One atomic body: the previous generation stops being readable exactly
+    // when the new one starts.
+    expect(swap.actions).toEqual([
+      { remove: { index: "*", alias: "summaries" } },
+      { add: { index: "summaries-gen-0", alias: "summaries" } },
+    ]);
+  });
+
+  it("retires a pre-alias physical index of the alias name in the same swap", async () => {
     const client = fakeClient();
     client.indices.exists = vi.fn(async () => true);
     const layer = summaryLayer(client);
 
     await layer.indexCommunitySummaries([summaryRow()]);
 
-    expect(client.indices.exists).toHaveBeenCalledWith({ index: "summaries" });
-    expect(client.indices.create).not.toHaveBeenCalled();
-    expect(client.bulk).toHaveBeenCalledTimes(1);
+    const swap = client.indices.updateAliases.mock.calls[0]?.[0] as {
+      actions: unknown[];
+    };
+    // An index and an alias cannot share a name, so the old build's index has
+    // to go in the same call that publishes the slot.
+    expect(swap.actions).toEqual([
+      { remove_index: { index: "summaries" } },
+      { add: { index: "summaries-gen-0", alias: "summaries" } },
+    ]);
   });
 
-  it("memoizes readiness so a second write does not re-create the index", async () => {
+  it("rebuilds the generation slot from scratch on every projection", async () => {
     const client = fakeClient();
     const layer = summaryLayer(client);
 
     await layer.indexCommunitySummaries([summaryRow()]);
     await layer.indexCommunitySummaries([summaryRow("ledger-uuid-8", "8")]);
 
-    expect(client.indices.create).toHaveBeenCalledTimes(1);
+    // Readiness memoization cannot skip a generation build: a slot that is
+    // reused starts empty, or the previous generation would still be readable.
+    expect(client.indices.create).toHaveBeenCalledTimes(2);
     expect(client.bulk).toHaveBeenCalledTimes(2);
   });
 
@@ -684,9 +723,9 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
     expect(inspected).not.toContain("summaries");
 
     await layer.indexCommunitySummaries([summaryRow()]);
-    expect(client.indices.create.mock.calls.map(
-      (call) => (call[0] as { index: string }).index
-    )).toContain("summaries");
+    expect(client.indices.create.mock.calls.some(
+      (call) => /^summaries-gen-\d$/.test((call[0] as { index: string }).index)
+    )).toBe(true);
   });
 
   it("surfaces a failing summary bulk as a typed PrecisionLayerError", async () => {
@@ -712,13 +751,112 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
 
     await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
       name: "PrecisionLayerError",
-      message: expect.stringContaining('summary index "summaries"'),
+      message: expect.stringMatching(/summary index "summaries-gen-\d"/),
+    });
+  });
+});
+
+/**
+ * Issue #272: the write path must REPLACE the published generation, not upsert
+ * into it. A community that dropped out of the generation stops being readable,
+ * and a write that dies midway must leave readers on the previous COMPLETE
+ * generation — never a half-old/half-new mix, which is what a per-community
+ * upsert into the live index allows.
+ */
+describe("ElasticsearchPrecisionLayer summary generation replacement", () => {
+  // Bulk batching is 1_000 documents per request, so a generation above that
+  // size is written in several bulks: exactly the window where a midway
+  // failure used to publish a partial generation.
+  const OVER_TWO_BATCHES = Array.from({ length: 1_001 }, (_, i) => `c${i}`);
+
+  function generation(communityIds: readonly string[]) {
+    return communityIds.map((communityId) => ({
+      id: `ledger-${communityId}`,
+      community_id: communityId,
+      content: "community report text",
+      level: 1,
+    }));
+  }
+
+  it("retires a community's document when it is absent from the new generation", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+
+    await layer.indexCommunitySummaries(generation(["7", "99"]));
+    expect(cluster.liveCommunityIds("summaries")).toEqual(["7", "99"]);
+
+    await layer.indexCommunitySummaries(generation(["7"]));
+
+    expect(cluster.liveCommunityIds("summaries")).toEqual(["7"]);
+    // The read seam targets the same name readers do, so what is stored live
+    // and what a report search answers can never drift apart.
+    await expect(
+      layer.searchCommunitySummariesLexical("community report", 5, 3)
+    ).resolves.toEqual([
+      {
+        id: "ledger-7",
+        communityId: "7",
+        summary: "community report text",
+        level: 1,
+        score: 1,
+      },
+    ]);
+  });
+
+  it("keeps the previous complete generation readable when a bulk dies midway", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+    await layer.indexCommunitySummaries(generation(OVER_TWO_BATCHES));
+    // Two bulks published the first generation; of the next projection the
+    // third bulk lands and the fourth dies.
+    cluster.failNthBulk = 4;
+
+    await expect(
+      layer.indexCommunitySummaries(
+        generation(OVER_TWO_BATCHES.map((id) => `fresh-${id}`))
+      )
+    ).rejects.toMatchObject({ name: "PrecisionLayerError" });
+
+    // Readers still resolve exactly the old generation: none of the fresh
+    // communities — which share no id with it — leaked into the live set.
+    const readable = cluster.liveCommunityIds("summaries");
+    expect(readable.filter((id) => id.startsWith("fresh-"))).toEqual([]);
+    expect(readable).toHaveLength(OVER_TWO_BATCHES.length);
+    expect(cluster.orphanIndices("summaries")).toEqual([]);
+  });
+
+  it("keeps the previous complete generation readable when the alias swap fails", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+    await layer.indexCommunitySummaries(generation(["7", "8"]));
+    cluster.failNextAliasUpdate = true;
+
+    await expect(
+      layer.indexCommunitySummaries(generation(["fresh"]))
+    ).rejects.toMatchObject({ name: "PrecisionLayerError" });
+
+    expect(cluster.liveCommunityIds("summaries")).toEqual(["7", "8"]);
+    expect(cluster.orphanIndices("summaries")).toEqual([]);
+  });
+
+  it("leaves reads typed not-ready once the index is cleared", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = summaryLayer(cluster.client());
+
+    await layer.indexCommunitySummaries(generation(["7"]));
+    await layer.deleteSummaryIndex();
+
+    expect(cluster.indexNames()).toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("community report", 5, 3)
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("community_summary_index_failure"),
     });
   });
 });
 
 describe("ElasticsearchPrecisionLayer.deleteSummaryIndex", () => {
-  it("removes only the summary index, and is a no-op when it is absent", async () => {
+  it("removes every generation slot and the alias name itself, no-op when absent", async () => {
     const client = fakeClient();
     const layer = summaryLayer(client);
 
@@ -727,8 +865,11 @@ describe("ElasticsearchPrecisionLayer.deleteSummaryIndex", () => {
 
     client.indices.exists = vi.fn(async () => true);
     await layer.deleteSummaryIndex();
-    expect(client.indices.delete).toHaveBeenCalledTimes(1);
-    expect(client.indices.delete).toHaveBeenCalledWith({ index: "summaries" });
+    expect(
+      client.indices.delete.mock.calls.map(
+        (call) => (call[0] as { index: string }).index
+      )
+    ).toEqual(["summaries-gen-0", "summaries-gen-1", "summaries"]);
   });
 
   it("re-creates the index on the next write after a delete (readiness memo cleared)", async () => {

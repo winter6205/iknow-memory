@@ -37,6 +37,8 @@ export interface ElasticsearchClientLike {
     create(request: Record<string, unknown>): Promise<unknown>;
     analyze(request: Record<string, unknown>): Promise<unknown>;
     delete(request: Record<string, unknown>): Promise<unknown>;
+    getAlias(request: Record<string, unknown>): Promise<unknown>;
+    updateAliases(request: Record<string, unknown>): Promise<unknown>;
   };
   bulk(request: Record<string, unknown>): Promise<unknown>;
   search(request: Record<string, unknown>): Promise<unknown>;
@@ -60,10 +62,11 @@ export type PrecisionIndexKind = "chunk" | "entity" | "summary";
 /**
  * One community report projected into the derived summary index.
  *
- * `community_id` is the document identity: a rebuild overwrites that
- * community's current report instead of appending a second one. `id` is the
- * ledger row's own id, so a report ranked by both this index and the
- * ledger's vector arm fuses as ONE hit (cross-arm identity is the hit id).
+ * `community_id` is the document identity WITHIN one generation. The write
+ * path publishes a generation as a whole (see `indexCommunitySummaries`), so
+ * a community absent from the new generation has no document left behind.
+ * `id` is the ledger row's own id, so a report ranked by both this index and
+ * the ledger's vector arm fuses as ONE hit (cross-arm identity is the hit id).
  * `level` is the product grain the read side caps on.
  */
 export interface CommunitySummaryIndexRecord {
@@ -79,10 +82,11 @@ export interface PrecisionIndexer extends EntityLexicalStorage {
   indexChunks(chunks: readonly ChunkRecord[]): Promise<void>;
   indexEntities(entities: readonly EntityIndexRecord[]): Promise<void>;
   /**
-   * Write the published community-report generation. This is the ONLY entry
-   * point that creates the summary index: a read must never assume a derived
-   * index into existence, because a summary index that is not there yet is a
-   * not-ready fact, not an empty answer.
+   * Publish the community-report generation as a whole: whatever is readable
+   * afterwards is exactly these rows, never a union with the previous
+   * generation. This is the ONLY entry point that creates the summary index: a
+   * read must never assume a derived index into existence, because a summary
+   * index that is not there yet is a not-ready fact, not an empty answer.
    */
   indexCommunitySummaries(
     rows: readonly CommunitySummaryIndexRecord[]
@@ -125,6 +129,65 @@ const DEFAULT_CHUNK_FIELDS: Readonly<Record<string, number>> = {
   "metadata.*": 1,
 };
 const BULK_BATCH_SIZE = 1_000;
+
+/**
+ * The derived summary index is an ALIAS over two generation slots. A
+ * projection fills the slot no reader currently resolves and the alias swap is
+ * what publishes it, which is the only way replacement can be atomic: a
+ * same-name upsert leaves retired communities' documents behind and publishes
+ * whatever part of a generation was written before a failure. Two fixed slots
+ * keep the index set bounded — the previous generation is reclaimed by the
+ * projection after next.
+ */
+const SUMMARY_SLOT_SUFFIXES = ["-gen-0", "-gen-1"] as const;
+
+function summaryGenerationSlots(alias: string): [string, string] {
+  const [zero, one] = SUMMARY_SLOT_SUFFIXES;
+  return [`${alias}${zero}`, `${alias}${one}`];
+}
+
+function summaryStagingSlot(
+  alias: string,
+  current: string | undefined
+): string {
+  const [first, second] = summaryGenerationSlots(alias);
+  return current === first ? second : first;
+}
+
+/**
+ * One atomic `_aliases` body that leaves exactly `staging` behind `alias`. A
+ * pre-alias build wrote the generation to a PHYSICAL index of the alias' own
+ * name; that name cannot be reused by an alias, so it is removed in the same
+ * call that publishes the new generation.
+ */
+function summaryAliasActions(
+  alias: string,
+  staging: string,
+  current: string | undefined
+): Record<string, unknown>[] {
+  const add = { add: { index: staging, alias } };
+  if (current === undefined) return [add];
+  if (current === alias) return [{ remove_index: { index: alias } }, add];
+  return [{ remove: { index: "*", alias } }, add];
+}
+
+function summaryDocument(
+  row: CommunitySummaryIndexRecord
+): Record<string, unknown> {
+  return {
+    id: row.id,
+    community_id: row.community_id,
+    content: row.content,
+    level: row.level,
+  };
+}
+
+/** Elasticsearch answers a `getAlias` on an unknown name with a 404 error. */
+function isMissingAliasResponse(error: unknown): boolean {
+  const statusCode = (error as { meta?: { statusCode?: unknown } }).meta
+    ?.statusCode;
+  return statusCode === 404;
+}
 
 /**
  * Construct the chunk lexical request without touching Elasticsearch.
@@ -385,24 +448,93 @@ export class ElasticsearchPrecisionLayer
     await this.bulk(this.config.entityIndex, operations);
   }
 
+  /**
+   * Publish one complete report generation: build it into the slot no reader
+   * resolves, then swap the alias. Nothing written here is readable until the
+   * swap, so a projection that fails leaves the previous generation intact
+   * rather than a half-new mix.
+   */
   async indexCommunitySummaries(
     rows: readonly CommunitySummaryIndexRecord[]
   ): Promise<void> {
     if (rows.length === 0) return;
-    await this.ensureIndex(this.config.summaryIndex, "summary");
+    const alias = this.config.summaryIndex;
+    const current = await this.currentSummaryGeneration(alias);
+    const staging = summaryStagingSlot(alias, current);
+    try {
+      await this.buildSummaryGeneration(staging, rows);
+      await this.swapSummaryAlias(alias, staging, current);
+    } catch (failure) {
+      await this.discardSummarySlot(staging, failure);
+    }
+  }
+
+  /**
+   * The generation readers resolve today: the alias' concrete index, the alias
+   * NAME itself when a pre-alias build left a physical index of that name, or
+   * undefined before the first successful projection.
+   */
+  private async currentSummaryGeneration(
+    alias: string
+  ): Promise<string | undefined> {
+    if (!(await this.summaryIndexPresent())) return undefined;
+    return (await this.summaryAliasTarget(alias)) ?? alias;
+  }
+
+  private async summaryAliasTarget(
+    alias: string
+  ): Promise<string | undefined> {
+    try {
+      const response = await this.client.indices.getAlias({ name: alias });
+      return Object.keys(responseBody<Record<string, unknown>>(response))[0];
+    } catch (error) {
+      if (isMissingAliasResponse(error)) return undefined;
+      throw new PrecisionLayerError(
+        `Elasticsearch summary alias "${alias}" lookup failed`,
+        errorMessage(error)
+      );
+    }
+  }
+
+  private async buildSummaryGeneration(
+    slot: string,
+    rows: readonly CommunitySummaryIndexRecord[]
+  ): Promise<void> {
+    await this.deleteIndex(slot);
+    await this.ensureIndex(slot, "summary");
     const operations: unknown[] = [];
     for (const row of rows) {
-      operations.push({
-        index: { _index: this.config.summaryIndex, _id: row.community_id },
-      });
-      operations.push({
-        id: row.id,
-        community_id: row.community_id,
-        content: row.content,
-        level: row.level,
-      });
+      operations.push({ index: { _index: slot, _id: row.community_id } });
+      operations.push(summaryDocument(row));
     }
-    await this.bulk(this.config.summaryIndex, operations);
+    await this.bulk(slot, operations);
+  }
+
+  private async swapSummaryAlias(
+    alias: string,
+    staging: string,
+    current: string | undefined
+  ): Promise<void> {
+    try {
+      await this.client.indices.updateAliases({
+        actions: summaryAliasActions(alias, staging, current),
+      });
+    } catch (error) {
+      throw new PrecisionLayerError(
+        `Elasticsearch summary alias "${alias}" could not be repointed`,
+        errorMessage(error)
+      );
+    }
+  }
+
+  private async discardSummarySlot(
+    slot: string,
+    failure: unknown
+  ): Promise<never> {
+    // EXIT: the slot was never published, so a failed discard is hygiene, not
+    // a reader-visible state — it must not replace the projection's failure.
+    await this.deleteIndex(slot).catch(() => undefined);
+    throw failure;
   }
 
   async rebuildChunks(chunks: readonly ChunkRecord[]): Promise<void> {
@@ -455,8 +587,18 @@ export class ElasticsearchPrecisionLayer
     await this.deleteIndex(this.config.entityIndex);
   }
 
+  /**
+   * Remove every physical generation of the derived summary index. Deleting
+   * the slots is what retires the alias (Elasticsearch drops alias entries
+   * with their index); the trailing name check clears a pre-alias build's
+   * index, which carries the alias name itself.
+   */
   async deleteSummaryIndex(): Promise<void> {
-    await this.deleteIndex(this.config.summaryIndex);
+    const alias = this.config.summaryIndex;
+    for (const slot of summaryGenerationSlots(alias)) {
+      await this.deleteIndex(slot);
+    }
+    await this.deleteIndex(alias);
   }
 
   async deleteEntities(ids: readonly string[]): Promise<void> {

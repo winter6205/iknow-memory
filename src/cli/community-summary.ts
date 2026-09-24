@@ -458,9 +458,10 @@ async function swapCommunitySummaries(
  *
  * EXIT: a throw here is logged and the run still succeeds. Postgres already
  * committed READY and is authoritative; failing the job would move a healthy
- * generation to `failed`, while a stale derived index is repaired by the next
- * run's idempotent write. An empty published generation CLEARS the index: a
- * ledger with no reports must not leave a lexical generation behind.
+ * generation to `failed`, while the derived index keeps serving the last
+ * COMPLETE generation until the next run replaces it whole. An empty published
+ * generation CLEARS the index: a ledger with no reports must not leave a
+ * lexical generation behind.
  */
 async function projectPublishedSummaries(
   client: CommunitySummaryDbClient,

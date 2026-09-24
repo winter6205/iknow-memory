@@ -66,7 +66,7 @@ import {
   supportsCommunityReportLexical,
   supportsCommunitySummaries,
 } from "../storage/backend.js";
-import { GraphragError } from "../errors.js";
+import { failureTokenOf, GraphragError } from "../errors.js";
 import { activeQueryEmbedder } from "../embed-slots.js";
 import {
   COMMUNITY_INDEX_STATUS,
@@ -241,15 +241,17 @@ async function requireCommunityIndexReady(
 
 function communitySummaryNotReady(detail: string): GraphragError {
   return new GraphragError(
-    // The refusal names the CANONICAL token it was routed from, so a host
-    // maps this failure deterministically from the same string every time.
-    // The retired letter `C` is named once at this site, as history only: a
-    // log line written before the 2026-09-22 retokenizing says
-    // `search_mode=C`, and this is the very refusal that call produced — `C`
-    // was never a second answer path, so no live route to it is owed.
+    // The declared failureToken is what the host and the report-ES seam below
+    // discriminate on; the prose repeats the token only so a human reading a
+    // log line sees the same named fact. The retired letter `C` is named once
+    // at this site, as history only: a log line written before the
+    // 2026-09-22 retokenizing says `search_mode=C`, and this is the very
+    // refusal that call produced — `C` was never a second answer path, so no
+    // live route to it is owed.
     `retrieve ${SEARCH_MODE_FILTER_KEY}=global is not ready: ` +
       `${COMMUNITY_SUMMARY_INDEX_FAILURE} (${detail})`,
-    "STORAGE_ERROR"
+    "STORAGE_ERROR",
+    COMMUNITY_SUMMARY_INDEX_FAILURE
   );
 }
 
@@ -302,17 +304,15 @@ async function runReportLexical(
       failed: false,
     };
   } catch (error) {
-    // The report-ES seam separates its two failure kinds by message. An
-    // absent summary index carries the community_summary_index_failure token
-    // — a readiness fact about the report generation — so it re-raises the
-    // typed 档 C refusal, winning over the vector arm that could otherwise
-    // answer (specs/search-mode-graph-global.md assumption 6). A transient ES
-    // error carries no token and stays the partner-answers fail-open the arm
+    // The report-ES seam separates its two failure kinds by the DECLARED
+    // failure token, never by message prose. An absent summary index declares
+    // community_summary_index_failure — a readiness fact about the report
+    // generation — so it re-raises the typed 档 C refusal, winning over the
+    // vector arm that could otherwise answer
+    // (specs/search-mode-graph-global.md assumption 6). A transient ES error
+    // declares no token and stays the partner-answers fail-open the arm
     // taxonomy reserves for an arm that ran and threw.
-    if (
-      error instanceof Error &&
-      error.message.includes(COMMUNITY_SUMMARY_INDEX_FAILURE)
-    ) {
+    if (failureTokenOf(error) === COMMUNITY_SUMMARY_INDEX_FAILURE) {
       throw communitySummaryNotReady("community report ES index is absent");
     }
     return { rows: [], ran: true, failed: true };

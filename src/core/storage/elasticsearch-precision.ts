@@ -15,7 +15,7 @@ import { Client } from "@elastic/elasticsearch";
 
 import type { ElasticsearchConfig } from "../../config.js";
 import { redactDiagnostic } from "../../logging.js";
-import { GraphragError } from "../errors.js";
+import { GraphragError, type GraphragFailureToken } from "../errors.js";
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../types.js";
 import type {
   ChunkRecord,
@@ -109,10 +109,15 @@ export interface PrecisionIndexer extends EntityLexicalStorage {
 
 /** Typed failure for configured-but-unavailable precision-layer calls. */
 export class PrecisionLayerError extends GraphragError {
-  constructor(message: string, cause?: unknown) {
+  constructor(
+    message: string,
+    cause?: unknown,
+    failureToken?: GraphragFailureToken
+  ) {
     super(
       cause === undefined ? message : `${message}: ${redactDiagnostic(cause)}`,
-      "STORAGE_ERROR"
+      "STORAGE_ERROR",
+      failureToken
     );
     this.name = "PrecisionLayerError";
   }
@@ -756,7 +761,9 @@ export class ElasticsearchPrecisionLayer
     if (!(await this.summaryIndexPresent())) {
       throw new PrecisionLayerError(
         `Elasticsearch summary index "${this.config.summaryIndex}" is not ready: ` +
-          `${COMMUNITY_SUMMARY_INDEX_FAILURE}`
+          `${COMMUNITY_SUMMARY_INDEX_FAILURE}`,
+        undefined,
+        COMMUNITY_SUMMARY_INDEX_FAILURE
       );
     }
     try {

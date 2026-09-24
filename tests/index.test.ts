@@ -11,6 +11,7 @@ import {
 } from "../src/index.ts";
 import { FakeEmbedder } from "../src/core/embedder.ts";
 import { MemoryBackend } from "../src/core/storage/memory-backend.ts";
+import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../src/core/types.ts";
 import { setSettingHomeForTests } from "../src/config.js";
 
 /**
@@ -336,6 +337,58 @@ describe("createServer — registered tool set (T7)", () => {
       });
       expect(result.isError).toBe(true);
       expect(textOf(result)).toMatch(/valid_from must be strictly before/);
+    } finally {
+      await close();
+    }
+  });
+});
+
+/**
+ * Issue #273 (producer side of the pinned wire contract): a named failure is
+ * classified from a STRUCTURED field of the isError text block, never from a
+ * substring of the human-readable prose. Only a failure that declares one
+ * changes shape; every other isError result keeps the plain text it had.
+ */
+describe("createServer — named failure on the wire", () => {
+  it("retrieve global reports the not-ready failure as a structured error field", async () => {
+    const { client, close } = await connectInProcess();
+    try {
+      // The offline server's memory store has no community_index_state row,
+      // so the global arm answers the typed not-ready refusal.
+      const result = await client.callTool({
+        name: "retrieve",
+        arguments: {
+          query: "anything at all",
+          filters: { search_mode: "global" },
+        },
+      });
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(textOf(result)) as {
+        error: unknown;
+        message: unknown;
+      };
+      expect(body.error).toBe(COMMUNITY_SUMMARY_INDEX_FAILURE);
+      expect(typeof body.message).toBe("string");
+    } finally {
+      await close();
+    }
+  });
+
+  it("an unrelated tool failure keeps its plain-text isError shape", async () => {
+    const { client, close } = await connectInProcess();
+    try {
+      const result = await client.callTool({
+        name: "ingest",
+        arguments: {
+          content: "reversed window again",
+          source_ref: "test://plain-error-shape",
+          valid_from: "2030-01-02T00:00:00.000Z",
+          valid_until: "2030-01-01T00:00:00.000Z",
+        },
+      });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toMatch(/valid_from must be strictly before/);
+      expect(textOf(result)).not.toContain(COMMUNITY_SUMMARY_INDEX_FAILURE);
     } finally {
       await close();
     }

@@ -74,6 +74,7 @@ describePg("T4 read_source: live PgvectorBackend", () => {
       source_ref: doc.source_ref,
       title: doc.title,
       content: doc.content,
+      next_position: null,
     });
 
     const byId = parseBody(await handler({ id: doc.id }));

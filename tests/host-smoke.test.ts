@@ -184,7 +184,8 @@ describe("host-smoke: real stdio MCP client against built server", () => {
       // specs/mcp-tool-surface.md Catalog + operator-console T4: exactly
       // these write/read tools over the wire. `echo` is archived; the
       // invalidation tool answers to `invalidate`; `extract` runs the
-      // lifted core pipeline; `read_source` serves the full 资料 body.
+      // lifted core pipeline; `read_source` serves one bounded, resumable
+      // slice of a 资料 body rather than the whole text.
       const names = tools.map((t) => t.name).sort();
       expect(names).toEqual([
         "extract",

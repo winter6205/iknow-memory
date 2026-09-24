@@ -12,11 +12,12 @@ This records the measured output of `tests/integration/read-source-gold-mcp-pg.t
 ## Command and exit status
 
 ```text
+env -u GRAPHRAG_MEMORY_EMBED_API_KEY \
 GRAPHRAG_MEMORY_DB_URL="postgresql://postgres@localhost:5432/postgres" \
 npx vitest run tests/integration/read-source-gold-mcp-pg.test.ts
 ```
 
-Exit 0 — `Test Files 1 passed (1)`, `Tests 9 passed (9)`, duration 4.14s. The suite self-skips loudly with the harness `Validation: Not run` block when PostgreSQL is unreachable, and throws instead of skipping when `CI=true`.
+Exit 0 — `Test Files 1 passed (1)`, `Tests 9 passed (9)`, duration 4.75s. The suite self-skips loudly with the harness `Validation: Not run` block when PostgreSQL is unreachable, and throws instead of skipping when `CI=true`. The `env -u` only guards the ambient-key caveat noted below; a clean CI shell does not need it.
 
 ## Persisted identity
 

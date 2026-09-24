@@ -3,8 +3,7 @@
  *
  * It materialises indices, bulk documents, and ALIASES, so a test can ask the
  * only question that matters for a derived index: which documents does a reader
- * aimed at the configured index name actually see right now. Call recordings
- * (`createCalls`, `bulkCalls`) stay available for request-shape assertions.
+ * aimed at the configured index name actually see right now.
  */
 import type { ElasticsearchClientLike } from "../../src/core/storage/elasticsearch-precision.js";
 
@@ -22,12 +21,6 @@ export class FakeEsCluster {
   private readonly indices = new Map<string, FakeIndex>();
   private readonly aliases = new Map<string, string>();
 
-  /** Every `_index` value ever passed to `indices.create`, in order. */
-  readonly createCalls: string[] = [];
-
-  /** `{index, operations}` of every accepted bulk, in order. */
-  readonly bulkCalls: Array<{ index: string; operations: unknown[] }> = [];
-
   /** When set, the bulk with this ordinal (1-based across all writes) rejects. */
   failNthBulk?: number;
 
@@ -41,16 +34,6 @@ export class FakeEsCluster {
     return this.entries(name)
       .map(([, doc]) => String(doc.community_id))
       .sort();
-  }
-
-  /** Documents currently readable through the given index name or alias. */
-  liveDocs(name: string): Record<string, unknown>[] {
-    return this.entries(name).map(([, doc]) => ({ ...doc }));
-  }
-
-  /** Concrete index an alias currently resolves to. */
-  aliasTarget(name: string): string | undefined {
-    return this.aliases.get(name);
   }
 
   indexNames(): string[] {
@@ -76,7 +59,6 @@ export class FakeEsCluster {
             throw new Error(`resource_already_exists_exception: [${name}]`);
           }
           this.indices.set(name, { docs: new Map() });
-          this.createCalls.push(name);
           return { acknowledged: true };
         },
         delete: async (request) => {
@@ -113,7 +95,6 @@ export class FakeEsCluster {
           throw new Error("cluster down: bulk rejected");
         }
         this.writeDocuments(index, operations);
-        this.bulkCalls.push({ index: name, operations: [...operations] });
         return { errors: false, items: [] };
       },
       search: async (request) => ({
@@ -156,16 +137,38 @@ export class FakeEsCluster {
       this.dropIndex(next, String(removeIndex.index));
       return;
     }
-    const remove = action.remove as { alias?: unknown } | undefined;
+    const remove = action.remove as
+      | { index?: unknown; alias?: unknown }
+      | undefined;
     if (remove !== undefined) {
-      const alias = String(remove.alias);
-      if (!next.has(alias)) throw new Error(`alias_missing: [${alias}]`);
-      next.delete(alias);
+      this.dropAlias(next, String(remove.index), String(remove.alias));
     }
     const add = action.add as { index?: unknown; alias?: unknown } | undefined;
     if (add !== undefined) {
       this.bindAlias(next, String(add.alias), String(add.index));
     }
+  }
+
+  /**
+   * A `remove` names the index it takes the alias off, so a request aimed at a
+   * slot the alias does not resolve to is an error: freeing the live binding
+   * instead would let the `add` that follows it in the same body publish over a
+   * generation the caller never saw. `*` is the documented "every index
+   * currently bound to this alias" form.
+   */
+  private dropAlias(
+    next: Map<string, string>,
+    index: string,
+    alias: string
+  ): void {
+    const bound = next.get(alias);
+    if (bound === undefined) throw new Error(`alias_missing: [${alias}]`);
+    if (index !== "*" && index !== bound) {
+      throw new Error(
+        `invalid_aliases: [${alias}] is not bound to [${index}]`
+      );
+    }
+    next.delete(alias);
   }
 
   private bindAlias(

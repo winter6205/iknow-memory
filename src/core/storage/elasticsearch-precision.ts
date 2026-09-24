@@ -82,9 +82,11 @@ export interface PrecisionIndexer extends EntityLexicalStorage {
   indexChunks(chunks: readonly ChunkRecord[]): Promise<void>;
   indexEntities(entities: readonly EntityIndexRecord[]): Promise<void>;
   /**
-   * Publish the community-report generation as a whole: whatever is readable
-   * afterwards is exactly these rows, never a union with the previous
-   * generation. This is the ONLY entry point that creates the summary index: a
+   * Publish a NON-EMPTY community-report generation as a whole: whatever is
+   * readable afterwards is exactly these rows, never a union with the previous
+   * generation. An empty row list publishes nothing and leaves the previous
+   * generation readable — clearing the index is `deleteSummaryIndex()`'s job.
+   * This is the ONLY entry point that creates the summary index: a
    * read must never assume a derived index into existence, because a summary
    * index that is not there yet is a not-ready fact, not an empty answer.
    */
@@ -458,6 +460,11 @@ export class ElasticsearchPrecisionLayer
    * resolves, then swap the alias. Nothing written here is readable until the
    * swap, so a projection that fails leaves the previous generation intact
    * rather than a half-new mix.
+   *
+   * CONSTRAINT: the slot is chosen from an unpinned alias read, so exactly one
+   * projection per summary alias may be in flight — two concurrent ones pick
+   * the same slot and interleave. Single writer is a precondition of the
+   * caller that owns scheduling, not something enforced here.
    */
   async indexCommunitySummaries(
     rows: readonly CommunitySummaryIndexRecord[]

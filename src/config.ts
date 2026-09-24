@@ -284,8 +284,14 @@ export interface ElasticsearchConfig {
   /** Derived entity + alias index used during graph seed finding. */
   entityIndex: string;
   /**
-   * Derived community-REPORT index (lexical arm of a report-first retrieve).
-   * The community-summary CLI is its only writer.
+   * ALIAS for the derived community-REPORT index (lexical arm of a
+   * report-first retrieve). The precision layer publishes a generation by
+   * repointing this alias at one of two physical slots it derives from the
+   * configured name, `<name>-gen-0` and `<name>-gen-1`, so an operator's ILM
+   * policy, index template, or privileges must target the `<name>-gen-*`
+   * pattern — pinning them to this single literal name silently misses every
+   * index that actually holds documents. The community-summary CLI is its
+   * only writer.
    */
   summaryIndex: string;
   /** Per-request client timeout. */

@@ -579,7 +579,9 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
       settings: Record<string, unknown>;
       mappings: { properties: Record<string, Record<string, unknown>> };
     };
-    expect(create.index).toMatch(/^summaries-gen-\d$/);
+    // The presence probe reports nothing live, so gen-0 is the only slot this
+    // projection could stage — the name is deterministic, not pattern-matched.
+    expect(create.index).toBe("summaries-gen-0");
     expect(JSON.stringify(create)).toContain("ik_max_word");
     expect(JSON.stringify(create)).toContain("ik_smart");
     expect(JSON.stringify(create)).toContain('"k1":1.4');
@@ -654,10 +656,19 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
   it("retires a pre-alias physical index of the alias name in the same swap", async () => {
     const client = fakeClient();
     client.indices.exists = vi.fn(async () => true);
+    // A physical index is not an alias, so a real cluster REJECTS the lookup
+    // with a 404 rather than answering with an empty mapping: only that branch
+    // may treat the alias name itself as the live generation.
+    client.indices.getAlias = vi.fn(async () => {
+      throw Object.assign(new Error("alias_not_found_exception"), {
+        meta: { statusCode: 404 },
+      });
+    });
     const layer = summaryLayer(client);
 
     await layer.indexCommunitySummaries([summaryRow()]);
 
+    expect(client.indices.getAlias).toHaveBeenCalledTimes(1);
     const swap = client.indices.updateAliases.mock.calls[0]?.[0] as {
       actions: unknown[];
     };
@@ -667,6 +678,26 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
       { remove_index: { index: "summaries" } },
       { add: { index: "summaries-gen-0", alias: "summaries" } },
     ]);
+  });
+
+  it("fails closed when the alias lookup rejects for anything but a missing alias", async () => {
+    const client = fakeClient();
+    client.indices.exists = vi.fn(async () => true);
+    client.indices.getAlias = vi.fn(async () => {
+      throw new Error("cluster down: alias lookup rejected");
+    });
+    const layer = summaryLayer(client);
+
+    // Guessing a slot from a lookup that merely failed would build a
+    // generation beside the live one and publish over it.
+    await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
+      name: "PrecisionLayerError",
+      code: "STORAGE_ERROR",
+      message: expect.stringContaining('summary alias "summaries" lookup failed'),
+    });
+    expect(client.indices.create).not.toHaveBeenCalled();
+    expect(client.bulk).not.toHaveBeenCalled();
+    expect(client.indices.updateAliases).not.toHaveBeenCalled();
   });
 
   it("rebuilds the generation slot from scratch on every projection", async () => {
@@ -723,9 +754,11 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
     expect(inspected).not.toContain("summaries");
 
     await layer.indexCommunitySummaries([summaryRow()]);
-    expect(client.indices.create.mock.calls.some(
-      (call) => /^summaries-gen-\d$/.test((call[0] as { index: string }).index)
-    )).toBe(true);
+    const afterWrite: string[] = [];
+    for (const call of client.indices.create.mock.calls.slice(created.length)) {
+      afterWrite.push((call[0] as { index: string }).index);
+    }
+    expect(afterWrite).toEqual(["summaries-gen-0"]);
   });
 
   it("surfaces a failing summary bulk as a typed PrecisionLayerError", async () => {
@@ -751,7 +784,9 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
 
     await expect(layer.indexCommunitySummaries([summaryRow()])).rejects.toMatchObject({
       name: "PrecisionLayerError",
-      message: expect.stringMatching(/summary index "summaries-gen-\d"/),
+      message: expect.stringContaining(
+        'summary index "summaries-gen-0" is unavailable'
+      ),
     });
   });
 });

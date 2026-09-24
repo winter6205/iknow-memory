@@ -59,6 +59,11 @@ import {
   COMMUNITY_SUMMARY_INDEX_FAILURE,
   type CommunityIndexStatus,
 } from "../core/types.js";
+import {
+  ElasticsearchPrecisionLayer,
+  type CommunitySummaryIndexRecord,
+  type PrecisionIndexer,
+} from "../core/storage/elasticsearch-precision.js";
 
 export type {
   Community,
@@ -89,6 +94,15 @@ export interface CommunitySummaryDeps {
    * legacy single-column swap; an open rotate typed-refuses inside the job.
    */
   slotEmbedding?: SlotEmbeddingSource;
+  /**
+   * ES write leg: the derived community-summary report index is refreshed
+   * from the generation the Postgres swap just published. Absent (no ES
+   * configured) → the run is Postgres-only, exactly as before.
+   */
+  summaryIndexer?: Pick<
+    PrecisionIndexer,
+    "indexCommunitySummaries" | "deleteSummaryIndex"
+  >;
 }
 
 interface Flags {
@@ -232,6 +246,7 @@ async function runSummaryJob(
   } catch (err) {
     throw new CommunitySummaryJobError("persist", errorMessage(err), err);
   }
+  await projectPublishedSummaries(client, deps);
   deps.logger.info("community-summary-complete", {
     communities: communities.length,
     stored: pending.length,
@@ -437,6 +452,52 @@ async function swapCommunitySummaries(
 }
 
 /**
+ * Post-swap ES leg: project the PUBLISHED generation — read back from the
+ * ledger, not the in-memory one — into the derived summary index, so the
+ * lexical report arm can only ever answer with what Postgres answers for.
+ *
+ * EXIT: a throw here is logged and the run still succeeds. Postgres already
+ * committed READY and is authoritative; failing the job would move a healthy
+ * generation to `failed`, while the derived index keeps serving the last
+ * COMPLETE generation until the next run replaces it whole. An empty published
+ * generation CLEARS the index: a ledger with no reports must not leave a
+ * lexical generation behind.
+ */
+async function projectPublishedSummaries(
+  client: CommunitySummaryDbClient,
+  deps: CommunitySummaryDeps
+): Promise<void> {
+  const indexer = deps.summaryIndexer;
+  if (indexer === undefined) return;
+  try {
+    const rows = await loadPublishedSummaries(client);
+    if (rows.length === 0) {
+      await indexer.deleteSummaryIndex();
+      return;
+    }
+    await indexer.indexCommunitySummaries(rows);
+  } catch (err) {
+    deps.logger.warn("community-summary-es-write-failed", {
+      error: errorMessage(err),
+    });
+  }
+}
+
+async function loadPublishedSummaries(
+  client: CommunitySummaryDbClient
+): Promise<CommunitySummaryIndexRecord[]> {
+  const result = await client.query(
+    `SELECT id, community_id, summary, level FROM community_summaries`
+  );
+  return result.rows.map((row) => ({
+    id: String(row.id),
+    community_id: String(row.community_id),
+    content: String(row.summary),
+    level: Number(row.level),
+  }));
+}
+
+/**
  * The singleton C-ready row (see `COMMUNITY_INDEX_STATUS` in core/types).
  * Called inside the swap transaction for `ready`, and outside it (via
  * `markStateBestEffort`) for the in-progress / failed transitions.
@@ -499,6 +560,21 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * Build the derived summary-index writer only when the operator configured an
+ * Elasticsearch node; `undefined` means Postgres-only and the write leg is
+ * skipped. Kept out of `runCliFromEnv` so the env-assembly path stays linear.
+ */
+function createSummaryIndexer(
+  env: GraphragEnv
+): ElasticsearchPrecisionLayer | undefined {
+  if (env.elasticsearch === undefined) return undefined;
+  return new ElasticsearchPrecisionLayer(env.elasticsearch, {
+    k1: env.retrieval.k1,
+    b: env.retrieval.b,
+  });
+}
+
 export async function runCliFromEnv(argv: string[]): Promise<number> {
   let env: GraphragEnv;
   try {
@@ -541,6 +617,10 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     apiKey: env.embedApiKey,
     dimensions: env.embedDimensions,
   });
+  // Mirrors src/cli/extract.ts: the precision layer exists only when the
+  // operator configured the ES block, so a Postgres-only deployment keeps
+  // running this job exactly as it did before the derived index existed.
+  const precision = createSummaryIndexer(env);
   const deps: CommunitySummaryDeps = {
     pool: pool as unknown as CommunitySummaryPool,
     detector: createNeo4jCommunityDetector(neo4j),
@@ -553,11 +633,13 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     dimensions: env.embedDimensions,
     logger: createLogger(env.logLevel),
     slotEmbedding: createSlotSourceFromGraphragEnv(env, embedder),
+    summaryIndexer: precision,
   };
   try {
     return await runCli(argv, deps);
   } finally {
     await pool.end();
+    await precision?.close();
   }
 }
 

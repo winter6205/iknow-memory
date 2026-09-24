@@ -116,6 +116,7 @@ iknow-memory 控制。容器只发布 IPv4（如 `-p 127.0.0.1:9200:9200`）而�
 | `GRAPHRAG_MEMORY_ES_NODE`                     | `GRAPHRAG_MEMORY_ES_URL` 的兼容别名 | 与 URL 二选一；两个都设时 URL 优先（`_NODE` 被忽略）                            |
 | `GRAPHRAG_MEMORY_ES_CHUNK_INDEX`              | chunk 派生索引名                    | `iknow-memory-chunks`（缺省 / 空串都落到这个默认值）                            |
 | `GRAPHRAG_MEMORY_ES_ENTITY_INDEX`             | entity + alias 派生索引名           | `iknow-memory-entities`（同左）                                                 |
+| `GRAPHRAG_MEMORY_ES_SUMMARY_INDEX`            | community 报告词法派生索引名        | `iknow-memory-summaries`（同左；由 community-summary 作业投影，非 reindex 覆盖） |
 
 Neo4j 开启认证时（Compose 默认如此），必须同时设置 `GRAPHRAG_MEMORY_NEO4J_USER` 和
 `GRAPHRAG_MEMORY_NEO4J_PASSWORD`。共享 / 生产 MCP JSON 里密码只用 placeholder

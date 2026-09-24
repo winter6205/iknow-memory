@@ -8,10 +8,14 @@
  *     state other than a READY/failure-free `community_index_state` row is
  *     the typed `community_summary_index_failure` exit — never a silent
  *     empty, never a silent fall through to B, never a healthy-looking
- *     miss. Readiness is a state-table fact only: a READY row vouches for
- *     its generation (the CLI swaps summaries atomically), so a ready
- *     generation with zero rows is a healthy C miss, while an unready one
- *     is typed even when stale summary rows physically exist.
+ *     miss. A READY row vouches for its generation (the CLI swaps summaries
+ *     atomically) and the reports it published are what the arms then rank,
+ *     so a ready generation whose reports simply do not match the query is a
+ *     healthy C miss. Readiness carries a second fact the report-TEXT arm
+ *     checks: its derived index must be present and populated, so a READY
+ *     generation that never wrote a report index (zero published summaries)
+ *     is typed too — global cannot serve reports it has none of, and a
+ *     refusal rather than an empty is what keeps that from reading as B.
  *   - the reports themselves are ranked by the EXISTING two arm kinds over
  *     the report corpus: `bm25` names the report-TEXT lexical arm (the ES
  *     precision seam, structurally probed), `vector` names the report
@@ -29,7 +33,10 @@
  *
  * Failure taxonomy, deliberately split (spec: B fail-open vs C typed):
  *   - not-ready state            → THROW `community_summary_index_failure`
- *     (the fin-pinned token, via the existing core-types constant);
+ *     (the fin-pinned token, via the existing core-types constant). This
+ *     arrives either from the `community_index_state` gate or from the
+ *     report-ES seam when its derived index is absent — both are readiness
+ *     facts about the same generation, so both type identically;
  *   - an arm that ran and threw  → `community_report:attempted-and-failed`
  *     degraded envelope; the partner arm still answers;
  *   - neither report arm could
@@ -59,7 +66,7 @@ import {
   supportsCommunityReportLexical,
   supportsCommunitySummaries,
 } from "../storage/backend.js";
-import { GraphragError } from "../errors.js";
+import { failureTokenOf, GraphragError } from "../errors.js";
 import { activeQueryEmbedder } from "../embed-slots.js";
 import {
   COMMUNITY_INDEX_STATUS,
@@ -234,15 +241,17 @@ async function requireCommunityIndexReady(
 
 function communitySummaryNotReady(detail: string): GraphragError {
   return new GraphragError(
-    // The refusal names the CANONICAL token it was routed from, so a host
-    // maps this failure deterministically from the same string every time.
-    // The retired letter `C` is named once at this site, as history only: a
-    // log line written before the 2026-09-22 retokenizing says
-    // `search_mode=C`, and this is the very refusal that call produced — `C`
-    // was never a second answer path, so no live route to it is owed.
+    // The declared failureToken is what the host and the report-ES seam below
+    // discriminate on; the prose repeats the token only so a human reading a
+    // log line sees the same named fact. The retired letter `C` is named once
+    // at this site, as history only: a log line written before the
+    // 2026-09-22 retokenizing says `search_mode=C`, and this is the very
+    // refusal that call produced — `C` was never a second answer path, so no
+    // live route to it is owed.
     `retrieve ${SEARCH_MODE_FILTER_KEY}=global is not ready: ` +
       `${COMMUNITY_SUMMARY_INDEX_FAILURE} (${detail})`,
-    "STORAGE_ERROR"
+    "STORAGE_ERROR",
+    COMMUNITY_SUMMARY_INDEX_FAILURE
   );
 }
 
@@ -251,11 +260,21 @@ function communitySummaryNotReady(detail: string): GraphragError {
  * the A arm's lexical pick order); a later ticket makes the ES layer
  * implement it and nothing here changes. `deps.storage` is probed too so a
  * ledger that can answer report text lexically is eligible by shape.
+ *
+ * `deps.entityLexical` is the raw precision layer: in production `deps.lexical`
+ * is only the narrow chunk-BM25 adapter, which deliberately omits this seam,
+ * so the ES report arm is reachable solely through the object wired as the
+ * entity port (see `lexicalAdapterFromPrecision` in the server assembly).
+ * Probing it is what lets the arm's not-ready fact reach the refusal instead
+ * of silently leaving the ES leg unrun.
  */
 function pickReportLexical(
   deps: AssembleDeps
 ): CommunityReportLexicalStorage | undefined {
   if (supportsCommunityReportLexical(deps.lexical)) return deps.lexical;
+  if (supportsCommunityReportLexical(deps.entityLexical)) {
+    return deps.entityLexical;
+  }
   if (supportsCommunityReportLexical(deps.storage)) return deps.storage;
   return undefined;
 }
@@ -284,7 +303,18 @@ async function runReportLexical(
       ran: true,
       failed: false,
     };
-  } catch {
+  } catch (error) {
+    // The report-ES seam separates its two failure kinds by the DECLARED
+    // failure token, never by message prose. An absent summary index declares
+    // community_summary_index_failure — a readiness fact about the report
+    // generation — so it re-raises the typed 档 C refusal, winning over the
+    // vector arm that could otherwise answer
+    // (specs/search-mode-graph-global.md assumption 6). A transient ES error
+    // declares no token and stays the partner-answers fail-open the arm
+    // taxonomy reserves for an arm that ran and threw.
+    if (failureTokenOf(error) === COMMUNITY_SUMMARY_INDEX_FAILURE) {
+      throw communitySummaryNotReady("community report ES index is absent");
+    }
     return { rows: [], ran: true, failed: true };
   }
 }

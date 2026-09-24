@@ -661,11 +661,14 @@ export interface CommunityIndexStateStorage {
  * because it is the derived precision-index read (query text in, ranked
  * rows out) while that seam is the ledger's vector read.
  *
- * Deliberately NOT part of `PrecisionIndexer` in this ticket: the live
- * summary-index write side belongs to the graph-index plan T5 wave, and
- * an uncallable index method would be dead code. The C arm discovers this
- * port structurally on whatever object is wired as `deps.lexical`, so the
- * later ES-side ticket only has to add the method.
+ * Stays separate from the write side: the C arm discovers this seam
+ * structurally across `deps.lexical`, `deps.entityLexical` and the ledger, so
+ * a deployment that wires none of them simply has one report arm fewer. Once
+ * the seam is wired it fails closed: an absent or unpopulated report index
+ * raises the typed `community_summary_index_failure` rather than degrading to
+ * an empty, so the read path never hides a not-ready 档 global. Its
+ * counterpart is `PrecisionIndexer.indexCommunitySummaries`, the only entry
+ * point that creates the index this seam reads.
  */
 export interface CommunityReportLexicalStorage {
   searchCommunitySummariesLexical(

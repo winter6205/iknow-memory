@@ -662,11 +662,13 @@ describe("modeCReportFirstArm report-ES arm via the production entityLexical sea
 
   function notReadyError(): GraphragError {
     // Mirrors the production seam: an absent derived summary index throws a
-    // STORAGE_ERROR whose message carries the canonical token.
+    // STORAGE_ERROR that DECLARES the canonical token and names it in prose
+    // for the human reading the log.
     return new GraphragError(
       `Elasticsearch summary index "summaries" is not ready: ` +
         `${COMMUNITY_SUMMARY_INDEX_FAILURE}`,
-      "STORAGE_ERROR"
+      "STORAGE_ERROR",
+      COMMUNITY_SUMMARY_INDEX_FAILURE
     );
   }
 
@@ -724,6 +726,60 @@ describe("modeCReportFirstArm report-ES arm via the production entityLexical sea
     // A transient ES error is NOT the not-ready path: the vector arm still
     // answers, marked attempted-and-failed, and nothing types out as a refusal.
     expect(envelope.chunks.map((c) => c.id)).toEqual(["sum-1", "sum-2"]);
+    expect(envelope.degraded).toBe(true);
+    expect(envelope.degraded_reasons).toContain(
+      "community_report:attempted-and-failed"
+    );
+  });
+
+  it("classifies the not-ready leg by the token it DECLARES, not by its prose", async () => {
+    const backend = await readyBackend();
+    const es = esPort(async () => {
+      // The same readiness fact worded entirely differently: what routes it
+      // is the declared failure token, so host-facing copy can change freely.
+      throw new GraphragError(
+        "Elasticsearch derived report index has no generation to read",
+        "STORAGE_ERROR",
+        COMMUNITY_SUMMARY_INDEX_FAILURE
+      );
+    });
+    const deps = baseDeps({
+      storage: withVectorSeam(backend, vectorSeam(reportRows())),
+      lexical: narrowAdapter as unknown as AssembleDeps["lexical"],
+      entityLexical: es as unknown as AssembleDeps["entityLexical"],
+    });
+    const refusal = await modeCReportFirstArm(
+      baseArgs(),
+      deps
+    ).then(() => undefined, (error: unknown) => error);
+    expect(refusal).toBeInstanceOf(GraphragError);
+    expect((refusal as GraphragError).failureToken).toBe(
+      COMMUNITY_SUMMARY_INDEX_FAILURE
+    );
+    expect((refusal as Error).message).toContain(
+      COMMUNITY_SUMMARY_INDEX_FAILURE
+    );
+  });
+
+  it("keeps a transient leg that merely MENTIONS the token in prose fail-open", async () => {
+    const backend = await readyBackend();
+    const es = esPort(async () => {
+      // Prose that quotes the token is not a readiness fact: without the
+      // declared field this stays the arm-that-ran-and-threw degrade.
+      throw new GraphragError(
+        `Elasticsearch report search failed while ${COMMUNITY_SUMMARY_INDEX_FAILURE} ` +
+          "was being logged as a hint",
+        "STORAGE_ERROR"
+      );
+    });
+    const envelope = await modeCReportFirstArm(
+      baseArgs(),
+      baseDeps({
+        storage: withVectorSeam(backend, vectorSeam(reportRows())),
+        lexical: narrowAdapter as unknown as AssembleDeps["lexical"],
+        entityLexical: es as unknown as AssembleDeps["entityLexical"],
+      })
+    );
     expect(envelope.degraded).toBe(true);
     expect(envelope.degraded_reasons).toContain(
       "community_report:attempted-and-failed"

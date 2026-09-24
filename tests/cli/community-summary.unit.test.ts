@@ -45,7 +45,11 @@ import type {
   CommunitySummaryRow,
   RetrieveConfig,
 } from "../../src/core/retrieval/types.js";
-import type { CommunitySummaryIndexRecord } from "../../src/core/storage/elasticsearch-precision.js";
+import {
+  ElasticsearchPrecisionLayer,
+  type CommunitySummaryIndexRecord,
+} from "../../src/core/storage/elasticsearch-precision.js";
+import { FakeEsCluster } from "../storage/es-fake-cluster.js";
 import type { Logger } from "../../src/logging.js";
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../../src/core/types.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
@@ -355,6 +359,20 @@ function swapWindow(client: FakeClient): string[] {
     (tag, i) => i > deleteIdx && (tag === "COMMIT" || tag === "ROLLBACK")
   );
   return tags.slice(beginIdx, endIdx === -1 ? undefined : endIdx + 1);
+}
+
+function warnRecorder(): { warnings: string[]; logger: Logger } {
+  const warnings: string[] = [];
+  const logger: Logger = {
+    level: "warn",
+    debug() {},
+    info() {},
+    warn(msg) {
+      warnings.push(msg);
+    },
+    error() {},
+  };
+  return { warnings, logger };
 }
 
 const RETRIEVE_CONFIG: RetrieveConfig = {
@@ -1040,20 +1058,6 @@ describe("community summary ES write leg", () => {
     return { indexer, calls, deletes: () => deletes };
   }
 
-  function warnRecorder() {
-    const warnings: string[] = [];
-    const logger: Logger = {
-      level: "warn",
-      debug() {},
-      info() {},
-      warn(msg) {
-        warnings.push(msg);
-      },
-      error() {},
-    };
-    return { warnings, logger };
-  }
-
   it("indexes the published generation only after the swap transaction committed", async () => {
     const client = new FakeClient(oldGeneration());
     const es = fakeIndexer(client);
@@ -1197,5 +1201,105 @@ describe("community summary ES write leg", () => {
     await expect(runCli(["--dry-run"], h.deps)).resolves.toBe(0);
     expect(es.calls).toEqual([]);
     expect(es.deletes()).toBe(0);
+  });
+});
+
+/**
+ * Issue #272 through the PRODUCTION writer: the leg runs against a real
+ * `ElasticsearchPrecisionLayer` over an in-memory cluster, so what is asserted
+ * is which documents a reader can actually resolve after the run — including
+ * after a run whose ES write died before publishing.
+ */
+describe("community summary ES leg with the production writer", () => {
+  const SUMMARY_ALIAS = "summaries";
+
+  function writer(cluster: FakeEsCluster): ElasticsearchPrecisionLayer {
+    return new ElasticsearchPrecisionLayer(
+      {
+        node: "http://localhost:9200",
+        chunkIndex: "chunks",
+        entityIndex: "entities",
+        summaryIndex: SUMMARY_ALIAS,
+      },
+      { client: cluster.client() }
+    );
+  }
+
+  function esRecord(communityId: string): CommunitySummaryIndexRecord {
+    return {
+      id: `ledger-${communityId}`,
+      community_id: communityId,
+      content: "community report text",
+      level: 1,
+    };
+  }
+
+  it("retires a community's report once it leaves the published generation", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = writer(cluster);
+    // A previous run published both reports into the derived index.
+    await layer.indexCommunitySummaries([
+      esRecord("7"),
+      esRecord("99"),
+    ]);
+
+    // This run publishes community 7 only: 99's entities are all retired.
+    const h = deps({ client: new FakeClient(), summaryIndexer: layer });
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+
+    expect(cluster.liveCommunityIds(SUMMARY_ALIAS)).toEqual(["7"]);
+    // A published swap leaves the previous generation on disk only until the
+    // next projection reclaims that slot: the derived index set stays bounded
+    // by the two slots, it never accumulates generations.
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(cluster.indexNames()).toHaveLength(2);
+    expect(cluster.liveCommunityIds(SUMMARY_ALIAS)).toEqual(["7"]);
+  });
+
+  it("keeps the previous complete generation readable when the write cannot publish", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = writer(cluster);
+    await layer.indexCommunitySummaries([esRecord("a"), esRecord("b")]);
+    // The new generation is fully written but never becomes readable.
+    cluster.failNextAliasUpdate = true;
+    const recorder = warnRecorder();
+    const h = deps({
+      client: new FakeClient(),
+      summaryIndexer: layer,
+      logger: recorder.logger,
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(cluster.liveCommunityIds(SUMMARY_ALIAS)).toEqual(["a", "b"]);
+    expect(cluster.orphanIndices(SUMMARY_ALIAS)).toEqual([]);
+    // The documented EXIT: Postgres is authoritative, so the run reports 0
+    // and the failed leg stays observable through the warn.
+    expect(h.client.readState()).toEqual({
+      status: "ready",
+      failure_code: null,
+    });
+    expect(recorder.warnings).toContain("community-summary-es-write-failed");
+  });
+
+  it("clears the derived index when the published generation is empty", async () => {
+    const cluster = new FakeEsCluster();
+    const layer = writer(cluster);
+    await layer.indexCommunitySummaries([esRecord("7")]);
+    const h = deps({
+      client: new FakeClient(),
+      summaryIndexer: layer,
+      detector: {
+        async detect() {
+          return [];
+        },
+        async close() {},
+      },
+    });
+
+    await expect(runCli([], h.deps)).resolves.toBe(0);
+    expect(cluster.indexNames()).toEqual([]);
+    await expect(
+      layer.searchCommunitySummariesLexical("community report", 5, 3)
+    ).rejects.toThrow(RegExp(COMMUNITY_SUMMARY_INDEX_FAILURE));
   });
 });

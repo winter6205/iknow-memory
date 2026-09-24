@@ -9,6 +9,12 @@ When adding or changing business logic, prioritize tests for the changed behavio
 5. Empty, malformed, or invalid input.
 6. Concurrent requests or duplicate submissions, when applicable.
 
+## Golden-set acceptance for every change
+
+For every change, identify the applicable committed, versioned golden set, run it, compare actual per-case results with independently defined expected results, and record the command, dataset version, observed results, and exit status. If the change alters a product contract that the current gold set does not cover, add or update the gold cases before implementation; a documentation-only change with no contract change still runs the repository's baseline gold set.
+
+When changed behavior crosses a real service, storage, model, or MCP boundary, the golden run must exercise that real boundary and assert observable results. Fake or fixture-server runs remain useful for deterministic tests but do not satisfy this golden acceptance. Missing gold coverage or an unavailable required dependency is blocked evidence, not a pass or a green skip.
+
 Do not delete tests to make a build pass. Do not weaken assertions. Do not change a failing test to a skip unless the user explicitly authorizes it and the commit message explains why.
 
 ## Real Dependencies and Representative Data

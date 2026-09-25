@@ -25,6 +25,7 @@ import {
   EXTRACT_METHODS,
   COMMUNITY_INDEX_STATUS,
   EMBED_ROTATE_MODES,
+  INDEX_JOB_STATUS,
   type SourceDocStatus,
 } from "../types.js";
 import { upSchemaProjection } from "./schema-projection.js";
@@ -49,6 +50,10 @@ function sqlTextLiteral(value: string): string {
 /** The three-value 资料 status vocabulary, in declaration order. */
 const SOURCE_DOC_STATUS_VALUES: readonly SourceDocStatus[] =
   Object.values(SOURCE_DOC_STATUS);
+
+/** The four-value index-job vocabulary, in declaration order (corpus-index-job T2). */
+const INDEX_JOB_STATUS_VALUES: readonly string[] =
+  Object.values(INDEX_JOB_STATUS);
 
 /**
  * Minimal client surface the bootstrap consumes: only `query`, with
@@ -569,6 +574,68 @@ async function createSourceDocuments(
     EXCEPTION
       WHEN duplicate_object THEN NULL;
     END $$`);
+  // corpus-index-job T2: the durable submit identity. `content_identity` is
+  // the document-level version the (source_ref, content_identity) idempotency
+  // pair keys on. Nullable because legacy rows predate the column — the next
+  // push backfills it — so the ALTER cannot be NOT NULL.
+  await client.query(`
+    ALTER TABLE source_documents
+      ADD COLUMN IF NOT EXISTS content_identity text NULL`);
+  // The pair is the index-job submission key. `source_ref` is already UNIQUE
+  // so this composite cannot admit a duplicate today, but naming the pair as
+  // a constraint is the storage-boundary record of the idempotency contract.
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS source_documents_source_ref_content_identity_idx
+      ON source_documents (source_ref, content_identity)`);
+}
+
+/**
+ * index_jobs: the durable corpus index-job ledger (corpus-index-job T2).
+ *
+ * One row per (source_ref, content_identity) submission, keyed by the
+ * derived `job_id` so a repeat submit resolves to the same job instead of
+ * a second one. `status` reuses the four C-ready words (`INDEX_JOB_STATUS`):
+ * queued-vs-running is `started_at IS NULL`, never a fifth state word, so
+ * the CHECK derives its literal list from the constant the writers use —
+ * the same doctrine as `source_documents_status_check`. `failure_code` sits
+ * beside `status` exactly as in `community_index_state`.
+ */
+async function createIndexJobs(client: SchemaBootstrapClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS index_jobs (
+      job_id           text PRIMARY KEY,
+      source_ref       text NOT NULL,
+      content_identity text NOT NULL,
+      status           text NOT NULL,
+      failure_code     text NULL,
+      created_at       timestamptz NOT NULL DEFAULT now(),
+      started_at       timestamptz NULL,
+      finished_at      timestamptz NULL
+    )`);
+  await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE index_jobs
+        ADD CONSTRAINT index_jobs_status_check
+        CHECK (status IN (${sqlTextList(INDEX_JOB_STATUS_VALUES)}));
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
+  // The active-job lookup the submit seam makes on every request.
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS index_jobs_source_ref_status_idx
+      ON index_jobs (source_ref, status)`);
+  // One live job per source, enforced at the source of truth: the submit
+  // seam's read-then-write leaves a window where two conflicting submits both
+  // see no active row, and only this index closes it. Terminal rows
+  // (`ready`/`failed`/`stale`) are outside the predicate, so history is
+  // unlimited while `in_progress` is singular (decision 3's per-source
+  // binding). The literal rides the same constant the CHECK and the writers
+  // use, so the predicate cannot drift from the vocabulary.
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS index_jobs_one_active_per_source_idx
+      ON index_jobs (source_ref)
+      WHERE status = ${sqlTextLiteral(INDEX_JOB_STATUS.IN_PROGRESS)}`);
 }
 
 /**
@@ -665,6 +732,7 @@ export async function upSchemaBootstrap(
     await createCommunityIndexState(client);
     await createEmbeddingGeneration(client);
     await createSourceDocuments(client);
+    await createIndexJobs(client);
     await upSchemaProjection(client);
     // ALTER chunks back-pointers must come after `source_documents` exists
     // (FK target) and after `chunks` itself exists (caller's responsibility —

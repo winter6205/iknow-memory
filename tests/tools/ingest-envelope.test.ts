@@ -12,10 +12,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  computeContentIdentity,
+  computeSourceDocId,
   IngestInputSchema,
   createIngestHandler,
   type IngestDeps,
 } from "../../src/tools/ingest.js";
+import { createPushHandler } from "../../src/tools/push.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { GraphragError } from "../../src/core/errors.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
@@ -429,7 +432,10 @@ describe("createIngestHandler — 资料 status (corpus-ready retrieve T3)", () 
       content: "a body",
       chunks: [{ content: "a body", index: 0 }],
     });
-    await deps.storage.recordSourceDocFailure("docs/ingest-a.md", "INVALID_INPUT");
+    await deps.storage.recordSourceDocFailure(
+      "docs/ingest-a.md",
+      "INVALID_INPUT"
+    );
     await handler({
       source_ref: "docs/ingest-b.md",
       content: "b body",
@@ -471,5 +477,195 @@ describe("MemoryBackend — source-doc seam", () => {
     const r: StorageReadResult<StorageSourceDocView> =
       await backend.getSourceDoc("docs/nope.md");
     expect(r).toEqual({ ok: false, code: "NOT_FOUND" });
+  });
+});
+
+/**
+ * One 资料 resolves to exactly one CURRENT content_identity, whichever writer
+ * touched the row last. `ingest` therefore declares the same body-level value
+ * `push` declares: a write that omitted it would blank the identity a previous
+ * push stored, and every later index-job submit for that source would come
+ * back as an identity mismatch. The identity is read back through the storage
+ * read port, never from a spy of the write call.
+ */
+describe("createIngestHandler — document content_identity", () => {
+  function pushItem(content: string, sourceRef: string) {
+    return {
+      content,
+      source_ref: sourceRef,
+      metadata: { kind: "test" },
+      valid_from: "2024-01-01T00:00:00Z",
+      valid_until: "2024-12-31T00:00:00Z",
+    };
+  }
+
+  async function storedDoc(
+    storage: MemoryBackend,
+    sourceRef: string
+  ): Promise<StorageSourceDocView> {
+    const read = await storage.getSourceDoc(sourceRef);
+    if (!read.ok) {
+      throw new Error(`expected a 资料 row for ${sourceRef}`);
+    }
+    return read.value;
+  }
+
+  it("declares the body-level identity computed with the DEFAULT versions", async () => {
+    const deps = makeDeps();
+    const body = "the whole 资料 body ingested verbatim";
+    const handler = createIngestHandler(deps);
+    await handler({
+      source_ref: "docs/identity.md",
+      content: body,
+      chunks: [{ content: body, index: 0 }],
+    });
+
+    const doc = await storedDoc(deps.storage, "docs/identity.md");
+    expect(doc.content_identity).toBe(computeContentIdentity(body));
+  });
+
+  it("a caller-side version override does not move the document identity", async () => {
+    const body = "overridden versions body";
+    const deps = {
+      ...makeDeps(),
+      identityVersions: { normalizationRuleVersion: "normalization-v9" },
+    };
+    const handler = createIngestHandler(deps);
+    await handler({
+      source_ref: "docs/override.md",
+      content: body,
+      chunks: [{ content: body, index: 0 }],
+    });
+
+    // The pair half must stay reproducible by the other writer, so it ignores
+    // the per-slice overrides entirely.
+    expect(
+      (await storedDoc(deps.storage, "docs/override.md")).content_identity
+    ).toBe(computeContentIdentity(body));
+  });
+
+  it("publishes the identity it stored, so a Host can form the submit pair", async () => {
+    const deps = makeDeps();
+    const body = "published identity";
+    const handler = createIngestHandler(deps);
+    const result = await handler({
+      source_ref: "docs/published.md",
+      content: body,
+      chunks: [{ content: body, index: 0 }],
+    });
+    const body1 = JSON.parse(result.content[0]!.text!) as {
+      source_doc_id: string;
+      content_identity: string;
+    };
+    expect(body1.content_identity).toBe(computeContentIdentity(body));
+    expect(
+      (await storedDoc(deps.storage, "docs/published.md")).content_identity
+    ).toBe(body1.content_identity);
+  });
+
+  it("push then ingest-upsert of the same body leaves the pair unchanged", async () => {
+    const deps = makeDeps();
+    const body = "shared across both writers";
+    const pushed = await createPushHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: deps.storage,
+    })({ items: [pushItem(body, "docs/cross-writer.md")] });
+    const pushBody = JSON.parse(pushed.content[0]!.text!) as {
+      content_identity: string;
+    };
+
+    const ingested = await createIngestHandler(deps)({
+      source_ref: "docs/cross-writer.md",
+      content: body,
+      chunks: [{ content: body, index: 0 }],
+    });
+    const ingestBody = JSON.parse(ingested.content[0]!.text!) as {
+      content_identity: string;
+    };
+
+    expect(ingestBody.content_identity).toBe(pushBody.content_identity);
+    const doc = await storedDoc(deps.storage, "docs/cross-writer.md");
+    expect(doc.content_identity).toBe(computeContentIdentity(body));
+  });
+
+  it("an ingest of a different body overwrites the pushed identity, never nulls it", async () => {
+    const deps = makeDeps();
+    const pushedBody = "version one from push";
+    await createPushHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: deps.storage,
+    })({ items: [pushItem(pushedBody, "docs/overwrite.md")] });
+
+    const newBody = "version two from ingest";
+    await createIngestHandler(deps)({
+      source_ref: "docs/overwrite.md",
+      content: newBody,
+      chunks: [{ content: newBody, index: 0 }],
+    });
+
+    const doc = await storedDoc(deps.storage, "docs/overwrite.md");
+    expect(doc.content_identity).not.toBeNull();
+    expect(doc.content_identity).toBe(computeContentIdentity(newBody));
+    expect(doc.content_identity).not.toBe(computeContentIdentity(pushedBody));
+  });
+
+  it("a legacy batch repeating one source_ref publishes the identity the row actually holds", async () => {
+    const deps = makeDeps();
+    const result = await createIngestHandler(deps)({
+      source_ref: "docs/legacy-batch.md",
+      content: ["first item", "second item"],
+    });
+    const body = JSON.parse(result.content[0]!.text!) as {
+      source_doc_id?: string;
+      content_identity?: string;
+      source_doc_ids?: string[];
+      content_identities?: string[];
+    };
+    // One locator, one row: both envelopes address the same 资料, so the
+    // response carries ONE id and ONE identity — the last write, mirroring
+    // the upsert. Per-envelope publication would name an identity no row
+    // ever held.
+    expect(body.source_doc_ids).toBeUndefined();
+    expect(body.content_identities).toBeUndefined();
+    expect(body.source_doc_id).toBe(computeSourceDocId("docs/legacy-batch.md"));
+    expect(body.content_identity).toBe(computeContentIdentity("second item"));
+    // Read the row back through the storage read port: what was published is
+    // what is stored.
+    const doc = await storedDoc(deps.storage, "docs/legacy-batch.md");
+    expect(doc.content).toBe("second item");
+    expect(doc.content_identity).toBe(body.content_identity);
+  });
+
+  it("a mixed legacy batch publishes one aligned entry per distinct source_ref", async () => {
+    const deps = makeDeps();
+    // Items 0 and 1 inherit the top-level locator (one 资料, last write
+    // wins); the object item names its own 资料.
+    const result = await createIngestHandler(deps)({
+      source_ref: "docs/mixed-a.md",
+      content: [
+        "a first slice",
+        "a final slice",
+        { content: "own row body", source_ref: "docs/mixed-b.md" },
+      ],
+    });
+    const body = JSON.parse(result.content[0]!.text!) as {
+      source_doc_ids: string[];
+      content_identities: string[];
+    };
+    expect(body.source_doc_ids).toEqual([
+      computeSourceDocId("docs/mixed-a.md"),
+      computeSourceDocId("docs/mixed-b.md"),
+    ]);
+    expect(body.content_identities).toEqual([
+      computeContentIdentity("a final slice"),
+      computeContentIdentity("own row body"),
+    ]);
+    // Every published pair equals the stored row for that source_ref, in the
+    // published order — the arrays are aligned, not merely equal in length.
+    const storedA = await storedDoc(deps.storage, "docs/mixed-a.md");
+    const storedB = await storedDoc(deps.storage, "docs/mixed-b.md");
+    expect([storedA.content_identity, storedB.content_identity]).toEqual(
+      body.content_identities
+    );
   });
 });

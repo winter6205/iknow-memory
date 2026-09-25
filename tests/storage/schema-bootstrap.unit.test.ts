@@ -6,6 +6,7 @@ import {
   SOURCE_DOC_STATUS,
   COMMUNITY_INDEX_STATUS,
   EMBED_ROTATE_MODES,
+  INDEX_JOB_STATUS,
 } from "../../src/core/types.js";
 
 function recordingClient(): {
@@ -371,6 +372,131 @@ describe("upSchemaBootstrap community_summaries.level (community-level T1)", () 
     expect(probe, "readiness probe not emitted").toBeDefined();
     expect(probe!.values?.[2]).toContain("community_summaries");
     expect(probe!.values?.[3]).toContain("level");
+  });
+});
+
+// corpus-index-job T2: the durable index-job ledger + the source_documents
+// content-identity column the (source_ref, content_identity) pair keys on.
+describe("upSchemaBootstrap index_jobs + content_identity (corpus-index-job T2)", () => {
+  it("forward-compat ALTERs source_documents with content_identity", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    const alters = queries.filter((query) =>
+      /ALTER TABLE source_documents\s+ADD COLUMN IF NOT EXISTS content_identity/i.test(
+        query
+      )
+    );
+    expect(alters).toHaveLength(1);
+    expect(alters[0]).toMatch(/content_identity\s+text\s+NULL/i);
+  });
+
+  it("creates the UNIQUE (source_ref, content_identity) pair index", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    expect(
+      queries.some(
+        (query) =>
+          /CREATE UNIQUE INDEX IF NOT EXISTS source_documents_source_ref_content_identity_idx/i.test(
+            query
+          ) &&
+          /ON source_documents \(source_ref, content_identity\)/i.test(query)
+      ),
+      "pair index not emitted"
+    ).toBe(true);
+  });
+
+  it("creates the index_jobs table with the submit-identity columns", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    const create = queries.find((query) =>
+      /CREATE TABLE IF NOT EXISTS index_jobs/i.test(query)
+    );
+    expect(create, "index_jobs CREATE TABLE not emitted").toBeDefined();
+    expect(create).toMatch(/job_id\s+text PRIMARY KEY/i);
+    expect(create).toMatch(/source_ref\s+text NOT NULL/i);
+    expect(create).toMatch(/content_identity\s+text NOT NULL/i);
+    expect(create).toMatch(/status\s+text NOT NULL/i);
+    expect(create).toMatch(/failure_code\s+text NULL/i);
+    expect(create).toMatch(
+      /created_at\s+timestamptz NOT NULL DEFAULT now\(\)/i
+    );
+    expect(create).toMatch(/started_at\s+timestamptz NULL/i);
+    expect(create).toMatch(/finished_at\s+timestamptz NULL/i);
+  });
+
+  it("binds the index_jobs status CHECK to INDEX_JOB_STATUS via a named constraint", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    const check = queries.find((query) =>
+      /ADD CONSTRAINT index_jobs_status_check/i.test(query)
+    );
+    expect(check, "index_jobs status CHECK not emitted").toBeDefined();
+    for (const value of Object.values(INDEX_JOB_STATUS)) {
+      expect(check, `CHECK misses '${value}'`).toContain(`'${value}'`);
+    }
+    // Guard the duplicate-object path so a replayed bootstrap stays idempotent.
+    expect(check).toMatch(/WHEN duplicate_object THEN NULL/);
+  });
+
+  it("creates the (source_ref, status) index for the active-job lookup", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    expect(
+      queries.some(
+        (query) =>
+          /CREATE INDEX IF NOT EXISTS index_jobs_source_ref_status_idx/i.test(
+            query
+          ) && /ON index_jobs \(source_ref, status\)/i.test(query)
+      ),
+      "active-job lookup index not emitted"
+    ).toBe(true);
+  });
+
+  it("creates the partial UNIQUE index keeping one active job per source", async () => {
+    const { client, queries } = recordingClient();
+    await upSchemaBootstrap(client, 1536, 2000);
+    const partial = queries.find((query) =>
+      /CREATE UNIQUE INDEX IF NOT EXISTS index_jobs_one_active_per_source_idx/i.test(
+        query
+      )
+    );
+    expect(partial, "one-active-per-source index not emitted").toBeDefined();
+    expect(partial).toMatch(/ON index_jobs \(source_ref\)/i);
+    // The predicate must bind to the vocabulary constant, exactly like the
+    // status CHECK — a drift here would police the wrong state word.
+    expect(partial).toMatch(
+      new RegExp(`WHERE status = '${INDEX_JOB_STATUS.IN_PROGRESS}'`, "i")
+    );
+  });
+
+  it("names index_jobs, its index, and content_identity in the readiness probe", async () => {
+    const records: { sql: string; values?: unknown[] }[] = [];
+    const client = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        records.push({ sql, values });
+        if (/AS ready/.test(sql)) return { rows: [{ ready: true }] };
+        if (/current_schema\(\)/.test(sql)) {
+          return { rows: [{ schema_name: "public" }] };
+        }
+        return { rows: [] };
+      }),
+    } as unknown as PoolClient;
+    await upSchemaBootstrap(client, 1536, 2000);
+
+    const probe = records.find(({ sql }) => /AS ready/.test(sql));
+    expect(probe, "readiness probe not emitted").toBeDefined();
+    expect(probe!.values?.[0]).toContain("index_jobs");
+    expect(probe!.values?.[1]).toContain("index_jobs_source_ref_status_idx");
+    // A forward-compat index must be IN the probe, or an old-schema database
+    // would read as ready without the one-active-per-source constraint.
+    expect(probe!.values?.[1]).toContain(
+      "index_jobs_one_active_per_source_idx"
+    );
+    expect(probe!.values?.[1]).toContain(
+      "source_documents_source_ref_content_identity_idx"
+    );
+    expect(probe!.values?.[2]).toContain("source_documents");
+    expect(probe!.values?.[3]).toContain("content_identity");
   });
 });
 

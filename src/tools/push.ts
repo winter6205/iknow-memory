@@ -416,9 +416,22 @@ async function writeEnvelope(
   storage: StorageBackend,
   env: NormalizedPushEnvelope,
   ctx: EnvelopeWriteContext
-): Promise<{ records: ChunkRecord[]; ids: string[]; sourceDocId: string }> {
+): Promise<{
+  records: ChunkRecord[];
+  ids: string[];
+  sourceDocId: string;
+  contentIdentity: string;
+}> {
   const sourceDocId = computeSourceDocId(env.source_ref);
   // Upsert the 资料 row keyed by source_ref (re-push updates body).
+  // Document-level content identity is the (source_ref, content_identity)
+  // idempotency pair the durable index-job submit keys on (corpus-index-job
+  // T2); computed from the whole body with the DEFAULT version components,
+  // unlike the per-slice ids below which honour the caller's version
+  // overrides. `ingest` declares the identical value for the rows it writes —
+  // one source_ref resolves to exactly one current content_identity no matter
+  // which of the two writers touched it last.
+  const documentContentIdentity = computeContentIdentity(env.content);
   const sourceDoc: SourceDocRecord = {
     id: sourceDocId,
     source_ref: env.source_ref,
@@ -427,6 +440,7 @@ async function writeEnvelope(
     created_at: ctx.now,
     status: SOURCE_DOC_STATUS.IN_PROGRESS,
     failure_code: null,
+    content_identity: documentContentIdentity,
   };
   await storage.upsertSourceDoc(sourceDoc);
 
@@ -446,8 +460,7 @@ async function writeEnvelope(
       ...(ctx.incomingEmbeddings === null
         ? {}
         : {
-            incoming_embedding:
-              ctx.incomingEmbeddings[ctx.embeddingCursor]!,
+            incoming_embedding: ctx.incomingEmbeddings[ctx.embeddingCursor]!,
           }),
       source_ref: env.source_ref,
       metadata: env.metadata,
@@ -467,7 +480,12 @@ async function writeEnvelope(
   const ids = await storage.upsert(records, {
     generation: ctx.generation,
   });
-  return { records, ids, sourceDocId };
+  return {
+    records,
+    ids,
+    sourceDocId,
+    contentIdentity: documentContentIdentity,
+  };
 }
 
 export function createPushHandler(deps: PushDeps) {
@@ -516,7 +534,20 @@ export function createPushHandler(deps: PushDeps) {
     };
     const records: ChunkRecord[] = [];
     const ids: string[] = [];
-    const sourceDocIds: string[] = [];
+    /**
+     * The 资料 rows this batch wrote, keyed by `source_ref` with
+     * LAST-write-wins — the same rule the upsert itself applies. The batch
+     * repetition refusal keeps one entry per 资料 in practice; keying here
+     * means the response can never publish an id or identity that no row
+     * holds, whichever envelope order the batch arrived in. The durable
+     * index-job submit takes this pair, so the response carries the value
+     * the write actually stored — a Host must not have to reimplement the
+     * hash.
+     */
+    const writtenBySourceRef = new Map<
+      string,
+      { sourceDocId: string; contentIdentity: string }
+    >();
     for (const env of envelopes) {
       // A batch is not a transaction: only the 资料 whose own write threw
       // is recorded 失败, and a sibling that landed is marked 就绪 before
@@ -529,16 +560,30 @@ export function createPushHandler(deps: PushDeps) {
       );
       records.push(...written.records);
       ids.push(...written.ids);
-      sourceDocIds.push(written.sourceDocId);
+      writtenBySourceRef.set(env.source_ref, {
+        sourceDocId: written.sourceDocId,
+        contentIdentity: written.contentIdentity,
+      });
       await markSourceDocReadyBestEffort(deps.storage, [written.sourceDocId]);
     }
+    // One entry per 资料 actually written, in first-touch order: both arrays
+    // come off the same map, so they stay aligned by construction.
+    const writtenDocs = [...writtenBySourceRef.values()];
+    const sourceDocIds = writtenDocs.map((w) => w.sourceDocId);
+    const contentIdentities = writtenDocs.map((w) => w.contentIdentity);
     const precisionFailed = await indexPrecisionBestEffort(deps, records);
     return textResult(
       JSON.stringify({
         chunk_ids: ids,
         ...(sourceDocIds.length === 1
-          ? { source_doc_id: sourceDocIds[0] }
-          : { source_doc_ids: sourceDocIds }),
+          ? {
+              source_doc_id: sourceDocIds[0],
+              content_identity: contentIdentities[0],
+            }
+          : {
+              source_doc_ids: sourceDocIds,
+              content_identities: contentIdentities,
+            }),
         ...(precisionFailed
           ? {
               degraded: true,
@@ -639,7 +684,8 @@ export const pushTool = (deps: PushDeps): ToolRegistration => ({
     "Idempotent on (source_ref, content_identity): an identical re-push " +
     "returns the same chunk_id without adding rows. Metadata is required " +
     "with at least one key; valid_from and valid_until are required. Text " +
-    "is stored verbatim — it is never re-chunked.",
+    "is stored verbatim — it is never re-chunked. The response names each " +
+    "资料 row's content identity, the pair half an index-job submit takes.",
   inputSchema: PushInputSchema,
   handler: createPushHandler(deps) as unknown as ToolRegistration["handler"],
 });

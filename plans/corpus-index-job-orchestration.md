@@ -5,7 +5,7 @@
 **Spec link:** T1 creates `specs/corpus-index-job-orchestration.md` and reconciles the existing MCP tool-surface contract before implementation.
 **Fin dependency:** [`../../fin/plans/permanent-corpus-upload.md`](../../fin/plans/permanent-corpus-upload.md) owns permanent upload, original-file retention, parsing, and chunking; this plan owns iknow-memory's durable graph-index job trigger and status seam. T1 here and fin upload-plan T1 form the first wave, run in parallel to pin the cross-repo contract, while fin thread-attachment T2a measures resources meanwhile.
 **Related, unchanged:** [`bounded-source-read.md`](bounded-source-read.md) is merged and remains the bounded source-read contract; this plan does not change it. [`graph-index-standard-fast.md`](graph-index-standard-fast.md) owns the existing extract and graph-index algorithms.
-**ACR:** all five yes for the proposed orchestration boundary; code is blocked on T1's contract decision.
+**ACR:** all five yes for the proposed orchestration boundary — provisional pending T1's new spec; code is blocked on T1's contract decision.
 
 bounded-context-guardian: yes — fin owns permanent-file storage, parsing, and fin-side upload state; iknow-memory owns the corpus index-job ledger and worker boundary; Postgres remains authoritative and Neo4j remains a projection.
 input-contract-tests: yes — the decision and implementation tickets cover empty, invalid, overflow, concurrent, and exception classes at submission, lookup, recovery, and worker boundaries.

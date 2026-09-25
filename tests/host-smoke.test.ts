@@ -191,9 +191,11 @@ describe("host-smoke: real stdio MCP client against built server", () => {
         "extract",
         "ingest",
         "invalidate",
+        "poll_index_job",
         "push",
         "read_source",
         "retrieve",
+        "submit_index_job",
       ]);
       expect(names).not.toContain("echo");
       expect(names).not.toContain("invalidation");

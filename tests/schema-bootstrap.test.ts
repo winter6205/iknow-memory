@@ -23,7 +23,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { upSchemaBootstrap } from "../src/core/storage/schema-bootstrap.js";
 import { ENTITY_TYPES } from "../src/core/extraction/entity-type.js";
-import { SOURCE_DOC_STATUS, COMMUNITY_INDEX_STATUS } from "../src/core/types.js";
+import {
+  SOURCE_DOC_STATUS,
+  COMMUNITY_INDEX_STATUS,
+  INDEX_JOB_STATUS,
+} from "../src/core/types.js";
 import {
   createPgIntegrationHarness,
   redactPgConnectionString,
@@ -1209,6 +1213,182 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
         )
       ).rejects.toThrow(/source_documents_status_check/);
     });
+
+    it("source_documents carries content_identity (corpus-index-job T2)", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "source_documents");
+      expect(cols, "source_documents.content_identity missing").toContain(
+        "content_identity"
+      );
+    });
+
+    it("source_documents has the UNIQUE (source_ref, content_identity) pair index", async () => {
+      const c = requireClient();
+      const res = await c.query<{ indexdef: string }>(
+        `SELECT indexdef FROM pg_indexes
+           WHERE schemaname = $1 AND tablename = 'source_documents'`,
+        [SCHEMA]
+      );
+      const pairUnique = res.rows.some(
+        (row) =>
+          /^CREATE UNIQUE INDEX/i.test(row.indexdef) &&
+          /\(source_ref, content_identity\)/.test(row.indexdef)
+      );
+      expect(
+        pairUnique,
+        "source_documents must have a UNIQUE (source_ref, content_identity) index"
+      ).toBe(true);
+    });
+  });
+
+  // -------------------------------------------------------------------
+  // corpus-index-job T2: the durable index-job ledger. Status reuses the
+  // four C-ready words (INDEX_JOB_STATUS); a fifth word is the storage
+  // boundary the CHECK must reject, and the derived job_id is the submit
+  // identity, so it is the PRIMARY KEY.
+  // -------------------------------------------------------------------
+  describe("index_jobs DDL contract", () => {
+    function requireClient(): pg.Client {
+      if (!client) {
+        throw new Error(
+          `Postgres not reachable at ${redactPgConnectionString(DB_URL)} — see Validation block in beforeAll`
+        );
+      }
+      return client;
+    }
+
+    async function readColumns(
+      c: pg.Client,
+      tableName: string
+    ): Promise<Set<string>> {
+      const res = await c.query<{ column_name: string }>(
+        `SELECT column_name FROM information_schema.columns
+           WHERE table_name = $1 AND table_schema = $2`,
+        [tableName, SCHEMA]
+      );
+      return new Set(res.rows.map((r) => r.column_name));
+    }
+
+    it("index_jobs exposes every column pinned in the corpus-index-job T2 contract", async () => {
+      const c = requireClient();
+      const cols = await readColumns(c, "index_jobs");
+      for (const col of [
+        "job_id",
+        "source_ref",
+        "content_identity",
+        "status",
+        "failure_code",
+        "created_at",
+        "started_at",
+        "finished_at",
+      ]) {
+        expect(cols, `index_jobs.${col} missing`).toContain(col);
+      }
+    });
+
+    it("the status CHECK accepts exactly INDEX_JOB_STATUS", async () => {
+      const c = requireClient();
+      let i = 0;
+      for (const status of Object.values(INDEX_JOB_STATUS)) {
+        await c.query(
+          `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+             VALUES ($1, $2, $3, $4)`,
+          [`check-${status}`, `idx-ref-${i}`, `identity-${i}`, status]
+        );
+        i += 1;
+      }
+      await expect(
+        c.query(
+          `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+             VALUES ('bogus-job', 'bogus-ref', 'bogus-identity', 'queued')`
+        )
+      ).rejects.toThrow(/index_jobs_status_check/);
+    });
+
+    it("job_id is the primary key so a repeat submit collapses onto one row", async () => {
+      const c = requireClient();
+      await c.query(
+        `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+           VALUES ('pk-1', 'pk-ref', 'pk-identity', 'in_progress')
+         ON CONFLICT (job_id) DO NOTHING`
+      );
+      await expect(
+        c.query(
+          `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+             VALUES ('pk-1', 'other-ref', 'other-identity', 'ready')`
+        )
+      ).rejects.toThrow(/index_jobs_pkey|duplicate key/);
+    });
+
+    it("has the (source_ref, status) index for the active-job lookup", async () => {
+      const c = requireClient();
+      const res = await c.query<{ indexdef: string }>(
+        `SELECT indexdef FROM pg_indexes
+           WHERE schemaname = $1 AND tablename = 'index_jobs'
+             AND indexname = 'index_jobs_source_ref_status_idx'`,
+        [SCHEMA]
+      );
+      expect(
+        res.rows.some((row) => /\(source_ref, status\)/.test(row.indexdef)),
+        "index_jobs must carry a (source_ref, status) index"
+      ).toBe(true);
+    });
+
+    it("the one-active-per-source UNIQUE index is partial to in_progress", async () => {
+      const c = requireClient();
+      const res = await c.query<{ indexdef: string }>(
+        `SELECT indexdef FROM pg_indexes
+           WHERE schemaname = $1 AND tablename = 'index_jobs'
+             AND indexname = 'index_jobs_one_active_per_source_idx'`,
+        [SCHEMA]
+      );
+      expect(
+        res.rows.some((row) => /^CREATE UNIQUE INDEX/.test(row.indexdef)),
+        "index_jobs must carry a UNIQUE one-active-per-source index"
+      ).toBe(true);
+      expect(
+        res.rows.some(
+          (row) =>
+            /\(source_ref\)/.test(row.indexdef) &&
+            /WHERE \(status = 'in_progress'::text\)/.test(row.indexdef)
+        ),
+        "the unique index must be partial to in_progress rows"
+      ).toBe(true);
+
+      // The live constraint, not just its definition: a second concurrent
+      // active row for one source is rejected at the storage boundary.
+      await c.query(
+        `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+           VALUES ('one-active-1', 'one-active-ref', 'one-active-id-1', 'in_progress')`
+      );
+      await expect(
+        c.query(
+          `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+             VALUES ('one-active-2', 'one-active-ref', 'one-active-id-2', 'in_progress')`
+        )
+      ).rejects.toThrow(/index_jobs_one_active_per_source_idx|duplicate key/);
+      // Terminal history is unlimited, and once the active row leaves the
+      // predicate a new active row for the SAME source is legal again.
+      await c.query(
+        `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+           VALUES ('one-active-3', 'one-active-ref', 'one-active-id-3', 'ready')`
+      );
+      await c.query(
+        `UPDATE index_jobs SET status = 'ready' WHERE job_id = 'one-active-1'`
+      );
+      await c.query(
+        `INSERT INTO index_jobs (job_id, source_ref, content_identity, status)
+           VALUES ('one-active-4', 'one-active-ref', 'one-active-id-4', 'in_progress')`
+      );
+      expect(
+        (
+          await c.query<{ n: string }>(
+            `SELECT count(*)::text AS n FROM index_jobs
+          WHERE source_ref = 'one-active-ref' AND status = 'in_progress'`
+          )
+        ).rows[0]!.n
+      ).toBe("1");
+    });
   });
 
   // -------------------------------------------------------------------
@@ -1326,10 +1506,7 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
       await c.query(`DELETE FROM entities WHERE id = $1`, [
         row.rows[0]!.entity_id,
       ]);
-      const after = await c.query(
-        `SELECT 1 FROM claims WHERE id = $1`,
-        [id]
-      );
+      const after = await c.query(`SELECT 1 FROM claims WHERE id = $1`, [id]);
       expect(after.rowCount).toBe(0);
     });
 
@@ -1376,7 +1553,9 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
         );
       }
       await expect(
-        c.query(`UPDATE community_index_state SET status = 'bogus' WHERE id = 1`)
+        c.query(
+          `UPDATE community_index_state SET status = 'bogus' WHERE id = 1`
+        )
       ).rejects.toThrow(/community_index_state_status_check/);
     });
 
@@ -1525,13 +1704,10 @@ describePg("schema-bootstrap: idempotent up() against real Postgres", () => {
 
       // Idempotent: a second up() (probe may or may not short-circuit) is a
       // no-op and does not touch the survivor.
-      await expect(
-        upSchemaBootstrap(c, 1536, 2000)
-      ).resolves.toBeUndefined();
-      const after = await c.query(
-        `SELECT 1 FROM entities WHERE id = $1`,
-        [personId]
-      );
+      await expect(upSchemaBootstrap(c, 1536, 2000)).resolves.toBeUndefined();
+      const after = await c.query(`SELECT 1 FROM entities WHERE id = $1`, [
+        personId,
+      ]);
       expect(after.rowCount).toBe(1);
     });
   });

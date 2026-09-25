@@ -65,7 +65,7 @@ export const TIMELINE_CHUNKS_SQL = `SELECT id, source_ref, valid_from, valid_unt
  * even though the failing envelope produced no row to derive it from.
  */
 const SOURCE_DOC_SUMMARY_COLUMNS = `sd.id, sd.source_ref, sd.title, sd.created_at, sd.valid_until,
-         sd.status, sd.failure_code,
+         sd.status, sd.failure_code, sd.content_identity,
          (SELECT count(*)::bigint FROM chunks c WHERE c.source_doc_id = sd.id) AS chunk_count`;
 
 /** Detail reads additionally carry the body the operator opened the row for. */
@@ -119,6 +119,7 @@ export interface StorageSourceDocRow {
   valid_until: unknown;
   status: string | null;
   failure_code: string | null;
+  content_identity?: string | null;
   chunk_count: string | number | bigint | null;
 }
 
@@ -146,6 +147,7 @@ export function toSourceDocFields(row: StorageSourceDocRow): {
   collection: string;
   status: SourceDocStatus;
   failure_code: string | null;
+  content_identity: string | null;
   chunk_count: number;
 } {
   return {
@@ -160,6 +162,7 @@ export function toSourceDocFields(row: StorageSourceDocRow): {
     collection: SOURCE_DOC_COLLECTION_NAME,
     status: normalizeSourceDocStatus(row.status),
     failure_code: row.failure_code ?? null,
+    content_identity: row.content_identity ?? null,
     chunk_count: Number(row.chunk_count ?? 0),
   };
 }

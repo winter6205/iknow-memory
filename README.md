@@ -11,7 +11,7 @@
 
 ## 当前状态
 
-- **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并；vector + BM25；Neo4j PPR 图臂；graph-priority；ES 精度层；质量栈 T1–T11；MCP 五件套 `ingest` / `push` / `invalidate` / `extract` / `retrieve`；图/精排/ES fail-start（ADR-0006 / ADR-0007）。
+- **已在 main**：Stage 0+1 ingest/retrieve；P0 抽取/合并；vector + BM25；Neo4j PPR 图臂；graph-priority；ES 精度层；质量栈 T1–T11；MCP 八件套 `ingest` / `push` / `invalidate` / `extract` / `retrieve` / `read_source` / `submit_index_job` / `poll_index_job`；图/精排/ES fail-start（ADR-0006 / ADR-0007）。
 - **精排**：默认走 MiniMax LLM（Anthropic 兼容 HTTP）。`GRAPHRAG_MEMORY_RETRIEVAL_RERANK_URL` 是可选的本地/专用 rerank sidecar，不是 MiniMax 那条。
 - **进行中**：`plans/retrieval-stack.md` T17–T24（自检 / 重灌 / 评测收口）。侧线 vitest flake [#170](https://github.com/winter6205/iknow-memory/issues/170)。
 - **后置**：多粒度切分、Neo4j 节点 embedding。进度以 `plans/` + `specs/` + `docs/CONTEXT.md` 为准（`docs/handoff/` 本地会话笔记，不入库）。

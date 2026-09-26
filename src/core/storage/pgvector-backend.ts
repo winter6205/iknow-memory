@@ -22,6 +22,10 @@
  */
 import type {
   ChunkRecord,
+  IndexJobInsertOutcome,
+  IndexJobRecord,
+  IndexJobStatus,
+  IndexJobStore,
   RetrievedChunk,
   SearchOptions,
   SourceDocRecord,
@@ -68,6 +72,7 @@ import {
 import { GraphragError } from "../errors.js";
 import {
   SOURCE_DOC_STATUS,
+  INDEX_JOB_STATUS,
   type ChunkUpsertOptions,
   type EmbeddingGenerationState,
 } from "../types.js";
@@ -102,6 +107,7 @@ import {
   SOURCE_DOC_LIST_SQL,
   SOURCE_DOC_MARK_READY_SQL,
   SOURCE_DOC_RECORD_FAILURE_SQL,
+  asIsoTimestamp,
   isPgInvalidTextRepresentation,
   wrapPgRead,
   lookupReadId,
@@ -278,6 +284,83 @@ const COMMUNITY_SUMMARY_BY_ID_SQL = `SELECT id, community_id, summary, level
 const COMMUNITY_INDEX_STATE_SQL = `SELECT status, failure_code
   FROM community_index_state
  WHERE id = 1`;
+
+/**
+ * The durable index-job ledger (schema-bootstrap `index_jobs`,
+ * corpus-index-job T2). Every read projects the same column list so the
+ * record the caller wrote is exactly the record it reads back.
+ */
+const INDEX_JOB_COLUMNS = `job_id, source_ref, content_identity, status,
+       failure_code, created_at, started_at, finished_at`;
+
+/** The one-active-job-per-source read: `in_progress` is the only active word. */
+const ACTIVE_JOB_FOR_SOURCE_SQL = `WHERE source_ref = $1 AND status = $2::text LIMIT 1`;
+
+/**
+ * PostgreSQL `unique_violation`. In `insertJobOrJoin` the INSERT's
+ * `ON CONFLICT (job_id)` arm absorbs primary-key collisions, so this is the
+ * partial unique index `index_jobs_one_active_per_source_idx` rejecting a
+ * second live job for one source — the racing submit's row, not an accident.
+ */
+const UNIQUE_VIOLATION_SQLSTATE = "23505";
+
+/** One `index_jobs` row as returned by pg (timestamps arrive as Date). */
+interface IndexJobRow {
+  job_id: string;
+  source_ref: string;
+  content_identity: string;
+  status: string;
+  failure_code: string | null;
+  created_at: Date | string;
+  started_at: Date | string | null;
+  finished_at: Date | string | null;
+}
+
+/** Map a row to the record, serializing timestamps as ISO strings. */
+function toIndexJobRecord(row: IndexJobRow): IndexJobRecord {
+  return {
+    job_id: row.job_id,
+    source_ref: row.source_ref,
+    content_identity: row.content_identity,
+    status: row.status as IndexJobStatus,
+    created_at: asIsoTimestamp(row.created_at),
+    started_at: row.started_at === null ? null : asIsoTimestamp(row.started_at),
+    finished_at:
+      row.finished_at === null ? null : asIsoTimestamp(row.finished_at),
+    failure_code: row.failure_code,
+  };
+}
+
+/** One `source_documents` row as RETURNED by the upsert statement. */
+interface SourceDocUpsertRow {
+  id: string;
+  source_ref: string;
+  title: string | null;
+  content: string;
+  created_at: Date | string;
+  valid_until: Date | null;
+  status: string | null;
+  failure_code: string | null;
+  content_identity: string | null;
+}
+
+/** Project the upsert's RETURNING row back onto the record contract. */
+function toSourceDocUpsertRecord(row: SourceDocUpsertRow): SourceDocRecord {
+  return {
+    id: row.id,
+    source_ref: row.source_ref,
+    title: row.title,
+    content: row.content,
+    created_at: asIsoTimestamp(row.created_at),
+    valid_until:
+      row.valid_until === null ? null : asIsoTimestamp(row.valid_until),
+    ...(row.status === null
+      ? {}
+      : { status: normalizeSourceDocStatus(row.status) }),
+    failure_code: row.failure_code,
+    content_identity: row.content_identity,
+  };
+}
 
 /**
  * Same-source neighboring chunks around already-ranked anchors.
@@ -505,6 +588,7 @@ export class PgvectorBackend
     ParentWindowStorage,
     CommunityIndexStateStorage,
     ProjectionDrainWaiter,
+    IndexJobStore,
     StorageReadPort
 {
   private pool: PgPool | undefined;
@@ -1117,9 +1201,9 @@ export class PgvectorBackend
       const result = await pool.query(
         `INSERT INTO source_documents
            (id, source_ref, title, content, created_at, valid_until,
-            status, failure_code)
+            status, failure_code, content_identity)
            VALUES ($1, $2, $3, $4, $5, NULL,
-                   $8::text, $7::text)
+                   $8::text, $7::text, $9::text)
            ON CONFLICT (source_ref) DO UPDATE SET
              title = EXCLUDED.title,
              content = EXCLUDED.content,
@@ -1128,13 +1212,14 @@ export class PgvectorBackend
                WHEN $6::text IS NULL THEN source_documents.failure_code
                ELSE $7::text
              END,
+             content_identity = EXCLUDED.content_identity,
              valid_until = CASE
                WHEN source_documents.content = EXCLUDED.content
                  THEN source_documents.valid_until
                ELSE NULL
              END
            RETURNING id, source_ref, title, content, created_at, valid_until,
-                     status, failure_code`,
+                     status, failure_code, content_identity`,
         [
           doc.id,
           doc.source_ref,
@@ -1144,33 +1229,10 @@ export class PgvectorBackend
           declaredStatus,
           doc.failure_code ?? null,
           insertStatus,
+          doc.content_identity ?? null,
         ]
       );
-      const row = result.rows[0] as {
-        id: string;
-        source_ref: string;
-        title: string | null;
-        content: string;
-        created_at: Date | string;
-        valid_until: Date | null;
-        status: string | null;
-        failure_code: string | null;
-      };
-      return {
-        id: row.id,
-        source_ref: row.source_ref,
-        title: row.title,
-        content: row.content,
-        created_at:
-          row.created_at instanceof Date
-            ? row.created_at.toISOString()
-            : String(row.created_at),
-        valid_until: row.valid_until?.toISOString() ?? null,
-        ...(row.status === null
-          ? {}
-          : { status: normalizeSourceDocStatus(row.status) }),
-        failure_code: row.failure_code,
-      };
+      return toSourceDocUpsertRecord(result.rows[0] as SourceDocUpsertRow);
     } catch (err) {
       if (err instanceof GraphragError) throw err;
       throw new GraphragError(
@@ -1401,6 +1463,156 @@ export class PgvectorBackend
         "STORAGE_ERROR"
       );
     }
+  }
+
+  /**
+   * Idempotent submit arm (corpus-index-job T2). The derived `job_id` is the
+   * pair key, so a repeat submit hits `ON CONFLICT (job_id) DO NOTHING`,
+   * which RETURNs no row, and the follow-up SELECT returns the EXISTING row —
+   * including whatever status/started_at a worker already advanced it to. The
+   * insert never overwrites a running job.
+   *
+   * `inserted` is read from the write itself, not inferred: a row came back
+   * from the INSERT ⇒ this call created it; nothing came back ⇒ this call
+   * joined it. A caller that reports "queued now" on a join would claim a
+   * queue entry another submit already made.
+   *
+   * A 23505 from the INSERT can only come from the one-active-per-source
+   * partial unique index (the `ON CONFLICT` arbiter already absorbs the
+   * `job_id` PK), i.e. a conflicting submit that raced past the handler's
+   * pre-check: the call returns that racing active row as `conflict` and
+   * persists nothing. Any other SQLSTATE rethrows untouched — a storage fault
+   * must not be dressed up as a domain conflict.
+   */
+  async insertJobOrJoin(
+    record: IndexJobRecord
+  ): Promise<IndexJobInsertOutcome> {
+    return wrapPgRead("insertJobOrJoin", async () => {
+      const pool = await this.ensureReady();
+      let inserted: { rows: unknown[] };
+      try {
+        inserted = await pool.query(
+          `INSERT INTO index_jobs
+             (job_id, source_ref, content_identity, status, failure_code,
+              created_at, started_at, finished_at)
+           VALUES ($1, $2, $3, $4::text, $5::text,
+                   $6::timestamptz, $7::timestamptz, $8::timestamptz)
+           ON CONFLICT (job_id) DO NOTHING
+           RETURNING ${INDEX_JOB_COLUMNS}`,
+          [
+            record.job_id,
+            record.source_ref,
+            record.content_identity,
+            record.status,
+            record.failure_code ?? null,
+            record.created_at,
+            record.started_at,
+            record.finished_at,
+          ]
+        );
+      } catch (err) {
+        if ((err as { code?: string }).code !== UNIQUE_VIOLATION_SQLSTATE) {
+          throw err;
+        }
+        const active = await this.readJob(pool, ACTIVE_JOB_FOR_SOURCE_SQL, [
+          record.source_ref,
+          INDEX_JOB_STATUS.IN_PROGRESS,
+        ]);
+        if (active === null) {
+          // The constraint rejected this write, so a row owned the source at
+          // INSERT time; if it terminalized before this read the conflict
+          // outcome has nothing to name — loud, never a fabricated verdict.
+          throw new GraphragError(
+            `PgvectorBackend.insertJobOrJoin: unique violation left no active job for ${record.source_ref}`,
+            "STORAGE_ERROR"
+          );
+        }
+        return { conflict: active };
+      }
+      const own = inserted.rows[0] as IndexJobRow | undefined;
+      if (own !== undefined) {
+        return { record: toIndexJobRecord(own), inserted: true };
+      }
+      const joined = await this.readJob(pool, `WHERE job_id = $1`, [
+        record.job_id,
+      ]);
+      if (joined === null) {
+        // The row is gone between insert and read — only a concurrent delete
+        // could do that, and nothing in this schema deletes jobs. Loud, not a
+        // silent null the caller would misread as a fresh submit.
+        throw new GraphragError(
+          `PgvectorBackend.insertJobOrJoin: job ${record.job_id} not found after write`,
+          "STORAGE_ERROR"
+        );
+      }
+      return { record: joined, inserted: false };
+    });
+  }
+
+  async getJob(jobId: string): Promise<IndexJobRecord | null> {
+    return wrapPgRead("getJob", async () => {
+      const pool = await this.ensureReady();
+      return this.readJob(pool, `WHERE job_id = $1`, [jobId]);
+    });
+  }
+
+  /**
+   * The one in-progress job for a source. `status='in_progress'` is the only
+   * active word (queued vs running is `started_at IS NULL`), and the partial
+   * unique index makes "at most one" a storage fact, so LIMIT 1 keeps the
+   * read cheap and total.
+   */
+  async getActiveJobForSource(
+    sourceRef: string
+  ): Promise<IndexJobRecord | null> {
+    return wrapPgRead("getActiveJobForSource", async () => {
+      const pool = await this.ensureReady();
+      return this.readJob(pool, ACTIVE_JOB_FOR_SOURCE_SQL, [
+        sourceRef,
+        INDEX_JOB_STATUS.IN_PROGRESS,
+      ]);
+    });
+  }
+
+  /**
+   * Demote every terminal `ready` job of a source to `stale` when a new
+   * content version supersedes them. Returns the number of rows demoted.
+   *
+   * No exception parameter: the incoming job is `in_progress`, so the
+   * `status = 'ready'` predicate cannot touch it, and a filter on the
+   * caller's own id would only re-derive a fact the submit path already
+   * settled when its join arm returned.
+   */
+  async supersedeReadyJobs(sourceRef: string): Promise<number> {
+    return wrapPgRead("supersedeReadyJobs", async () => {
+      const pool = await this.ensureReady();
+      const result = await pool.query(
+        `UPDATE index_jobs
+            SET status = $3::text
+          WHERE source_ref = $1
+            AND status = $2::text
+          RETURNING job_id`,
+        [sourceRef, INDEX_JOB_STATUS.READY, INDEX_JOB_STATUS.STALE]
+      );
+      // RETURNING job_id lets the PgPool surface (rows only, no rowCount)
+      // report the demoted count as an observable result rather than an
+      // inferred one.
+      return result.rows.length;
+    });
+  }
+
+  /** Shared single-row job read; a missing row is null, not an error. */
+  private async readJob(
+    pool: PgPool,
+    predicate: string,
+    values: unknown[]
+  ): Promise<IndexJobRecord | null> {
+    const result = await pool.query(
+      `SELECT ${INDEX_JOB_COLUMNS} FROM index_jobs ${predicate}`,
+      values
+    );
+    const row = result.rows[0] as IndexJobRow | undefined;
+    return row === undefined ? null : toIndexJobRecord(row);
   }
 
   /**

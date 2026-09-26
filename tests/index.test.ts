@@ -153,11 +153,12 @@ function textOf(result: { content: unknown }): string {
 }
 
 describe("createServer — registered tool set (T7)", () => {
-  it("tools/list advertises ingest, invalidate, push, extract, read_source, and retrieve", async () => {
+  it("tools/list advertises ingest, invalidate, push, extract, read_source, retrieve, and the index-job pair", async () => {
     // specs/mcp-tool-surface.md Catalog + operator-console T4: the
     // Host-facing tool set is exactly ingest + invalidate + push +
     // extract + retrieve + read_source. `echo` is archived and the
-    // invalidation tool answers to `invalidate`.
+    // invalidation tool answers to `invalidate`. The durable index-job pair
+    // is the graph re-index handoff beside them, never folded into push.
     const { client, close } = await connectInProcess();
     try {
       const { tools } = await client.listTools();
@@ -166,9 +167,11 @@ describe("createServer — registered tool set (T7)", () => {
         "extract",
         "ingest",
         "invalidate",
+        "poll_index_job",
         "push",
         "read_source",
         "retrieve",
+        "submit_index_job",
       ]);
       // The archived names are gone from the wire, not merely shadowed.
       expect(names).not.toContain("echo");

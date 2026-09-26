@@ -3,7 +3,9 @@
  *
  * Wires the tool registry into a stdio MCP server. The catalog is the
  * Host-facing contract frozen by specs/mcp-tool-surface.md: ingest, push,
- * invalidate, extract, retrieve.
+ * invalidate, extract, retrieve, plus the durable index-job pair
+ * (`submit_index_job` / `poll_index_job`) that hands graph re-indexing to a
+ * worker without changing what `push` means.
  *
  * Decoupling contract (per map #33 / ticket #35):
  *   - No import from iknow (`src/shared/schema.ts`, `src/config/`, etc.).
@@ -33,6 +35,12 @@ import {
 import { ingestTool } from "./tools/ingest.js";
 import { invalidationTool } from "./tools/invalidation.js";
 import { pushTool } from "./tools/push.js";
+import {
+  pollIndexJobTool,
+  submitIndexJobTool,
+  type CommunityIndexStateReader,
+  type IndexJobReadPort,
+} from "./tools/index-job.js";
 import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
 import { readSourceTool } from "./tools/read_source.js";
 import {
@@ -60,9 +68,17 @@ import {
 } from "./core/graph/neo4j-ppr.js";
 import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
 import { createAnthropicChunkReranker } from "./core/rerank/anthropic-reranker.js";
-import type { StorageBackend, StorageReadPort } from "./core/types.js";
+import type {
+  IndexJobStore,
+  StorageBackend,
+  StorageReadPort,
+} from "./core/types.js";
 import type { SearchOptions } from "./core/types.js";
-import type { LexicalStorageBackend } from "./core/storage/backend.js";
+import {
+  supportsCommunityIndexState,
+  supportsIndexJobStore,
+  type LexicalStorageBackend,
+} from "./core/storage/backend.js";
 
 const SERVER_NAME = "iknow-memory";
 const SERVER_VERSION = "0.0.0";
@@ -105,6 +121,26 @@ interface ServerDeps {
   storage: StorageBackend & StorageReadPort;
   /** Optional Elasticsearch precision layer for derived indexes. */
   precision?: PrecisionIndexer;
+  /**
+   * Durable corpus index-job ledger, narrowed from the selected backend by
+   * `supportsIndexJobStore`. Required at wiring, not per call: the job tools
+   * are registered unconditionally, so a backend without the ledger would
+   * otherwise turn every submit into a storage fault indistinguishable from a
+   * busy queue. See `buildIndexJobSeams`.
+   */
+  indexJobs: IndexJobStore;
+  /**
+   * 档 C readiness singleton reader, narrowed by `supportsCommunityIndexState`.
+   * `poll_index_job` reports it beside the job row as a separate fact — the
+   * retrieve C arm is the only other reader.
+   */
+  communityState: CommunityIndexStateReader;
+  /**
+   * 资料 lookup for `submit_index_job`, adapted from the read port so a
+   * missing row is `null` (the tool's own unknown-source vocabulary) rather
+   * than the port's discriminated result.
+   */
+  indexJobReadPort: IndexJobReadPort;
   /**
    * Retrieval pipeline config. Always present — loadEnv() always returns
    * it. Structural type from GraphragEnv so this file never imports
@@ -374,12 +410,56 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     embedder,
     ...(slotEmbedding !== undefined ? { slotEmbedding } : {}),
     storage,
+    ...buildIndexJobSeams(storage),
     ...(precision !== undefined ? { precision } : {}),
     retrieval: env.retrieval,
     ...(env.neo4j !== undefined
       ? { graphRanker: createNeo4jPprRanker(env.neo4j) }
       : {}),
     ...(reranker !== undefined ? { reranker } : {}),
+  };
+}
+
+/**
+ * Assert the seams the durable index-job tools need on the selected backend
+ * and adapt the read port to the shape those tools ask for.
+ *
+ * Loud at wiring rather than per call on purpose: `submit_index_job` and
+ * `poll_index_job` are in the catalog unconditionally, so a backend without a
+ * job ledger or without the 档 C singleton must stop the server at startup —
+ * a host must never see a submit that looks accepted but cannot persist.
+ *
+ * Exported so the read-port and C-seam adapters are assertable against a real
+ * backend without a live Postgres (tests/tools/index-job.test.ts) — the same
+ * reason `buildRetrieveDeps` / `buildExtractDeps` are exported.
+ */
+export function buildIndexJobSeams(
+  storage: StorageBackend & StorageReadPort
+): Pick<ServerDeps, "indexJobs" | "communityState" | "indexJobReadPort"> {
+  if (!supportsIndexJobStore(storage)) {
+    throw new ConfigError(
+      "GRAPHRAG_MEMORY_STORAGE backend has no index-job ledger: submit_index_job " +
+        "and poll_index_job need an IndexJobStore (insertJobOrJoin/getJob)"
+    );
+  }
+  if (!supportsCommunityIndexState(storage)) {
+    throw new ConfigError(
+      "GRAPHRAG_MEMORY_STORAGE backend exposes no community_index_state singleton: " +
+        "poll_index_job must report 档 C readiness beside the job row"
+    );
+  }
+  const indexJobs: IndexJobStore = storage;
+  return {
+    indexJobs,
+    communityState: storage,
+    indexJobReadPort: {
+      async getSourceDoc(sourceRef) {
+        const read = await storage.getSourceDoc(sourceRef);
+        // The port's NOT_FOUND answer and a genuinely absent row are the same
+        // fact to the tool: nothing was ever pushed under this locator.
+        return read.ok ? read.value : null;
+      },
+    },
   };
 }
 
@@ -483,6 +563,18 @@ export async function createServer(): Promise<McpServer> {
     // Operator-console T4: pure read tool over the same deps — the
     // StorageReadPort is implemented by both production backends.
     readSourceTool(deps),
+    // Durable index-job handoff: submit queues one content version's graph
+    // re-index, poll reads it. Neither runs a stage, so push stays the only
+    // writer of `source_documents.status` and the C runner the only writer of
+    // `community_index_state`.
+    submitIndexJobTool({
+      jobStore: deps.indexJobs,
+      readPort: deps.indexJobReadPort,
+    }),
+    pollIndexJobTool({
+      jobStore: deps.indexJobs,
+      communityState: deps.communityState,
+    }),
   ]);
 
   const server = new McpServer(

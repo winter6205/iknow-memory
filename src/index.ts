@@ -59,7 +59,7 @@ import {
 } from "./core/embed-slots.js";
 import { MemoryBackend } from "./core/storage/memory-backend.js";
 import {
-  ElasticsearchPrecisionLayer,
+  createPrecisionLayer,
   type PrecisionIndexer,
 } from "./core/storage/elasticsearch-precision.js";
 import {
@@ -370,13 +370,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     storage = new MemoryBackend(env.embedDimensions);
   }
 
-  const precision =
-    env.elasticsearch === undefined
-      ? undefined
-      : new ElasticsearchPrecisionLayer(env.elasticsearch, {
-          k1: env.retrieval.k1,
-          b: env.retrieval.b,
-        });
+  const precision = createPrecisionLayer(env);
 
   // Both branches always pass `dimensions` through; the dim value is always
   // required by config so this is just plumbing.

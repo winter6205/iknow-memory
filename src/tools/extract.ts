@@ -56,6 +56,8 @@ import {
 } from "../core/extraction/clients.js";
 import type { LLMClient } from "../core/extraction/llm-client.js";
 import {
+  EXTRACT_WRITE_FAILURE_CODE,
+  notIndexed,
   processBatch,
   selectChunksByIds,
   selectPendingChunksBySourceRef,
@@ -383,7 +385,7 @@ function failedChunkFromOutcome(
         : // Write failures leave no extraction_records row (the whole chunk
           // transaction rolled back), so the report code is named here
           // rather than in the database.
-          "WRITE_FAILURE",
+          EXTRACT_WRITE_FAILURE_CODE,
     error_msg:
       outcome.errorMsg ??
       (outcome.kind === "failed"
@@ -407,7 +409,7 @@ function buildExtractOutput(
     succeeded: summary.succeeded,
     // Host view: every chunk that did not succeed counts as failed;
     // write_failures is the rolled-back-transaction subset.
-    failed: summary.failed + summary.writeFailures,
+    failed: notIndexed(summary),
     write_failures: summary.writeFailures,
     ungrounded: summary.ungrounded,
     failed_chunks: failedChunks,

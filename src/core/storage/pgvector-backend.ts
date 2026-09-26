@@ -22,10 +22,12 @@
  */
 import type {
   ChunkRecord,
+  IndexJobClaimOptions,
   IndexJobInsertOutcome,
   IndexJobRecord,
   IndexJobStatus,
   IndexJobStore,
+  IndexJobTerminalOutcome,
   RetrievedChunk,
   SearchOptions,
   SourceDocRecord,
@@ -295,6 +297,18 @@ const INDEX_JOB_COLUMNS = `job_id, source_ref, content_identity, status,
 
 /** The one-active-job-per-source read: `in_progress` is the only active word. */
 const ACTIVE_JOB_FOR_SOURCE_SQL = `WHERE source_ref = $1 AND status = $2::text LIMIT 1`;
+
+/**
+ * Which rows a worker may claim. `in_progress AND started_at IS NULL` is the
+ * queued arm (queued vs running is `started_at`, never a fifth status word);
+ * the second arm — a running row that started before
+ * `$3::timestamptz` — is what keeps a durable request alive after the worker
+ * that held it died mid-stage. `$3` is NULL when the caller claims queued
+ * rows only, so that arm opens only when `stalledBefore` was supplied.
+ */
+const CLAIMABLE_JOB_SQL = `status = $2::text
+     AND (started_at IS NULL
+          OR ($3::timestamptz IS NOT NULL AND started_at < $3::timestamptz))`;
 
 /**
  * PostgreSQL `unique_violation`. In `insertJobOrJoin` the INSERT's
@@ -1598,6 +1612,85 @@ export class PgvectorBackend
       // report the demoted count as an observable result rather than an
       // inferred one.
       return result.rows.length;
+    });
+  }
+
+  /**
+   * Claim the oldest claimable job for this worker and stamp its start.
+   *
+   * Pick and write are one statement: `FOR UPDATE SKIP LOCKED` makes a
+   * concurrent claimant step over the row another worker is holding instead of
+   * blocking on it or taking the same job twice — the same idiom as
+   * `claimPendingIntents` in projection-outbox.ts. A re-claim overwrites
+   * `started_at` deliberately: the column records the current attempt, while
+   * `created_at` stays the queue time the next claim still orders by.
+   */
+  async claimNextJob(
+    options: IndexJobClaimOptions
+  ): Promise<IndexJobRecord | null> {
+    return wrapPgRead("claimNextJob", async () => {
+      const pool = await this.ensureReady();
+      const result = await pool.query(
+        `UPDATE index_jobs
+            SET started_at = $1::timestamptz
+          WHERE job_id = (
+                  SELECT job_id
+                    FROM index_jobs
+                   WHERE ${CLAIMABLE_JOB_SQL}
+                   ORDER BY created_at, job_id
+                      LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+          RETURNING ${INDEX_JOB_COLUMNS}`,
+        [
+          options.startedAt,
+          INDEX_JOB_STATUS.IN_PROGRESS,
+          options.stalledBefore ?? null,
+        ]
+      );
+      // Zero rows updated means the queue held nothing claimable — null is the
+      // honest answer, never a stand-in row for a job that was not claimed.
+      const row = result.rows[0] as IndexJobRow | undefined;
+      return row === undefined ? null : toIndexJobRecord(row);
+    });
+  }
+
+  /**
+   * Publish a claimed job's terminal outcome.
+   *
+   * `AND status = in_progress` is the lease check inside the write: a row that
+   * already reached a terminal state belongs to whoever settled it, so this
+   * call answers null and the worker must not report the outcome it computed.
+   * No runtime status validator lives here — the column CHECK admits exactly
+   * the four vocabulary words, and `IndexJobTerminalStatus` is the compile-time
+   * guard that `in_progress` cannot be published.
+   */
+  async publishJobOutcome(
+    jobId: string,
+    outcome: IndexJobTerminalOutcome
+  ): Promise<IndexJobRecord | null> {
+    return wrapPgRead("publishJobOutcome", async () => {
+      const pool = await this.ensureReady();
+      const result = await pool.query(
+        `UPDATE index_jobs
+            SET status = $2::text,
+                failure_code = $3::text,
+                finished_at = $4::timestamptz
+          WHERE job_id = $1
+            AND status = $5::text
+            AND started_at IS NOT DISTINCT FROM $6::timestamptz
+          RETURNING ${INDEX_JOB_COLUMNS}`,
+        [
+          jobId,
+          outcome.status,
+          outcome.failureCode ?? null,
+          outcome.finishedAt,
+          INDEX_JOB_STATUS.IN_PROGRESS,
+          outcome.claimedStartedAt,
+        ]
+      );
+      const row = result.rows[0] as IndexJobRow | undefined;
+      return row === undefined ? null : toIndexJobRecord(row);
     });
   }
 

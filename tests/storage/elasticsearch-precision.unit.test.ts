@@ -1,11 +1,39 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  createPrecisionLayer,
   ElasticsearchPrecisionLayer,
   type ElasticsearchClientLike,
 } from "../../src/core/storage/elasticsearch-precision.js";
+import type { ElasticsearchConfig, GraphragEnv } from "../../src/config.js";
 import type { ChunkRecord } from "../../src/core/types.js";
 import { FakeEsCluster } from "./es-fake-cluster.js";
+
+/**
+ * What the `@elastic/elasticsearch` client construction received, and the fake
+ * client the layer then drives. Captured at the library seam because that is
+ * the only place `createPrecisionLayer`'s env→layer mapping is observable: the
+ * endpoint reaches the client it builds, the BM25 knobs reach the index requests
+ * the layer writes. `vi.hoisted` because the mock factory below runs while the
+ * module graph is still being imported.
+ */
+const esLayerConstruction = vi.hoisted(() => ({
+  clientOptions: undefined as unknown,
+  client: undefined as unknown,
+}));
+
+vi.mock("@elastic/elasticsearch", () => ({
+  Client: class {
+    constructor(options: Record<string, unknown>) {
+      esLayerConstruction.clientOptions = options;
+      // Every entry point that dials a cluster is off-limits in a unit test, so
+      // the constructed client IS this file's fake, with its request spies.
+      const client = fakeClient();
+      esLayerConstruction.client = client;
+      Object.assign(this, client);
+    }
+  },
+}));
 
 const NOW = "2026-01-01T00:00:00.000Z";
 
@@ -1117,5 +1145,116 @@ describe("ElasticsearchPrecisionLayer.searchCommunitySummariesLexical", () => {
     expect(a).toHaveLength(2);
     expect(b).toHaveLength(3);
     expect(a.map((r) => r.id)).toEqual(["ledger-0", "ledger-1"]);
+  });
+});
+
+/**
+ * The env→layer mapping shared by every entry point that wires the layer from
+ * a resolved `GraphragEnv`. Asserted against the REAL class because the mapping
+ * has exactly one owner and a fake of the class would only re-state the
+ * constructor call, and asserted at the two seams the mapping is observable
+ * through — the client it dials, the index request it writes — because the
+ * layer's own fields are private state, not a contract.
+ */
+describe("createPrecisionLayer", () => {
+  const esConfig: ElasticsearchConfig = {
+    node: "http://localhost:9200",
+    chunkIndex: "chunks",
+    entityIndex: "entities",
+    username: undefined,
+    password: undefined,
+    apiKey: undefined,
+    requestTimeoutMs: 5000,
+  };
+
+  /** The mapping reads `elasticsearch` plus `retrieval.k1/b`; the rest of the
+   * env is the whole resolved shape, the way every other fixture in this repo
+   * builds it, so the fixture stays assignable rather than cast. */
+  function envWith(
+    elasticsearch: ElasticsearchConfig | undefined,
+    k1: number,
+    b: number
+  ): GraphragEnv {
+    return {
+      logLevel: "info",
+      storage: "pgvector",
+      dbUrl: "postgres://localhost/test",
+      embedBaseUrl: undefined,
+      embedModel: undefined,
+      embedDimensions: 8,
+      pgvectorAnnMaxDimensions: 2048,
+      ingestBatchLimit: 100,
+      pgvectorPoolMax: 4,
+      pgvectorConnectionWaitTimeoutMs: 5000,
+      embedApiKey: undefined,
+      retrieval: {
+        preset: "balanced",
+        rrfK: 60,
+        w_vec: 1,
+        w_bm25: 1,
+        w_graph: 0.15,
+        k1,
+        b,
+        bm25Enabled: true,
+        cjkSegmentationEnabled: true,
+        phraseEnabled: true,
+        fieldBoostEnabled: true,
+        fieldBoosts: { content: 1 },
+        rrfEnabled: true,
+        vectorEnabled: true,
+        graphEnabled: true,
+        nodeEmbeddingEnabled: false,
+        rerankEnabled: false,
+        waitForDrainEnabled: false,
+        waitForDrainTimeoutMs: 5000,
+        entityLinkTopK: 10,
+        candidateCap: 100,
+        neighborWidth: 1,
+        graphArmFloor: 3,
+      },
+      neo4j: undefined,
+      elasticsearch,
+      rerank: undefined,
+      rerankUrl: undefined,
+      jev: undefined,
+      // Required on GraphragEnv since the ADR-0009 default flip; this mapping
+      // never threads it (the precision layer does not extract).
+      extractWriteTimeSupersede: true,
+    };
+  }
+
+  it("maps a configured ES block with its endpoint and BM25 knobs", async () => {
+    // k1 is deliberately not the layer's own default, so a mapping that dropped
+    // the env's knob could not still read 1.2 from the fallback.
+    const layer = createPrecisionLayer(envWith(esConfig, 1.4, 0.42));
+
+    expect(layer).toBeInstanceOf(ElasticsearchPrecisionLayer);
+    if (layer === undefined) {
+      throw new Error("test setup: a configured ES block built no layer");
+    }
+    // The endpoint half of the env block, at the client it dials: no credential
+    // in the fixture, so no `auth` key may appear either.
+    expect(esLayerConstruction.clientOptions).toEqual({
+      node: esConfig.node,
+      requestTimeout: esConfig.requestTimeoutMs,
+    });
+
+    // The BM25 half: k1/b are INDEX-TIME settings, so the only place they are
+    // observable is the create request, whose index name is the config's own.
+    await layer.indexChunks([chunk()]);
+    const client = esLayerConstruction.client as ReturnType<typeof fakeClient>;
+    expect(client.indices.create).toHaveBeenCalledTimes(1);
+    const create = client.indices.create.mock.calls[0]?.[0] as {
+      index: string;
+      settings: Record<string, unknown>;
+    };
+    expect(create.index).toBe(esConfig.chunkIndex);
+    expect(JSON.stringify(create.settings)).toContain('"k1":1.4');
+    expect(JSON.stringify(create.settings)).toContain('"b":0.42');
+  });
+
+  it("answers undefined when no ES node is configured", () => {
+    // The Postgres-only arm every caller depends on: no layer, so no write leg.
+    expect(createPrecisionLayer(envWith(undefined, 1.2, 0.42))).toBeUndefined();
   });
 });

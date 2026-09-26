@@ -47,6 +47,7 @@
     "graph:backfill": "node dist/cli/graph-backfill.js",
     "graph:drain": "node dist/cli/graph-drain.js",
     "community:summary": "node dist/cli/community-summary.js",
+    "index:worker": "node dist/cli/index-job-worker.js",
     "embed:rotate": "node dist/cli/embed-rotate.js",
     "es:reindex": "node dist/cli/es-reindex.js",
     "prepare": "husky"

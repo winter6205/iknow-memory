@@ -38,19 +38,14 @@
  */
 import { Pool } from "pg";
 
-import {
-  ConfigError,
-  NEO4J_URI_VAR,
-  loadEnv,
-  type Neo4jConfig,
-} from "../config.js";
+import { ConfigError, loadEnv, type Neo4jConfig } from "../config.js";
 import {
   createLogger,
   redactDiagnostic,
   type Logger,
   writeStderr,
 } from "../logging.js";
-import { connectNeo4j } from "../core/graph/neo4j-writer.js";
+import { openConfiguredNeo4j } from "../core/graph/neo4j-writer.js";
 import {
   loadEntitiesByIds,
   loadTriplesByIds,
@@ -418,8 +413,12 @@ async function recordFailure(
 /**
  * Neo4j is configured but not answering. Report it in the Validation shape the
  * test rules use so an unattended run cannot be mistaken for a drained queue,
- * and exit 3 (re-run safe) rather than 1.
+ * and exit 3 (re-run safe) rather than 1. Exported because the index-job
+ * worker maps this exact exit onto the drain's own failure code: the exit-code
+ * contract has one owner.
  */
+export const GRAPH_DRAIN_LOUD_SKIP_EXIT = 3;
+
 function loudSkip(deps: DrainDeps, err: GraphUnavailableError): number {
   writeStderr(
     `\ngraph-drain: Neo4j unreachable at ${err.uri}\n` +
@@ -432,7 +431,7 @@ function loudSkip(deps: DrainDeps, err: GraphUnavailableError): number {
     reason: "neo4j-unreachable",
     uri: err.uri,
   });
-  return 3;
+  return GRAPH_DRAIN_LOUD_SKIP_EXIT;
 }
 
 /** Wire real deps from env and run; used by main(). */
@@ -463,28 +462,15 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     return await runCli(argv, {
       pool: pool as unknown as DrainPool,
       logger,
-      connectGraph: () => openConfiguredNeo4j(neo4j),
+      connectGraph: () =>
+        openConfiguredNeo4j(
+          neo4j,
+          "to drain the projection outbox; pass --dry-run or --retry-failed for a Postgres-only run"
+        ),
     });
   } finally {
     await pool.end();
   }
-}
-
-/**
- * An absent block (no URI configured) is a ConfigError here, not a silent
- * skip: this CLI was invoked precisely to project, so "no target configured"
- * is an operator mistake — the skip-without-degraded rule belongs to the
- * retrieve arm, which was not asked to touch Neo4j.
- */
-async function openConfiguredNeo4j(
-  config: Neo4jConfig | undefined
-): Promise<GraphWriter> {
-  if (config === undefined) {
-    throw new ConfigError(
-      `${NEO4J_URI_VAR} is required to drain the projection outbox; pass --dry-run or --retry-failed for a Postgres-only run`
-    );
-  }
-  return connectNeo4j(config);
 }
 
 /** Top-level entry: wire real deps, exit with the CLI exit code. */

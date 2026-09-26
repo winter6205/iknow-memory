@@ -9,7 +9,7 @@
  */
 import neo4j, { type Driver } from "neo4j-driver";
 
-import type { Neo4jConfig } from "../../config.js";
+import { ConfigError, NEO4J_URI_VAR, type Neo4jConfig } from "../../config.js";
 import {
   GraphUnavailableError,
   type GraphEdge,
@@ -125,4 +125,22 @@ export async function connectNeo4j(config: Neo4jConfig): Promise<GraphWriter> {
     throw new GraphUnavailableError(config.uri, err);
   }
   return new Neo4jGraphWriter(driver, config.uri);
+}
+
+/**
+ * Open the configured projection target, or refuse: an absent block (no URI
+ * configured) is a ConfigError, never a silent skip — an operator invoked
+ * this path precisely to project, so "no target configured" is their mistake
+ * (the skip-without-degraded rule belongs to the retrieve arm, which was not
+ * asked to touch Neo4j). `purpose` keeps each caller's own message, with its
+ * own flags, next to this one decision.
+ */
+export async function openConfiguredNeo4j(
+  config: Neo4jConfig | undefined,
+  purpose: string
+): Promise<GraphWriter> {
+  if (config === undefined) {
+    throw new ConfigError(`${NEO4J_URI_VAR} is required ${purpose}`);
+  }
+  return connectNeo4j(config);
 }

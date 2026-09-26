@@ -24,6 +24,7 @@ export type {
 } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type {
+  IndexJobStore,
   RetrievedChunk,
   SearchOptions,
   StorageBackend,
@@ -182,6 +183,24 @@ export function supportsCommunityIndexState(
   return (
     typeof (storage as Partial<CommunityIndexStateStorage>)
       .getCommunityIndexState === "function"
+  );
+}
+
+/**
+ * Runtime narrowing for the durable index-job ledger (corpus-index-job T2).
+ * Takes `unknown` because the submit seam probes whichever object the job
+ * store is wired into. The guard checks all four methods so the narrowed
+ * type provably satisfies `IndexJobStore` — a partial store fails closed.
+ */
+export function supportsIndexJobStore(
+  candidate: unknown
+): candidate is StorageBackend & IndexJobStore {
+  const seam = candidate as Partial<IndexJobStore> | null | undefined;
+  return (
+    typeof seam?.insertJobOrJoin === "function" &&
+    typeof seam?.getJob === "function" &&
+    typeof seam?.getActiveJobForSource === "function" &&
+    typeof seam?.supersedeReadyJobs === "function"
   );
 }
 

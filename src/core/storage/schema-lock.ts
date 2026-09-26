@@ -32,6 +32,9 @@ const BOOTSTRAP_COLUMNS = [
   ["source_documents", "status"],
   ["source_documents", "failure_code"],
   ["source_documents", "extract_method"],
+  // corpus-index-job T2: forward-compat ALTER in createSourceDocuments, so it
+  // MUST be probed or deployed databases never get the column.
+  ["source_documents", "content_identity"],
   // the judge-failure proposal payload. Deployed
   // extraction_records tables predate the column, so it rides the probe too.
   ["extraction_records", "proposed_payload"],
@@ -59,6 +62,9 @@ const BOOTSTRAP_TABLES = [
   "embedding_generation",
   "projection_outbox",
   "source_documents",
+  // corpus-index-job T2: a brand-new table — CREATE IF NOT EXISTS alone never
+  // reaches a deployed store once the probe says ready, so the probe names it.
+  "index_jobs",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -80,6 +86,11 @@ const BOOTSTRAP_INDEXES = [
   "projection_outbox_subject_idx",
   "projection_outbox_pending_subject_idx",
   "chunks_source_doc_id_ordinal_idx",
+  // corpus-index-job T2: forward-compat CREATE ... IF NOT EXISTS indexes —
+  // absent from a deployed store until the probe reports not-ready.
+  "source_documents_source_ref_content_identity_idx",
+  "index_jobs_source_ref_status_idx",
+  "index_jobs_one_active_per_source_idx",
 ] as const;
 
 /**

@@ -252,7 +252,26 @@ describe("dashboard-api GET /api/sources/:id", () => {
       content: "full body one",
       created_at: "2026-01-01T00:00:00.000Z",
       valid_until: null,
+      // The seeded row was written straight through the storage seam rather
+      // than by push/ingest, so it has no declared content version yet.
+      content_identity: null,
       ...pageFields(SOURCE_DOC_STATUS.IN_PROGRESS, 0),
+    });
+  });
+
+  it("publishes the declared content_identity on the detail view", async () => {
+    const deps = memoryDeps();
+    const storage = deps.storage as MemoryBackend;
+    await storage.upsertSourceDoc({
+      ...DOC_A,
+      content_identity: "identity-of-full-body-one",
+    });
+    const { baseUrl } = await boot(deps);
+    const res = await fetchJson(`${baseUrl}/api/sources/${UUID_A}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      id: UUID_A,
+      content_identity: "identity-of-full-body-one",
     });
   });
 

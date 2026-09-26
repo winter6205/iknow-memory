@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   createPushHandler,
   pushTool,
@@ -7,6 +7,10 @@ import {
 import { FakeEmbedder } from "../../src/core/embedder.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
 import { GraphragError } from "../../src/core/errors.js";
+import {
+  computeContentIdentity,
+  computeSourceDocId,
+} from "../../src/tools/ingest.js";
 import type { ToolResult } from "../../src/tools/registry.js";
 
 const TEST_DIM = 1536;
@@ -14,6 +18,10 @@ const TEST_DIM = 1536;
 /** Parse the JSON text body of a ToolResult. */
 function parseBody(result: ToolResult): {
   chunk_ids: string[];
+  source_doc_id?: string;
+  source_doc_ids?: string[];
+  content_identity?: string;
+  content_identities?: string[];
 } {
   const text = result.content[0]?.text;
   if (typeof text !== "string") {
@@ -341,5 +349,142 @@ describe("push error typing", () => {
     expect(GraphragError).toBeDefined();
     const err = new GraphragError("test", "INVALID_INPUT");
     expect(err.code).toBe("INVALID_INPUT");
+  });
+});
+
+// corpus-index-job T2: push persists the document-level content identity the
+// durable submit pair keys on, publishes it on the response, and never writes
+// the index-job ledger itself.
+describe("createPushHandler — document content_identity (corpus-index-job T2)", () => {
+  function pushItem(content: string, sourceRef: string) {
+    return {
+      content,
+      source_ref: sourceRef,
+      metadata: { kind: "test" },
+      valid_from: "2024-01-01T00:00:00Z",
+      valid_until: "2024-12-31T00:00:00Z",
+    };
+  }
+
+  function handlerFor(storage: MemoryBackend) {
+    return createPushHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage,
+    });
+  }
+
+  /** Read the 资料 row back through the storage read port, not a write spy. */
+  async function storedIdentity(
+    storage: MemoryBackend,
+    sourceRef: string
+  ): Promise<string | null> {
+    const read = await storage.getSourceDoc(sourceRef);
+    if (!read.ok) {
+      throw new Error(`expected a 资料 row for ${sourceRef}`);
+    }
+    return read.value.content_identity ?? null;
+  }
+
+  it("writes the document-level identity from the full body, DEFAULT versions", async () => {
+    const storage = new MemoryBackend(TEST_DIM);
+    const content = "the whole 资料 body pushed verbatim";
+    await handlerFor(storage)({ items: [pushItem(content, "docs/id.md")] });
+    expect(await storedIdentity(storage, "docs/id.md")).toBe(
+      computeContentIdentity(content)
+    );
+  });
+
+  it("publishes on the response the identity it persisted", async () => {
+    const storage = new MemoryBackend(TEST_DIM);
+    const content = "published identity";
+    const result = await handlerFor(storage)({
+      items: [pushItem(content, "docs/published.md")],
+    });
+    const body = parseBody(result);
+    // Independently recomputed expectation (not read back off the handler),
+    // then pinned against the row actually stored.
+    expect(body.content_identity).toBe(computeContentIdentity(content));
+    expect(await storedIdentity(storage, "docs/published.md")).toBe(
+      body.content_identity
+    );
+  });
+
+  it("a batch publishes one identity per 资料, aligned with source_doc_ids", async () => {
+    const storage = new MemoryBackend(TEST_DIM);
+    const first = "first batch body";
+    const second = "second batch body";
+    const result = await handlerFor(storage)({
+      items: [
+        pushItem(first, "docs/batch-a.md"),
+        pushItem(second, "docs/batch-b.md"),
+      ],
+    });
+    const body = parseBody(result);
+    expect(body.source_doc_ids).toEqual([
+      computeSourceDocId("docs/batch-a.md"),
+      computeSourceDocId("docs/batch-b.md"),
+    ]);
+    expect(body.content_identities).toEqual([
+      computeContentIdentity(first),
+      computeContentIdentity(second),
+    ]);
+    // The arrays are aligned to the actual per-资料 ids, not merely equal in
+    // length: zip them and every published identity is the stored row's value
+    // (read back through the storage read port, last-write-wins mirror).
+    const refs = ["docs/batch-a.md", "docs/batch-b.md"];
+    expect(
+      await Promise.all(refs.map((ref) => storedIdentity(storage, ref)))
+    ).toEqual(body.content_identities);
+    expect(body.content_identity).toBeUndefined();
+    expect(body.source_doc_id).toBeUndefined();
+    expect(await storedIdentity(storage, "docs/batch-a.md")).toBe(
+      computeContentIdentity(first)
+    );
+    expect(await storedIdentity(storage, "docs/batch-b.md")).toBe(
+      computeContentIdentity(second)
+    );
+  });
+
+  it("is deterministic: an identical re-push yields the same identity", async () => {
+    const storage = new MemoryBackend(TEST_DIM);
+    const content = "identical body";
+    const handler = handlerFor(storage);
+    const first = parseBody(
+      await handler({ items: [pushItem(content, "docs/a.md")] })
+    );
+    const second = parseBody(
+      await handler({ items: [pushItem(content, "docs/a.md")] })
+    );
+    expect(first.content_identity).toBe(second.content_identity);
+    expect(await storedIdentity(storage, "docs/a.md")).toBe(
+      computeContentIdentity(content)
+    );
+  });
+
+  it("a changed body yields a different identity for the same source_ref", async () => {
+    const storage = new MemoryBackend(TEST_DIM);
+    const handler = handlerFor(storage);
+    const first = parseBody(
+      await handler({ items: [pushItem("version one", "docs/v.md")] })
+    );
+    const second = parseBody(
+      await handler({ items: [pushItem("version two", "docs/v.md")] })
+    );
+    expect(first.content_identity).not.toBe(second.content_identity);
+    // The row holds exactly one current identity: the newest one.
+    expect(await storedIdentity(storage, "docs/v.md")).toBe(
+      computeContentIdentity("version two")
+    );
+  });
+
+  it("never touches the index-job ledger — push stays write-only for text", async () => {
+    const storage = new MemoryBackend(TEST_DIM);
+    const insertJob = vi.spyOn(storage, "insertJobOrJoin");
+    const supersede = vi.spyOn(storage, "supersedeReadyJobs");
+    const handler = handlerFor(storage);
+    await handler({ items: [pushItem("body", "docs/nojob.md")] });
+    expect(insertJob).not.toHaveBeenCalled();
+    expect(supersede).not.toHaveBeenCalled();
+    expect(await storage.getActiveJobForSource("docs/nojob.md")).toBeNull();
   });
 });

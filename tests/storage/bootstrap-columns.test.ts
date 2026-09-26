@@ -168,6 +168,10 @@ describe("BOOTSTRAP_COLUMNS lockstep with the forward-compat ALTERs", () => {
     // of the derivation (a narrowed ALTER regex, say) still names the concrete
     // column whose absence shipped `column "evidence_span" does not exist`.
     expect(pairs).toContainEqual(["triples", "evidence_span"]);
+    // corpus-index-job T2: the content-identity column the durable submit
+    // pair keys on — restated by hand so a future relaxation of the
+    // derivation still names the concrete column a deployed database must get.
+    expect(pairs).toContainEqual(["source_documents", "content_identity"]);
   });
 
   it("the mock itself is pinned: ready must short-circuit before the DDL", async () => {

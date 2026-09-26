@@ -80,6 +80,12 @@ export interface SourceDocRecord {
   status?: SourceDocStatus;
   /** Stable code of the last failed push; written with `status: "failed"`. */
   failure_code?: string | null;
+  /**
+   * Current content version of the (source_ref, content_identity) idempotency
+   * pair (corpus-index-job T2). NULL on legacy rows until the next push
+   * backfills it.
+   */
+  content_identity?: string | null;
 }
 
 /**
@@ -143,6 +149,61 @@ export const COMMUNITY_INDEX_STATUS = {
 
 export type CommunityIndexStatus =
   (typeof COMMUNITY_INDEX_STATUS)[keyof typeof COMMUNITY_INDEX_STATUS];
+
+/**
+ * Durable corpus index-job status vocabulary (corpus-index-job T2).
+ *
+ * Reuses the four C values; queued vs running is `started_at IS NULL`,
+ * never a fifth state word. `source_documents.status` stays a separate fact.
+ */
+export const INDEX_JOB_STATUS = {
+  IN_PROGRESS: "in_progress",
+  READY: "ready",
+  FAILED: "failed",
+  STALE: "stale",
+} as const;
+
+export type IndexJobStatus =
+  (typeof INDEX_JOB_STATUS)[keyof typeof INDEX_JOB_STATUS];
+
+/** One persisted index-job row bound to exactly one (source_ref, content_identity). */
+export interface IndexJobRecord {
+  /** Derived id: same pair → same job (idempotent submit arm). */
+  job_id: string;
+  source_ref: string;
+  content_identity: string;
+  status: IndexJobStatus;
+  created_at: string;
+  /** null = queued (persisted, not yet picked up). */
+  started_at: string | null;
+  finished_at: string | null;
+  /** Typed stage failure; set when status is failed. */
+  failure_code: string | null;
+}
+
+/**
+ * Persistence seam for the index-job ledger (corpus-index-job T2).
+ *
+ * insertJobOrJoin is the idempotent arm: when the derived job_id row already
+ * exists it returns that row with `inserted: false` instead of creating a
+ * second job — the caller must not claim a fresh queue entry it did not make.
+ * The `conflict` arm is the one-active-job-per-source rule enforced at the
+ * source of truth (partial unique index on `index_jobs`, and its memory
+ * twin): an `in_progress` insert for a source another active job already owns
+ * persists nothing and returns that racing row instead.
+ */
+export type IndexJobInsertOutcome =
+  | { readonly record: IndexJobRecord; readonly inserted: boolean }
+  | { readonly conflict: IndexJobRecord };
+
+export interface IndexJobStore {
+  insertJobOrJoin(record: IndexJobRecord): Promise<IndexJobInsertOutcome>;
+  getJob(jobId: string): Promise<IndexJobRecord | null>;
+  getActiveJobForSource(sourceRef: string): Promise<IndexJobRecord | null>;
+  /** Demote this source's terminal `ready` jobs to `stale` when a new
+   * content version supersedes them; returns the number of rows demoted. */
+  supersedeReadyJobs(sourceRef: string): Promise<number>;
+}
 
 /**
  * Rotate-mode vocabulary for the embedding-generation ledger
@@ -392,6 +453,11 @@ export interface StorageSourceDocView {
    * the rows).
    */
   chunk_count: number;
+  /**
+   * Current content version of the (source_ref, content_identity) pair
+   * (corpus-index-job T2). `undefined`/`null` = legacy row not yet backfilled.
+   */
+  content_identity?: string | null;
 }
 
 export type StorageTimelineEvent =

@@ -526,7 +526,18 @@ export function createIngestHandler(deps: IngestDeps) {
     const allChunkIds: string[] = [];
     const records: ChunkRecord[] = [];
     let embeddingCursor = 0;
-    const sourceDocIds: string[] = [];
+    /**
+     * The 资料 rows this batch wrote, keyed by `source_ref` with
+     * LAST-write-wins — the same rule the upsert itself applies. A legacy
+     * batch may repeat one `source_ref` (its items are slices of one 资料),
+     * so publishing per-envelope ids/identities would name values no row
+     * ever held. The index-job submit pair keys on the identity, so the
+     * response publishes exactly the per-资料 facts that survive the writes.
+     */
+    const writtenBySourceRef = new Map<
+      string,
+      { sourceDocId: string; contentIdentity: string }
+    >();
     /**
      * New chunk ids grouped by source_doc_id. After upsert, these are
      * the ids we MUST NOT delete — they're the same-id merges that
@@ -537,15 +548,27 @@ export function createIngestHandler(deps: IngestDeps) {
     const keptIdsBySourceDoc = new Map<string, Set<string>>();
     for (const env of envelopes) {
       const sourceDocId = computeSourceDocId(env.source_ref);
-      sourceDocIds.push(sourceDocId);
 
       // Upsert the 资料 SoR row keyed by source_ref (re-push updates body).
+      // Document-level content identity is declared here with the SAME
+      // derivation push uses — over the whole body with the DEFAULT version
+      // components, not the caller's `identityVersions` overrides — because
+      // `source_ref` resolves to exactly one current identity: a writer that
+      // hashed with its own versions would leave the row addressable by a
+      // pair the other writer cannot reproduce, and every later submit for
+      // that source would be an identity mismatch.
+      const documentContentIdentity = computeContentIdentity(env.content);
+      writtenBySourceRef.set(env.source_ref, {
+        sourceDocId,
+        contentIdentity: documentContentIdentity,
+      });
       const sourceDoc: SourceDocRecord = {
         id: sourceDocId,
         source_ref: env.source_ref,
         title: env.title,
         content: env.content,
         created_at: now,
+        content_identity: documentContentIdentity,
       };
       await deps.storage.upsertSourceDoc(sourceDoc);
 
@@ -578,6 +601,11 @@ export function createIngestHandler(deps: IngestDeps) {
         embeddingCursor += 1;
       }
     }
+    // One entry per 资料 actually written, in first-touch order: the arrays
+    // are aligned because both come off the same last-write-wins map.
+    const writtenDocs = [...writtenBySourceRef.values()];
+    const sourceDocIds = writtenDocs.map((w) => w.sourceDocId);
+    const contentIdentities = writtenDocs.map((w) => w.contentIdentity);
 
     // Rebuild sweep BEFORE the upsert, excluding the ids this push is
     // about to write:
@@ -627,8 +655,14 @@ export function createIngestHandler(deps: IngestDeps) {
       JSON.stringify({
         chunk_ids: ids,
         ...(sourceDocIds.length === 1
-          ? { source_doc_id: sourceDocIds[0] }
-          : { source_doc_ids: sourceDocIds }),
+          ? {
+              source_doc_id: sourceDocIds[0],
+              content_identity: contentIdentities[0],
+            }
+          : {
+              source_doc_ids: sourceDocIds,
+              content_identities: contentIdentities,
+            }),
         ...(precisionFailed
           ? {
               degraded: true,
@@ -651,7 +685,9 @@ export const ingestTool = (deps: IngestDeps): ToolRegistration => ({
     "store. Each call takes an envelope with source_ref, the prose body " +
     "(content), and the slice list (chunks) the injector pre-cut. " +
     "Re-pushing the same source_ref updates the body and rebuilds its " +
-    "derived chunks without growing the 资料 row count.",
+    "derived chunks without growing the 资料 row count. The response names " +
+    "each 资料 row's content identity, the pair half an index-job submit " +
+    "takes.",
   inputSchema: IngestInputSchema,
   // The registry's handler signature is `(input: unknown) => ...` (the
   // generic is erased at the boundary so the registry stays a single

@@ -9,6 +9,9 @@
 import type {
   ChunkRecord,
   ChunkUpsertOptions,
+  IndexJobInsertOutcome,
+  IndexJobRecord,
+  IndexJobStore,
   PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
@@ -31,7 +34,11 @@ import type {
   ParentWindowRow,
   ParentWindowStorage,
 } from "../retrieval/types.js";
-import { SOURCE_DOC_COLLECTION_NAME, SOURCE_DOC_STATUS } from "../types.js";
+import {
+  INDEX_JOB_STATUS,
+  SOURCE_DOC_COLLECTION_NAME,
+  SOURCE_DOC_STATUS,
+} from "../types.js";
 import {
   appendContentInvalidation,
   CONTENT_INVALIDATIONS_METADATA_KEY,
@@ -112,6 +119,7 @@ export class MemoryBackend
     ContentInvalidationStorage,
     ParentWindowStorage,
     CommunityIndexStateStorage,
+    IndexJobStore,
     StorageReadPort
 {
   private readonly store = new Map<string, ChunkRecord>();
@@ -129,6 +137,13 @@ export class MemoryBackend
    * dashboard detail view.
    */
   private readonly sourceDocs = new Map<string, SourceDocRecord>();
+  /**
+   * Durable index-job ledger twin (corpus-index-job T2), keyed by the derived
+   * `job_id` so a repeat submit collapses onto the existing row. Offline
+   * semantics match the pg backend; durability across a process restart is a
+   * pg-only claim (this Map is lost on exit).
+   */
+  private readonly indexJobs = new Map<string, IndexJobRecord>();
 
   /**
    * Lexical index, maintained on write rather than rebuilt on read.
@@ -330,6 +345,84 @@ export class MemoryBackend
   }
 
   /**
+   * Idempotent submit arm (corpus-index-job T2). The derived `job_id` already
+   * present returns the existing row unchanged — a repeat submit never
+   * overwrites a job a worker has already advanced. `inserted` says which arm
+   * ran, so a caller cannot report a queue entry this call did not create.
+   *
+   * The memory twin of `index_jobs_one_active_per_source_idx`: a second live
+   * `in_progress` row for one `source_ref` is refused as `conflict` naming the
+   * row that owns the source, and nothing is stored. Check-then-set is
+   * synchronous here (no await between probe and `Map.set`), so two racing
+   * callers cannot both pass — the same total the partial unique index gives
+   * Postgres.
+   */
+  async insertJobOrJoin(
+    record: IndexJobRecord
+  ): Promise<IndexJobInsertOutcome> {
+    const existing = this.indexJobs.get(record.job_id);
+    if (existing !== undefined) {
+      return { record: { ...existing }, inserted: false };
+    }
+    if (record.status === INDEX_JOB_STATUS.IN_PROGRESS) {
+      for (const other of this.indexJobs.values()) {
+        if (
+          other.source_ref === record.source_ref &&
+          other.status === INDEX_JOB_STATUS.IN_PROGRESS
+        ) {
+          return { conflict: { ...other } };
+        }
+      }
+    }
+    const stored: IndexJobRecord = { ...record };
+    this.indexJobs.set(record.job_id, stored);
+    return { record: { ...stored }, inserted: true };
+  }
+
+  async getJob(jobId: string): Promise<IndexJobRecord | null> {
+    const record = this.indexJobs.get(jobId);
+    return record === undefined ? null : { ...record };
+  }
+
+  async getActiveJobForSource(
+    sourceRef: string
+  ): Promise<IndexJobRecord | null> {
+    for (const record of this.indexJobs.values()) {
+      if (
+        record.source_ref === sourceRef &&
+        record.status === INDEX_JOB_STATUS.IN_PROGRESS
+      ) {
+        return { ...record };
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Demote every terminal `ready` job of a source to `stale`; returns the
+   * number demoted. Mutates the stored rows, not the copies handed to callers.
+   *
+   * No exception parameter: the incoming job is `in_progress`, so the `ready`
+   * predicate cannot touch it — same reasoning as the pg store's SQL.
+   */
+  async supersedeReadyJobs(sourceRef: string): Promise<number> {
+    let demoted = 0;
+    for (const [jobId, record] of this.indexJobs) {
+      if (
+        record.source_ref === sourceRef &&
+        record.status === INDEX_JOB_STATUS.READY
+      ) {
+        this.indexJobs.set(jobId, {
+          ...record,
+          status: INDEX_JOB_STATUS.STALE,
+        });
+        demoted += 1;
+      }
+    }
+    return demoted;
+  }
+
+  /**
    * List every chunk row that back-points to `sourceDocId`, ordered by
    * ordinal ascending. Used by T4's `read_source` and the dashboard detail.
    */
@@ -423,7 +516,10 @@ export class MemoryBackend
     }
     const doc = this.findSourceDocById(id);
     if (doc === undefined) return { ok: false, code: "NOT_FOUND" };
-    return { ok: true, value: toSourceDocView(doc, this.countChunksOf(doc.id)) };
+    return {
+      ok: true,
+      value: toSourceDocView(doc, this.countChunksOf(doc.id)),
+    };
   }
 
   /** 资料 row by primary-key id (the Map is keyed by source_ref). */
@@ -926,6 +1022,7 @@ function toSourceDocView(
     collection: SOURCE_DOC_COLLECTION_NAME,
     status: doc.status ?? SOURCE_DOC_STATUS.IN_PROGRESS,
     failure_code: doc.failure_code ?? null,
+    content_identity: doc.content_identity ?? null,
     chunk_count: chunkCount,
   };
 }

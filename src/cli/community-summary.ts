@@ -60,7 +60,7 @@ import {
   type CommunityIndexStatus,
 } from "../core/types.js";
 import {
-  ElasticsearchPrecisionLayer,
+  createPrecisionLayer,
   type CommunitySummaryIndexRecord,
   type PrecisionIndexer,
 } from "../core/storage/elasticsearch-precision.js";
@@ -112,8 +112,12 @@ interface Flags {
 export const COMMUNITY_SUMMARY_SKIP_EXIT = 3;
 export const COMMUNITY_SUMMARY_JOB_EXIT = 1;
 
+/** The public reason a summary run never started: no graph to detect on. */
+const COMMUNITY_SUMMARY_SKIP_CODE =
+  "COMMUNITY_SUMMARY_NEO4J_NOT_CONFIGURED" as const;
+
 export class CommunitySummarySkipError extends Error {
-  readonly code = "COMMUNITY_SUMMARY_NEO4J_NOT_CONFIGURED" as const;
+  readonly code = COMMUNITY_SUMMARY_SKIP_CODE;
   readonly exitCode = COMMUNITY_SUMMARY_SKIP_EXIT;
 
   constructor() {
@@ -560,21 +564,6 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/**
- * Build the derived summary-index writer only when the operator configured an
- * Elasticsearch node; `undefined` means Postgres-only and the write leg is
- * skipped. Kept out of `runCliFromEnv` so the env-assembly path stays linear.
- */
-function createSummaryIndexer(
-  env: GraphragEnv
-): ElasticsearchPrecisionLayer | undefined {
-  if (env.elasticsearch === undefined) return undefined;
-  return new ElasticsearchPrecisionLayer(env.elasticsearch, {
-    k1: env.retrieval.k1,
-    b: env.retrieval.b,
-  });
-}
-
 export async function runCliFromEnv(argv: string[]): Promise<number> {
   let env: GraphragEnv;
   try {
@@ -617,10 +606,10 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     apiKey: env.embedApiKey,
     dimensions: env.embedDimensions,
   });
-  // Mirrors src/cli/extract.ts: the precision layer exists only when the
-  // operator configured the ES block, so a Postgres-only deployment keeps
-  // running this job exactly as it did before the derived index existed.
-  const precision = createSummaryIndexer(env);
+  // The shared env→layer mapping: `undefined` when no ES block is configured,
+  // so a Postgres-only deployment keeps running this job exactly as it did
+  // before the derived index existed, with the write leg skipped.
+  const precision = createPrecisionLayer(env);
   const deps: CommunitySummaryDeps = {
     pool: pool as unknown as CommunitySummaryPool,
     detector: createNeo4jCommunityDetector(neo4j),

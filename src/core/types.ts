@@ -166,6 +166,24 @@ export const INDEX_JOB_STATUS = {
 export type IndexJobStatus =
   (typeof INDEX_JOB_STATUS)[keyof typeof INDEX_JOB_STATUS];
 
+/**
+ * The five typed error codes the index-job wire answers with — the published
+ * contract of `submit_index_job` / `poll_index_job` (spec
+ * corpus-index-job-orchestration.md §Error and status vocabulary, Open
+ * Question 1). One shared `index_job_` prefix so a Host names the failure class
+ * without reading iknow internals. They live beside `INDEX_JOB_STATUS` because
+ * the tool surface and the runner read the same family: the worker reuses
+ * `UNKNOWN_SOURCE` for a 资料 row that vanished mid-job, so a host classifies a
+ * submit-side miss and a worker-side miss alike.
+ */
+export const INDEX_JOB_ERROR_CODE = {
+  INVALID_LOCATOR: "index_job_invalid_locator",
+  UNKNOWN_SOURCE: "index_job_unknown_source",
+  IDENTITY_MISMATCH: "index_job_identity_mismatch",
+  IN_PROGRESS: "index_job_in_progress",
+  UNKNOWN_JOB: "index_job_unknown_job",
+} as const;
+
 /** One persisted index-job row bound to exactly one (source_ref, content_identity). */
 export interface IndexJobRecord {
   /** Derived id: same pair → same job (idempotent submit arm). */
@@ -196,6 +214,46 @@ export type IndexJobInsertOutcome =
   | { readonly record: IndexJobRecord; readonly inserted: boolean }
   | { readonly conflict: IndexJobRecord };
 
+/**
+ * Claim options for the worker side of the ledger.
+ *
+ * The caller supplies both instants so ONE clock — that worker process's own
+ * — decides the write and the stall comparison; a storage-side `now()` would
+ * let a reclaimed lease and the lease it replaced disagree about when the job
+ * started. The remaining limit this cannot fix: different worker processes
+ * judge stalls by their own clocks, and wall-clock skew between them shifts
+ * the reclaim point by the skew.
+ */
+export interface IndexJobClaimOptions {
+  /** Written to `started_at` of the row this call claims. */
+  readonly startedAt: string;
+  /** Also re-claim a running job that started before this instant — the
+   * crashed-worker arm. Omit to claim queued rows only. */
+  readonly stalledBefore?: string;
+}
+
+/** The three states a claimed job may move to; `in_progress` is not terminal. */
+export type IndexJobTerminalStatus =
+  | typeof INDEX_JOB_STATUS.READY
+  | typeof INDEX_JOB_STATUS.FAILED
+  | typeof INDEX_JOB_STATUS.STALE;
+
+/** Terminal outcome published by the worker once its stages have finished. */
+export interface IndexJobTerminalOutcome {
+  readonly status: IndexJobTerminalStatus;
+  /** Typed stage failure; set when status is `failed`, null otherwise. */
+  readonly failureCode?: string | null;
+  /** Written to `finished_at`. */
+  readonly finishedAt: string;
+  /**
+   * The `started_at` this worker wrote when it claimed the row — the claim
+   * token. The publish only lands while the row still carries it, so a worker
+   * whose lease a second worker re-claimed cannot report the outcome it
+   * computed. Null is the token of a row nobody ever claimed.
+   */
+  readonly claimedStartedAt: string | null;
+}
+
 export interface IndexJobStore {
   insertJobOrJoin(record: IndexJobRecord): Promise<IndexJobInsertOutcome>;
   getJob(jobId: string): Promise<IndexJobRecord | null>;
@@ -203,6 +261,28 @@ export interface IndexJobStore {
   /** Demote this source's terminal `ready` jobs to `stale` when a new
    * content version supersedes them; returns the number of rows demoted. */
   supersedeReadyJobs(sourceRef: string): Promise<number>;
+  /**
+   * Atomically claim the oldest claimable job and mark it running
+   * (`started_at = options.startedAt`); null when the queue is empty.
+   * Claimable is `in_progress` with `started_at IS NULL`, plus — when
+   * `stalledBefore` is given — `in_progress` rows started before it, which is
+   * what makes a request survive a worker that died mid-stage; omitting it
+   * claims queued rows only, which is how a caller takes the FIFO head without
+   * reaching into another worker's lease. Concurrent claimants must never hand
+   * the same row to two workers.
+   */
+  claimNextJob(options: IndexJobClaimOptions): Promise<IndexJobRecord | null>;
+  /**
+   * Move one still-active job to a terminal state and stamp `finished_at`;
+   * returns the row as persisted, or null when the row was no longer
+   * `in_progress` **or** no longer carries `claimedStartedAt` — either answer
+   * means this worker lost its lease and must not report the outcome it
+   * computed.
+   */
+  publishJobOutcome(
+    jobId: string,
+    outcome: IndexJobTerminalOutcome
+  ): Promise<IndexJobRecord | null>;
 }
 
 /**

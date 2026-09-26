@@ -86,9 +86,11 @@ import {
   supportsIndexJobStore,
 } from "../../src/core/storage/backend.js";
 import type {
+  IndexJobClaimOptions,
   IndexJobInsertOutcome,
   IndexJobRecord,
   IndexJobStore,
+  IndexJobTerminalOutcome,
   SourceDocRecord,
 } from "../../src/core/types.js";
 
@@ -133,13 +135,20 @@ const POLL_KEYS = [
   "community_index_state",
 ].sort();
 
-const WRITE_METHODS = ["insertJobOrJoin", "supersedeReadyJobs"];
+const WRITE_METHODS = [
+  "insertJobOrJoin",
+  "supersedeReadyJobs",
+  "claimNextJob",
+  "publishJobOutcome",
+];
 
 type LedgerCall =
   | { method: "insertJobOrJoin"; jobId: string }
   | { method: "getJob"; jobId: string }
   | { method: "getActiveJobForSource"; sourceRef: string }
-  | { method: "supersedeReadyJobs"; sourceRef: string };
+  | { method: "supersedeReadyJobs"; sourceRef: string }
+  | { method: "claimNextJob" }
+  | { method: "publishJobOutcome"; jobId: string };
 
 /**
  * Records the ledger call sequence while delegating every read and write to the
@@ -180,6 +189,21 @@ class RecordingJobStore implements IndexJobStore {
   async supersedeReadyJobs(sourceRef: string): Promise<number> {
     this.calls.push({ method: "supersedeReadyJobs", sourceRef });
     return this.backend.supersedeReadyJobs(sourceRef);
+  }
+
+  async claimNextJob(
+    options: IndexJobClaimOptions
+  ): Promise<IndexJobRecord | null> {
+    this.calls.push({ method: "claimNextJob" });
+    return this.backend.claimNextJob(options);
+  }
+
+  async publishJobOutcome(
+    jobId: string,
+    outcome: IndexJobTerminalOutcome
+  ): Promise<IndexJobRecord | null> {
+    this.calls.push({ method: "publishJobOutcome", jobId });
+    return this.backend.publishJobOutcome(jobId, outcome);
   }
 
   methods(): string[] {

@@ -2433,20 +2433,21 @@ describe("runCliFromEnv precision wiring (production entry point)", () => {
     };
   }
 
+  /** A stand-in for the layer that records only its close lifecycle. */
+  interface FakeLayer {
+    closed: number;
+    close(): Promise<void>;
+  }
+
   async function withMockedEnv(
     env: import("../../src/config.js").GraphragEnv
   ): Promise<{
-    layerInstances: Array<{
-      config: unknown;
-      options: unknown;
-      closed: number;
-    }>;
+    exit: number;
+    layerInstances: FakeLayer[];
+    mappedEnvs: unknown[];
   }> {
-    const layerInstances: Array<{
-      config: unknown;
-      options: unknown;
-      closed: number;
-    }> = [];
+    const layerInstances: FakeLayer[] = [];
+    const mappedEnvs: unknown[] = [];
     const stderr = captureStderr();
     vi.doMock("../../src/config.js", async () => {
       const actual = await vi.importActual<
@@ -2468,28 +2469,33 @@ describe("runCliFromEnv precision wiring (production entry point)", () => {
         async end() {}
       },
     }));
+    // The env→layer mapping is `createPrecisionLayer`'s own contract, asserted
+    // against the real class in tests/storage/elasticsearch-precision.unit.test.ts.
+    // This file owns the CLI's half: it hands the mapping the env block it
+    // resolved, and closes whatever the mapping answered with.
     vi.doMock("../../src/core/storage/elasticsearch-precision.js", () => ({
-      ElasticsearchPrecisionLayer: class {
-        config: unknown;
-        options: unknown;
-        closed = 0;
-        constructor(config: unknown, options: unknown) {
-          this.config = config;
-          this.options = options;
-          layerInstances.push(this);
-        }
-        async close() {
-          this.closed += 1;
-        }
+      createPrecisionLayer: (envArg: unknown) => {
+        mappedEnvs.push(envArg);
+        const configured = (envArg as { elasticsearch: unknown }).elasticsearch;
+        if (configured === undefined) return undefined;
+        const layer: FakeLayer = {
+          closed: 0,
+          async close() {
+            layer.closed += 1;
+          },
+        };
+        layerInstances.push(layer);
+        return layer;
       },
     }));
+    let exit = -1;
     try {
       // Drop the statically-cached extract module so the dynamic import
       // re-evaluates it against the mocks above (vi.doMock only affects
       // imports after a module-registry reset).
       vi.resetModules();
       const mod = await import("../../src/cli/extract.js");
-      await mod.runCliFromEnv(["--list-unmapped"]);
+      exit = await mod.runCliFromEnv(["--list-unmapped"]);
     } finally {
       stderr.restore();
       vi.doUnmock("../../src/config.js");
@@ -2497,26 +2503,34 @@ describe("runCliFromEnv precision wiring (production entry point)", () => {
       vi.doUnmock("../../src/core/storage/elasticsearch-precision.js");
       vi.resetModules();
     }
-    return { layerInstances };
+    return { exit, layerInstances, mappedEnvs };
   }
 
-  it("builds an ElasticsearchPrecisionLayer from env.elasticsearch with k1/b from env.retrieval", async () => {
-    const { layerInstances } = await withMockedEnv(makeFakeEnv(ES_CONFIG));
+  it("hands the env block it resolved to the shared precision mapping and closes the layer", async () => {
+    const env = makeFakeEnv(ES_CONFIG);
+    const { exit, layerInstances, mappedEnvs } = await withMockedEnv(env);
 
+    // Exactly one call, with the very block `loadEnv()` answered: the CLI maps
+    // no env field of its own onto the layer.
+    expect(mappedEnvs).toEqual([env]);
     expect(layerInstances).toHaveLength(1);
-    expect(layerInstances[0]!.config).toEqual(ES_CONFIG);
-    expect(layerInstances[0]!.options).toEqual({ k1: 1.4, b: 0.6 });
+    expect(exit).toBe(0);
     // Resource cleanup: the layer is closed with the pool in `finally`.
     expect(layerInstances[0]!.closed).toBe(1);
   });
 
-  it("leaves precision unconfigured (undefined) when env has no ES block", async () => {
-    const { layerInstances } = await withMockedEnv(makeFakeEnv(undefined));
+  it("runs to a clean exit when the mapping answers no layer, closing nothing", async () => {
+    const { exit, layerInstances, mappedEnvs } = await withMockedEnv(
+      makeFakeEnv(undefined)
+    );
 
-    // No precision layer was ever constructed, and the run still exits 0 —
-    // the pipeline's precision calls are silent no-ops on the unconfigured
-    // path (same posture as the MCP push/ingest wiring).
+    // The CLI still asks the shared mapping (which is what returns undefined
+    // for an env with no ES block), constructs nothing, and exits 0 — the
+    // pipeline's precision calls are silent no-ops on the unconfigured path
+    // (same posture as the MCP push/ingest wiring).
+    expect(mappedEnvs).toHaveLength(1);
     expect(layerInstances).toHaveLength(0);
+    expect(exit).toBe(0);
   });
 });
 

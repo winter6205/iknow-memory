@@ -9,9 +9,11 @@
 import type {
   ChunkRecord,
   ChunkUpsertOptions,
+  IndexJobClaimOptions,
   IndexJobInsertOutcome,
   IndexJobRecord,
   IndexJobStore,
+  IndexJobTerminalOutcome,
   PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
@@ -420,6 +422,66 @@ export class MemoryBackend
       }
     }
     return demoted;
+  }
+
+  /**
+   * Memory twin of the pg claim: take the oldest claimable row and stamp its
+   * start. `status` stays `in_progress` — queued vs running is `started_at`,
+   * never a fifth state word — and re-claiming a stalled row overwrites that
+   * column on purpose, since it names the current attempt while `created_at`
+   * stays the queue time.
+   *
+   * No row lock is needed: the probe and the write below are synchronous, with
+   * no `await` between the scan and `Map.set`, so Node finishes one call before
+   * the next starts and two callers cannot both see one row as claimable.
+   * Postgres needs `FOR UPDATE SKIP LOCKED` precisely because its workers are
+   * separate processes that do await each other.
+   */
+  async claimNextJob(
+    options: IndexJobClaimOptions
+  ): Promise<IndexJobRecord | null> {
+    let next: IndexJobRecord | undefined;
+    for (const record of this.indexJobs.values()) {
+      if (!isClaimableJob(record, options)) continue;
+      if (next === undefined || compareJobQueueOrder(record, next) < 0) {
+        next = record;
+      }
+    }
+    if (next === undefined) return null;
+    const claimed: IndexJobRecord = { ...next, started_at: options.startedAt };
+    this.indexJobs.set(claimed.job_id, claimed);
+    return { ...claimed };
+  }
+
+  /**
+   * Publish the terminal outcome of the job this worker holds.
+   *
+   * null is the lost-lease answer: a row that is not (or no longer)
+   * `in_progress` was settled by someone else, so this worker's own verdict
+   * must not overwrite it, and no row is invented for an unknown id.
+   * `IndexJobTerminalStatus` is the guard against publishing `in_progress`;
+   * the pg CHECK is the storage-side twin, so neither repeats the other.
+   */
+  async publishJobOutcome(
+    jobId: string,
+    outcome: IndexJobTerminalOutcome
+  ): Promise<IndexJobRecord | null> {
+    const record = this.indexJobs.get(jobId);
+    if (
+      record === undefined ||
+      record.status !== INDEX_JOB_STATUS.IN_PROGRESS ||
+      record.started_at !== outcome.claimedStartedAt
+    ) {
+      return null;
+    }
+    const published: IndexJobRecord = {
+      ...record,
+      status: outcome.status,
+      failure_code: outcome.failureCode ?? null,
+      finished_at: outcome.finishedAt,
+    };
+    this.indexJobs.set(jobId, published);
+    return { ...published };
   }
 
   /**
@@ -918,6 +980,36 @@ function applyPhraseBoost(
 function compareIngestOrder(a: ChunkRecord, b: ChunkRecord): number {
   const createdAt = Date.parse(a.created_at) - Date.parse(b.created_at);
   return createdAt !== 0 ? createdAt : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * Which ledger rows a claim may take, mirroring `CLAIMABLE_JOB_SQL` on the pg
+ * side: an `in_progress` row that has not started is queued, and a started one
+ * is claimable again only once it is older than `stalledBefore` — the
+ * crashed-worker arm. A malformed instant parses to NaN, which compares false
+ * on both sides, so it can never read as stalled.
+ */
+function isClaimableJob(
+  record: IndexJobRecord,
+  options: IndexJobClaimOptions
+): boolean {
+  if (record.status !== INDEX_JOB_STATUS.IN_PROGRESS) return false;
+  if (record.started_at === null) return true;
+  return (
+    options.stalledBefore !== undefined &&
+    Date.parse(record.started_at) < Date.parse(options.stalledBefore)
+  );
+}
+
+/**
+ * FIFO order for the claim: queue time first, `job_id` breaking ties so two
+ * rows submitted in one instant still have one agreed oldest — the same rule
+ * the pg side applies with `ORDER BY created_at, job_id`.
+ */
+function compareJobQueueOrder(a: IndexJobRecord, b: IndexJobRecord): number {
+  const createdAt = Date.parse(a.created_at) - Date.parse(b.created_at);
+  if (createdAt !== 0) return createdAt;
+  return a.job_id.localeCompare(b.job_id);
 }
 
 function preserveInvalidationState(

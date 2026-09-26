@@ -1,3 +1,14 @@
+/**
+ * PostgreSQL advisory-lock ownership for schema bootstrap — plus the key
+ * derivation every advisory lock in the repo shares.
+ *
+ * `advisoryLockKey` is repo-wide, not schema-migration machinery: the schema
+ * bootstrap lock and the index-job serialization lock both take their bigint
+ * from it, and one derivation is the point (two hashes would let two names for
+ * the same domain silently stop contending). It is exported from this module
+ * because the bootstrap lock was its first user; a job-serialization caller
+ * importing it imports the derivation only, never a bootstrap behaviour.
+ */
 import { Buffer } from "node:buffer";
 
 import type { SchemaBootstrapClient } from "./schema-bootstrap.js";
@@ -94,14 +105,21 @@ const BOOTSTRAP_INDEXES = [
 ] as const;
 
 /**
- * Derive the signed bigint accepted by PostgreSQL's advisory-lock API.
+ * Derive the signed bigint accepted by PostgreSQL's advisory-lock API from
+ * a lock name.
  *
- * FNV-1a over the schema's UTF-8 bytes keeps the key stable across processes
- * while preserving separate lock domains for ordinary schema names.
+ * Repo-wide, not bootstrap-only: every advisory lock here takes its key from
+ * this function — the schema bootstrap's transaction-scoped lock and the index
+ * job's session-scoped serialization lock alike.
+ *
+ * FNV-1a over the name's UTF-8 bytes keeps the key stable across processes
+ * AND PostgreSQL majors (a server-side hash like `hashtext` is neither
+ * 64-bit nor version-stable) while preserving separate lock domains for
+ * ordinary names.
  */
-export function schemaBootstrapLockKey(schemaName: string): bigint {
+export function advisoryLockKey(name: string): bigint {
   let hash = FNV1A_OFFSET_BASIS;
-  for (const byte of Buffer.from(schemaName, "utf8")) {
+  for (const byte of Buffer.from(name, "utf8")) {
     hash = (hash ^ BigInt(byte)) * FNV1A_PRIME;
     hash &= UINT64_MASK;
   }
@@ -133,7 +151,7 @@ export async function acquireSchemaBootstrapLock(
     );
   }
 
-  const key = schemaBootstrapLockKey(schemaName);
+  const key = advisoryLockKey(schemaName);
   await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [
     key.toString(),
   ]);

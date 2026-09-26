@@ -9,7 +9,7 @@ import { buildRetrieveDeps, buildRetrieveReranker } from "../index.js";
 import { NineRouterEmbedder, UnavailableEmbedder } from "../core/embedder.js";
 import { createSlotSourceFromGraphragEnv } from "../core/embed-slots.js";
 import { MemoryBackend } from "../core/storage/memory-backend.js";
-import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
+import { createPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { createNeo4jPprRanker } from "../core/graph/neo4j-ppr.js";
 import { connectNeo4j } from "../core/graph/neo4j-writer.js";
 import type { StorageBackend, StorageReadPort } from "../core/types.js";
@@ -89,13 +89,7 @@ export async function main(): Promise<void> {
   const storage = await buildStorage(env);
   const embedder = buildEmbedder(env);
   const slotEmbedding = createSlotSourceFromGraphragEnv(env, embedder);
-  const precision =
-    env.elasticsearch === undefined
-      ? undefined
-      : new ElasticsearchPrecisionLayer(env.elasticsearch, {
-          k1: env.retrieval.k1,
-          b: env.retrieval.b,
-        });
+  const precision = createPrecisionLayer(env);
   const reranker = buildRetrieveReranker(env);
   const graphRanker =
     env.neo4j !== undefined ? createNeo4jPprRanker(env.neo4j) : undefined;

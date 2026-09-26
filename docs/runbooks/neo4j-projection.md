@@ -1,8 +1,8 @@
 # Neo4j projection — backfill, drain, verify
 
 **Status:** shipped on the #70 implementation branch (T2–T5).
-**Applies to:** the `graph:backfill` / `graph:drain` operator CLIs and the
-Neo4j graph arm on `retrieve`.
+**Applies to:** the `graph:backfill` / `graph:drain` operator CLIs, the
+`index:worker` durable job runner, and the Neo4j graph arm on `retrieve`.
 
 Postgres is the system of record. Neo4j holds a derived, read-only
 projection of `entities` and `triples` (ADR-0001), kept in sync by a
@@ -17,6 +17,8 @@ Nothing else does — not the MCP server, not `ingest`, not `retrieve`,
 not the `extract` CLI. Extract writes an _intent_ row to
 `projection_outbox` inside the same Postgres transaction as the ledger
 rows it describes; the drain is what turns intents into graph writes.
+`npm run index:worker` schedules that drain for a durable index job; it is
+a caller of the same two writers, not a third one.
 
 That is a spec contract (SC1), not a convention. The retrieve-side arm
 opens read-only sessions, and `projection_outbox.subject_kind` is CHECKed
@@ -39,8 +41,8 @@ rule between them and a re-drain can never push a stale value.
 Local sidecar options (do not bind both to `:7687`):
 
 - **Docker (common case):** `docker compose up -d --wait` — Neo4j `5.26.0`
-  + GDS `2.13.2` baked in `docker/neo4j`, auth `neo4j` / `iknow-memory-dev`.
-  Set URI, USER, and PASSWORD. See `docs/runbooks/local-infra.md`.
+  - GDS `2.13.2` baked in `docker/neo4j`, auth `neo4j` / `iknow-memory-dev`.
+    Set URI, USER, and PASSWORD. See `docs/runbooks/local-infra.md`.
 - **No Docker:** `bash scripts/neo4j.sh install && bash scripts/neo4j.sh start`
   — same version pin, auth disabled on `127.0.0.1`, URI only.
 
@@ -94,15 +96,72 @@ $ npm run graph:drain
 INFO graph-drain-complete {"intents":5,"nodes":3,"edges":2,"unresolved":0,"batches":1}
 ```
 
-`unresolved` counts intents whose subject no longer exists in the ledger.
-They are logged and marked done; the stale node stays in Neo4j, because
-projection GC is not implemented. Deleting entities is rare enough that
-the honest answer today is to re-create the graph from a backfill.
+`unresolved` counts intents whose subject the ledger no longer answers for.
+They are logged and marked done, and the drain garbage-collects exactly that
+subject by id (`DETACH DELETE` for a node, `DELETE` for an edge). GC is only
+as wide as the queue: a retirement that never emitted an intent leaves its
+node in place, and the honest answer there is a backfill.
 
 Intents that failed mid-batch keep their `last_error` and stay visible.
 `npm run graph:drain -- --retry-failed` moves them back to `pending` for
 the next run and reports how many it re-armed (`{"rearmed":0}` when there
 were none — that is a clean queue, not a no-op bug).
+
+## Running the durable index job
+
+`submit_index_job` queues a job; nothing runs until a worker claims it. One
+worker handles one job at a time, and a Postgres session advisory lock
+(`iknow-memory:index-job`) keeps two workers from interleaving the
+community-summary swap:
+
+```
+$ npm run index:worker                             # loop until the queue empties
+$ npm run index:worker -- --once                   # claim at most one job (cron)
+$ npm run index:worker -- --stalled-after 300000   # reclaim after 5 min
+```
+
+A job runs extract, then the drain above, then Leiden detection and the
+summary swap — through the same CLI entries this runbook documents, not a
+copy of them. The drain leg opens with `--retry-failed`, so a job re-arms the
+whole outbox, not only its own source's intents. That re-arm has no ceiling
+and no way to scope it to one source (an intent names an entity or a triple,
+never a source), which is worth knowing before you read a failure: every
+`failed` intent goes back to `pending` and the drain that follows projects it
+before this job's own summary swap, so one intent that fails permanently — a
+subject the graph rejects on every attempt — stops being that source's
+problem. From then on every later job, for every source, re-arms it, fails in
+its drain leg with `PROJECTION_DRAIN_FAILURE`, and corpus C stays not-ready
+until it is cleared. Triage it with the commands this runbook already
+documents: `--dry-run` for depth per status, the `WHERE status = 'failed'`
+query in §Verifying for the subject's `attempts` and `last_error`, then fix
+the underlying fault (sidecar reachable, driver error resolved) and drain once
+by hand — `--retry-failed` followed by a plain `graph:drain` — before trusting
+the worker again. Nothing drops an intent silently: `failed` rows stay
+visible, and an intent whose subject the ledger no longer answers for is
+marked done by the drain itself.
+
+A job's terminal state is published only while the row still
+carries the `started_at` this worker stamped at claim, so a worker whose
+lease a second worker re-claimed cannot report the outcome it computed.
+
+Killing the process mid-stage is a supported event: the row stays
+`in_progress` and becomes claimable again once it is older than
+`--stalled-after` (15 minutes by default, so a `--once` timer needs a value
+above its own worst-case stage time — and above the worst case of every job
+that can claim ahead of it, since a row's stall clock starts at claim, before
+the job lock is taken). Each job that ended without a published outcome is
+named by its own `index-job-unsettled` line, which carries the `jobId` to grep
+for — `index-job-worker-drained` reports only the `{claimed, unsettled}` counts
+— and one unsettled job is what turns the run's exit into `1`.
+
+| Code | Meaning                                                                 |
+| ---- | ----------------------------------------------------------------------- |
+| `0`  | Queue drained (or nothing was claimable) and every claimed job settled  |
+| `1`  | Config / claim / lock fault, or a claimed job published no terminal row |
+| `2`  | Usage error — unknown or malformed flag                                 |
+
+The job-state vocabulary, what each `failure_code` names, and how corpus C
+readiness is read are in `specs/corpus-index-job-orchestration.md`.
 
 ## Verifying
 
@@ -173,6 +232,11 @@ pass --dry-run or --retry-failed for a Postgres-only run`.
   relationship type is `RELATION`.
 - **Drain says `pending` but nothing lands** — the sidecar is likely
   reachable yet rejecting writes. Look at `last_error` on the failed rows.
+- **Every index job fails with `PROJECTION_DRAIN_FAILURE`, including jobs
+  for unrelated sources** — one permanently failing intent is re-armed by
+  every job's own `--retry-failed`, so the fault is the outbox's, not the
+  submitted source's. See §Running the durable index job for the triage
+  order.
 - **Graph arm contributes nothing to retrieve** — an empty projection
   is not an error and does not set `degraded`. Backfill first, then
   re-check the counts above.

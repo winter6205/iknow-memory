@@ -32,6 +32,23 @@ import {
 /** Error code for a method that conflicts with the version's recorded method. */
 export const EXTRACT_METHOD_CONFLICT_CODE = "EXTRACT_METHOD_CONFLICT";
 
+/**
+ * Code for a method VALUE outside the {standard, fast} vocabulary — a
+ * caller-contract violation, never a chunk outcome. A different condition from
+ * `EXTRACT_METHOD_CONFLICT_CODE` (recorded method vs requested method), so the
+ * two codes never overlap. Exported because a caller that enforces the same
+ * vocabulary elsewhere — the index-job worker reading a stored
+ * `source_documents.extract_method` — must forward this code, not name its own.
+ */
+export const INVALID_EXTRACT_METHOD_CODE = "INVALID_INPUT";
+
+/** The one message for a method value outside the vocabulary. */
+export function invalidExtractMethodMessage(raw: string): string {
+  return `unknown extract method "${raw}": expected ${EXTRACT_METHODS.join(
+    " or "
+  )}`;
+}
+
 /** Runtime vocabulary guard for values that bypassed the TS type. */
 export function isExtractMethod(value: unknown): value is ExtractMethod {
   return (
@@ -40,15 +57,12 @@ export function isExtractMethod(value: unknown): value is ExtractMethod {
   );
 }
 
-/** Typed failure for a method value outside the {standard, fast} vocabulary. */
+/**
+ * Typed failure for a method value outside the {standard, fast} vocabulary.
+ */
 export class InvalidExtractMethodError extends GraphragError {
   constructor(raw: string) {
-    super(
-      `unknown extract method "${raw}": expected ${EXTRACT_METHODS.join(
-        " or "
-      )}`,
-      "INVALID_INPUT"
-    );
+    super(invalidExtractMethodMessage(raw), INVALID_EXTRACT_METHOD_CODE);
     this.name = "InvalidExtractMethodError";
   }
 }

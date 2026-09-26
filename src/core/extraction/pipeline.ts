@@ -260,6 +260,57 @@ export interface ProcessBatchOptions {
 }
 
 /**
+ * The report code for a `write-failure` leg: the one failure whose whole chunk
+ * transaction rolled back, so no `extraction_records` row exists to read a code
+ * from and whatever reports the leg has to name it.
+ */
+export const EXTRACT_WRITE_FAILURE_CODE = "WRITE_FAILURE";
+
+/**
+ * The failure half of a batch, or of a stage tally over several batches:
+ * `BatchSummary` and the index-job extract outcome are both assignable.
+ */
+export interface FailureTally {
+  readonly failed: number;
+  readonly writeFailures: number;
+  readonly failureCodes: readonly string[];
+}
+
+/**
+ * Every leg that indexed nothing: a sealed failure and a rolled-back write are
+ * different legs (the second left no record and no code of its own), so the
+ * batch's not-indexed total is their sum. One owner because every caller asks
+ * the same question and two hand-written sums can drift apart.
+ */
+export function notIndexed(tally: FailureTally): number {
+  return tally.failed + tally.writeFailures;
+}
+
+/**
+ * The one code that names a failed batch — the single place the precedence
+ * lives, so no caller restates it.
+ *
+ * The answer is null exactly when the tally indexed everything (`notIndexed`
+ * zero), so a caller that takes the non-null half gets its failure gate and its
+ * code from one predicate instead of two that can drift.
+ *
+ * WHY the typed code outranks `EXTRACT_WRITE_FAILURE_CODE`: a sealed leg's code
+ * says *why* the chunk produced nothing (the class an operator or a retrier can
+ * act on), while a write failure says only that a leg persisted nothing — the
+ * container, not the cause. A batch that mixed both therefore names the cause;
+ * `EXTRACT_WRITE_FAILURE_CODE` answers only a batch whose failed legs ALL rolled
+ * back and so report no code of their own.
+ *
+ * Exit severity is a different question (see `src/cli/extract.ts`): which arm
+ * outranks there is about what the operator must fix first, not about which
+ * code names the failure.
+ */
+export function batchFailureCode(tally: FailureTally): string | null {
+  if (notIndexed(tally) === 0) return null;
+  return tally.failureCodes[0] ?? EXTRACT_WRITE_FAILURE_CODE;
+}
+
+/**
  * One chunk's sealed outcome, as reported to `onChunkOutcome`. Mirrors the
  * `extraction_records` shape (`chunk_id` / `error_code` / `error_msg`) so a
  * caller can forward it to its client verbatim; write-failure legs carry no

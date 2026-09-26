@@ -63,6 +63,7 @@ import {
 } from "./registry.js";
 import {
   INDEX_JOB_STATUS,
+  INDEX_JOB_ERROR_CODE,
   type IndexJobRecord,
   type IndexJobStore,
 } from "../core/types.js";
@@ -197,7 +198,7 @@ export function createPollIndexJobHandler(deps: PollIndexJobDeps) {
     if (job === null) {
       // EXIT: named miss — mirrors read_source_not_found, never an empty body.
       return errorResult({
-        error: "index_job_unknown_job",
+        error: INDEX_JOB_ERROR_CODE.UNKNOWN_JOB,
         job_id: jobId,
         message: `no index job with job_id ${jobId}`,
       });
@@ -286,14 +287,14 @@ function locatorFault(
 ): ToolResult | undefined {
   if (typeof value !== "string" || value.length === 0) {
     return errorResult({
-      error: "index_job_invalid_locator",
+      error: INDEX_JOB_ERROR_CODE.INVALID_LOCATOR,
       missing: name,
       message: `${name} must be a non-empty string`,
     });
   }
   if (Array.from(value).length > SOURCE_READ_MAX_LOCATOR_CODE_POINTS) {
     return errorResult({
-      error: "index_job_invalid_locator",
+      error: INDEX_JOB_ERROR_CODE.INVALID_LOCATOR,
       oversized: name,
       message: `${name} exceeds ${SOURCE_READ_MAX_LOCATOR_CODE_POINTS} code points`,
     });
@@ -309,7 +310,7 @@ async function sourceIdentityFault(
   const source = await readPort.getSourceDoc(input.source_ref);
   if (source === null) {
     return errorResult({
-      error: "index_job_unknown_source",
+      error: INDEX_JOB_ERROR_CODE.UNKNOWN_SOURCE,
       source_ref: input.source_ref,
       message: `no pushed 资料 with source_ref ${input.source_ref}`,
     });
@@ -318,7 +319,7 @@ async function sourceIdentityFault(
   // not guess which content version it stands for, so it is a mismatch.
   if (source.content_identity !== input.content_identity) {
     return errorResult({
-      error: "index_job_identity_mismatch",
+      error: INDEX_JOB_ERROR_CODE.IDENTITY_MISMATCH,
       source_ref: input.source_ref,
       message:
         "content_identity does not match the pushed version of this source_ref",
@@ -345,7 +346,7 @@ async function activeJobConflict(
  * and the store-level constraint rejection so both name the racing row alike. */
 function activeJobError(sourceRef: string, activeJobId: string): ToolResult {
   return errorResult({
-    error: "index_job_in_progress",
+    error: INDEX_JOB_ERROR_CODE.IN_PROGRESS,
     source_ref: sourceRef,
     active_job_id: activeJobId,
     message:

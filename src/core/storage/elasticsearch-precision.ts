@@ -13,7 +13,7 @@
  */
 import { Client } from "@elastic/elasticsearch";
 
-import type { ElasticsearchConfig } from "../../config.js";
+import type { ElasticsearchConfig, GraphragEnv } from "../../config.js";
 import { redactDiagnostic } from "../../logging.js";
 import { GraphragError, type GraphragFailureToken } from "../errors.js";
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../types.js";
@@ -1085,4 +1085,21 @@ function summaryMappings(): Record<string, unknown> {
       level: { type: "integer" },
     },
   };
+}
+
+/**
+ * The precision layer for an operator-configured deployment, or undefined when
+ * none is configured — the caller then runs Postgres-only and skips its write
+ * leg. Every entry point that wires the layer from a resolved `GraphragEnv`
+ * block goes through here, so the env→layer mapping (endpoint + BM25 knobs) has
+ * exactly one owner.
+ */
+export function createPrecisionLayer(
+  env: GraphragEnv
+): ElasticsearchPrecisionLayer | undefined {
+  if (env.elasticsearch === undefined) return undefined;
+  return new ElasticsearchPrecisionLayer(env.elasticsearch, {
+    k1: env.retrieval.k1,
+    b: env.retrieval.b,
+  });
 }

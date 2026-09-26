@@ -37,7 +37,7 @@ import { Pool } from "pg";
 
 import { loadEnv, ConfigError, type GraphragEnv } from "../config.js";
 import { createLogger, writeStderr, type Logger } from "../logging.js";
-import { ElasticsearchPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
+import { createPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
 import { listFailed } from "../core/extraction/records.js";
 import { discardRecord, promoteRecord } from "../core/extraction/actions.js";
@@ -491,8 +491,10 @@ async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
       batchSize: flags.batchSize,
       ...(method !== null ? { method } : {}),
     });
-    // Exit precedence: writeFailures → 2 first (unchanged), then the T4
-    // job fail, then mark-and-continue 0 (any success, or a non-fast run).
+    // EXIT severity (not the failure-code ranking, which `batchFailureCode`
+    // owns): a rolled-back leg is the one failure the operator must handle
+    // outside this run, so it outranks the content-level job fail below, then
+    // mark-and-continue 0 (any success, or a non-fast run).
     if (summary.writeFailures > 0) return 2;
     if (isEmptyFastGraphJobFail(method, summary)) {
       deps.logger.error("fast-empty-graph-job-fail", {
@@ -513,8 +515,9 @@ async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
  * every single one of them with at least one typed FAST_EMPTY_GRAPH is not a
  * success — the operator asked for a graph and the Chinese-content fast leg
  * produced none. Standard runs and mixed fast runs (any success) keep the
- * mark-and-continue exit 0; the caller checks writeFailures first, so a
- * rolled-back chunk outranks this fail.
+ * mark-and-continue exit 0. The caller's `writeFailures` arm outranks this one
+ * as an EXIT severity only: which code names a failed batch is decided once,
+ * in `batchFailureCode`, and never by ranking here.
  */
 function isEmptyFastGraphJobFail(
   method: ExtractMethod | null,
@@ -849,13 +852,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
   // in the pipeline, matching the MCP push/ingest path. Without this, the
   // extract CLI's entity projection was unreachable in production and the
   // entity index could only be repaired by a manual `npm run es:reindex`.
-  const precision =
-    env.elasticsearch === undefined
-      ? undefined
-      : new ElasticsearchPrecisionLayer(env.elasticsearch, {
-          k1: env.retrieval.k1,
-          b: env.retrieval.b,
-        });
+  const precision = createPrecisionLayer(env);
   try {
     // The credential guards run inside `buildCliDeps` (hence inside this
     // try): a ConfigError here is the typed "refusing to persist without

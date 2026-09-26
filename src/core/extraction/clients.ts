@@ -5,7 +5,12 @@
  * the MCP extract tool share ONE guard implementation. The environment is a
  * parameter, not a `process.env` read: the caller resolves its own env block
  * (CLI: `loadEnv()` + raw env vars; MCP: the server's config) and states its
- * intent, and this module refuses unsafe keyless runs.
+ * intent, and this module refuses unsafe keyless runs. The boundary rule that
+ * goes with it: the pure builders below never resolve an env block, and
+ * `buildPersistingExtractionClients` is the one place at the process boundary
+ * that does — for the extract LLM's own three variables, because `GraphragEnv`
+ * carries no extract-LLM block (its `rerank` field is the retrieve-rerank role,
+ * resolved through a different precedence).
  *
  * The SC rule (specs/mcp-tool-surface.md SC9, inherited from the CLI's
  * CR High #1 / #3 fixes): a run whose output is PERSISTED must never fall
@@ -22,6 +27,7 @@ import {
   ConfigError,
   DEFAULT_LLM_BASE_URL,
   DEFAULT_LLM_MODEL,
+  type GraphragEnv,
 } from "../../config.js";
 import {
   AnthropicLLMClient,
@@ -156,4 +162,47 @@ export function buildEmbedderClient(
     );
   }
   return new FakeEmbedder(env.dimensions);
+}
+
+/** Both clients a run that persists its extraction output needs. */
+export interface PersistingExtractionClients {
+  llm: LLMClient;
+  embedder: EmbeddingClient;
+}
+
+/**
+ * Build the client pair for a run whose extraction output is persisted.
+ *
+ * WHAT this one owns: the persisting intent on both guards plus the operator's
+ * environment as the single source of both credentials. A caller cannot share
+ * it unless both of those hold for it — the extract CLI's intent depends on its
+ * own flags (`--dry-run` and friends stay keyless-legal) and the summary
+ * stage's model client is not an `LLMClient`, so those call the two builders
+ * above with their own intent instead.
+ *
+ * WHY the order is fixed inside: the LLM guard is consulted first, so a keyless
+ * run reports the refusal an extraction cannot proceed without — the order the
+ * extract CLI has always reported to operators.
+ */
+export function buildPersistingExtractionClients(
+  env: GraphragEnv
+): PersistingExtractionClients {
+  const llm = buildLlmClient(
+    {
+      authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+      baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
+      model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
+    },
+    { extraction: true }
+  );
+  const embedder = buildEmbedderClient(
+    {
+      apiKey: env.embedApiKey,
+      baseUrl: env.embedBaseUrl,
+      model: env.embedModel,
+      dimensions: env.embedDimensions,
+    },
+    { persistsEmbeddings: true }
+  );
+  return { llm, embedder };
 }

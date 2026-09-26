@@ -48,6 +48,9 @@ export interface GraphWriter {
   close(): Promise<void>;
 }
 
+/** The public reason this graph arm did not run: a configured but silent peer. */
+export const GRAPH_UNAVAILABLE_CODE = "NEO4J_UNAVAILABLE" as const;
+
 /**
  * Neo4j is configured but not usable right now (down, refusing connections,
  * auth rejected, connection dropped mid-run).
@@ -59,7 +62,7 @@ export interface GraphWriter {
  * a CLI/projection concern would leak the projection into the server contract.
  */
 export class GraphUnavailableError extends Error {
-  readonly code = "NEO4J_UNAVAILABLE" as const;
+  readonly code = GRAPH_UNAVAILABLE_CODE;
   constructor(
     readonly uri: string,
     readonly cause: unknown

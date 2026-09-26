@@ -28,14 +28,9 @@
  */
 import { Pool } from "pg";
 
-import {
-  ConfigError,
-  NEO4J_URI_VAR,
-  loadEnv,
-  type Neo4jConfig,
-} from "../config.js";
+import { ConfigError, loadEnv, type Neo4jConfig } from "../config.js";
 import { createLogger, type Logger, writeStderr } from "../logging.js";
-import { connectNeo4j } from "../core/graph/neo4j-writer.js";
+import { openConfiguredNeo4j } from "../core/graph/neo4j-writer.js";
 import {
   SCAN_START,
   scanEntities,
@@ -307,28 +302,15 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     return await runCli(argv, {
       pool: pool as unknown as BackfillPool,
       logger,
-      connectGraph: () => openConfiguredNeo4j(neo4j),
+      connectGraph: () =>
+        openConfiguredNeo4j(
+          neo4j,
+          "to project into Neo4j; pass --reconcile or --dry-run for a Postgres-only run"
+        ),
     });
   } finally {
     await pool.end();
   }
-}
-
-/**
- * An absent block (no URI configured) is a ConfigError here, not a silent
- * skip: this CLI was invoked precisely to project, so "no target configured"
- * is an operator mistake — the skip-without-degraded rule belongs to the
- * retrieve arm, which was not asked to touch Neo4j.
- */
-async function openConfiguredNeo4j(
-  config: Neo4jConfig | undefined
-): Promise<GraphWriter> {
-  if (config === undefined) {
-    throw new ConfigError(
-      `${NEO4J_URI_VAR} is required to project into Neo4j; pass --reconcile or --dry-run for a Postgres-only run`
-    );
-  }
-  return connectNeo4j(config);
 }
 
 /** Top-level entry: wire real deps, exit with the CLI exit code. */

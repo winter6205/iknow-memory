@@ -1,5 +1,5 @@
 /**
- * Gold acceptance for the durable corpus index-job wire (T2).
+ * Gold acceptance for the durable corpus index-job wire.
  *
  * `submit_index_job` / `poll_index_job` are exercised through the REAL stdio
  * MCP process (`node dist/index.js`) against a REAL PostgreSQL 16 / pgvector,
@@ -32,6 +32,7 @@ import {
   computeSourceDocId,
 } from "../../src/tools/ingest.js";
 import { createPgIntegrationHarness } from "./pg-test-harness.js";
+import { egressEnv } from "./egress-env.js";
 
 // The real Zhipu embedding-3 config from .env.example: push embeds over the
 // wire, so the child must dial a real embedder whose returned dimension
@@ -179,7 +180,9 @@ async function pushDocument(
 }
 
 /** Spawn a real MCP child against this run's schema; keys pass through, never
- *  logged. A boot failure rejects the connect, so a bad config is loud. */
+ *  logged. A boot failure rejects the connect, so a bad config is loud. The
+ *  child dials the real embedding endpoint, which this box reaches through the
+ *  operator's egress proxy only, so the proxy variable names are inherited. */
 async function connectServer(name: string): Promise<McpHandle> {
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -200,6 +203,7 @@ async function connectServer(name: string): Promise<McpHandle> {
       GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED: "false",
       HOME: mkdtempSync(join(tmpdir(), "iknow-index-gold-home-")),
       PATH: process.env.PATH ?? "",
+      ...egressEnv(),
     },
     stderr: "pipe",
   });

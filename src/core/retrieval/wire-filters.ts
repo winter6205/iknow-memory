@@ -181,3 +181,46 @@ export function stripCommunityLevelFilter(
 ): Record<string, string> | undefined {
   return stripFilterKey(filters, COMMUNITY_LEVEL_FILTER_KEY);
 }
+
+/**
+ * The `filters` keys carrying the `sql` 档's expiry window
+ * (specs/search-mode-business-sql-contract.md §2.3, §5c): inclusive ISO
+ * `YYYY-MM-DD` bounds for the one permitted `contracts_expiring` template.
+ * Same routing contract as `search_mode`: the exact-match backends must
+ * never see them.
+ */
+export const SQL_WINDOW_START_FILTER_KEY = "sql_window_start";
+export const SQL_WINDOW_END_FILTER_KEY = "sql_window_end";
+
+/** The window handed to the business-query executor as bound parameters. */
+export interface SqlWindow {
+  windowStart: string;
+  windowEnd: string;
+}
+
+/**
+ * Read the window values without validating them. Validation is the
+ * executor's single authority (`isBoundWindow`): a malformed or absent
+ * window must fail there as `invalid_business_query` before a connection
+ * exists, so a second validator here could only drift from the first.
+ * Absent keys read as empty strings, which the executor refuses — there is
+ * no defaulted window on the wire path.
+ */
+export function readSqlWindowFilter(
+  filters: Record<string, string> | undefined
+): SqlWindow {
+  return {
+    windowStart: filters?.[SQL_WINDOW_START_FILTER_KEY] ?? "",
+    windowEnd: filters?.[SQL_WINDOW_END_FILTER_KEY] ?? "",
+  };
+}
+
+/** Strip both window keys from the exact-match filters. */
+export function stripSqlWindowFilter(
+  filters: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  return stripFilterKey(
+    stripFilterKey(filters, SQL_WINDOW_START_FILTER_KEY),
+    SQL_WINDOW_END_FILTER_KEY
+  );
+}

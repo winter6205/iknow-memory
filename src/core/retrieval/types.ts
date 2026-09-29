@@ -2,11 +2,13 @@
  * Retrieval layer types — bounded context for the graph-arm + RRF fusion
  * pipeline (spec-3, p0-integration T2).
  *
- * No value imports (this file stays a runtime leaf; the only edge is the
- * type-only `EntityType` from extraction, erased at compile time). Errors
+ * No value imports (this file stays a runtime leaf; the only edges are the
+ * type-only `EntityType` from extraction and the type-only `DatabaseRow`
+ * from business-query, both erased at compile time). Errors
  * follow the *Error suffix convention from src/core/errors.ts.
  */
 import type { EntityType } from "../extraction/entity-type.js";
+import type { DatabaseRow } from "../business-query/sql-query-types.js";
 
 /**
  * A retrieval arm the fusion layer understands.
@@ -718,6 +720,15 @@ export interface RetrieveOutputEnvelope {
     score: number;
     metadata?: RetrieveHitMetadata;
   }>;
+  /**
+   * Business-ledger rows (specs/search-mode-business-sql-contract.md §8.0):
+   * a SIBLING key, never a member of `chunks[]`. A row is not a slice of a
+   * frozen unit — it has no document `source_ref` and no validity interval,
+   * so it carries its own identity (`record_key`) and its own time
+   * (`queried_at`) beside the passages instead of borrowing theirs.
+   * Absent (never empty) unless the `sql` 档 answered.
+   */
+  database_rows?: readonly DatabaseRow[];
   /** Optional: true only when the central capability decision finds reasons. */
   degraded?: boolean;
   /**

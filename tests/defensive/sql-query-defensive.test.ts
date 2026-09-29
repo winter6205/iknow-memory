@@ -117,7 +117,7 @@ describe("normal", () => {
       params: PARAMS,
     });
     expect(result.rows).toHaveLength(1);
-    expect(result.rows[0]?.recordKey).toBe("C-2291");
+    expect(result.rows[0]?.record_key).toEqual({ contract_id: "C-2291" });
   });
 });
 

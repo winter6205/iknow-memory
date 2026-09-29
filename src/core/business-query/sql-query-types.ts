@@ -148,16 +148,22 @@ export type SqlRow = Readonly<Record<string, unknown>>;
  * not a member: the envelope's chunk shape requires a document `source_ref`
  * and a validity interval, and a ledger row has neither — fabricating them
  * would invent the identity the citation then claims.
+ *
+ * The field names are the spec §8 WIRE names (snake_case), not an internal
+ * spelling: this object is serialized into the envelope verbatim, and fin
+ * consumes exactly `{source, record_key, queried_at, fields, summary}`.
+ * One shape, one authority — there is no second row type to translate to.
  */
 export interface DatabaseRow {
   /** Which permitted view answered, so the read scope is auditable from the
    *  citation alone. */
   source: string;
-  /** The row's own identity, independent of its position in any text. */
-  recordKey: string;
+  /** The row's own identity as a named-key mapping (`{"contract_id":
+   *  "C-2291"}`), independent of its position in any text. */
+  record_key: Readonly<Record<string, string>>;
   /** When the database answered. A ledger changes; a value with no time is a
    *  claim about a moving target. */
-  queriedAt: string;
+  queried_at: string;
   /** The values actually returned this round — the model may not invent one. */
   fields: Readonly<Record<string, unknown>>;
   /** One line for display; quotable but not synthesizable. */

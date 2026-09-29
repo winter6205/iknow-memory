@@ -323,7 +323,9 @@ describe("a normal query", () => {
 
     const row = result.rows[0]!;
     expect(row.source).toBe("ledger_ro.contract_expiry");
-    expect(row.recordKey).toBe("C-2291");
+    // Spec §8 wire shape: the row's identity is a named-key mapping, so a
+    // citation traces to a record without inventing a document locator.
+    expect(row.record_key).toEqual({ contract_id: "C-2291" });
     // The values are the ones the fixture DDL writes, not what a model said.
     expect(row.fields).toEqual({
       title: "Warehouse logistics master agreement",
@@ -334,7 +336,7 @@ describe("a normal query", () => {
       currency: "USD",
       owner_dept: "operations",
     });
-    expect(row.queriedAt).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+    expect(row.queried_at).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
     expect(row.summary).toContain("C-2291");
     expect(row.summary).toContain("Northwind Logistics");
   });

@@ -57,3 +57,12 @@ export const INVALID_BUSINESS_QUERY = "invalid_business_query" as const;
  * seat, and a second spelling would be a parallel scheme for one state.
  */
 export const RETRIEVE_UNAVAILABLE = "retrieve_unavailable" as const;
+
+/**
+ * No business ledger is provisioned on this instance. After the A2 wire-in
+ * this token means *not provisioned* ONLY — never "refused" (spec §7:
+ * collapsing the two is the empty-vs-error conflation the port forbids).
+ * It shares its name verbatim with fin's `named_failures.REAL_DB_NOT_WIRED`
+ * so the host maps the code without a second translation table.
+ */
+export const REAL_DB_NOT_WIRED = "real_db_not_wired" as const;

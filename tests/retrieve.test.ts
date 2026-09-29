@@ -341,11 +341,12 @@ describe("createRetrieveHandler", () => {
       expect(error.message).toContain(INVALID_SEARCH_MODE_REASON);
     });
 
-    it("lexical, global and sql each run their own arm: not-ready and unwired type out", async () => {
+    it("lexical, global and sql each run their own arm: not-ready and not-provisioned type out", async () => {
       const baseline = await handler({ query: "anything" });
-      // T4 opened the `sql` row: the closed 档 whose SQL path does not exist
-      // yet is the typed `real_db_not_wired` refusal — never a provisional
-      // graph answer over chunks (spec SC5: not fake SQL over document chunks).
+      // T7 opened the `sql` row: with no ledger provisioned on this
+      // instance the exit is the TYPED, TOKENED `real_db_not_wired`
+      // refusal (spec §7: after A2 the token means *not provisioned*
+      // only) — never a provisional graph answer over chunks (spec SC5).
       let thrownSql: unknown;
       try {
         await handler({ query: "anything", filters: { search_mode: "sql" } });
@@ -353,6 +354,12 @@ describe("createRetrieveHandler", () => {
         thrownSql = err;
       }
       expect(thrownSql).toBeInstanceOf(GraphragError);
+      // Stronger than the pre-A2 prose pin: the refusal declares the
+      // token, which is what makes it serialize as a structured
+      // {"error": …} on the wire (spec §7.1).
+      expect((thrownSql as GraphragError).failureToken).toBe(
+        REAL_DB_NOT_WIRED_REASON
+      );
       expect((thrownSql as GraphragError).message).toContain(
         REAL_DB_NOT_WIRED_REASON
       );

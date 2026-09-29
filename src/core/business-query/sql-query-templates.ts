@@ -80,6 +80,17 @@ export interface ResolvedTemplate {
 }
 
 /**
+ * The read surface this build can answer: the source view of every
+ * permitted template. The provisioning layer derives the authorized
+ * scope set from here, so "what the instance may answer" and "what the
+ * executor can run" cannot drift into two lists.
+ */
+export const BUSINESS_LEDGER_AUTHORIZED_SCOPES: readonly string[] =
+  Object.values(BUSINESS_QUERY_TEMPLATE_REGISTRY).map(
+    (definition) => definition.source
+  );
+
+/**
  * The statement and projection for a recognized name, or undefined for
  * anything else. One lookup, so the allowlist cannot admit a name the
  * executor then fails to find a statement for (or the reverse).

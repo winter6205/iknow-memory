@@ -117,6 +117,49 @@ const C_2291 = {
 
 const WINDOW = { windowStart: "2026-01-01", windowEnd: "2026-03-31", limit: 20 };
 
+describe("driver date normalization", () => {
+  /**
+   * `pg` parses a `date` column (1082) and the `timestamp without time zone`
+   * the view derives `notice_by` as (1114) into a Date at LOCAL midnight, so
+   * on a server east of Greenwich `toISOString()` renders the previous
+   * calendar day. That would put a wrong date in a citation, which is the
+   * one thing the record_key/fields evidence contract exists to prevent.
+   */
+  function inTimeZone<T>(zone: string, run: () => T): T {
+    const previous = process.env.TZ;
+    process.env.TZ = zone;
+    try {
+      return run();
+    } finally {
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
+    }
+  }
+
+  /** The Dates a driver hands back for the seeded contract's two dates. */
+  function driverDates(): Record<string, Date> {
+    return {
+      expiry_date: new Date(2026, 2, 14), // 2026-03-14 local midnight
+      notice_by: new Date(2026, 1, 12), // 2026-02-12 local midnight
+    };
+  }
+
+  for (const zone of ["UTC", "Asia/Shanghai", "America/Los_Angeles"]) {
+    it(`cites the ledger's calendar day, not the UTC day, in ${zone}`, async () => {
+      // The row is built INSIDE the zone, because that is where the driver
+      // would parse it: `pg` reads 2026-03-14 into a Date at local midnight
+      // of whatever zone the server runs in. Building the Date in a
+      // different zone would test the harness, not the executor.
+      const result = await inTimeZone(zone, async () => {
+        const { executor } = executorWith([{ ...C_2291, ...driverDates() }]);
+        return executor.query({ template: "contracts_expiring", params: WINDOW });
+      });
+      expect(result.rows[0]?.fields.expiry_date).toBe("2026-03-14");
+      expect(result.rows[0]?.fields.notice_by).toBe("2026-02-12");
+    });
+  }
+});
+
 describe("module independence and the lazy driver", () => {
   const source = (name: string): string =>
     readFileSync(

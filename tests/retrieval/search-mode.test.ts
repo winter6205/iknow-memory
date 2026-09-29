@@ -11,8 +11,9 @@
  *      zero the lexical arm);
  *   3. the dispatch table exists for all four modes: `graph` is the
  *      graph-priority assembler, `lexical` the child→parent arm, `global`
- *      the report-first arm, `sql` the typed unwired refusal (the closed 档
- *      whose product fact is `real_db_not_wired`, never a provisional
+ *      the report-first arm, `sql` the business-SQL arm (T7: rows answer as
+ *      the `database_rows` envelope sibling, and an unprovisioned ledger is
+ *      the tokened `real_db_not_wired` refusal, never a provisional
  *      `graph` answer).
  */
 import { describe, it, expect } from "vitest";
@@ -27,11 +28,14 @@ import {
   parseSearchMode,
   stripSearchModeFilter,
   invalidSearchModeMessage,
-  realDbNotWiredMessage,
   C_DROP_WINDOWS_FILTER_KEY,
   cDropWindowsEnabled,
   stripCDropWindowsFilter,
 } from "../../src/core/retrieval/search-mode.js";
+import {
+  businessLedgerNotProvisionedMessage,
+  modeDBusinessSqlArm,
+} from "../../src/core/retrieval/mode-d-arm.js";
 import { assembleRetrievalResult } from "../../src/core/retrieval/index.js";
 import { modeAParentWindowArm } from "../../src/core/retrieval/mode-a-arm.js";
 import { modeCReportFirstArm } from "../../src/core/retrieval/mode-c-arm.js";
@@ -197,9 +201,11 @@ describe("SEARCH_MODE_ARMS dispatch table", () => {
     expect(SEARCH_MODE_ARMS.global).not.toBe(assembleRetrievalResult);
   });
 
-  it("routes sql to the typed unwired refusal (not a provisional graph answer)", () => {
-    // `sql` is a closed 档 whose product fact is 真库未接 — answering it
-    // through the graph assembler would pretend the SQL path exists.
+  it("routes sql to the business-SQL arm (not a provisional graph answer)", () => {
+    // T7 replaced the pre-A2 refusal stub with the real arm: a
+    // provisional graph answer would pretend the SQL path runs over
+    // document chunks, which the spec forbids.
+    expect(SEARCH_MODE_ARMS.sql).toBe(modeDBusinessSqlArm);
     expect(SEARCH_MODE_ARMS.sql).not.toBe(assembleRetrievalResult);
   });
 
@@ -208,16 +214,16 @@ describe("SEARCH_MODE_ARMS dispatch table", () => {
   });
 });
 
-describe("realDbNotWiredMessage", () => {
+describe("businessLedgerNotProvisionedMessage", () => {
   it("carries the stable token, the routing key and the 档 token", () => {
-    const message = realDbNotWiredMessage();
+    const message = businessLedgerNotProvisionedMessage();
     expect(message).toContain(REAL_DB_NOT_WIRED_REASON);
     expect(message).toContain(SEARCH_MODE_FILTER_KEY);
     expect(message).toContain("sql");
   });
 
   it("names the token the document tables stay on", () => {
-    expect(realDbNotWiredMessage()).toContain("graph");
+    expect(businessLedgerNotProvisionedMessage()).toContain("graph");
   });
 });
 

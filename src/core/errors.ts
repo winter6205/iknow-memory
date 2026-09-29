@@ -9,6 +9,7 @@
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "./types.js";
 import {
   INVALID_BUSINESS_QUERY,
+  REAL_DB_NOT_WIRED,
   RETRIEVE_UNAVAILABLE,
   SQL_AUTHORIZATION_UNVERIFIED,
   SQL_NO_MATCHING_ROWS,
@@ -41,7 +42,8 @@ export type GraphragFailureToken =
   | typeof SQL_AUTHORIZATION_UNVERIFIED
   | typeof SQL_NO_MATCHING_ROWS
   | typeof INVALID_BUSINESS_QUERY
-  | typeof RETRIEVE_UNAVAILABLE;
+  | typeof RETRIEVE_UNAVAILABLE
+  | typeof REAL_DB_NOT_WIRED;
 
 export class GraphragError extends Error {
   constructor(

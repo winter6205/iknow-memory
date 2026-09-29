@@ -151,12 +151,16 @@ function projectRow(
     const value = row[column];
     if (value !== undefined) fields[column] = isoDate(value);
   }
+  const keyValue = String(recordKey);
   return {
     source,
-    recordKey: String(recordKey),
-    queriedAt,
+    // The identity keeps its column name (spec §8): `{"contract_id":
+    // "C-2291"}` traces to a record, and the citation never has to guess
+    // which column was the key.
+    record_key: { [recordKeyColumn]: keyValue },
+    queried_at: queriedAt,
     fields,
-    summary: summaryOf(String(recordKey), fields),
+    summary: summaryOf(keyValue, fields),
   };
 }
 

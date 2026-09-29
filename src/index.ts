@@ -42,6 +42,9 @@ import {
   type IndexJobReadPort,
 } from "./tools/index-job.js";
 import { retrieveTool, type RetrieveDeps } from "./tools/retrieve.js";
+import { BusinessQueryExecutor } from "./core/business-query/sql-query-executor.js";
+import { BUSINESS_LEDGER_AUTHORIZED_SCOPES } from "./core/business-query/sql-query-templates.js";
+import type { BusinessLedgerConfig } from "./core/business-query/sql-query-types.js";
 import { readSourceTool } from "./tools/read_source.js";
 import {
   extractTool,
@@ -165,6 +168,13 @@ interface ServerDeps {
       candidates: readonly { id: string; content: string }[]
     ): Promise<readonly string[]>;
   };
+  /**
+   * Business ledger provisioning for the `sql` 档, built only when
+   * `FIN_BUSINESS_LEDGER_URL` is configured. Absent is the provisioning
+   * fact the arm reads as the structured `real_db_not_wired` (not
+   * provisioned) exit — see specs/search-mode-business-sql-contract.md §7.
+   */
+  businessLedger?: BusinessLedgerConfig;
 }
 
 /**
@@ -203,6 +213,7 @@ export function buildRetrieveDeps(
     | "retrieval"
     | "graphRanker"
     | "reranker"
+    | "businessLedger"
   >,
   debug: boolean
 ): RetrieveDeps {
@@ -223,6 +234,12 @@ export function buildRetrieveDeps(
       ? { graphRanker: deps.graphRanker }
       : {}),
     ...(deps.reranker !== undefined ? { reranker: deps.reranker } : {}),
+    // The executor opens no pool until a query actually dials the ledger
+    // (lazy `pg` discipline), so building it here costs a non-sql server
+    // nothing. Absent key = not provisioned = the typed sql exit.
+    ...(deps.businessLedger !== undefined
+      ? { businessQuery: new BusinessQueryExecutor(deps.businessLedger) }
+      : {}),
     debug,
   };
 }
@@ -411,6 +428,17 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
       ? { graphRanker: createNeo4jPprRanker(env.neo4j) }
       : {}),
     ...(reranker !== undefined ? { reranker } : {}),
+    ...(env.businessLedgerUrl !== undefined
+      ? {
+          businessLedger: {
+            connectionString: env.businessLedgerUrl,
+            // Scopes are what this build's permitted templates can answer,
+            // never what the request claims (spec §5.2 v1: there is no
+            // scope field on the call to forge).
+            authorizedScopes: BUSINESS_LEDGER_AUTHORIZED_SCOPES,
+          },
+        }
+      : {}),
   };
 }
 

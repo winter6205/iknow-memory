@@ -35,9 +35,10 @@ import {
 } from "./index.js";
 import { modeAParentWindowArm } from "./mode-a-arm.js";
 import { modeCReportFirstArm } from "./mode-c-arm.js";
+import { modeDBusinessSqlArm } from "./mode-d-arm.js";
 import { SEARCH_MODE_FILTER_KEY } from "./wire-filters.js";
+import { REAL_DB_NOT_WIRED } from "../business-query/sql-failure-tokens.js";
 import type { RetrieveOutputEnvelope } from "./types.js";
-import { GraphragError } from "../errors.js";
 
 // Re-exported so wire-side callers (src/tools/retrieve.ts, tests) keep one
 // import point; the constants live in the leaf module for the cyclic-TDZ
@@ -49,6 +50,11 @@ export {
   cDropWindowsEnabled,
   stripSearchModeFilter,
   stripCDropWindowsFilter,
+  SQL_WINDOW_START_FILTER_KEY,
+  SQL_WINDOW_END_FILTER_KEY,
+  readSqlWindowFilter,
+  stripSqlWindowFilter,
+  type SqlWindow,
 } from "./wire-filters.js";
 
 /** The closed set from specs/search-mode-graph-global.md; never widen it silently. */
@@ -63,15 +69,17 @@ export const DEFAULT_SEARCH_MODE: SearchMode = "graph";
 export const INVALID_SEARCH_MODE_REASON = "invalid_search_mode";
 
 /**
- * Stable host-mappable token for the `sql` 档, aligned with fin
- * `named_failures.REAL_DB_NOT_WIRED` (specs/search-mode-retrieve.md Open
- * Question: codes shared with fin `named_failures`). It lives HERE, beside
- * the other wire-side reason token, not beside `COMMUNITY_SUMMARY_INDEX_
- * FAILURE` in core types: that constant is a persisted `failure_code`
- * column value written by the community-summary job, while this one is a
- * routing-time refusal that never touches storage.
+ * Stable host-mappable token for the `sql` 档's not-provisioned exit.
+ * After A2 (T7) it means *not provisioned* only — never "refused"
+ * (specs/search-mode-business-sql-contract.md §7). The literal lives in
+ * the business-query leaf (`sql-failure-tokens.ts`), which owns the SQL
+ * failure vocabulary; this alias keeps the wire-side import point stable
+ * and aligned with fin `named_failures.REAL_DB_NOT_WIRED`. Unlike
+ * `COMMUNITY_SUMMARY_INDEX_FAILURE` in core types (a persisted
+ * `failure_code` column value), this token is a routing-time refusal that
+ * never touches storage.
  */
-export const REAL_DB_NOT_WIRED_REASON = "real_db_not_wired";
+export const REAL_DB_NOT_WIRED_REASON = REAL_DB_NOT_WIRED;
 
 export type SearchModeResolution =
   | { kind: "resolved"; mode: SearchMode }
@@ -108,15 +116,6 @@ export function invalidSearchModeMessage(value: string): string {
   );
 }
 
-/** Same constant pattern as `invalidSearchModeMessage`, for the `sql` 档's refusal. */
-export function realDbNotWiredMessage(): string {
-  return (
-    `retrieve ${SEARCH_MODE_FILTER_KEY}=sql is not wired: ` +
-    `${REAL_DB_NOT_WIRED_REASON} (document tables stay on 档 graph until a ` +
-    `business SQL path exists)`
-  );
-}
-
 /**
  * Routing controls the dispatcher resolves from `filters` before any arm
  * runs, so an arm never re-reads a control key out of the exact-match map
@@ -146,29 +145,15 @@ export type SearchModeArm = (
 ) => Promise<RetrieveOutputEnvelope>;
 
 /**
- * The `sql` 档 (plans/search-mode-retrieve.md T4, spec assumption 5 + SC5):
- * the business-SQL path is a plan slot, not implemented, so the honest
- * answer is a typed refusal — reading `args`/`deps` at all would mean
- * running SQL (fake or real) over chunks, exactly what the spec forbids;
- * document tables stay on `graph`. Same exit chain as T1's invalid mode and
- * T3's not-ready
- * gate: throw a `GraphragError` whose message carries the stable fin-pinned
- * token, because the MCP adapter serializes only thrown Error messages
- * into the `isError` result. Code `INVALID_INPUT` mirrors fin's
- * routing-time 400 for `real_db_not_wired` (the run never starts — no
- * storage was touched, so it is not a `STORAGE_ERROR`).
- */
-async function modeDNotWiredArm(): Promise<RetrieveOutputEnvelope> {
-  throw new GraphragError(realDbNotWiredMessage(), "INVALID_INPUT");
-}
-
-/**
  * specs/search-mode-retrieve.md confirms each 档 gets its own arm: T2 opened
  * the lexical child→parent arm (mode-a-arm.ts, ADR-0060), T3 opened the
  * report-first arm (mode-c-arm.ts, ADR-0070), each replacing exactly ONE row
  * of this table — the handler parsing, stripping and envelope stay as they
- * are. T4 opened the `sql` row below. Arm identifiers keep their plan-side
- * names; renaming them is a separate step from the wire contract.
+ * are. T7 replaced the `sql` stub with the business-SQL arm
+ * (mode-d-arm.ts): one named template, rows as the `database_rows`
+ * sibling, and the tokened not-provisioned exit. Arm identifiers keep
+ * their plan-side names; renaming them is a separate step from the wire
+ * contract.
  *
  * The keys are the wire tokens of specs/search-mode-graph-global.md — the
  * same `SEARCH_MODES` values `parseSearchMode` resolves, so a value can
@@ -181,6 +166,6 @@ export const SEARCH_MODE_ARMS: Readonly<Record<SearchMode, SearchModeArm>> = {
   graph: assembleRetrievalResult,
   // T3: report-first community summaries, ES ∥ report vectors (ADR-0070).
   global: modeCReportFirstArm,
-  // T4: typed 真库未接 refusal, never a provisional graph answer over chunks.
-  sql: modeDNotWiredArm,
+  // T7: the business-SQL arm, never a provisional graph answer over chunks.
+  sql: modeDBusinessSqlArm,
 };

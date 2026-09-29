@@ -73,6 +73,8 @@ import type {
   StorageBackend,
 } from "../types.js";
 import type { EntityType } from "../extraction/entity-type.js";
+import type { SqlWindow } from "./wire-filters.js";
+import type { BusinessQueryExecutor } from "../business-query/sql-query-executor.js";
 import {
   supportsNeighborChunks,
   supportsProjectionDrain,
@@ -128,6 +130,14 @@ export interface AssembleArgs {
    * chunk filter. Absent → the default cap, so omit ≡ 2 on every path.
    */
   communityLevel?: number;
+  /**
+   * Resolved `filters.sql_window_start` / `sql_window_end` expiry bounds
+   * (specs/search-mode-business-sql-contract.md §2.3). Routing control
+   * like `community_level`: only the `sql` 档 arm reads it, and it reaches
+   * the database as bound parameters or not at all. Absent → the executor
+   * refuses `invalid_business_query`; there is no defaulted window.
+   */
+  sqlWindow?: SqlWindow;
 }
 
 /**
@@ -179,6 +189,14 @@ export interface AssembleDeps {
   capabilityObservations?: readonly CapabilityObservation[];
   /** Optional read-only projection outbox wait seam. */
   projectionDrain?: ProjectionDrainWaiter;
+  /**
+   * The business-ledger executor, built only when this instance is
+   * provisioned with a ledger DSN (spec §5.2: the reader role comes from
+   * the instance's own configuration, never from the request). Absent is
+   * the provisioning fact the `sql` 档 reads as the structured
+   * `real_db_not_wired` exit — skip, not a degraded answer.
+   */
+  businessQuery?: BusinessQueryExecutor;
 }
 
 interface AssemblyResult {

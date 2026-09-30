@@ -105,12 +105,14 @@ function storageProbe(target: StorageBackend): {
 
 /**
  * The frozen ingress envelope (fin enterprise-evidence-contract.md §4.4):
- * `database_rows` is an OBJECT `{schema, rows, result_count}` — the bare
- * array this arm shipped pre-envelope is refused by fin ingress as
- * `database-rows-envelope-wrong-type`.
+ * `database_rows` is an OBJECT `{schema, schema_version, rows,
+ * result_count}` — the bare array this arm shipped pre-envelope is refused
+ * by fin ingress as `database-rows-envelope-wrong-type`. The four keys are
+ * the whole contract: fin ingress refuses an unknown OR a missing one.
  */
 interface RetrieveRowsEnvelopeBody {
   schema: string;
+  schema_version: number;
   rows: Array<Record<string, unknown>>;
   result_count: number;
 }
@@ -146,7 +148,20 @@ describe("mode-d arm — provisioned ledger", () => {
     expect(body.chunks).toEqual([]);
     // The sibling key is the envelope OBJECT, never a bare array (§4.4).
     expect(Array.isArray(body.database_rows)).toBe(false);
-    expect(body.database_rows!.schema).toBe("fin.evidence.retrieve_rows.v1");
+    // The token is the stable NAME of the shape, unsuffixed: its version
+    // travels as the integer `schema_version` beside it (§2.1).
+    expect(body.database_rows!.schema).toBe("fin.evidence.retrieve_rows");
+    expect(body.database_rows!.schema_version).toBe(1);
+    // Exactly four keys, no more and no fewer: fin ingress refuses an
+    // unknown OR a missing key, so an extra field is a refusal, not an
+    // extension. A row must NOT re-declare `schema` (§4.4 places the pair
+    // on the envelope only).
+    expect(Object.keys(body.database_rows!).sort()).toEqual([
+      "result_count",
+      "rows",
+      "schema",
+      "schema_version",
+    ]);
     expect(body.database_rows!.rows).toHaveLength(1);
     expect(body.database_rows!.result_count).toBe(1);
     const row = body.database_rows!.rows[0]!;
@@ -155,7 +170,10 @@ describe("mode-d arm — provisioned ledger", () => {
     expect(row).toEqual({
       source: "ledger_ro.contract_expiry",
       record_key: { contract_id: "C-2291" },
-      queried_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/),
+      // Whole seconds. The pre-tightening `[\d:.]+` matched `12:22:14.741`
+      // as happily as `12:22:14`, so it could not catch a regression to a
+      // fractional stamp — which the evidence contract refuses outright.
+      queried_at: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/),
       fields: {
         title: "Warehouse logistics master agreement",
         counterparty: "Northwind Logistics",
@@ -192,7 +210,7 @@ describe("mode-d arm — provisioned ledger", () => {
   it("carries the 20-row cap through the envelope: 21 fetched rows ship as 20 with result_count 20", async () => {
     // Pins the CURRENT shipped semantics (review M7 deferral): the executor
     // marks the page truncated internally, but the frozen
-    // `fin.evidence.retrieve_rows.v1` envelope {schema, rows,
+    // `fin.evidence.retrieve_rows` envelope {schema, schema_version, rows,
     // result_count} has no truncation field, so a truncated page and an
     // exactly-full page are byte-identical on the wire. Making truncation
     // observable (§6) requires a fin-side envelope revision; until then

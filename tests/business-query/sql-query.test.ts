@@ -350,7 +350,11 @@ describe("a normal query", () => {
       currency: "USD",
       owner_dept: "operations",
     });
-    expect(row.queried_at).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
+    // Whole seconds. The pre-tightening `[\d:.]+` matched `12:22:14.741` as
+    // happily as `12:22:14`, so it could not catch a regression to a
+    // fractional stamp — which the evidence contract refuses outright and
+    // fin is forbidden from normalizing.
+    expect(row.queried_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
     expect(row.summary).toContain("C-2291");
     expect(row.summary).toContain("Northwind Logistics");
   });

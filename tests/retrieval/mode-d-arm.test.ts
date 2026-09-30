@@ -103,9 +103,21 @@ function storageProbe(target: StorageBackend): {
   return { storage, touched };
 }
 
+/**
+ * The frozen ingress envelope (fin enterprise-evidence-contract.md §4.4):
+ * `database_rows` is an OBJECT `{schema, rows, result_count}` — the bare
+ * array this arm shipped pre-envelope is refused by fin ingress as
+ * `database-rows-envelope-wrong-type`.
+ */
+interface RetrieveRowsEnvelopeBody {
+  schema: string;
+  rows: Array<Record<string, unknown>>;
+  result_count: number;
+}
+
 function parseBody(result: ToolResult): {
   chunks: unknown[];
-  database_rows?: Array<Record<string, unknown>>;
+  database_rows?: RetrieveRowsEnvelopeBody;
 } {
   const text = result.content[0]?.text;
   if (typeof text !== "string") {
@@ -132,8 +144,12 @@ describe("mode-d arm — provisioned ledger", () => {
       await handler({ query: "which contracts expire", filters: WINDOW_FILTERS })
     );
     expect(body.chunks).toEqual([]);
-    expect(body.database_rows).toHaveLength(1);
-    const row = body.database_rows![0]!;
+    // The sibling key is the envelope OBJECT, never a bare array (§4.4).
+    expect(Array.isArray(body.database_rows)).toBe(false);
+    expect(body.database_rows!.schema).toBe("fin.evidence.retrieve_rows.v1");
+    expect(body.database_rows!.rows).toHaveLength(1);
+    expect(body.database_rows!.result_count).toBe(1);
+    const row = body.database_rows!.rows[0]!;
     // Spec §8 shape, snake_case on the wire: the row carries its own
     // identity and its own time, not a fabricated document locator.
     expect(row).toEqual({

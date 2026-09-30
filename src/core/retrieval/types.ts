@@ -710,6 +710,20 @@ export interface GraphArmStorage {
   >;
 }
 
+/**
+ * The frozen retrieve-ingress envelope for ledger rows (fin
+ * enterprise-evidence-contract.md §4.4, `fin.evidence.retrieve_rows.v1`):
+ * `database_rows` names this OBJECT, never the bare array it wraps. A
+ * bare-array producer shape is refused by fin ingress as
+ * `database-rows-envelope-wrong-type`. `result_count` is `rows.length`
+ * for the leg.
+ */
+export interface RetrieveRowsEnvelope {
+  schema: "fin.evidence.retrieve_rows.v1";
+  rows: readonly DatabaseRow[];
+  result_count: number;
+}
+
 /** Output envelope — the retrieve tool wire shape. */
 export interface RetrieveOutputEnvelope {
   chunks: Array<{
@@ -721,14 +735,16 @@ export interface RetrieveOutputEnvelope {
     metadata?: RetrieveHitMetadata;
   }>;
   /**
-   * Business-ledger rows (specs/search-mode-business-sql-contract.md §8.0):
-   * a SIBLING key, never a member of `chunks[]`. A row is not a slice of a
-   * frozen unit — it has no document `source_ref` and no validity interval,
-   * so it carries its own identity (`record_key`) and its own time
-   * (`queried_at`) beside the passages instead of borrowing theirs.
-   * Absent (never empty) unless the `sql` 档 answered.
+   * Business-ledger rows (specs/search-mode-business-sql-contract.md §8.0;
+   * envelope shape frozen by fin enterprise-evidence-contract.md §4.4):
+   * a SIBLING key holding the `fin.evidence.retrieve_rows.v1` envelope
+   * object, never a member of `chunks[]` and never a bare array. A row is
+   * not a slice of a frozen unit — it has no document `source_ref` and no
+   * validity interval, so it carries its own identity (`record_key`) and
+   * its own time (`queried_at`) beside the passages instead of borrowing
+   * theirs. Absent (never empty) unless the `sql` 档 answered.
    */
-  database_rows?: readonly DatabaseRow[];
+  database_rows?: RetrieveRowsEnvelope;
   /** Optional: true only when the central capability decision finds reasons. */
   degraded?: boolean;
   /**

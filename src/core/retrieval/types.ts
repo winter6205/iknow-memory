@@ -711,15 +711,35 @@ export interface GraphArmStorage {
 }
 
 /**
+ * The retrieve-ingress envelope version this producer emits (fin
+ * enterprise-evidence-contract.md §2.1: every object carrying `schema`
+ * also carries an integer `schema_version`; the token is the stable
+ * NAME of the shape and the integer is its version).
+ *
+ * A named constant, not a bare literal, so the wire value and the
+ * `schema_version` field type in {@link RetrieveRowsEnvelope} cannot
+ * drift apart — the two are derived from this one declaration.
+ */
+export const RETRIEVE_ROWS_SCHEMA_VERSION = 1;
+
+/**
  * The frozen retrieve-ingress envelope for ledger rows (fin
- * enterprise-evidence-contract.md §4.4, `fin.evidence.retrieve_rows.v1`):
+ * enterprise-evidence-contract.md §4.4, `fin.evidence.retrieve_rows`):
  * `database_rows` names this OBJECT, never the bare array it wraps. A
  * bare-array producer shape is refused by fin ingress as
  * `database-rows-envelope-wrong-type`. `result_count` is `rows.length`
  * for the leg.
+ *
+ * The token carries NO version suffix: fin ingress admits exactly the
+ * four keys `{schema, schema_version, rows, result_count}` and refuses
+ * an unknown or missing one, so a `.v1`-suffixed token and a missing
+ * `schema_version` are both refused. §4.4 places the `schema` /
+ * `schema_version` pair on the ENVELOPE only — a row in `rows[]` does
+ * not re-declare the format the envelope already names.
  */
 export interface RetrieveRowsEnvelope {
-  schema: "fin.evidence.retrieve_rows.v1";
+  schema: "fin.evidence.retrieve_rows";
+  schema_version: typeof RETRIEVE_ROWS_SCHEMA_VERSION;
   rows: readonly DatabaseRow[];
   result_count: number;
 }
@@ -737,7 +757,7 @@ export interface RetrieveOutputEnvelope {
   /**
    * Business-ledger rows (specs/search-mode-business-sql-contract.md §8.0;
    * envelope shape frozen by fin enterprise-evidence-contract.md §4.4):
-   * a SIBLING key holding the `fin.evidence.retrieve_rows.v1` envelope
+   * a SIBLING key holding the `fin.evidence.retrieve_rows` envelope
    * object, never a member of `chunks[]` and never a bare array. A row is
    * not a slice of a frozen unit — it has no document `source_ref` and no
    * validity interval, so it carries its own identity (`record_key`) and

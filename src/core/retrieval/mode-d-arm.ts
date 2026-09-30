@@ -31,6 +31,7 @@ import {
   SEARCH_MODE_FILTER_KEY,
   readSqlWindowFilter,
 } from "./wire-filters.js";
+import { RETRIEVE_ROWS_SCHEMA_VERSION } from "./types.js";
 import { GraphragError } from "../errors.js";
 import { REAL_DB_NOT_WIRED } from "../business-query/sql-failure-tokens.js";
 import type { BusinessQueryTemplate } from "../business-query/sql-query-types.js";
@@ -84,15 +85,20 @@ export const modeDBusinessSqlArm: SearchModeArm = async function assembleBusines
   // Empty `chunks` is honest here, not a degraded document answer: a
   // successful ledger read cites rows, and no document passage was or
   // could be retrieved on this route. The rows travel in the frozen
-  // `fin.evidence.retrieve_rows.v1` envelope OBJECT (fin contract §4.4):
+  // `fin.evidence.retrieve_rows` envelope OBJECT (fin contract §4.4):
   // a bare array under this key is refused by fin ingress as
   // `database-rows-envelope-wrong-type`. `result_count` is this leg's
   // `rows.length`.
   //
+  // The object carries EXACTLY `{schema, schema_version, rows,
+  // result_count}`: fin ingress refuses an unknown or missing key, so a
+  // fifth field is a refusal, not an extension. The version travels as the
+  // integer `schema_version`, not as a token suffix (§2.1).
+  //
   // DEFERRED (review M7): the executor's `truncated` flag is observable
-  // inside this module but the E1-frozen envelope {schema, rows,
-  // result_count} has no field to carry it, so a truncated page and an
-  // exactly-full 20-row page are identical on the wire — §6's truncation
+  // inside this module but the frozen envelope {schema, schema_version,
+  // rows, result_count} has no field to carry it, so a truncated page and
+  // an exactly-full 20-row page are identical on the wire — §6's truncation
   // observability is NOT met by this envelope. Changing the envelope is a
   // fin-side revision; until then the shipped semantics are pinned by
   // tests/retrieval/mode-d-arm.test.ts ("carries the 20-row cap through
@@ -100,7 +106,8 @@ export const modeDBusinessSqlArm: SearchModeArm = async function assembleBusines
   return {
     chunks: [],
     database_rows: {
-      schema: "fin.evidence.retrieve_rows.v1",
+      schema: "fin.evidence.retrieve_rows",
+      schema_version: RETRIEVE_ROWS_SCHEMA_VERSION,
       rows: result.rows,
       result_count: result.rows.length,
     },

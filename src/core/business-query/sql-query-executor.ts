@@ -300,7 +300,15 @@ export class BusinessQueryExecutor {
 
     const limit = Math.min(request.params.limit, SQL_MAX_ROWS);
     const pool = await this.ensureReady();
-    const queriedAt = new Date().toISOString();
+    // Whole seconds only. The evidence contract's timestamp is
+    // `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`, and fin is forbidden from
+    // normalizing a fractional value it receives — a millisecond here is a
+    // refused envelope, not a rounded one. `queried_at` is an INSTANT, so
+    // unlike `isoDate` above (a business calendar DATE, which must stay on
+    // local components) UTC truncation is the correct frame. This is the one
+    // mint site; `queriedAt` is threaded by reference, so truncating here
+    // fixes every row on the page.
+    const queriedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 
     let fetched: SqlRow[];
     try {

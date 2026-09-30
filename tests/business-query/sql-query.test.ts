@@ -1,5 +1,5 @@
 /**
- * Business-query module contract tests (plans/post322-a2-sql-slice.md T4).
+ * Business-query module contract tests (fin:plans/post322-a2-sql-slice.md T4).
  *
  * Drivable with a fake pool and no database: the module takes its pool from a
  * factory, so every assertion here is about the module's own behaviour —
@@ -8,7 +8,7 @@
  * separate opt-in suite and is NOT what this file stands in for.
  *
  * Expected values are the literals written in the committed fixture
- * (tests/retrieve/fixtures/ledger/002_seed.sql), not values read back from a
+ * (fin:tests/retrieve/fixtures/ledger/002_seed.sql), not values read back from a
  * database, so a broken seed cannot make these pass vacuously.
  */
 import { describe, expect, it } from "vitest";
@@ -293,6 +293,20 @@ describe("window and limit binding", () => {
       expect(isBoundWindow(bad)).toBe(false);
     }
   });
+
+  it("refuses an impossible calendar date that matches the ISO shape", () => {
+    // The digit shape alone accepts `2024-13-45`. If it were bound, the
+    // template's `$n::date` cast would reject it in the database (SQLSTATE
+    // 22007) and classifyDriverFailure would publish `retrieve_unavailable`
+    // — a client typo reported as an operator outage, violating the token's
+    // own invariant. Only a calendar round-trip refuses it here.
+    expect(isBoundWindow({ ...WINDOW, windowStart: "2024-13-45" })).toBe(false);
+    expect(isBoundWindow({ ...WINDOW, windowEnd: "2024-02-30" })).toBe(false);
+    expect(isBoundWindow({ ...WINDOW, windowStart: "2023-02-29" })).toBe(false);
+    // A leap day exists in a leap year: the validator refuses the impossible
+    // date, not the valid one shaped like it.
+    expect(isBoundWindow({ ...WINDOW, windowStart: "2024-02-29" })).toBe(true);
+  });
 });
 
 describe("a normal query", () => {
@@ -364,6 +378,25 @@ describe("a normal query", () => {
 });
 
 describe("the connection posture", () => {
+  it("refuses an impossible calendar date with no pool touched", async () => {
+    // The shape-only check let `2024-13-45` reach the `::date` cast, where
+    // SQLSTATE 22007 surfaced as `retrieve_unavailable` — an operator outage
+    // reported for a client typo. The calendar round-trip must refuse it
+    // before a pool is constructed (spec §5c: request refusals open nothing).
+    for (const bad of [
+      { ...WINDOW, windowStart: "2024-13-45", windowEnd: "2024-12-31" },
+      { ...WINDOW, windowStart: "2024-01-01", windowEnd: "2024-02-30" },
+    ]) {
+      const { executor, calls } = executorWith([C_2291]);
+      const error = (await executor
+        .query({ template: "contracts_expiring", params: bad })
+        .catch((caught: unknown) => caught)) as Error;
+      expect(failureTokenOf(error)).toBe(INVALID_BUSINESS_QUERY);
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+
   it("opens the pool as the configured reader credential, never a claim's role", async () => {
     const { executor, calls } = executorWith([C_2291]);
     await executor.query({ template: "contracts_expiring", params: WINDOW });
@@ -511,10 +544,27 @@ describe("an empty result", () => {
   });
 
   it("treats a row with no record key as uncarryable rather than a healthy hit", async () => {
+    // Documents the all-dropped path: the view's PRIMARY KEY makes a null
+    // key unproducible from a real ledger, so the only way to reach this
+    // branch is an off-contract driver row. The fake pool drives it here so
+    // the exit is pinned, not incidental.
     const { executor } = executorWith([{ ...C_2291, contract_id: null }]);
     const error = (await executor
       .query({ template: "contracts_expiring", params: WINDOW })
       .catch((caught: unknown) => caught)) as Error;
     expect(failureTokenOf(error)).toBe(SQL_NO_MATCHING_ROWS);
+  });
+
+  it("drops a keyless row but keeps the rest of the page", async () => {
+    const { executor } = executorWith([
+      { ...C_2291, contract_id: null },
+      C_2291,
+    ]);
+    const result = await executor.query({
+      template: "contracts_expiring",
+      params: WINDOW,
+    });
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]?.record_key).toEqual({ contract_id: "C-2291" });
   });
 });

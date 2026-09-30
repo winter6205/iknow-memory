@@ -1,5 +1,6 @@
 /**
- * The business-query executor (spec §1.1, §5, §6, §7).
+ * The business-query executor (fin:specs/search-mode-business-sql-contract.md
+ * §1.1, §5, §6, §7).
  *
  * iknow owns the credential, runs one named parameterized template, and lets
  * the database enforce the scope. This module is independent of the document
@@ -16,6 +17,7 @@ import { redactPgDiagnostic } from "../storage/pg-diagnostics.js";
 import {
   isBoundWindow,
   resolveTemplate,
+  type BusinessQueryTemplateDefinition,
 } from "./sql-query-templates.js";
 import {
   INVALID_BUSINESS_QUERY,
@@ -77,18 +79,6 @@ function sqlStateOf(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-/** Unused-parameter-free accessor kept for driver errors whose SQLSTATE is
- *  absent but whose message names it (some poolers re-wrap). Exported for the
- *  boundary tests, which assert the taxonomy on wrapped driver errors. */
-export function describeSqlFailure(error: unknown): string {
-  const state = sqlStateOf(error);
-  return state === undefined ? messageOf(error) : `SQLSTATE ${state}`;
-}
-
 export class SqlBusinessQueryError extends GraphragError {
   constructor(
     message: string,
@@ -145,6 +135,13 @@ function projectRow(
   queriedAt: string
 ): DatabaseRow | undefined {
   const recordKey = row[recordKeyColumn];
+  // A row with no key cannot be cited, so it cannot ship. The drop is
+  // defense in depth, not a live branch: `contract_id` is the base table's
+  // PRIMARY KEY and the view projects it directly
+  // (fin:tests/retrieve/fixtures/ledger/001_schema.sql), so a real ledger
+  // cannot produce a null key. If the view DDL ever relaxes that, this
+  // drop site is where a matched-but-undisplayable row would surface —
+  // pinned by the fake-pool tests, not by hope.
   if (recordKey === undefined || recordKey === null) return undefined;
   const fields: Record<string, unknown> = {};
   for (const column of fieldColumns) {
@@ -173,6 +170,8 @@ function projectRow(
  * with no row would read as a healthy miss (`sql_no_matching_rows`) when the
  * fact is that the row is too large to carry. A request that cannot be
  * answered inside the result contract is a request refusal, not an answer.
+ * The token carries two surfaces — the agreement and the deferred dedicated
+ * token are documented on `INVALID_BUSINESS_QUERY` itself.
  */
 function fitToByteBudget(
   result: BusinessQueryResult,
@@ -221,17 +220,22 @@ export class BusinessQueryExecutor {
   /**
    * Refuse a claim this instance cannot vouch for.
    *
-   * Two distinct refusals, and the distinction is the whole point of the
-   * authorization model: a claim the instance was never provisioned for is
-   * *unverified* (we could not check it), while a claim naming a scope this
-   * instance does hold is a *denial* (we checked, the answer is no). Neither
-   * ever falls back to a default scope — that would be the silent widening
-   * the design exists to prevent.
+   * v1 (fin spec §5.2): this build ships no verifier, so a request that
+   * DELIVERS a claim is refused as `sql_authorization_unverified` even when
+   * the named scope is provisioned — matching a scope the instance happens
+   * to hold does not verify anything, since a forged claim would name
+   * exactly that. A request with no claim passes: there is nothing to
+   * vouch for, and scope enforcement is the credential and the view's.
+   * The scope-comparison branches below only fire once `trustedClaimKinds`
+   * is populated — the per-identity era. Nothing ever falls back to a
+   * default scope; that would be the silent widening this model exists to
+   * prevent. `sql_query_denied` stays reserved for the database's own no.
    */
   private assertAuthorization(request: SqlQueryRequest): void {
     const claim = request.authorization;
+    const trustExpected = (this.config.trustedClaimKinds ?? []).length > 0;
     if (claim === undefined) {
-      if ((this.config.trustedClaimKinds ?? []).length > 0) {
+      if (trustExpected) {
         // The per-identity era: this instance expects to be able to check a
         // claim, and an absent one means no verified identity. Refused, not
         // defaulted.
@@ -242,6 +246,14 @@ export class BusinessQueryExecutor {
         );
       }
       return;
+    }
+    if (!trustExpected) {
+      throw new SqlBusinessQueryError(
+        `business query named scope "${claim.scope}", but this build accepts ` +
+          `no authorization claim (v1, spec §5.2)`,
+        SQL_AUTHORIZATION_UNVERIFIED,
+        "INVALID_INPUT"
+      );
     }
     if (claim.scope === undefined || claim.scope === "") {
       throw new SqlBusinessQueryError(
@@ -296,7 +308,9 @@ export class BusinessQueryExecutor {
         request.params.windowStart,
         request.params.windowEnd,
         // One past the cap, so a full page is distinguishable from a
-        // truncated one instead of looking identical.
+        // truncated one instead of looking identical. The executor is the
+        // single bind site: `$n` order lives next to the template it
+        // binds into, never in a second registry nobody calls.
         Math.min(limit + 1, SQL_FETCH_ROWS),
       ]);
       fetched = result.rows as SqlRow[];
@@ -304,6 +318,26 @@ export class BusinessQueryExecutor {
       throw this.classifyDriverFailure(error);
     }
 
+    return fitToByteBudget(
+      this.buildResult(request, definition, fetched, limit, queriedAt),
+      SQL_MAX_RESULT_BYTES,
+      request.template
+    );
+  }
+
+  /**
+   * Project fetched driver rows into the returned page: drop uncarryable
+   * rows, name the miss, cut at the cap, and mark truncation from the
+   * over-fetch. Kept separate from `query()` so the transport half (bind,
+   * dial, classify) and the answer-shape half are each one job.
+   */
+  private buildResult(
+    request: SqlQueryRequest,
+    definition: BusinessQueryTemplateDefinition,
+    fetched: SqlRow[],
+    limit: number,
+    queriedAt: string
+  ): BusinessQueryResult {
     const projected: DatabaseRow[] = [];
     for (const row of fetched) {
       const record = projectRow(
@@ -325,17 +359,17 @@ export class BusinessQueryExecutor {
       );
     }
 
-    const truncated = projected.length > limit;
-    const result: BusinessQueryResult = {
+    return {
       source: definition.source,
       rows: projected.slice(0, limit),
-      truncated,
+      // Only true when the over-fetch actually returned a row past the
+      // cap — a page that ends at exactly the cap is complete, not trimmed.
+      truncated: projected.length > limit,
       window: {
         start: request.params.windowStart,
         end: request.params.windowEnd,
       },
     };
-    return fitToByteBudget(result, SQL_MAX_RESULT_BYTES, request.template);
   }
 
   /**

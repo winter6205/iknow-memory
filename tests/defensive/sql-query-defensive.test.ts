@@ -1,5 +1,5 @@
 /**
- * Business-query failure matrix (plans/post322-a2-sql-slice.md T5).
+ * Business-query failure matrix (fin:plans/post322-a2-sql-slice.md T5).
  *
  * The six classes of .claude/rules/test.md over the business-query seam, all
  * against a fake pool — no live database, and no document-index machinery.
@@ -226,6 +226,26 @@ describe("boundary", () => {
     // a malformed parameter, never forwarded to be parsed by the database.
     expect(opens()).toBe(0);
   });
+
+  it("refuses an impossible calendar date as invalid_business_query, never as an outage", async () => {
+    // `2024-13-45` and `2024-02-30` match the ISO digit shape but name no
+    // calendar day. Bound, the template's date cast would raise SQLSTATE
+    // 22007 and the classifier would publish `retrieve_unavailable` — a
+    // client typo reported as an operator outage. The calendar round-trip
+    // refuses them with the request token, and the pool is never built.
+    for (const bad of [
+      { ...PARAMS, windowStart: "2024-13-45", windowEnd: "2024-12-31" },
+      { ...PARAMS, windowStart: "2024-01-01", windowEnd: "2024-02-30" },
+    ]) {
+      const { executor, opens } = harness(async () => ({ rows: oneRow() }));
+      const error = await executor
+        .query({ template: "contracts_expiring", params: bad })
+        .catch((caught: unknown) => caught);
+      expect(failureTokenOf(error)).toBe(INVALID_BUSINESS_QUERY);
+      expect(failureTokenOf(error)).not.toBe(RETRIEVE_UNAVAILABLE);
+      expect(opens()).toBe(0);
+    }
+  });
 });
 
 // --- 4. insufficient permissions ------------------------------------------
@@ -261,14 +281,22 @@ describe("insufficient permissions", () => {
     expect(failureTokenOf(error)).toBe(SQL_AUTHORIZATION_UNVERIFIED);
   });
 
-  it("accepts a claim naming a scope the instance holds", async () => {
-    const { executor } = harness(async () => ({ rows: oneRow() }));
-    const result = await executor.query({
-      template: "contracts_expiring",
-      params: PARAMS,
-      authorization: { scope: "ledger_ro.contract_expiry" },
-    });
-    expect(result.rows).toHaveLength(1);
+  it("refuses a delivered claim even when it names a provisioned scope: v1 admits no claim", async () => {
+    // Settled decision (fin spec §5.2): in v1 a request naming a scope is a
+    // named failure — this build has nothing that verified a claim, so it
+    // never vouches for one, matching scope included. Accepting a
+    // provisioned-scope claim would make the forged-or-not difference hinge
+    // on the very field the claim cannot be trusted to carry.
+    const { executor, opens } = harness(async () => ({ rows: oneRow() }));
+    const error = await executor
+      .query({
+        template: "contracts_expiring",
+        params: PARAMS,
+        authorization: { scope: "ledger_ro.contract_expiry" },
+      })
+      .catch((caught: unknown) => caught);
+    expect(failureTokenOf(error)).toBe(SQL_AUTHORIZATION_UNVERIFIED);
+    expect(opens()).toBe(0);
   });
 
   it("never widens to a default scope when a claim cannot be vouched for", async () => {

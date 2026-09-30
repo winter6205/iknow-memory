@@ -8,9 +8,10 @@
 import type { GraphragFailureToken } from "../errors.js";
 
 /**
- * Rows returned to the caller. Matches fin's `_LIMIT_CAP`, so no 档 ships a
- * 21st row — a SQL answer that outgrew the corpus answer's cap would be a
- * silent inconsistency between two 档 of the same entry point.
+ * Rows returned to the caller. Matches `fin:src/fin/retrieve/fake_port.py`
+ * `_LIMIT_CAP`, so no 档 ships a 21st row — a SQL answer that outgrew the
+ * corpus answer's cap would be a silent inconsistency between two 档 of the
+ * same entry point.
  */
 export const SQL_MAX_ROWS = 20;
 
@@ -33,9 +34,10 @@ export const SQL_MAX_RESULT_BYTES = 32_768;
 /**
  * Per-statement budget. Must stay under the host's 5 s MCP timeout so the
  * *server* answers with a typed error rather than the host giving up on a
- * socket the database is still working on. Applied as a transaction-local
- * `SET LOCAL` rather than trusted to the role's `ALTER ROLE`, so an operator
- * who forgets the role-level setting still gets the server-side answer.
+ * socket the database is still working on. Applied as a session-level `-c`
+ * option on the pool connection string (see `SqlPoolFactory.options`), not
+ * per-transaction, so an operator who never set the role-level `ALTER
+ * ROLE` default still gets the server-side answer.
  */
 export const SQL_STATEMENT_TIMEOUT_MS = 3_000;
 
@@ -78,8 +80,9 @@ export function isBusinessQueryTemplate(
 
 /**
  * The window and row cap one template is bound with. A named field, not a
- * positional array, so the executor's `$n` ordering is a property of one
- * place and a caller cannot transpose two dates.
+ * positional array, so a caller cannot transpose two dates; the `$n`
+ * ordering is fixed at the executor's single bind site, next to the
+ * template it binds into.
  */
 export interface ContractsExpiringParams {
   /** ISO `YYYY-MM-DD`; the inclusive start of the expiry window. */
@@ -89,9 +92,6 @@ export interface ContractsExpiringParams {
   /** The caller's requested row cap, clamped to `SQL_MAX_ROWS`. */
   limit: number;
 }
-
-/** Parameter values as they are bound — never interpolated into SQL text. */
-export type BoundParams = readonly unknown[];
 
 /**
  * The authorization claim as it arrives on the call. It names a SCOPE
@@ -116,8 +116,10 @@ export interface BusinessLedgerConfig {
   authorizedScopes: readonly string[];
   /**
    * Accepted authorization claims. Empty — the default, and the only posture
-   * this module ships — means the request may carry no claim at all, so there
-   * is no scope field to forge. Populating it is the per-identity era.
+   * this module ships — means v1 admits no claim at all: a request that
+   * DELIVERS one is refused `sql_authorization_unverified` even when the
+   * named scope is provisioned (fin spec §5.2). Populating it is the
+   * per-identity era.
    */
   trustedClaimKinds?: readonly string[];
 }

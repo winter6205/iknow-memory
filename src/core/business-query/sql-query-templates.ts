@@ -13,7 +13,6 @@
  */
 import {
   isBusinessQueryTemplate,
-  type BoundParams,
   type BusinessQueryTemplate,
   type ContractsExpiringParams,
 } from "./sql-query-types.js";
@@ -43,12 +42,26 @@ export interface BusinessQueryTemplateDefinition {
   recordKeyColumn: string;
   /** Columns projected into a row's `fields`, in display order. */
   fieldColumns: readonly string[];
-  /** Bind one request's parameters to `$1..$n`. Called with already
-   *  validated values; must return exactly the template's placeholder count. */
-  bind: (params: ContractsExpiringParams) => BoundParams;
 }
 
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * True only for a real calendar day. The digit shape alone accepts
+ * `2024-13-45`; parsed and re-serialized against UTC, that date is not.
+ * `Date.UTC` maps years 0000-0099 into 1900-1999, so the round-trip also
+ * refuses the pathological small years rather than binding them.
+ */
+function isCalendarDate(value: string): boolean {
+  if (!ISO_DATE.test(value)) return false;
+  const [year, month, day] = value.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year!, month! - 1, day!));
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month! - 1 &&
+    parsed.getUTCDate() === day
+  );
+}
 
 /**
  * Templates keyed by name. The key IS the wire token: a value outside this
@@ -70,7 +83,6 @@ export const BUSINESS_QUERY_TEMPLATE_REGISTRY: Readonly<
       "currency",
       "owner_dept",
     ],
-    bind: (params) => [params.windowStart, params.windowEnd, params.limit],
   },
 };
 
@@ -105,15 +117,19 @@ export function resolveTemplate(name: unknown): ResolvedTemplate | undefined {
 }
 
 /**
- * A bound window is an ISO calendar date, a start that does not follow the
- * end, and a positive integer cap. Checked here rather than trusted: the
- * `::date` cast in the template turns a malformed value into a database
- * error, and a database error is a much worse place to learn that a date was
- * nonsense.
+ * A bound window is a real ISO calendar date, a start that does not follow
+ * the end, and a positive integer cap. Checked here rather than trusted:
+ * the `::date` cast in the template turns a malformed value into a database
+ * error, and a database error is a much worse place to learn that a date
+ * was nonsense. The check is a calendar round-trip, not a digit shape,
+ * because `2024-13-45` has the shape of a date but none of its meaning:
+ * bound, it reaches the database as SQLSTATE 22007, which this module
+ * classifies as an unavailability — a client typo published as an operator
+ * outage, violating `invalid_business_query`'s own invariant.
  */
 export function isBoundWindow(params: ContractsExpiringParams): boolean {
-  if (!ISO_DATE.test(params.windowStart)) return false;
-  if (!ISO_DATE.test(params.windowEnd)) return false;
+  if (!isCalendarDate(params.windowStart)) return false;
+  if (!isCalendarDate(params.windowEnd)) return false;
   if (params.windowEnd < params.windowStart) return false;
   if (!Number.isInteger(params.limit) || params.limit <= 0) return false;
   return true;

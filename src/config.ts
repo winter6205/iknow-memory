@@ -245,7 +245,8 @@ export interface GraphragEnv {
    */
   jev: JevConfig | undefined;
   /**
-   * Write-time contradiction resolution switch (extract pipeline T4).   *
+   * Write-time contradiction resolution switch (extract pipeline T4).
+   *
    * ON (default, ADR-0009): a triple whose (head, relation_norm) matches an
    * existing row with a DIFFERENT tail and an overlapping valid window
    * supersedes the older row in the same per-chunk transaction —

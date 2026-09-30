@@ -1,5 +1,5 @@
 /**
- * 档 D (sql) arm contract tests — plans/post322-a2-sql-slice.md T7.
+ * 档 D (sql) arm contract tests — fin:plans/post322-a2-sql-slice.md T7.
  *
  * The arm is the row's wire home: a provisioned ledger answers
  * `{ chunks: [], database_rows: [...] }` (spec §8.0 — a sibling key, never
@@ -8,7 +8,7 @@
  * provisioned* only). Driven with a fake pool through the real executor,
  * so every assertion is about the arm's own behaviour and no database is
  * required. Expected row values are the literals of the committed fixture
- * `tests/retrieve/fixtures/ledger/002_seed.sql` (contract C-2291).
+ * `fin:tests/retrieve/fixtures/ledger/002_seed.sql` (contract C-2291).
  */
 import { describe, expect, it } from "vitest";
 import { createRetrieveHandler } from "../../src/tools/retrieve.js";
@@ -187,6 +187,38 @@ describe("mode-d arm — provisioned ledger", () => {
     // appears nowhere in what was sent.
     expect(sent[0]!.values).toEqual(["2026-01-01", "2026-03-31", 6]);
     expect(sent[0]!.text).not.toContain("DROP TABLE");
+  });
+
+  it("carries the 20-row cap through the envelope: 21 fetched rows ship as 20 with result_count 20", async () => {
+    // Pins the CURRENT shipped semantics (review M7 deferral): the executor
+    // marks the page truncated internally, but the frozen
+    // `fin.evidence.retrieve_rows.v1` envelope {schema, rows,
+    // result_count} has no truncation field, so a truncated page and an
+    // exactly-full page are byte-identical on the wire. Making truncation
+    // observable (§6) requires a fin-side envelope revision; until then
+    // this test guards against a silent change to the shipped shape.
+    const { executor } = executorWith(
+      Array.from({ length: 21 }, (_unused, i) => ({
+        ...C_2291,
+        contract_id: `C-${String(i).padStart(4, "0")}`,
+      }))
+    );
+    const handler = createRetrieveHandler({
+      embedder: new FakeEmbedder(TEST_DIM),
+      storage: new MemoryBackend(TEST_DIM),
+      businessQuery: executor,
+    });
+    const body = parseBody(
+      await handler({
+        query: "anything",
+        filters: WINDOW_FILTERS,
+        // Explicit at the tier cap: the pin is the 21-fetched → 20-shipped
+        // boundary, not the request default limit.
+        limit: 20,
+      })
+    );
+    expect(body.database_rows!.rows).toHaveLength(20);
+    expect(body.database_rows!.result_count).toBe(20);
   });
 
   it("touches no embedder and no document storage on the sql route", async () => {

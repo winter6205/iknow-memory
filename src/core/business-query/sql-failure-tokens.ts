@@ -44,9 +44,21 @@ export const SQL_AUTHORIZATION_UNVERIFIED = "sql_authorization_unverified" as co
 export const SQL_NO_MATCHING_ROWS = "sql_no_matching_rows" as const;
 
 /**
- * The request never reached the permitted query: an unknown template name, or
- * a window/limit the template cannot bind. Refused before a connection is
- * opened, so it is never a database fact.
+ * The request could not be answered as the permitted query was written.
+ * Two surfaces, shared by the remedy (change the request, not the ledger):
+ *
+ * - an unknown template name, or a window/limit the template cannot bind:
+ *   refused before a connection is opened, so never a database fact.
+ * - a row the database returned that does not fit the result byte budget:
+ *   raised AFTER the database answered. The database is healthy and did
+ *   exactly what was asked; the uncarryable fact is the request's. This is
+ *   why the token does not become `sql_no_matching_rows` (a different fact)
+ *   or `retrieve_unavailable` (a wrong remedy).
+ *
+ * Deferred rename (review M4): the oversized-row surface deserves its own
+ * token, but the failure vocabulary is the seven-member cross-repo
+ * agreement of fin:specs/search-mode-business-sql-contract.md §7.1, so
+ * adding a member is gated on a fin-side spec revision, not on this module.
  */
 export const INVALID_BUSINESS_QUERY = "invalid_business_query" as const;
 

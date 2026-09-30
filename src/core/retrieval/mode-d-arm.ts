@@ -1,6 +1,6 @@
 /**
- * 档 D arm — the business-SQL path (plans/post322-a2-sql-slice.md T7;
- * specs/search-mode-business-sql-contract.md §5–§8).
+ * 档 D arm — the business-SQL path (fin:plans/post322-a2-sql-slice.md T7;
+ * fin:specs/search-mode-business-sql-contract.md §5–§8).
  *
  * The arm is the row's wire home: a provisioned ledger answers
  * `{ chunks: [], database_rows: {schema, rows, result_count} }` (spec
@@ -27,7 +27,10 @@
  * arm for the dispatch table without a runtime cycle.
  */
 import type { SearchModeArm } from "./search-mode.js";
-import { SEARCH_MODE_FILTER_KEY } from "./wire-filters.js";
+import {
+  SEARCH_MODE_FILTER_KEY,
+  readSqlWindowFilter,
+} from "./wire-filters.js";
 import { GraphragError } from "../errors.js";
 import { REAL_DB_NOT_WIRED } from "../business-query/sql-failure-tokens.js";
 import type { BusinessQueryTemplate } from "../business-query/sql-query-types.js";
@@ -64,11 +67,17 @@ export const modeDBusinessSqlArm: SearchModeArm = async function assembleBusines
       REAL_DB_NOT_WIRED
     );
   }
+  // The absent-window sentinel has ONE producer — `readSqlWindowFilter` —
+  // so a second `?? ""` spelling cannot drift from the first. An arm
+  // invoked without a window asks that function for the same empty values
+  // the wire read would produce, and the executor refuses them as
+  // `invalid_business_query` before any connection.
+  const sqlWindow = args.sqlWindow ?? readSqlWindowFilter(undefined);
   const result = await executor.query({
     template: CONTRACTS_EXPIRING,
     params: {
-      windowStart: args.sqlWindow?.windowStart ?? "",
-      windowEnd: args.sqlWindow?.windowEnd ?? "",
+      windowStart: sqlWindow.windowStart,
+      windowEnd: sqlWindow.windowEnd,
       limit: args.limit,
     },
   });
@@ -78,8 +87,16 @@ export const modeDBusinessSqlArm: SearchModeArm = async function assembleBusines
   // `fin.evidence.retrieve_rows.v1` envelope OBJECT (fin contract §4.4):
   // a bare array under this key is refused by fin ingress as
   // `database-rows-envelope-wrong-type`. `result_count` is this leg's
-  // `rows.length`; truncation stays observable via the executor's own
-  // `truncated` semantics, not a count mismatch.
+  // `rows.length`.
+  //
+  // DEFERRED (review M7): the executor's `truncated` flag is observable
+  // inside this module but the E1-frozen envelope {schema, rows,
+  // result_count} has no field to carry it, so a truncated page and an
+  // exactly-full 20-row page are identical on the wire — §6's truncation
+  // observability is NOT met by this envelope. Changing the envelope is a
+  // fin-side revision; until then the shipped semantics are pinned by
+  // tests/retrieval/mode-d-arm.test.ts ("carries the 20-row cap through
+  // the envelope"), and this gap must be stated in the fin PR description.
   return {
     chunks: [],
     database_rows: {

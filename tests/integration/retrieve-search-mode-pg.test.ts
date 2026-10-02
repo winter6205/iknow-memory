@@ -500,9 +500,12 @@ describeLive(
       expect(thrown).toBeInstanceOf(GraphragError);
       const error = thrown as GraphragError;
       expect(error.code).toBe("INVALID_INPUT");
+      // Declared token, not only message prose: this is what serializes
+      // the exit as a structured {"error": …} for the host (spec §7.1).
+      expect(error.failureToken).toBe(REAL_DB_NOT_WIRED_REASON);
       expect(error.message).toContain(REAL_DB_NOT_WIRED_REASON);
       expect(error.message).toContain("search_mode=sql");
-      // The refusal is a routing-time one: no SQL ran, so no chunk body —
+      // The exit is provisioning-time: no SQL ran, so no chunk body —
       // the envelope is never reached on this path.
       expect(error.message).not.toContain(CHILD_ZERO);
     });

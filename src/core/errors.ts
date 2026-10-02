@@ -7,6 +7,15 @@
  * result it hands the host.
  */
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "./types.js";
+import {
+  INVALID_BUSINESS_QUERY,
+  REAL_DB_NOT_WIRED,
+  RETRIEVE_UNAVAILABLE,
+  SQL_AUTHORIZATION_UNVERIFIED,
+  SQL_NO_MATCHING_ROWS,
+  SQL_QUERY_DENIED,
+  SQL_QUERY_TIMEOUT,
+} from "./business-query/sql-failure-tokens.js";
 
 export type GraphragErrorCode =
   | "INVALID_INPUT" // Zod passed but semantically invalid (e.g. valid_from > valid_until)
@@ -19,8 +28,22 @@ export type GraphragErrorCode =
  * Named failures a host classifies deterministically. One vocabulary, anchored
  * on the constant the ledger and the arms already publish: `code` stays the
  * coarse internal category, `failureToken` is the public named fact.
+ *
+ * A union, not a single member: an error that names no token is serialized as
+ * plain-text `isError`, and the host then classifies by scanning prose and
+ * falls through to `retrieve_unavailable` (spec §7.1). A typed denial
+ * arriving as prose is indistinguishable from a dead server, so every
+ * business-SQL exit has to have a name to declare.
  */
-export type GraphragFailureToken = typeof COMMUNITY_SUMMARY_INDEX_FAILURE;
+export type GraphragFailureToken =
+  | typeof COMMUNITY_SUMMARY_INDEX_FAILURE
+  | typeof SQL_QUERY_DENIED
+  | typeof SQL_QUERY_TIMEOUT
+  | typeof SQL_AUTHORIZATION_UNVERIFIED
+  | typeof SQL_NO_MATCHING_ROWS
+  | typeof INVALID_BUSINESS_QUERY
+  | typeof RETRIEVE_UNAVAILABLE
+  | typeof REAL_DB_NOT_WIRED;
 
 export class GraphragError extends Error {
   constructor(

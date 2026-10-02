@@ -20,10 +20,13 @@
  *   - graph summary-ledger fail-open (alone): tests/retrieval/
  *     community-summary.test.ts — NOT weakened here; this file adds the
  *     graph-vs-global contrast on ONE dead-ledger backend.
- * What is NEW here: the `sql` 档's typed `real_db_not_wired` exit (empty/
- * corpus-full/limit variants, zero backend contact), the per-档 isolation
- * when every route plus single-letter rejections are in flight, and the
- * fail-open-vs-typed exception contrast. No duplicated healthy-miss.
+ * What is NEW here: the `sql` 档's typed `real_db_not_wired` exit when no
+ * ledger is provisioned (empty/corpus-full/limit variants, zero backend
+ * contact, DECLARED token so the host reads it as structure), the per-档
+ * isolation when every route plus single-letter rejections are in flight,
+ * and the fail-open-vs-typed exception contrast. No duplicated
+ * healthy-miss. The provisioned sql arm surface lives in
+ * tests/retrieval/mode-d-arm.test.ts.
  */
 import { describe, it, expect } from "vitest";
 import { createRetrieveHandler } from "../../src/tools/retrieve.js";
@@ -170,7 +173,7 @@ describe("search-mode empty boundary", () => {
 });
 
 // ======================================================================
-// negative — sql unwired (new); global not-ready / invalid mode referenced
+// negative — sql not provisioned; global not-ready / invalid mode referenced
 // ======================================================================
 
 describe("search-mode negative boundary", () => {
@@ -180,8 +183,9 @@ describe("search-mode negative boundary", () => {
 
   it("sql types real_db_not_wired even when every other 档's seam could answer", async () => {
     // A full fixture: vector rows, a ready community index with a summary.
-    // `sql` must still refuse — it cannot borrow another 档's seams to fake
-    // a document-table answer (spec SC5: document tables stay on `graph`).
+    // `sql` still exits typed when no business ledger is provisioned —
+    // it cannot borrow another 档's seams to fake a document-table answer
+    // (spec SC5: document tables stay on `graph`).
     const base = new MemoryBackend(TEST_DIM);
     await base.upsert([chunkRecord("b-1")]);
     await base.setCommunityIndexState({
@@ -218,10 +222,12 @@ describe("search-mode negative boundary", () => {
     }
     expect(thrown).toBeInstanceOf(GraphragError);
     const error = thrown as GraphragError;
-    // Routing-time refusal, the fin `named_failures` 400 class: nothing
-    // was read, so this is not a storage failure — the stable token in
-    // the message is what the host maps on through MCP isError.
+    // Routing-time exit, the fin `named_failures` 400 class: nothing was
+    // read, so this is not a storage failure. After T7 the token is
+    // DECLARED, not only in the message — that is what serializes it as a
+    // structured {"error": …} instead of prose (spec §7.1).
     expect(error.code).toBe("INVALID_INPUT");
+    expect(error.failureToken).toBe(REAL_DB_NOT_WIRED_REASON);
     expect(error.message).toContain(REAL_DB_NOT_WIRED_REASON);
     expect(error.message).toContain("search_mode");
   });
@@ -234,9 +240,11 @@ describe("search-mode negative boundary", () => {
 describe("search-mode overflow boundary (limit)", () => {
   // The lexical limit-applies-after-parent-dedup and the global hard cap at
   // limit are pinned in mode-a-arm.test.ts / mode-c-arm.test.ts
-  // (overflow/drop sections). `sql` is limit-INDEPENDENT: it types out
-  // before any arm reads the request, so the schema bounds must not change
-  // the exit.
+  // (overflow/drop sections). The limit-DEPENDENT sql behaviour (bound
+  // parameter, cap at SQL_MAX_ROWS) is pinned in
+  // tests/retrieval/mode-d-arm.test.ts. What stays pinned HERE: with no
+  // ledger provisioned the exit is identical at either schema bound — a
+  // schema bound must not change a not-provisioned fact.
   it("sql answers identically at limit=1 and limit=100 with zero embedder and storage contact", async () => {
     for (const limit of [1, 100]) {
       const embedder = new CountingEmbedder(new FakeEmbedder(TEST_DIM));
@@ -256,6 +264,9 @@ describe("search-mode overflow boundary (limit)", () => {
         thrown = err;
       }
       expect(thrown).toBeInstanceOf(GraphragError);
+      expect((thrown as GraphragError).failureToken).toBe(
+        REAL_DB_NOT_WIRED_REASON
+      );
       expect((thrown as GraphragError).message).toContain(
         REAL_DB_NOT_WIRED_REASON
       );
@@ -333,12 +344,13 @@ describe("search-mode concurrent boundary", () => {
     expect(parseBody(global.value).chunks.map((chunk) => chunk.id)).toEqual([
       "sum-1",
     ]);
-    // `sql` rejects — twice, the same typed way: the refusal is stateless
-    // and never poisons the concurrent siblings.
+    // `sql` rejects — twice, the same typed way: the not-provisioned exit
+    // is stateless and never poisons the concurrent siblings.
     for (const attempt of [sql, sqlAgain]) {
       expect(attempt.status).toBe("rejected");
       const reason = (attempt as PromiseRejectedResult).reason as GraphragError;
       expect(reason).toBeInstanceOf(GraphragError);
+      expect(reason.failureToken).toBe(REAL_DB_NOT_WIRED_REASON);
       expect(reason.message).toContain(REAL_DB_NOT_WIRED_REASON);
     }
     // A single letter rejects the same isolated way, typed invalid with its
@@ -414,8 +426,8 @@ describe("search-mode exception boundary", () => {
       COMMUNITY_SUMMARY_INDEX_FAILURE
     );
 
-    // sql: typed 未接 — a THIRD distinct fact on the same backend, and its
-    // message never borrows global's token.
+    // sql: typed not-provisioned — a THIRD distinct fact on the same
+    // backend, and its message never borrows global's token.
     let thrownSql: unknown;
     try {
       await handler({ query: "anything", filters: { search_mode: "sql" } });
@@ -423,7 +435,9 @@ describe("search-mode exception boundary", () => {
       thrownSql = err;
     }
     expect(thrownSql).toBeInstanceOf(GraphragError);
-    const sqlMessage = (thrownSql as GraphragError).message;
+    const sqlError = thrownSql as GraphragError;
+    expect(sqlError.failureToken).toBe(REAL_DB_NOT_WIRED_REASON);
+    const sqlMessage = sqlError.message;
     expect(sqlMessage).toContain(REAL_DB_NOT_WIRED_REASON);
     expect(sqlMessage).not.toContain(COMMUNITY_SUMMARY_INDEX_FAILURE);
   });

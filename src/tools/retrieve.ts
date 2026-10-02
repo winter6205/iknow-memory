@@ -13,8 +13,17 @@
  * handler before the arms run: missing → `graph`, outside the closed set →
  * typed INVALID_INPUT, `lexical` → the lexical child-hit/parent-body arm
  * (plans T2), `global` → the report-first community-summary arm (plans T3),
- * `sql` → the typed `real_db_not_wired` refusal (plans T4; see
- * src/core/retrieval/search-mode.ts).
+ * `sql` → the business-SQL arm (plans/post322-a2 T7): with a ledger
+ * provisioned it answers `{ chunks: [], database_rows }` from one named
+ * parameterized template, and without one it exits the tokened
+ * `real_db_not_wired` (specs/search-mode-business-sql-contract.md §7).
+ *
+ * `filters.sql_window_start` / `filters.sql_window_end` (inclusive ISO
+ * `YYYY-MM-DD`) are the `sql` 档's expiry-window routing controls: the
+ * dispatcher resolves and strips them like every other control key, and
+ * the executor validates them (a malformed or absent window is refused
+ * `invalid_business_query` before a connection exists — there is no
+ * defaulted window).
  *
  * `filters.entity_type` (plans/entity-type-and-filter.md T3) is resolved
  * and stripped the same way: missing → all types, one of the closed set →
@@ -73,6 +82,11 @@ import {
   stripEntityTypeFilter,
 } from "../core/retrieval/wire-filters.js";
 import { GraphragError } from "../core/errors.js";
+import type { BusinessQueryExecutor } from "../core/business-query/sql-query-executor.js";
+import {
+  readSqlWindowFilter,
+  stripSqlWindowFilter,
+} from "../core/retrieval/wire-filters.js";
 
 const DEFAULT_LIMIT = 10;
 
@@ -165,6 +179,13 @@ export interface RetrieveDeps {
    * incoming pair. Absent → the env embedder is used as-is.
    */
   slotEmbedding?: SlotEmbeddingSource;
+  /**
+   * Business-ledger executor for the `sql` 档, present only when this
+   * instance is provisioned with a ledger DSN (spec §5.2: the reader role
+   * comes from instance configuration, never from the request). Absent is
+   * the structured `real_db_not_wired` (not provisioned) exit.
+   */
+  businessQuery?: BusinessQueryExecutor;
 }
 
 export function createRetrieveHandler(deps: RetrieveDeps) {
@@ -207,9 +228,16 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     const control: SearchModeControl = {
       cDropWindows: cDropWindowsEnabled(input.filters),
     };
-    const matchFilters = stripCommunityLevelFilter(
-      stripEntityTypeFilter(
-        stripCDropWindowsFilter(stripSearchModeFilter(input.filters))
+    // The `sql` 档's expiry window is a routing control like every key
+    // above: resolved here, stripped here, and validated only by the
+    // executor — so the refusal of a malformed window happens before a
+    // connection exists (spec §5c).
+    const sqlWindow = readSqlWindowFilter(input.filters);
+    const matchFilters = stripSqlWindowFilter(
+      stripCommunityLevelFilter(
+        stripEntityTypeFilter(
+          stripCDropWindowsFilter(stripSearchModeFilter(input.filters))
+        )
       )
     );
     const retrieveConfig = applyPreset(
@@ -236,6 +264,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
           ? { entityType: entityTypeFilter.entityType }
           : {}),
         communityLevel,
+        ...(searchMode.mode === "sql" ? { sqlWindow } : {}),
       },
       {
         embedder: deps.embedder,
@@ -253,6 +282,9 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         projectionDrain: deps.projectionDrain,
         ...(deps.slotEmbedding !== undefined
           ? { slotEmbedding: deps.slotEmbedding }
+          : {}),
+        ...(deps.businessQuery !== undefined
+          ? { businessQuery: deps.businessQuery }
           : {}),
       },
       control
@@ -360,7 +392,10 @@ export const retrieveTool = (deps: RetrieveDeps): ToolRegistration => ({
     ") optionally restricts graph/entity " +
     "seeding; missing recalls all types. filters.community_level (positive " +
     "integer string) bounds community-summary reads to level <= N; missing " +
-    "defaults to 2.",
+    "defaults to 2. The sql tier reads its expiry window from " +
+    "filters.sql_window_start and filters.sql_window_end (inclusive " +
+    "YYYY-MM-DD dates, both required) and returns business-ledger rows as " +
+    "database_rows beside the chunks.",
   inputSchema:
     deps.inputValidationFailureCounter === undefined
       ? RetrieveInputSchema

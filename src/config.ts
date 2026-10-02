@@ -130,6 +130,18 @@ export const DEFAULT_ELASTICSEARCH_SUMMARY_INDEX = "iknow-memory-summaries";
 export const DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT_MS = 5_000;
 
 /**
+ * Business ledger DSN (plans/post322-a2-sql-slice.md T7). The name is the
+ * one specs/search-mode-business-sql-contract.md §9 uses; it reaches the
+ * server only through the environment or the operator setting, and the
+ * read-only credential inside it is never logged, echoed, or repeated in
+ * an error message. Absent is legal and means NOT provisioned: the `sql`
+ * 档 then exits the structured `real_db_not_wired` — deliberately not a
+ * fail-start dependency, because a server without a ledger still answers
+ * every document tier.
+ */
+export const BUSINESS_LEDGER_URL_VAR = "FIN_BUSINESS_LEDGER_URL";
+
+/**
  * Startup configuration failure. Distinct from GraphragError (core/errors.ts),
  * which covers per-request tool failures: a ConfigError is unrecoverable and
  * aborts the process with EXIT_CODES.BAD_CONFIG before any transport opens.
@@ -165,6 +177,12 @@ export interface GraphragEnv {
   storage: StorageMode;
   /** Postgres connection string; required iff storage === "pgvector". */
   dbUrl: string | undefined;
+  /**
+   * Business ledger DSN for the `sql` 档, or undefined when this instance
+   * is not provisioned with a ledger. Never logged; never echoed into an
+   * error. See `BUSINESS_LEDGER_URL_VAR`.
+   */
+  businessLedgerUrl: string | undefined;
   /**
    * Embedding endpoint base URL (trailing slash stripped). Convention
    * includes /v1 — only /embeddings is appended at call time. Undefined
@@ -1129,6 +1147,25 @@ function parseElasticsearchConfig(): ElasticsearchConfig | undefined {
   };
 }
 
+/**
+ * Load the business ledger DSN. Absent → undefined (the `sql` 档 exits
+ * not-provisioned). A declared value must be usable: only PostgreSQL URI
+ * schemes are accepted (spec §5.1 fixes the engine assumption for this
+ * path), and the error names the var without echoing the value — it can
+ * carry a password.
+ */
+function parseBusinessLedgerUrl(): string | undefined {
+  const url = readTrimmed(BUSINESS_LEDGER_URL_VAR);
+  if (url === undefined) return undefined;
+  const scheme = uriScheme(url);
+  if (scheme !== "postgresql:" && scheme !== "postgres:") {
+    throw new ConfigError(
+      `${BUSINESS_LEDGER_URL_VAR} must be a postgresql:// or postgres:// connection string (the value is not echoed)`
+    );
+  }
+  return url;
+}
+
 /** Scheme of `uri` including the colon, or undefined if it is not a URI. */
 function uriScheme(uri: string): string | undefined {
   try {
@@ -1201,6 +1238,7 @@ export function loadEnv(): GraphragEnv {
   }
 
   const retrieval = parseRetrievalConfig();
+  const businessLedgerUrl = parseBusinessLedgerUrl();
   const neo4j = parseNeo4jConfig();
   const elasticsearch = parseElasticsearchConfig();
   const rerank = parseRerankConfig();
@@ -1224,6 +1262,7 @@ export function loadEnv(): GraphragEnv {
     logLevel,
     storage: rawStorage,
     dbUrl,
+    businessLedgerUrl,
     embedDimensions,
     pgvectorAnnMaxDimensions,
     ingestBatchLimit,

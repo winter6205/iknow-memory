@@ -173,6 +173,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
   it("returns the stage 1 field set with no transport field", () => {
     const env = loadEnv();
     expect(Object.keys(env).sort()).toEqual([
+      "businessLedgerUrl",
       "dbUrl",
       "elasticsearch",
       "embedApiKey",

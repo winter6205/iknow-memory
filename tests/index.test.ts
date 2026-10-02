@@ -11,6 +11,7 @@ import {
 } from "../src/index.ts";
 import { FakeEmbedder } from "../src/core/embedder.ts";
 import { MemoryBackend } from "../src/core/storage/memory-backend.ts";
+import { BusinessQueryExecutor } from "../src/core/business-query/sql-query-executor.js";
 import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "../src/core/types.ts";
 import { setSettingHomeForTests } from "../src/config.js";
 
@@ -49,6 +50,10 @@ const ENV_KEYS = [
   "GRAPHRAG_MEMORY_ANTHROPIC_API_KEY",
   "GRAPHRAG_MEMORY_RETRIEVAL_RERANK_ENABLED",
   "GRAPHRAG_MEMORY_RETRIEVAL_BM25_ENABLED",
+  // A developer machine with a real ledger DSN exported must not make the
+  // offline server provision the business-SQL arm: these tests pin the
+  // NOT-provisioned exit.
+  "FIN_BUSINESS_LEDGER_URL",
 ] as const;
 
 async function createOfflineServer(): Promise<ReturnType<typeof createServer>> {
@@ -216,6 +221,38 @@ describe("createServer — registered tool set (T7)", () => {
       expect(textOf(result)).toMatch(
         /embedding credentials are not configured/
       );
+    } finally {
+      await close();
+    }
+  });
+
+  it("tools/call retrieve search_mode=sql without a provisioned ledger answers a structured error field", async () => {
+    // plans/post322-a2-sql-slice.md T7 / spec §7.1: a SQL failure may not
+    // reach the host as prose. The offline server has no
+    // FIN_BUSINESS_LEDGER_URL, so the `sql` 档 exits
+    // `real_db_not_wired` (means *not provisioned* after A2, spec §7),
+    // and registerOne serializes the DECLARED token as a JSON `error`
+    // field — a host classifies from structure, not from a prose scan.
+    const { client, close } = await connectInProcess();
+    try {
+      const result = await client.callTool({
+        name: "retrieve",
+        arguments: {
+          query: "which contracts expire",
+          filters: {
+            search_mode: "sql",
+            sql_window_start: "2026-01-01",
+            sql_window_end: "2026-03-31",
+          },
+        },
+      });
+      expect(result.isError).toBe(true);
+      const body = JSON.parse(textOf(result)) as {
+        error?: string;
+        message?: string;
+      };
+      expect(body.error).toBe("real_db_not_wired");
+      expect(body.message).toContain("real_db_not_wired");
     } finally {
       await close();
     }
@@ -496,6 +533,43 @@ describe("buildRetrieveDeps — Neo4j graph arm wiring (#70)", () => {
       false
     );
     expect(deps.graphRanker).toBe(graphRanker);
+  });
+});
+
+describe("buildRetrieveDeps — business ledger wiring (T7)", () => {
+  const embedder = new FakeEmbedder(1536);
+  const storage = new MemoryBackend(1536);
+  const retrieval = {
+    w_vec: 0.7,
+    w_bm25: 0.15,
+    w_graph: 0.15,
+    bm25Enabled: true,
+    graphEnabled: true,
+    rerankEnabled: false,
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    graphArmFloor: 3,
+  };
+  const businessLedger = {
+    connectionString:
+      "postgresql://fin_sql_reader:unused-test-secret@ledger.invalid/fin_business",
+    authorizedScopes: ["ledger_ro.contract_expiry"],
+  };
+
+  it("omits businessQuery entirely when no ledger is provisioned", () => {
+    const deps = buildRetrieveDeps({ embedder, storage, retrieval }, false);
+    // Absence IS the provisioning fact: the sql 档 reads it as
+    // `real_db_not_wired`, and an explicit `undefined` key would let a
+    // later refactor fill it in without tripping this guard.
+    expect(Object.hasOwn(deps, "businessQuery")).toBe(false);
+  });
+
+  it("builds one business-query executor when a ledger is configured", () => {
+    const deps = buildRetrieveDeps(
+      { embedder, storage, retrieval, businessLedger },
+      false
+    );
+    expect(deps.businessQuery).toBeInstanceOf(BusinessQueryExecutor);
   });
 });
 

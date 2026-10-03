@@ -24,6 +24,7 @@ export type {
 } from "../retrieval/types.js";
 import { GraphragError } from "../errors.js";
 import type {
+  EvidenceStore,
   IndexJobStore,
   RetrievedChunk,
   SearchOptions,
@@ -217,6 +218,48 @@ export function supportsCommunityReportLexical(
     typeof (candidate as Partial<CommunityReportLexicalStorage> | null | undefined)
       ?.searchCommunitySummariesLexical === "function"
   );
+}
+
+/**
+ * Every `EvidenceStore` method, as a key map.
+ *
+ * Typed `Record<keyof EvidenceStore, true>` rather than a list so the
+ * coverage requirement is the type system talking: a method added to the
+ * capability without an entry here fails `tsc`, which is the only thing that
+ * can notice — a runtime `every` over a shorter list would simply stop
+ * checking. It is also a conjunction that cannot grow a thirteenth clause.
+ */
+const EVIDENCE_STORE_METHODS: Record<keyof EvidenceStore, true> = {
+  registerSourceVersion: true,
+  bindSourceLocator: true,
+  recordSupport: true,
+  getSupport: true,
+  listSupportExtractions: true,
+  issueGrant: true,
+  readGrant: true,
+  listGrantSupports: true,
+  listGrantPinnedExtractions: true,
+  setScopeRevisions: true,
+  markSourceVersionRetired: true,
+  collectSourceVersionPayload: true,
+  stopAcceptingObligations: true,
+};
+
+/**
+ * Runtime narrowing for the immutable source/support storage and the finite
+ * row/count grants. Takes `unknown` and checks every method: the store is
+ * split in two — a reference can be read without the ability to mint one — so
+ * a partial implementation fails closed rather than letting a caller reach a
+ * grant it cannot create.
+ */
+export function supportsEvidenceStore(
+  candidate: unknown
+): candidate is StorageBackend & EvidenceStore {
+  const seam = candidate as Partial<EvidenceStore> | null | undefined;
+  const methods: readonly (keyof EvidenceStore)[] = Object.keys(
+    EVIDENCE_STORE_METHODS
+  ) as readonly (keyof EvidenceStore)[];
+  return methods.every((method) => typeof seam?.[method] === "function");
 }
 
 /**

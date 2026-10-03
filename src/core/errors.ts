@@ -6,7 +6,10 @@
  * declared `failureToken` as the structured `error` field of the isError
  * result it hands the host.
  */
-import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "./types.js";
+import {
+  COMMUNITY_SUMMARY_INDEX_FAILURE,
+  type EvidenceFailureToken,
+} from "./types.js";
 
 export type GraphragErrorCode =
   | "INVALID_INPUT" // Zod passed but semantically invalid (e.g. valid_from > valid_until)
@@ -20,7 +23,9 @@ export type GraphragErrorCode =
  * on the constant the ledger and the arms already publish: `code` stays the
  * coarse internal category, `failureToken` is the public named fact.
  */
-export type GraphragFailureToken = typeof COMMUNITY_SUMMARY_INDEX_FAILURE;
+export type GraphragFailureToken =
+  | typeof COMMUNITY_SUMMARY_INDEX_FAILURE
+  | EvidenceFailureToken;
 
 export class GraphragError extends Error {
   constructor(

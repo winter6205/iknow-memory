@@ -35,6 +35,7 @@ import {
   normalizeRelationNorm,
   normalizeRelationAssertion,
   normalizeValidWindow,
+  readUuidShape,
   RELATION_ASSERTION_IDENTITY_VERSION,
   requireEntityType,
   serializeRelationAssertionTuple,
@@ -161,6 +162,68 @@ describe("strict whole-second UTC validity normalization", () => {
     );
   });
 
+  it("names the offending ENDPOINT on each side of the window", () => {
+    // `field` is what an operator-facing handler acts on, so a refusal raised
+    // while normalizing the `until` endpoint must not be reported as a `from`
+    // problem — the handler would send the caller to fix the wrong bound. The
+    // two sides are symmetric, so the offsets are the sharpest probe: they
+    // fail AFTER the regex matched, in the offset reader.
+    for (const offset of ["+05:30:30", "+99:00", "-99:00"]) {
+      refusalFor(
+        () =>
+          normalizeValidWindow({
+            from: `2024-01-01T00:00:00${offset}`,
+            until: null,
+          }),
+        "valid_window.from"
+      );
+      refusalFor(
+        () =>
+          normalizeValidWindow({
+            from: null,
+            until: `2024-01-01T00:00:00${offset}`,
+          }),
+        "valid_window.until"
+      );
+    }
+  });
+
+  it("refuses an UNDEFINED endpoint instead of widening the window to unbounded", () => {
+    // `ValidWindowInput` declares `string | null`, so `undefined` is already
+    // outside the contract. Coercing it to null would silently turn a LOST
+    // endpoint into an unbounded one and derive a DIFFERENT persistent id for
+    // the same assertion — a scope widening with no refusal.
+    refusalFor(
+      () =>
+        normalizeValidWindow({
+          from: undefined as unknown as string | null,
+          until: null,
+        }),
+      "valid_window.from"
+    );
+    refusalFor(
+      () =>
+        normalizeValidWindow({
+          from: null,
+          until: undefined as unknown as string | null,
+        }),
+      "valid_window.until"
+    );
+  });
+
+  it("keeps a null endpoint unbounded while refusing an undefined one", () => {
+    expect(normalizeValidWindow({ from: null, until: null })).toEqual({
+      from: null,
+      until: null,
+    });
+    expect(
+      normalizeValidWindow({ from: null, until: "2024-01-01T00:00:00Z" })
+    ).toEqual({ from: null, until: "2024-01-01T00:00:00Z" });
+    expect(
+      normalizeValidWindow({ from: "2024-01-01T00:00:00Z", until: null })
+    ).toEqual({ from: "2024-01-01T00:00:00Z", until: null });
+  });
+
   it("refuses a leap second as non-representable", () => {
     // `:60` is a real leap second, not a whole second in the POSIX timeline;
     // rounding it to `:00` would name a different instant.
@@ -257,6 +320,39 @@ describe("entity identity reuses the existing UUID boundary", () => {
   it("refuses a value that is not a UUID at all", () => {
     for (const bad of ["", "not-a-uuid", "alice", "  "]) {
       refusalFor(() => normalizeEntityId(bad), "entity_id");
+    }
+  });
+
+  it("shares ONE UUID primitive whose case policy is an explicit input", () => {
+    // The two boundaries validate the same shape and deliberately differ on
+    // case, so the policy is a named input rather than a second function:
+    //   `preserve`    — the request boundary. PG's `uuid` comparison is
+    //                   case-insensitive, so a preserved-case id still matches
+    //                   the stored row; folding it here would change what the
+    //                   caller sent.
+    //   `canonicalize` — the identity boundary. Every spelling of one entity
+    //                   must derive ONE id, so folding is the whole point.
+    // Collapse the two policies and one boundary silently changes meaning, so
+    // both are pinned here on the shared primitive itself.
+    expect(readUuidShape(HEAD, "preserve")).toBe(HEAD);
+    expect(readUuidShape(HEAD, "canonicalize")).toBe(HEAD);
+    expect(readUuidShape(HEAD.toUpperCase(), "preserve")).toBe(
+      HEAD.toUpperCase()
+    );
+    expect(readUuidShape(HEAD.toUpperCase(), "canonicalize")).toBe(HEAD);
+    // The shape is the strict 8-4-4-4-12 spelling on BOTH policies. Braced and
+    // `urn:uuid:` forms are canonicalized by `normalizeEntityId` before the
+    // check, so accepting them here would silently widen the request boundary
+    // too.
+    for (const bad of [
+      "",
+      "not-a-uuid",
+      HEAD.replace(/-/g, ""),
+      `{${HEAD}}`,
+      `urn:uuid:${HEAD}`,
+    ]) {
+      expect(readUuidShape(bad, "preserve")).toBeUndefined();
+      expect(readUuidShape(bad, "canonicalize")).toBeUndefined();
     }
   });
 

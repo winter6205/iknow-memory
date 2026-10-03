@@ -59,8 +59,45 @@ const RELATION_ASSERTION_IDENTITY_DOMAIN = "iknow.structured_relation_identity";
  */
 const UNBOUNDED_ENDPOINT = "\u0000";
 
-const CANONICAL_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UUID_SHAPE_RE =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/**
+ * What a UUID boundary does with the CASE of a value it has accepted. The two
+ * boundaries need opposite things from the same shape, so the policy is a named
+ * input of one shared primitive rather than two validators that could drift:
+ *
+ *   - `preserve` — the structured REQUEST boundary (`request.ts`). PostgreSQL's
+ *     `uuid` comparison is case-insensitive, so an id the caller spelled in
+ *     uppercase still matches the stored lowercase row. Folding it here would
+ *     silently change what the caller sent.
+ *   - `canonicalize` — the identity boundary (this module). Every spelling of
+ *     one entity must derive ONE id, so folding is the entire point.
+ */
+export type UuidCasePolicy = "preserve" | "canonicalize";
+
+/**
+ * The one UUID shape check both structured boundaries share.
+ *
+ * Returns `undefined` when the value is not the strict 8-4-4-4-12 hex spelling,
+ * and leaves the refusal to the caller: the two boundaries refuse with
+ * different vocabularies (`invalid_value` at the request edge,
+ * `StructuredIdentityError` with a `field` here), and neither owns the other's.
+ *
+ * The shape is deliberately strict on BOTH policies — braced and `urn:uuid:`
+ * forms are decorator spellings that `normalizeEntityId` strips before it gets
+ * here. Accepting them in the primitive would silently widen the request
+ * boundary as well.
+ */
+export function readUuidShape(
+  raw: string,
+  policy: UuidCasePolicy
+): string | undefined {
+  if (typeof raw !== "string" || !UUID_SHAPE_RE.test(raw)) {
+    return undefined;
+  }
+  return policy === "canonicalize" ? raw.toLowerCase() : raw;
+}
 
 /**
  * Accepted endpoint grammar: a whole-second UTC instant, optionally with a
@@ -106,6 +143,17 @@ export interface ValidWindowInput {
   readonly until: string | null;
 }
 
+/**
+ * The two endpoints of a validity interval, as the `field` a refusal names.
+ *
+ * A closed union rather than a bare string because `field` is what an
+ * operator-facing handler ACTS on: a refusal raised while reading the `until`
+ * offset must not be reported as a `from` problem, or the handler sends the
+ * caller to fix the wrong bound. Typing it makes that drift a compile error at
+ * every refusal site below.
+ */
+export type ValidWindowField = "valid_window.from" | "valid_window.until";
+
 /** The exact normalized tuple a relation assertion's identity is derived from. */
 export interface RelationAssertionTuple {
   readonly headEntityId: string;
@@ -149,11 +197,12 @@ export function normalizeEntityId(raw: string): string {
   if (candidate.startsWith("{") && candidate.endsWith("}")) {
     candidate = candidate.slice(1, -1);
   }
-  candidate = candidate.trim().toLowerCase();
-  if (!CANONICAL_UUID_RE.test(candidate)) {
+  candidate = candidate.trim();
+  const canonical = readUuidShape(candidate, "canonicalize");
+  if (canonical === undefined) {
     return refuse("entity_id", `${raw} is not a canonical UUID`);
   }
-  return candidate;
+  return canonical;
 }
 
 /**
@@ -199,8 +248,15 @@ export function requireEntityType(raw: string): EntityType {
   return found;
 }
 
-/** Signed minute offset of a parsed endpoint, or 0 for `Z`. */
-function offsetMinutesOf(offset: string | undefined): number {
+/**
+ * Signed minute offset of a parsed endpoint, or 0 for `Z`. `field` is the
+ * endpoint this offset was read from, so a refusal names the bound the caller
+ * actually has to fix.
+ */
+function offsetMinutesOf(
+  offset: string | undefined,
+  field: ValidWindowField
+): number {
   if (offset === undefined || offset === "Z" || offset === "z") return 0;
   const sign = offset.startsWith("-") ? -1 : 1;
   const digits = offset.slice(1).replace(/:/g, "");
@@ -211,17 +267,17 @@ function offsetMinutesOf(offset: string | undefined): number {
   // canonical whole-second form cannot represent it without inventing a value.
   if (seconds !== 0) {
     return refuse(
-      "valid_window.from",
+      field,
       "an offset with a seconds component is not losslessly convertible to whole-second UTC"
     );
   }
   if (hours > 23 || minutes > 59) {
-    return refuse("valid_window.from", `offset ${offset} is out of range`);
+    return refuse(field, `offset ${offset} is out of range`);
   }
   return sign * (hours * 60 + minutes);
 }
 
-function normalizeEndpoint(raw: string, field: string): string {
+function normalizeEndpoint(raw: string, field: ValidWindowField): string {
   if (typeof raw !== "string" || raw.trim() === "") {
     return refuse(field, "must be a non-empty timestamp string");
   }
@@ -268,7 +324,7 @@ function normalizeEndpoint(raw: string, field: string): string {
     // over to the next month; refused instead of rolled.
     return refuse(field, `${raw} is not a real calendar instant`);
   }
-  const shifted = new Date(local.getTime() - offsetMinutesOf(offset) * 60_000);
+  const shifted = new Date(local.getTime() - offsetMinutesOf(offset, field) * 60_000);
   const canonical = shifted.toISOString().replace(/\.000Z$/, "Z");
   if (!CANONICAL_ENDPOINT_RE.test(canonical)) {
     return refuse(
@@ -289,18 +345,17 @@ function normalizeEndpoint(raw: string, field: string): string {
  * date; and with both endpoints present the interval must be non-empty, i.e.
  * `from < until` — a zero-length or reversed interval is refused BEFORE it can
  * be registered, not repaired.
+ *
+ * `undefined` is refused on either side rather than coerced to `null`.
+ * `ValidWindowInput` declares `string | null`, so an `undefined` endpoint is a
+ * LOST endpoint, and reading it as unbounded would silently widen the
+ * assertion's scope and derive a different persistent id with no refusal.
  */
 export function normalizeValidWindow(
   input: ValidWindowInput
 ): NormalizedValidWindow {
-  const from =
-    input.from === null || input.from === undefined
-      ? null
-      : normalizeEndpoint(input.from, "valid_window.from");
-  const until =
-    input.until === null || input.until === undefined
-      ? null
-      : normalizeEndpoint(input.until, "valid_window.until");
+  const from = normalizeEndpointOrUnbounded(input.from, "valid_window.from");
+  const until = normalizeEndpointOrUnbounded(input.until, "valid_window.until");
   if (from !== null && until !== null) {
     // Both endpoints are now fixed-width, zero-padded, UTC, so their string
     // order IS their chronological order.
@@ -318,6 +373,25 @@ export function normalizeValidWindow(
     }
   }
   return { from, until };
+}
+
+/**
+ * One endpoint: `null` is the declared unbounded case, a string is normalized,
+ * and `undefined` — outside the declared `string | null` — is a lost endpoint
+ * and is refused instead of being read as unbounded.
+ */
+function normalizeEndpointOrUnbounded(
+  raw: string | null,
+  field: ValidWindowField
+): string | null {
+  if (raw === undefined) {
+    return refuse(
+      field,
+      "is undefined; use null for an unbounded endpoint — a missing endpoint " +
+        "is a lost endpoint, not an open-ended one"
+    );
+  }
+  return raw === null ? null : normalizeEndpoint(raw, field);
 }
 
 /**

@@ -263,22 +263,61 @@ export function readStructuredQueryFilter(
 }
 
 /**
- * Strip the structured key and narrow back to the exact-match map the arms
- * consume. A request without the key is returned as-is, and a request whose
- * only filter was the structured key reads as no filters at all, so the arm
- * call shape never differs from a request that carried none.
+ * Resolution of the `filters` map once the structured key is removed.
+ *
+ * A refusal, not a silent drop. `structured_query` is the ONE key whose value
+ * is an object; every other key keeps the string-only exact-match contract, so
+ * a non-string under one of them is a filter the arms cannot apply. Returning
+ * it as `ok` would hand the arm a map missing an entry the caller sent, and the
+ * arm would answer a NARROWER question than the one asked with no refusal
+ * anywhere. This module owns no error vocabulary of its own (see the leaf
+ * note at the top), so it names the offending key and the handler refuses.
+ */
+export type StructuredQueryFilterStrip =
+  | { kind: "ok"; filters: Record<string, string> | undefined }
+  | { kind: "invalid"; key: string; received: string };
+
+/** Stable host-mappable reason token, aligned with the other routing keys. */
+export const INVALID_FILTER_VALUE_REASON = "invalid_filter_value";
+
+/** Build the thrown-error message; keeps the reason token out of magic strings. */
+export function invalidFilterValueMessage(
+  key: string,
+  received: string
+): string {
+  return (
+    `retrieve ${key} must be a string (or the object-valued ` +
+    `${STRUCTURED_QUERY_FILTER_KEY}), got a ${received} ` +
+    `(${INVALID_FILTER_VALUE_REASON})`
+  );
+}
+
+/**
+ * Strip the structured key and narrow to the exact-match map the arms consume.
+ *
+ * A request whose only filter was the structured key reads as no filters at
+ * all, so the arm call shape never differs from a request that carried none.
+ * Every other entry must be a string: one that is not is refused rather than
+ * dropped, because dropping it silently narrows the query.
  */
 export function stripStructuredQueryFilter(
   filters: RetrieveWireFilters | undefined
-): Record<string, string> | undefined {
-  if (filters === undefined || !(STRUCTURED_QUERY_FILTER_KEY in filters)) {
-    return filters as Record<string, string> | undefined;
+): StructuredQueryFilterStrip {
+  if (filters === undefined) {
+    return { kind: "ok", filters: undefined };
   }
   const rest: Record<string, string> = {};
   for (const [key, value] of Object.entries(filters)) {
-    if (key !== STRUCTURED_QUERY_FILTER_KEY && typeof value === "string") {
-      rest[key] = value;
+    if (key === STRUCTURED_QUERY_FILTER_KEY) {
+      continue;
     }
+    if (typeof value !== "string") {
+      return { kind: "invalid", key, received: typeof value };
+    }
+    rest[key] = value;
   }
-  return Object.keys(rest).length > 0 ? rest : undefined;
+  return {
+    kind: "ok",
+    filters: Object.keys(rest).length > 0 ? rest : undefined,
+  };
 }

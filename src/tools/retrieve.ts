@@ -83,6 +83,7 @@ import {
   STRUCTURED_QUERY_FILTER_KEY,
   invalidCommunityLevelMessage,
   invalidEntityTypeMessage,
+  invalidFilterValueMessage,
   parseCommunityLevelFilter,
   parseEntityTypeFilter,
   stripCommunityLevelFilter,
@@ -135,9 +136,19 @@ export function createRetrieveInputSchema(
     // `structured_query` is the one filter key whose value is an object (the
     // bounded structured request). A Zod record cannot type one member
     // differently from the rest, so the value union admits an object and the
-    // refine holds the other keys to the string-only exact-match contract.
+    // refine holds every OTHER key to the string-only exact-match contract.
+    //
+    // The union is a PUBLICATION decision as much as a parse one: `z.unknown()`
+    // would collapse the advertised JSON Schema to an unconstrained
+    // `additionalProperties: {}`, so a host reading only the published schema
+    // would believe `filters` accepts any value at all — exactly the boundary
+    // this change tightens. Naming the two accepted cases keeps the string case
+    // documented for that host, and the refine stays the runtime enforcer.
     filters: z
-      .record(z.string(), z.unknown())
+      .record(
+        z.string(),
+        z.union([z.string(), z.record(z.string(), z.unknown())])
+      )
       .refine(
         (filters) =>
           Object.entries(filters).every(
@@ -222,8 +233,17 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     // the one filter key whose value is an object. Read and strip it FIRST, so
     // every control reader below sees the string-only exact-match map it has
     // always seen; the request itself is validated once the bound 档 is known.
+    // A non-string under any OTHER key is refused here rather than dropped:
+    // dropping it would narrow the query without answering it.
     const structured = readStructuredQueryFilter(input.filters);
-    const stringFilters = stripStructuredQueryFilter(input.filters);
+    const stripped = stripStructuredQueryFilter(input.filters);
+    if (stripped.kind === "invalid") {
+      throw new GraphragError(
+        invalidFilterValueMessage(stripped.key, stripped.received),
+        "INVALID_INPUT"
+      );
+    }
+    const stringFilters = stripped.filters;
     // Resolve the 档 before anything else so an invalid value is a typed
     // refusal, never a degraded or empty answer (plans/search-mode-retrieve
     // .md T1 acceptance). `search_mode` is routing, not matching: strip it

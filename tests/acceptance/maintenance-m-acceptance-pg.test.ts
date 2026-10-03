@@ -37,6 +37,7 @@ import {
   PgMaintenanceWorkStore,
   type MaintenanceWorkPool,
 } from "../../src/core/storage/maintenance-work-pg.js";
+import { InMemoryMaintenanceWorkStore } from "../../src/core/storage/maintenance-work-memory.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
 import {
   createPgIntegrationHarness,
@@ -458,6 +459,18 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
 
     await expect(dead.scheduleWork(request(), T0)).rejects.toMatchObject({
       failureCode: "backend_unavailable",
+    });
+  });
+
+  it("raises the same typed fault from the memory twin after close", async () => {
+    const store = new InMemoryMaintenanceWorkStore();
+    await store.close();
+
+    // Both stores must answer the same way: a caller branching on `failureCode`
+    // cannot be told apart by which backend it happens to be running on.
+    await expect(store.scheduleWork(request(), T0)).rejects.toMatchObject({
+      failureCode: "backend_unavailable",
+      code: "STORAGE_ERROR",
     });
   });
 });

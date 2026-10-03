@@ -10,7 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { GraphragError } from "../errors.js";
+import { MaintenanceStoreError } from "../maintenance/store-error.js";
 import {
   absoluteDeadlineFrom,
   canonicalDependencyRevision,
@@ -331,9 +331,11 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
 
   private assertOpen(): void {
     if (this.closed) {
-      throw new GraphragError(
+      // The same typed fault the SQL twin raises, so a caller branching on
+      // `failureCode` gets the same answer from either store.
+      throw new MaintenanceStoreError(
         "maintenance work store used after close",
-        "STORAGE_ERROR"
+        "backend_unavailable"
       );
     }
   }
@@ -364,9 +366,9 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       // A settle whose attempt row is missing means the history is broken, and
       // reporting `settled` on top of it would report a success the ledger cannot
       // explain.
-      throw new GraphragError(
+      throw new MaintenanceStoreError(
         `maintenance attempt ${attempt.attemptNumber} missing for job ${attempt.jobKey}`,
-        "STORAGE_ERROR"
+        "backend_unavailable"
       );
     }
     history[index] = {

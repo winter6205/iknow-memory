@@ -13,6 +13,8 @@
  * this capability is an opt-in lifecycle ledger that no read path touches. A
  * separate class also keeps the maintenance tables unreachable from a query.
  */
+import { randomUUID } from "node:crypto";
+
 import { GraphragError } from "../errors.js";
 import {
   canonicalDependencyRevision,
@@ -21,6 +23,9 @@ import {
   verifyAttemptGuard,
 } from "../maintenance/durable-work.js";
 import {
+  MAINTENANCE_WORK_KINDS,
+  MAINTENANCE_WORK_STATUS,
+  MAX_AUTO_ATTEMPTS,
   WORK_ABSOLUTE_LIMIT_MS,
   WORK_LEASE_MS,
   type MaintenanceAttemptGuard,
@@ -51,12 +56,38 @@ export interface MaintenanceWorkPool {
   connect(): Promise<MaintenanceWorkLease>;
 }
 
+/**
+ * A storage fault carries BOTH vocabularies on purpose: `GraphragError` keeps
+ * this package's typed-error convention, and `failureCode` names the maintenance
+ * work failure the worker should record. A raw driver error carries neither, so
+ * a caller would have to parse its message to decide whether the failure was
+ * worth retrying.
+ */
+export class MaintenanceStoreError extends GraphragError {
+  constructor(
+    message: string,
+    readonly failureCode: MaintenanceWorkFailureCode
+  ) {
+    super(message, "STORAGE_ERROR");
+    this.name = "MaintenanceStoreError";
+  }
+}
+
 const JOB_COLUMNS =
   "job_key, work_kind, source_ref, source_version, source_generation, " +
   "input_revision, config_revision, status, attempt_count, auto_attempt_count, " +
   "max_attempts, next_attempt_at, last_failure_code, created_at, updated_at";
 
-const ABSOLUTE_BOUND_SQL = `attempt_started_at + interval '${WORK_ABSOLUTE_LIMIT_MS / 1000} seconds'`;
+/**
+ * The absolute bound and the lease, both rendered from the compile-time
+ * constants. No request value ever reaches these strings — only module-level
+ * numbers do, so interpolating them is not an injection surface.
+ */
+export const ABSOLUTE_BOUND_SQL =
+  `attempt_started_at + interval '${WORK_ABSOLUTE_LIMIT_MS / 1000} seconds'`;
+const LEASE_SQL = `interval '${WORK_LEASE_MS / 1000} seconds'`;
+
+export { MAINTENANCE_WORK_KINDS, MAINTENANCE_WORK_STATUS, MAX_AUTO_ATTEMPTS };
 
 export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   private readonly pool: MaintenanceWorkPool;
@@ -67,34 +98,32 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   }
 
   /**
-   * One statement, so the insert and the join it may lose to observe the same
-   * snapshot: the INSERT branch returns `inserted = true`, and if the key
-   * already exists the ON CONFLICT branch yields nothing so the SELECT branch
-   * returns that row with `inserted = false`.
+   * Insert the job, or join the one already holding this key.
+   *
+   * `ON CONFLICT ... DO UPDATE` whose `SET` is a no-op is what makes the join
+   * correct under concurrency. The obvious `DO NOTHING` cannot be: a
+   * data-modifying CTE's SELECT branch reads the statement's own snapshot, so a
+   * row another transaction commits concurrently would be invisible to it and
+   * the call would see nothing at all. Taking the conflicting row instead forces
+   * the same speculative lock and returns that row.
+   *
+   * `xmax = 0` distinguishes the two outcomes — a row this statement inserted
+   * has no locking transaction, one it merely updated does.
    */
   async scheduleWork(
     request: MaintenanceWorkRequest,
     now: Date
   ): Promise<MaintenanceScheduleOutcome> {
-    const lease = await this.lease();
-    try {
+    return this.transact(async (lease) => {
       const { rows } = await lease.query(
-        `WITH inserted AS (
-           INSERT INTO maintenance_jobs
-             (job_key, work_kind, source_ref, source_version, source_generation,
-              input_revision, config_revision, status, attempt_count,
-              auto_attempt_count, max_attempts, next_attempt_at, last_failure_code,
-              created_at, updated_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0,0,3,$8,NULL,$8,$8)
-           ON CONFLICT (job_key) DO NOTHING
-           RETURNING ${JOB_COLUMNS}, true AS inserted
-         )
-         SELECT ${JOB_COLUMNS}, true AS inserted FROM inserted
-         UNION ALL
-         SELECT ${JOB_COLUMNS}, false AS inserted
-           FROM maintenance_jobs
-          WHERE job_key = $1
-         LIMIT 1`,
+        `INSERT INTO maintenance_jobs
+           (job_key, work_kind, source_ref, source_version, source_generation,
+            input_revision, config_revision, status, attempt_count,
+            auto_attempt_count, max_attempts, next_attempt_at, last_failure_code,
+            created_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0,0,$8,$9,NULL,$9,$9)
+         ON CONFLICT (job_key) DO UPDATE SET updated_at = maintenance_jobs.updated_at
+         RETURNING ${JOB_COLUMNS}, (xmax = 0) AS inserted`,
         [
           computeMaintenanceJobKey(request),
           request.workKind,
@@ -103,20 +132,19 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
           request.sourceGeneration,
           canonicalDependencyRevision(request.dependencies),
           request.configRevision,
+          MAX_AUTO_ATTEMPTS,
           now.toISOString(),
         ]
       );
       const row = rows[0];
       if (!row) {
-        throw new GraphragError(
+        throw new MaintenanceStoreError(
           "maintenance job schedule returned no row",
-          "STORAGE_ERROR"
+          "backend_unavailable"
         );
       }
       return { record: toRecord(row), inserted: row.inserted === true };
-    } finally {
-      lease.release();
-    }
+    });
   }
 
   async getJob(jobKey: string): Promise<MaintenanceJobRecord | null> {
@@ -142,56 +170,39 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
    * reclaimer invalidates the old token before anybody claims a new attempt.
    */
   async claimWork(now: Date): Promise<MaintenanceAttemptGuard | null> {
-    const lease = await this.lease();
-    try {
-      await lease.query("BEGIN");
-      try {
-        const stamp = now.toISOString();
-        const { rows } = await lease.query(
-          `UPDATE maintenance_jobs SET
-             status = 'running',
-             attempt_count = attempt_count + 1,
-             auto_attempt_count = auto_attempt_count + 1,
-             fencing_token = $1,
-             lease_expires_at = $2,
-             attempt_started_at = $3,
-             last_failure_code = NULL,
-             next_attempt_at = NULL,
-             updated_at = $3
-           WHERE job_key = (
-             SELECT job_key FROM maintenance_jobs
-              WHERE status = 'pending'
-                AND (next_attempt_at IS NULL OR next_attempt_at <= $3)
-              ORDER BY next_attempt_at ASC NULLS FIRST, created_at ASC, job_key ASC
-              FOR UPDATE SKIP LOCKED
-              LIMIT 1)
-           RETURNING ${JOB_COLUMNS}, fencing_token, lease_expires_at, attempt_started_at`,
-          [
-            fenceToken(),
-            new Date(now.getTime() + WORK_LEASE_MS).toISOString(),
-            stamp,
-          ]
-        );
-        const row = rows[0];
-        if (!row) {
-          await lease.query("COMMIT");
-          return null;
-        }
-        await lease.query(
-          `INSERT INTO maintenance_job_attempts
-             (job_key, attempt_number, fencing_token, started_at)
-           VALUES ($1,$2,$3,$4)`,
-          [row.job_key, row.attempt_count, row.fencing_token, stamp]
-        );
-        await lease.query("COMMIT");
-        return toGuard(row);
-      } catch (error) {
-        await lease.query("ROLLBACK");
-        throw error;
-      }
-    } finally {
-      lease.release();
-    }
+    return this.transact(async (lease) => {
+      const stamp = now.toISOString();
+      const { rows } = await lease.query(
+        `UPDATE maintenance_jobs SET
+           status = 'running',
+           attempt_count = attempt_count + 1,
+           auto_attempt_count = auto_attempt_count + 1,
+           fencing_token = $1,
+           lease_expires_at = $2,
+           attempt_started_at = $3,
+           last_failure_code = NULL,
+           next_attempt_at = NULL,
+           updated_at = $3
+         WHERE job_key = (
+           SELECT job_key FROM maintenance_jobs
+            WHERE status = 'pending'
+              AND (next_attempt_at IS NULL OR next_attempt_at <= $3)
+            ORDER BY next_attempt_at ASC NULLS FIRST, created_at ASC, job_key ASC
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1)
+         RETURNING ${JOB_COLUMNS}, fencing_token, lease_expires_at, attempt_started_at`,
+        [randomUUID(), new Date(now.getTime() + WORK_LEASE_MS).toISOString(), stamp]
+      );
+      const row = rows[0];
+      if (!row) return null;
+      await lease.query(
+        `INSERT INTO maintenance_job_attempts
+           (job_key, attempt_number, fencing_token, started_at)
+         VALUES ($1,$2,$3,$4)`,
+        [String(row.job_key), Number(row.attempt_count), String(row.fencing_token), stamp]
+      );
+      return toGuard(row);
+    });
   }
 
   /**
@@ -207,9 +218,7 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
     try {
       const { rows } = await lease.query(
         `UPDATE maintenance_jobs
-            SET lease_expires_at = LEAST(
-                  $2::timestamptz + interval '${WORK_LEASE_MS / 1000} seconds',
-                  ${ABSOLUTE_BOUND_SQL}),
+            SET lease_expires_at = LEAST($2::timestamptz + ${LEASE_SQL}, ${ABSOLUTE_BOUND_SQL}),
                 updated_at = $2
           WHERE job_key = $1
             AND status = 'running'
@@ -250,7 +259,7 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
 
   /**
    * Publish the terminal outcome under the full fence. The row is re-read
-   * `FOR UPDATE` first so the ownership and input verdicts are decided against
+   * `FOR UPDATE` first, so the ownership and input verdicts are decided against
    * the committed row inside the same transaction that then writes, rather than
    * against a value read before the write began.
    */
@@ -260,77 +269,31 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
     live: MaintenanceLiveInputs,
     now: Date
   ): Promise<MaintenanceSettleResult> {
-    const lease = await this.lease();
-    try {
-      await lease.query("BEGIN");
-      try {
-        const stamp = now.toISOString();
-        const { rows } = await lease.query(
-          `SELECT ${JOB_COLUMNS}, fencing_token, lease_expires_at, attempt_started_at
-             FROM maintenance_jobs
-            WHERE job_key = $1
-            FOR UPDATE`,
-          [guard.jobKey]
-        );
-        const row = rows[0];
-        if (!row || row.status !== "running") {
-          await lease.query("COMMIT");
-          return { result: "lease_lost" };
-        }
+    return this.transact(async (lease) => {
+      const stamp = now.toISOString();
+      const row = await this.lockRunningJob(lease, guard.jobKey);
+      if (!row) return { result: "lease_lost" };
 
-        const stored = toGuard(row);
-        const verdict = verifyAttemptGuard(stored, live, now, guard.fencingToken);
-        if (!verdict.ok) {
-          if (verdict.code === "input_stale") {
-            const record = await this.writeSettled(lease, row, {
-              status: "stale",
-              nextDelayMs: null,
-              lastFailureCode: "input_stale",
-            }, stamp);
-            await this.finishAttempt(
-              lease,
-              String(row.job_key),
-              Number(row.attempt_count),
-              "input_stale",
-              stamp
-            );
-            await lease.query("COMMIT");
-            return { result: "stale", record };
-          }
-          await lease.query("COMMIT");
-          return verdict.code === "execution_timeout"
-            ? { result: "timed_out" }
-            : { result: "lease_lost" };
-        }
+      const verdict = verifyAttemptGuard(toGuard(row), live, now, guard.fencingToken);
+      if (!verdict.ok) return this.refuseSettle(lease, row, verdict.code, stamp);
 
-        const plan = planSettle(
-          Number(row.auto_attempt_count),
-          Number(row.max_attempts),
-          outcome
-        );
-        const record = await this.writeSettled(
-          lease,
-          row,
-          plan,
-          stamp,
-          plan.nextDelayMs
-        );
-        await this.finishAttempt(
-          lease,
-          String(row.job_key),
-          Number(row.attempt_count),
-          plan.lastFailureCode,
-          stamp
-        );
-        await lease.query("COMMIT");
-        return { result: "settled", record };
-      } catch (error) {
-        await lease.query("ROLLBACK");
-        throw error;
-      }
-    } finally {
-      lease.release();
-    }
+      // MAX_AUTO_ATTEMPTS, not the row's `max_attempts`: the column is readable
+      // and writable, and the retry budget must not be something an UPDATE can
+      // widen past the spec's three attempts.
+      const plan = planSettle(
+        Number(row.auto_attempt_count),
+        MAX_AUTO_ATTEMPTS,
+        outcome
+      );
+      const record = await this.writeSettled(lease, row, plan, stamp);
+      await this.finishAttempt(lease, {
+        jobKey: String(row.job_key),
+        attemptNumber: Number(row.attempt_count),
+        failureCode: plan.lastFailureCode,
+        finishedAt: stamp,
+      });
+      return { result: "settled", record };
+    });
   }
 
   /**
@@ -341,44 +304,33 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   async reclaimExpiredWork(
     now: Date
   ): Promise<readonly MaintenanceReclaimOutcome[]> {
-    const lease = await this.lease();
-    try {
-      await lease.query("BEGIN");
-      try {
-        const stamp = now.toISOString();
-        const { rows } = await lease.query(
-          `UPDATE maintenance_jobs
-              SET status = 'pending',
-                  next_attempt_at = $1,
-                  fencing_token = NULL,
-                  lease_expires_at = NULL,
-                  attempt_started_at = NULL,
-                  updated_at = $1
-            WHERE status = 'running'
-              AND lease_expires_at IS NOT NULL
-              AND lease_expires_at <= $1
-          RETURNING job_key, attempt_count`,
-          [stamp]
-        );
-        for (const row of rows) {
-          await this.finishAttempt(
-            lease,
-            row.job_key as string,
-            row.attempt_count as number,
-            "lease_lost",
-            stamp,
-            true
-          );
-        }
-        await lease.query("COMMIT");
-        return rows.map((row) => ({ jobKey: String(row.job_key), reclaimed: true }));
-      } catch (error) {
-        await lease.query("ROLLBACK");
-        throw error;
+    return this.transact(async (lease) => {
+      const stamp = now.toISOString();
+      const { rows } = await lease.query(
+        `UPDATE maintenance_jobs
+            SET status = 'pending',
+                next_attempt_at = $1,
+                fencing_token = NULL,
+                lease_expires_at = NULL,
+                attempt_started_at = NULL,
+                updated_at = $1
+          WHERE status = 'running'
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at <= $1
+        RETURNING job_key, attempt_count`,
+        [stamp]
+      );
+      for (const row of rows) {
+        await this.finishAttempt(lease, {
+          jobKey: String(row.job_key),
+          attemptNumber: Number(row.attempt_count),
+          failureCode: "lease_lost",
+          finishedAt: stamp,
+          reclaimed: true,
+        });
       }
-    } finally {
-      lease.release();
-    }
+      return rows.map((row) => ({ jobKey: String(row.job_key), reclaimed: true }));
+    });
   }
 
   async listAttempts(
@@ -404,6 +356,85 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
     this.closed = true;
   }
 
+  /**
+   * Run `fn` inside one transaction, and never let a failing ROLLBACK mask the
+   * error that caused it.
+   */
+  private async transact<T>(
+    fn: (lease: MaintenanceWorkLease) => Promise<T>
+  ): Promise<T> {
+    const lease = await this.lease();
+    try {
+      await lease.query("BEGIN");
+      try {
+        const result = await fn(lease);
+        await lease.query("COMMIT");
+        return result;
+      } catch (error) {
+        try {
+          await lease.query("ROLLBACK");
+        } catch {
+          // The original failure is the one worth reporting.
+        }
+        throw error;
+      }
+    } finally {
+      lease.release();
+    }
+  }
+
+  private async lockRunningJob(
+    lease: MaintenanceWorkLease,
+    jobKey: string
+  ): Promise<Record<string, unknown> | null> {
+    const { rows } = await lease.query(
+      `SELECT ${JOB_COLUMNS}, fencing_token, lease_expires_at, attempt_started_at
+         FROM maintenance_jobs
+        WHERE job_key = $1
+        FOR UPDATE`,
+      [jobKey]
+    );
+    const row = rows[0];
+    if (!row || row.status !== "running") return null;
+    return row;
+  }
+
+  /** Persist the refusal itself: a superseded attempt is `stale`, not a failure. */
+  private async refuseSettle(
+    lease: MaintenanceWorkLease,
+    row: Record<string, unknown>,
+    code: MaintenanceWorkFailureCode,
+    stamp: string
+  ): Promise<MaintenanceSettleResult> {
+    if (code === "input_stale") {
+      const record = await this.writeSettled(
+        lease,
+        row,
+        { status: "stale", nextDelayMs: null, lastFailureCode: "input_stale" },
+        stamp
+      );
+      await this.finishAttempt(lease, {
+        jobKey: String(row.job_key),
+        attemptNumber: Number(row.attempt_count),
+        failureCode: "input_stale",
+        finishedAt: stamp,
+      });
+      return { result: "stale", record };
+    }
+    if (code === "execution_timeout") {
+      // The attempt ran past its absolute bound, so the attempt row records that
+      // — not the `lease_lost` a later reclaim would otherwise stamp over it.
+      await this.finishAttempt(lease, {
+        jobKey: String(row.job_key),
+        attemptNumber: Number(row.attempt_count),
+        failureCode: "execution_timeout",
+        finishedAt: stamp,
+      });
+      return { result: "timed_out" };
+    }
+    return { result: "lease_lost" };
+  }
+
   private async writeSettled(
     lease: MaintenanceWorkLease,
     row: Record<string, unknown>,
@@ -412,16 +443,12 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
       readonly nextDelayMs: number | null;
       readonly lastFailureCode: MaintenanceWorkFailureCode | null;
     },
-    stamp: string,
-    delayMs?: number | null
+    stamp: string
   ): Promise<MaintenanceJobRecord> {
-    const delay = delayMs ?? plan.nextDelayMs;
-    const status =
-      plan.status === "failed" && plan.nextDelayMs !== null ? "pending" : plan.status;
     const nextAttemptAt =
-      delay === null || delay === undefined
+      plan.nextDelayMs === null
         ? null
-        : new Date(new Date(stamp).getTime() + delay).toISOString();
+        : new Date(new Date(stamp).getTime() + plan.nextDelayMs).toISOString();
     const { rows } = await lease.query(
       `UPDATE maintenance_jobs
           SET status = $2,
@@ -433,13 +460,13 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
               updated_at = $5
         WHERE job_key = $1
       RETURNING ${JOB_COLUMNS}`,
-      [String(row.job_key), status, nextAttemptAt, plan.lastFailureCode, stamp]
+      [String(row.job_key), plan.status, nextAttemptAt, plan.lastFailureCode, stamp]
     );
     const updated = rows[0];
     if (!updated) {
-      throw new GraphragError(
+      throw new MaintenanceStoreError(
         "maintenance job settle updated no row",
-        "STORAGE_ERROR"
+        "backend_unavailable"
       );
     }
     return toRecord(updated);
@@ -447,33 +474,57 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
 
   private async finishAttempt(
     lease: MaintenanceWorkLease,
-    jobKey: string,
-    attemptNumber: number,
-    failureCode: MaintenanceWorkFailureCode | null,
-    finishedAt: string,
-    reclaimed = false
+    attempt: {
+      readonly jobKey: string;
+      readonly attemptNumber: number;
+      readonly failureCode: MaintenanceWorkFailureCode | null;
+      readonly finishedAt: string;
+      readonly reclaimed?: boolean;
+    }
   ): Promise<void> {
-    await lease.query(
+    const { rows } = await lease.query(
       `UPDATE maintenance_job_attempts
           SET failure_code = $3, finished_at = $4, reclaimed = $5
-        WHERE job_key = $1 AND attempt_number = $2`,
-      [jobKey, attemptNumber, failureCode, finishedAt, reclaimed]
+        WHERE job_key = $1 AND attempt_number = $2
+      RETURNING job_key`,
+      [
+        attempt.jobKey,
+        attempt.attemptNumber,
+        attempt.failureCode,
+        attempt.finishedAt,
+        attempt.reclaimed ?? false,
+      ]
     );
+    if (rows.length === 0) {
+      // A settle whose attempt row is gone means the history cannot explain the
+      // outcome, so it must not be reported as a success.
+      throw new MaintenanceStoreError(
+        `maintenance attempt ${attempt.attemptNumber} missing for job ${attempt.jobKey}`,
+        "backend_unavailable"
+      );
+    }
   }
 
   private async lease(): Promise<MaintenanceWorkLease> {
     if (this.closed) {
-      throw new GraphragError(
+      throw new MaintenanceStoreError(
         "maintenance work store used after close",
-        "STORAGE_ERROR"
+        "backend_unavailable"
       );
     }
-    return this.pool.connect();
+    try {
+      return await this.pool.connect();
+    } catch (error) {
+      throw new MaintenanceStoreError(
+        `maintenance work store connection failed: ${messageOf(error)}`,
+        "backend_unavailable"
+      );
+    }
   }
 }
 
-function fenceToken(): string {
-  return crypto.randomUUID();
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function toRecord(row: Record<string, unknown>): MaintenanceJobRecord {
@@ -524,9 +575,17 @@ function toAttempt(row: Record<string, unknown>): MaintenanceAttemptRecord {
   };
 }
 
+/** Never throw a bare `RangeError` out of a storage read. */
 function isoOf(value: unknown): string {
   if (value instanceof Date) return value.toISOString();
-  return new Date(String(value)).toISOString();
+  const parsed = new Date(String(value));
+  if (Number.isNaN(parsed.getTime())) {
+    throw new MaintenanceStoreError(
+      `maintenance timestamp column unreadable: ${String(value)}`,
+      "backend_unavailable"
+    );
+  }
+  return parsed.toISOString();
 }
 
 function isoOrNull(value: unknown): string | null {

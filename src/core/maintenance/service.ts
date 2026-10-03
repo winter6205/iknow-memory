@@ -10,11 +10,12 @@ import {
   canonicalDependencyRevision,
   computeMaintenanceJobKey,
   isMaintenanceWorkKind,
-  isTransientFailureCode,
 } from "./durable-work.js";
 import {
   type MaintenanceAttemptGuard,
+  type MaintenanceFailure,
   type MaintenanceJobRecord,
+  type MaintenanceWorkFailureCode,
   type MaintenanceLiveInputs,
   type MaintenanceReclaimOutcome,
   type MaintenanceScheduleOutcome,
@@ -81,28 +82,35 @@ export async function settleWork(
   guard: MaintenanceAttemptGuard,
   outcome: MaintenanceSettleOutcome,
   live: MaintenanceLiveInputs
-): Promise<MaintenanceSettleResult> {
+): Promise<MaintenanceSettleResult | MaintenanceFailure> {
+  if (!Array.isArray(live?.dependencies)) {
+    return refused("invalid_input", "live.dependencies must be an array");
+  }
+  if (typeof live.configRevision !== "string" || live.configRevision.length === 0) {
+    return refused("invalid_input", "live.configRevision is required");
+  }
   return deps.store.settleWork(guard, outcome, live, deps.clock());
 }
 
-/** Operator retry: a new attempt with a fresh automatic budget, history intact. */
+/**
+ * Operator retry: a new attempt with a fresh automatic budget, history intact.
+ *
+ * A job that is not `failed` or `stale` is refused as `invalid_input` rather
+ * than answered with the unchanged row, so "retry did nothing" can never be
+ * mistaken for "retry happened".
+ */
 export async function retryWork(
   deps: MaintenanceWorkDeps,
   jobKey: string
-): Promise<MaintenanceJobRecord | null> {
+): Promise<MaintenanceJobRecord | MaintenanceFailure | null> {
+  if (typeof jobKey !== "string" || jobKey.trim().length === 0) {
+    return refused("invalid_input", "jobKey is required");
+  }
   return deps.store.retryWork(jobKey, deps.clock());
 }
 
-/**
- * Whether this failure may be retried automatically. Exported so a worker can
- * log the decision rather than infer it from the settled status.
- */
-export function willRetryAutomatically(
-  failureCode: string,
-  automaticAttempts: number,
-  maxAttempts: number
-): boolean {
-  return isTransientFailureCode(failureCode) && automaticAttempts < maxAttempts;
+function refused(code: MaintenanceWorkFailureCode, detail: string): MaintenanceFailure {
+  return { refused: true, code, detail };
 }
 
 /** The bound inputs a worker must re-read before settling. */

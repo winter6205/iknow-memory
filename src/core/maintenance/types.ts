@@ -41,7 +41,7 @@ export const MAINTENANCE_WORK_STATUS = [
 
 export type MaintenanceWorkStatus = (typeof MAINTENANCE_WORK_STATUS)[number];
 
-/** Terminal states; a job in one of them holds no live attempt. */
+/** States a job in which no attempt holds a lease. */
 export const MAINTENANCE_WORK_TERMINAL_STATUS = [
   "ready",
   "failed",
@@ -50,6 +50,11 @@ export const MAINTENANCE_WORK_TERMINAL_STATUS = [
 
 export type MaintenanceWorkTerminalStatus =
   (typeof MAINTENANCE_WORK_TERMINAL_STATUS)[number];
+
+/** Whether an operator retry may return this job to `pending`. */
+export function isRetryableStatus(status: MaintenanceWorkStatus): boolean {
+  return status === "failed" || status === "stale";
+}
 
 /**
  * Typed work failures. A failure is always a value that names its class — never
@@ -81,9 +86,14 @@ export type MaintenanceWorkFailureCode =
 export const MAX_AUTO_ATTEMPTS = 3;
 export const RETRY_DELAY_MS = [5_000, 30_000] as const;
 
-/** Worker lease, heartbeat interval, and absolute attempt bound (spec §State and recovery). */
+/**
+ * Worker lease and absolute attempt bound (spec §State and recovery).
+ *
+ * The spec's third number — heartbeat at most every minute — is deliberately not
+ * a constant here. It is an obligation on whoever runs the heartbeat loop, and
+ * this slice has no loop yet; a constant nothing reads would document nothing.
+ */
 export const WORK_LEASE_MS = 5 * 60 * 1000;
-export const WORK_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 export const WORK_ABSOLUTE_LIMIT_MS = 30 * 60 * 1000;
 
 /**
@@ -241,10 +251,14 @@ export interface MaintenanceWorkStore {
   ): Promise<MaintenanceScheduleOutcome>;
   getJob(jobKey: string): Promise<MaintenanceJobRecord | null>;
   /**
-   * Atomically claim the oldest claimable job — `pending` whose retry deadline
-   * has passed, plus `running` attempts whose lease expired — mint a fresh
-   * fencing token, and extend the lease. Returns null when nothing is claimable.
-   * Concurrent claimants must never receive the same job.
+   * Atomically claim the oldest `pending` job whose retry deadline has passed,
+   * mint a fresh fencing token, and extend the lease. Returns null when nothing
+   * is claimable; concurrent claimants never receive the same job.
+   *
+   * Only `pending` rows are claimable. A `running` row whose lease expired
+   * belongs to `reclaimExpiredWork` first — a third party implementing this
+   * interface must not claim expired-lease rows directly, because that is what
+   * lets two workers each believe they own a job whose previous attempt died.
    */
   claimWork(now: Date): Promise<MaintenanceAttemptGuard | null>;
   /** Extend the lease while the token, lease, and absolute bound still hold.
@@ -254,6 +268,10 @@ export interface MaintenanceWorkStore {
    * Operator retry: return a `failed` or `stale` job to `pending` with a fresh
    * automatic budget. Prior attempts stay in the history untouched — this adds a
    * new attempt rather than rewriting the old ones.
+   *
+   * Returns null — never the unchanged row — for a job that is not retryable, so
+   * a caller cannot mistake "retry did nothing" for "retry happened". Both
+   * implementations must answer identically here.
    */
   retryWork(jobKey: string, now: Date): Promise<MaintenanceJobRecord | null>;
   /** Publish the terminal outcome, fenced by token, lease, and bound inputs. */
@@ -272,6 +290,15 @@ export interface MaintenanceWorkStore {
 }
 
 /** Dependencies every maintenance work operation needs. */
+/**
+ * How a refusal is reported at a public entry. A refusal is a value, never a
+ * thrown error, because a bad request is an expected outcome: the caller must be
+ * able to tell `invalid_input` from `access_denied` without parsing a message.
+ */
+export type MaintenanceFailure =
+  | { readonly refused: true; readonly code: MaintenanceWorkFailureCode; readonly detail: string }
+  | { readonly refused: false };
+
 export interface MaintenanceWorkDeps {
   readonly store: MaintenanceWorkStore;
   readonly clock: Clock;

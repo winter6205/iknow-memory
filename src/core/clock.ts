@@ -12,8 +12,3 @@
  * core because the collector's day arithmetic (MP13) needs it too.
  */
 export type Clock = () => Date;
-
-export const systemClock: Clock = () => new Date();
-
-/** Whole UTC days as elapsed 24-hour periods, the retention unit in the spec. */
-export const MS_PER_DAY = 24 * 60 * 60 * 1000;

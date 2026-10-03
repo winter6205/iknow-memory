@@ -21,6 +21,7 @@ import {
   verifyAttemptOwnership,
 } from "../maintenance/durable-work.js";
 import {
+  isRetryableStatus,
   MAX_AUTO_ATTEMPTS,
   type MaintenanceAttemptGuard,
   type MaintenanceAttemptRecord,
@@ -160,9 +161,10 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     this.assertOpen();
     const job = this.jobs.get(jobKey);
     if (!job) return null;
-    if (job.status !== "failed" && job.status !== "stale") {
-      return toRecord(job);
-    }
+    // null, not a success-shaped record, for a job that is not retryable — the
+    // SQL twin's `WHERE status IN ('failed','stale')` returns no row here, and the
+    // two implementations must answer identically.
+    if (!isRetryableStatus(job.status)) return null;
     const stamp = now.toISOString();
     const retried: StoredJob = {
       ...job,
@@ -190,7 +192,12 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     const stamp = now.toISOString();
     if (!verdict.ok && verdict.code === "input_stale") {
       const superseded = this.persist(job, "stale", stamp, null);
-      this.finishAttempt(job.jobKey, job.attemptCount, "input_stale", stamp);
+      this.finishAttempt({
+        jobKey: job.jobKey,
+        attemptNumber: job.attemptCount,
+        failureCode: "input_stale",
+        finishedAt: stamp,
+      });
       return { result: "stale", record: toRecord(superseded) };
     }
     if (!verdict.ok) {
@@ -200,12 +207,12 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     }
 
     const settled = this.applyOutcome(job, outcome, stamp);
-    this.finishAttempt(
-      job.jobKey,
-      job.attemptCount,
-      outcome.status === "failed" ? outcome.failureCode : null,
-      stamp
-    );
+    this.finishAttempt({
+      jobKey: job.jobKey,
+      attemptNumber: job.attemptCount,
+      failureCode: outcome.status === "failed" ? outcome.failureCode : null,
+      finishedAt: stamp,
+    });
     return { result: "settled", record: toRecord(settled) };
   }
 
@@ -223,7 +230,13 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
         continue;
       }
       this.persist(job, "pending", stamp, job.lastFailureCode);
-      this.finishAttempt(job.jobKey, job.attemptCount, "lease_lost", stamp, true);
+      this.finishAttempt({
+        jobKey: job.jobKey,
+        attemptNumber: job.attemptCount,
+        failureCode: "lease_lost",
+        finishedAt: stamp,
+        reclaimed: true,
+      });
       outcomes.push({ jobKey: job.jobKey, reclaimed: true });
     }
     return outcomes;
@@ -256,10 +269,10 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     outcome: MaintenanceSettleOutcome,
     stamp: string
   ): StoredJob {
-    const plan = planSettle(job.autoAttemptCount, job.maxAttempts, outcome);
+    const plan = planSettle(job.autoAttemptCount, MAX_AUTO_ATTEMPTS, outcome);
     const next: StoredJob = {
       ...job,
-      status: plan.status === "failed" && plan.nextDelayMs !== null ? "pending" : plan.status,
+      status: plan.status,
       lastFailureCode: plan.lastFailureCode,
       nextAttemptAt:
         plan.nextDelayMs === null ? null : shift(stamp, plan.nextDelayMs),
@@ -308,18 +321,33 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
   }
 
   private finishAttempt(
-    jobKey: string,
-    attemptNumber: number,
-    failureCode: MaintenanceAttemptRecord["failureCode"],
-    finishedAt: string,
-    reclaimed = false
+    attempt: {
+      readonly jobKey: string;
+      readonly attemptNumber: number;
+      readonly failureCode: MaintenanceAttemptRecord["failureCode"];
+      readonly finishedAt: string;
+      readonly reclaimed?: boolean;
+    }
   ): void {
-    const history = this.attempts.get(jobKey) ?? [];
+    const history = this.attempts.get(attempt.jobKey) ?? [];
     const index = history.findIndex(
-      (attempt) => attempt.attemptNumber === attemptNumber
+      (entry) => entry.attemptNumber === attempt.attemptNumber
     );
-    if (index < 0) return;
-    history[index] = { ...history[index]!, failureCode, finishedAt, reclaimed };
+    if (index < 0) {
+      // A settle whose attempt row is missing means the history is broken, and
+      // reporting `settled` on top of it would report a success the ledger cannot
+      // explain.
+      throw new GraphragError(
+        `maintenance attempt ${attempt.attemptNumber} missing for job ${attempt.jobKey}`,
+        "STORAGE_ERROR"
+      );
+    }
+    history[index] = {
+      ...history[index]!,
+      failureCode: attempt.failureCode,
+      finishedAt: attempt.finishedAt,
+      reclaimed: attempt.reclaimed ?? false,
+    };
   }
 }
 
@@ -331,7 +359,18 @@ function shift(iso: string, ms: number): string {
   return new Date(new Date(iso).getTime() + ms).toISOString();
 }
 
+/**
+ * Queue order mirroring the SQL claim's `ORDER BY next_attempt_at ASC NULLS FIRST,
+ * created_at, job_key`. Nulls first is Postgres's default for ASC and must be
+ * reproduced explicitly: the twins claiming different jobs from the same ledger
+ * state is a parity bug, not a preference.
+ */
 function byQueueOrder(left: StoredJob, right: StoredJob): number {
+  if (left.nextAttemptAt !== right.nextAttemptAt) {
+    const leftRank = left.nextAttemptAt === null ? -Infinity : Date.parse(left.nextAttemptAt);
+    const rightRank = right.nextAttemptAt === null ? -Infinity : Date.parse(right.nextAttemptAt);
+    if (leftRank !== rightRank) return leftRank < rightRank ? -1 : 1;
+  }
   if (left.createdAt !== right.createdAt) {
     return left.createdAt < right.createdAt ? -1 : 1;
   }

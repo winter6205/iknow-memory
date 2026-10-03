@@ -109,6 +109,7 @@ describe("MP2 — durable job key", () => {
       request({ configRevision: "rules-4" }),
     ]) {
       const outcome = await scheduleWork(h.deps, operator, variant);
+      if ("refused" in outcome) throw new Error(outcome.detail);
       expect(outcome.record.jobKey).not.toBe(base.jobKey);
     }
   });
@@ -137,6 +138,7 @@ describe("MP2 — durable job key", () => {
     for (const [label, invalid] of cases) {
       const outcome = await scheduleWork(h.deps, operator, invalid);
       expect(outcome, label).toHaveProperty("refused", "invalid_input");
+      expect("record" in outcome, label).toBe(false);
     }
     const claimable = await claimNextWork(h.deps);
     expect(claimable.guard).toBeNull();
@@ -249,6 +251,25 @@ describe("MP3 — bounded retry and attempt history", () => {
     expect(first.fencingToken).toBe(history[0]?.fencingToken);
   });
 
+  it("answers a non-retryable job the same way the SQL twin does", async () => {
+    const job = await scheduleDefault(h);
+    const guard = await claim(h);
+    await settleWork(h.deps, guard, { status: "ready" }, live);
+
+    // Both implementations must answer `null` here. The memory twin used to
+    // return the unchanged record, which made "retry did nothing" look like
+    // "retry happened" to any caller branching on the result.
+    expect(await h.store.retryWork(job.jobKey, h.now())).toBeNull();
+    expect((await h.store.getJob(job.jobKey))?.status).toBe("ready");
+  });
+
+  it("refuses a retry with no job key instead of silently doing nothing", async () => {
+    const outcome = await retryWork(h.deps, "   ");
+
+    expect(outcome).toHaveProperty("refused", true);
+    expect(outcome).toHaveProperty("code", "invalid_input");
+  });
+
   it("gives an explicit retry a fresh budget without erasing prior attempts", async () => {
     const job = await scheduleDefault(h);
     for (const at of ["10:00:00.000", "10:00:05.000", "10:00:35.000"]) {
@@ -258,7 +279,9 @@ describe("MP3 — bounded retry and attempt history", () => {
     }
 
     const retried = await retryWork(h.deps, job.jobKey);
-    expect(retried?.status).toBe("pending");
+    expect(retried).not.toHaveProperty("refused");
+    if (!retried || "refused" in retried) throw new Error("expected a retried job");
+    expect(retried.status).toBe("pending");
     expect(retried?.autoAttemptCount).toBe(0);
 
     const guard = await claim(h);

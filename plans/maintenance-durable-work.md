@@ -26,9 +26,8 @@ reason, not a local preference.
 
 affects:
 - `src/core/clock.ts` (new)
-- `src/core/maintenance/types.ts` (new)
+- `src/core/maintenance/types.ts` (new — holds the store seam with the rest of the vocabulary)
 - `src/core/maintenance/durable-work.ts` (new)
-- `src/core/maintenance/store.ts` (new)
 - `src/core/maintenance/service.ts` (new)
 - `src/core/storage/schema-maintenance-work.ts` (new)
 - `src/core/storage/maintenance-work-pg.ts` (new)
@@ -36,10 +35,10 @@ affects:
 - `src/core/storage/schema-bootstrap.ts` (edit: one call)
 - `tests/core/maintenance/durable-work.unit.test.ts` (new)
 - `tests/storage/maintenance-work-memory.test.ts` (new)
-- `tests/integration/maintenance-work-pg.test.ts` (new)
-- `tests/acceptance/maintenance-m-acceptance-pg.test.ts` (new)
+- `tests/acceptance/maintenance-m-acceptance-pg.test.ts` (new — the M acceptance lane, and the only real-boundary coverage MP2–MP4 need)
 - `specs/maintenance-durable-work.md` (new)
 - `docs/validation/maintenance-m1-m20-acceptance.md` (new)
+- `plans/maintenance-durable-work.md` (new — this file)
 
 bounded-context-guardian: yes — the capability is a new sibling of `index_jobs`, not an
 extension of it. The spec permits reusing durable storage only "where it satisfies the
@@ -47,11 +46,15 @@ contract", and `index_jobs` binds nothing but `(source_ref, content_identity)`: 
 kind, no revision vector, no attempt history. Its own plan calls it an ingest-side
 search-index handoff, so it stays untouched and no statement in it changes.
 
-input-contract-tests: yes — the fin plan's boundary table rows for Schedule/retry and
-Worker/read leases are implemented as five-class tests per public entry: empty/malformed
-key or work kind, negative/overflow attempt and deadline values, duplicate/concurrent
-schedule and reclaim, denied caller, and storage fault. Numeric cases use the spec's fixed
-counters; revision inputs are opaque strings and are explicitly not coerced.
+input-contract-tests: yes, with the coverage stated rather than implied. Implemented on
+the real boundary or the memory twin: empty/malformed key and work kind; negative
+generation/extraction-revision values; duplicate and concurrent schedule (real PG);
+lease expiry, absolute bound, and reclaim (real PG); denied caller; storage fault
+(typed, including a driver fault). NOT covered, and not claimed: the negative/overflow
+class for attempt and deadline values — no public entry in this slice accepts an
+attempt number or a deadline, so there is nothing to overflow — and the READ side of
+the Worker/read leases row (reader lease, 60-second typed timeout, cursor deadline),
+which belongs to the slice that implements the authorized read (`MP10`).
 
 error-handling-enforcer: yes — a typed work failure is a value, never an empty success.
 `MAINTAINANCE_WORK_FAILURE_CODES` covers `invalid_input`, `access_denied`, `input_stale`,
@@ -74,9 +77,19 @@ collection are `MP5`+ and stay out.
 | `MP1` acceptance driver record | done | `docs/validation/maintenance-m1-m20-acceptance.md` |
 | `MP2` durable job key + restart recovery + query read purity | done | acceptance lane (real PG) + memory twin |
 | `MP3` attempt history + bounded retry | done | acceptance lane M7 (real PG) + memory twin |
-| `MP4` fencing token, lease, heartbeat, absolute limit, dependency-vector recheck | done | acceptance lane M6 (real PG) + memory twin |
+| `MP4` fencing token, lease, heartbeat, absolute limit, dependency-vector recheck | done for the writes that exist | acceptance lane M6 and the heartbeat clamp (real PG) + memory twin. There is no stage writer yet, so "every stage write rechecks" lands with `MP5`; this is why M4 is only partly provable. |
 
-Two findings from the real boundary changed the implementation, not just the tests:
+Three findings from review changed the implementation, not just the tests:
+
+- Concurrent duplicate scheduling could not join under `ON CONFLICT DO NOTHING`: a
+  data-modifying CTE's SELECT branch reads the statement snapshot and cannot see a row
+  another transaction commits. The join now takes the conflicting row instead.
+- The two store implementations disagreed on `retryWork` for a job that is not
+  retryable — one returned null, the other a success-shaped record.
+- The lease clamp (`LEAST`) had only ever been exercised on the memory twin, and the
+  twin compared the lease boundary one instant differently from the SQL.
+
+Two more from the real boundary itself:
 
 - `PgvectorBackend.search` is the real query read, and the maintenance tables are
   unreachable from it — the query-purity half of M1 is a property of the table boundary,

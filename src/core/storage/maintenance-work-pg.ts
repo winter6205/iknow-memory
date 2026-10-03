@@ -15,7 +15,7 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { GraphragError } from "../errors.js";
+import { MaintenanceStoreError } from "../maintenance/store-error.js";
 import {
   canonicalDependencyRevision,
   computeMaintenanceJobKey,
@@ -52,23 +52,6 @@ export interface MaintenanceWorkLease {
 /** Anything that can lease a connection: `pg.Pool` satisfies this. */
 export interface MaintenanceWorkPool {
   connect(): Promise<MaintenanceWorkLease>;
-}
-
-/**
- * A storage fault carries BOTH vocabularies on purpose: `GraphragError` keeps
- * this package's typed-error convention, and `failureCode` names the maintenance
- * work failure the worker should record. A raw driver error carries neither, so
- * a caller would have to parse its message to decide whether the failure was
- * worth retrying.
- */
-export class MaintenanceStoreError extends GraphragError {
-  constructor(
-    message: string,
-    readonly failureCode: MaintenanceWorkFailureCode
-  ) {
-    super(message, "STORAGE_ERROR");
-    this.name = "MaintenanceStoreError";
-  }
 }
 
 const JOB_COLUMNS =

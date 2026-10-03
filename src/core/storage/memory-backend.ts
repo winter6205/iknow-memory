@@ -6,18 +6,31 @@
  * Thread-safety: single-threaded Node; concurrent upserts are safe
  * because Map.set is synchronous within each await boundary.
  */
+import { randomUUID } from "node:crypto";
+
 import type {
+  AuthorizationReceipt,
   ChunkRecord,
   ChunkUpsertOptions,
+  EvidenceGrantRead,
+  EvidenceGrantRecord,
+  EvidenceStore,
+  EvidenceSupportRole,
+  GrantDependencyFact,
+  GrantRequest,
   IndexJobClaimOptions,
   IndexJobInsertOutcome,
   IndexJobRecord,
   IndexJobStore,
   IndexJobTerminalOutcome,
+  NewSourceVersion,
   PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
+  ScopeRevisionRecord,
   SourceDocRecord,
+  SourceLocatorBinding,
+  SourceVersionRecord,
   StorageBackend,
   StorageChunkView,
   StorageCounts,
@@ -29,6 +42,8 @@ import type {
   StorageSourceDocSummary,
   StorageSourceDocView,
   StorageTimelineEvent,
+  SupportOccurrence,
+  SupportRecord,
 } from "../types.js";
 import type {
   CommunityIndexStateRow,
@@ -37,6 +52,8 @@ import type {
   ParentWindowStorage,
 } from "../retrieval/types.js";
 import {
+  EVIDENCE_FAILURE,
+  EVIDENCE_GRANT_KIND,
   INDEX_JOB_STATUS,
   SOURCE_DOC_COLLECTION_NAME,
   SOURCE_DOC_STATUS,
@@ -59,6 +76,25 @@ import {
 } from "./storage-reads.js";
 import { cosineSimilarity } from "../cosine.js";
 import { GraphragError } from "../errors.js";
+import {
+  assertFilled,
+  assertUuid,
+  canonicalJson,
+  evidenceError,
+  instantText,
+  normalizeLocatorBinding,
+  normalizeOccurrence,
+  normalizeSourceVersion,
+  supportOccurrenceKey,
+  type NormalizedSourceVersion,
+  type SourceVersionStamp,
+} from "./evidence-source.js";
+import {
+  decideGrantRead,
+  normalizeGrantRequest,
+  type GrantReadFacts,
+  type NormalizedGrant,
+} from "./evidence-store.js";
 
 /** Okapi BM25 term-frequency saturation. */
 const BM25_K1 = 1.2;
@@ -101,6 +137,57 @@ interface LexicalDoc {
   length: number;
 }
 
+/** The (logical source, version key) pair that names one source version. */
+function sourceVersionKey(sourceRef: string, sourceVersion: string): string {
+  return JSON.stringify([sourceRef, sourceVersion]);
+}
+
+/** One declared locator of one source version. */
+function locatorKey(binding: SourceLocatorBinding): string {
+  return JSON.stringify([
+    binding.source_version_id,
+    binding.document_id,
+    binding.version,
+    binding.unit,
+  ]);
+}
+
+/** The share key of one authorization receipt. */
+function receiptKey(scope: ScopeRevisionRecord): string {
+  return JSON.stringify([
+    scope.scope_binding,
+    scope.authorization_revision,
+    scope.purge_revision,
+  ]);
+}
+
+/** One pinned (support, extraction) pair. The separator is absent from both. */
+function pinnedExtractionKey(
+  supportId: string,
+  extractionRef: string
+): string {
+  return `${supportId}|${extractionRef}`;
+}
+
+/** The immutable half two spellings of one version key must agree on. */
+function sameImmutableVersion(
+  existing: SourceVersionRecord,
+  plan: NormalizedSourceVersion
+): boolean {
+  return (
+    existing.content_digest === plan.content_digest &&
+    existing.origin_object_ref === plan.origin_object_ref &&
+    existing.parser_revision === plan.parser_revision &&
+    canonicalJson(existing.unit_manifest) === plan.unit_manifest_canonical
+  );
+}
+
+/** One revision value, or null when this call does not move that dimension. */
+function optionalRevision(value: unknown, field: string): string | null {
+  if (value === undefined) return null;
+  return assertFilled(value, field);
+}
+
 /**
  * In-process StorageBackend. Suitable for unit tests, local dev, and any
  * context where durability is not required (no snapshot_id in stage 1).
@@ -122,6 +209,7 @@ export class MemoryBackend
     ParentWindowStorage,
     CommunityIndexStateStorage,
     IndexJobStore,
+    EvidenceStore,
     StorageReadPort
 {
   private readonly store = new Map<string, ChunkRecord>();
@@ -146,6 +234,36 @@ export class MemoryBackend
    * pg-only claim (this Map is lost on exit).
    */
   private readonly indexJobs = new Map<string, IndexJobRecord>();
+
+  /**
+   * Immutable source versions and the supports extracted from them. Keyed by
+   * id, with `supportIdsByOccurrence` carrying occurrence identity — the
+   * in-memory twin of `assertion_supports_occurrence_key`, so a repeated
+   * extraction here joins the same support PostgreSQL would.
+   */
+  private readonly sourceVersions = new Map<string, SourceVersionRecord>();
+  private readonly versionIdsByKey = new Map<string, string>();
+  private readonly locatorBindings = new Set<string>();
+  private readonly supports = new Map<string, SupportRecord>();
+  private readonly supportIdsByOccurrence = new Map<string, string>();
+  /** support_id → extraction_ref → the link's own instant. */
+  private readonly supportLinks = new Map<string, Map<string, string>>();
+
+  /**
+   * The finite grants. A count grant's retained state is its receipt plus one
+   * shared authorization receipt; `grantSupports` stays empty for it, which is
+   * what "retains no membership" means concretely in this store.
+   */
+  private readonly grants = new Map<string, EvidenceGrantRecord>();
+  private readonly scopeRevisions = new Map<string, ScopeRevisionRecord>();
+  private readonly receipts = new Map<string, AuthorizationReceipt>();
+  private readonly receiptsByScope = new Map<string, AuthorizationReceipt>();
+  /** evidence_ref → support_id → why the grant holds it. */
+  private readonly grantSupports = new Map<string, Map<string, EvidenceSupportRole>>();
+  private readonly grantExtractions = new Map<
+    string,
+    Set<string>
+  >();
 
   /**
    * Lexical index, maintained on write rather than rebuilt on read.
@@ -903,6 +1021,376 @@ export class MemoryBackend
       }
       return true;
     };
+  }
+
+  /**
+   * Insert one immutable source version, or join the row that already owns the
+   * (source_ref, source_version) key.
+   *
+   * The join is only valid when the immutable content agrees: a changed
+   * digest, origin object, parser revision or unit manifest is a different
+   * version, and returning the old row would attribute new parsing to a
+   * version that never had it.
+   */
+  async registerSourceVersion(
+    input: NewSourceVersion
+  ): Promise<{ record: SourceVersionRecord; created: boolean }> {
+    const plan = normalizeSourceVersion(input);
+    const key = sourceVersionKey(plan.source_ref, plan.source_version);
+    const existingId = this.versionIdsByKey.get(key);
+    if (existingId !== undefined) {
+      const existing = this.sourceVersions.get(existingId)!;
+      if (!sameImmutableVersion(existing, plan)) {
+        throw evidenceError(
+          EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+          `source version "${plan.source_ref}/${plan.source_version}" already exists with different immutable content; a changed unit manifest is a new source version`
+        );
+      }
+      return { record: { ...existing }, created: false };
+    }
+    const record: SourceVersionRecord = {
+      source_version_id: plan.source_version_id || randomUUID(),
+      source_ref: plan.source_ref,
+      source_version: plan.source_version,
+      content_digest: plan.content_digest,
+      origin_object_ref: plan.origin_object_ref,
+      parser_revision: plan.parser_revision,
+      unit_manifest: plan.unit_manifest,
+      created_at: plan.created_at,
+      retired_at: null,
+      payload_collected_at: null,
+      obligations_stopped_at: null,
+    };
+    this.sourceVersions.set(record.source_version_id, record);
+    this.versionIdsByKey.set(key, record.source_version_id);
+    return { record: { ...record }, created: true };
+  }
+
+  async bindSourceLocator(
+    input: SourceLocatorBinding
+  ): Promise<SourceLocatorBinding> {
+    const binding = normalizeLocatorBinding(input);
+    // Refused here rather than left to the foreign key, so a binding to a
+    // version that does not exist is the same typed answer the PostgreSQL path
+    // gives instead of a constraint violation.
+    if (!this.sourceVersions.has(binding.source_version_id)) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
+        `locator binding names source version ${binding.source_version_id}, which is not registered`
+      );
+    }
+    this.locatorBindings.add(locatorKey(binding));
+    return { ...binding };
+  }
+
+  /**
+   * Record one extracted occurrence: join the existing support for that
+   * occurrence, or create it, then attach this extraction as another link.
+   *
+   * The check-then-set is synchronous — no `await` between the probe and the
+   * `Map.set` below — which is what gives the in-memory store the same "at
+   * most one support per occurrence" total the unique constraint gives
+   * PostgreSQL.
+   */
+  async recordSupport(
+    occurrence: SupportOccurrence
+  ): Promise<{ support: SupportRecord; created: boolean }> {
+    const plan = normalizeOccurrence(occurrence);
+    const key = sourceVersionKey(plan.source_ref, plan.source_version);
+    const versionId = this.versionIdsByKey.get(key);
+    if (versionId === undefined) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
+        `support names source version "${plan.source_ref}/${plan.source_version}", which is not registered`
+      );
+    }
+    if (!this.locatorBindings.has(locatorKey({ source_version_id: versionId, ...plan.location }))) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
+        `source version ${versionId} does not bind locator ${plan.location.document_id}/${plan.location.version}/${plan.location.unit}`
+      );
+    }
+    const occurrenceKey = supportOccurrenceKey(plan);
+    const existingId = this.supportIdsByOccurrence.get(occurrenceKey);
+    const support: SupportRecord =
+      existingId === undefined
+        ? {
+            support_id: randomUUID(),
+            subject: plan.subject,
+            result_id: plan.result_id,
+            source_ref: plan.source_ref,
+            source_version: plan.source_version,
+            source_version_id: versionId,
+            location: plan.location,
+            span: plan.span,
+            created_at: plan.extracted_at,
+          }
+        : this.supports.get(existingId)!;
+    if (existingId === undefined) {
+      this.supports.set(support.support_id, support);
+      this.supportIdsByOccurrence.set(occurrenceKey, support.support_id);
+    }
+    const links = this.supportLinks.get(support.support_id) ?? new Map();
+    if (!links.has(plan.extraction_ref)) {
+      links.set(plan.extraction_ref, plan.extracted_at);
+      this.supportLinks.set(support.support_id, links);
+    }
+    return { support: { ...support }, created: existingId === undefined };
+  }
+
+  async getSupport(supportId: string): Promise<SupportRecord | null> {
+    const support = this.supports.get(assertUuid(supportId, "support_id"));
+    return support === undefined ? null : { ...support };
+  }
+
+  /** Oldest first, with the reference breaking ties so the order is total. */
+  async listSupportExtractions(supportId: string): Promise<string[]> {
+    const links = this.supportLinks.get(
+      assertUuid(supportId, "support_id")
+    );
+    if (links === undefined) return [];
+    return [...links.entries()]
+      .sort(
+        ([leftRef, leftAt], [rightRef, rightAt]) =>
+          leftAt.localeCompare(rightAt) || leftRef.localeCompare(rightRef)
+      )
+      .map(([extractionRef]) => extractionRef);
+  }
+
+  /**
+   * Create one nonrenewable grant from a supplied owner-validated snapshot.
+   * Validation runs before anything is written, so a refused request leaves
+   * no partial state — the property the PostgreSQL path gets from its
+   * transaction.
+   */
+  async issueGrant(request: GrantRequest): Promise<EvidenceGrantRecord> {
+    const plan = normalizeGrantRequest(request);
+    const scope = this.scopeRevisions.get(plan.scope_binding);
+    if (scope === undefined) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.UNAVAILABLE,
+        `grant: admission scope "${plan.scope_binding}" has no revisions on record`
+      );
+    }
+    const evidenceRef = randomUUID();
+    const isCount = plan.kind === EVIDENCE_GRANT_KIND.COUNT;
+    const receipt = isCount ? this.joinReceipt(scope, plan.queried_at) : null;
+    for (const ref of plan.supports) {
+      this.requireGrantable(ref.support_id);
+    }
+    const grant: EvidenceGrantRecord = {
+      evidence_ref: evidenceRef,
+      kind: plan.kind,
+      subject: plan.subject,
+      operation: plan.operation,
+      query_digest: plan.query_digest,
+      scope_binding: plan.scope_binding,
+      read_revision: plan.read_revision,
+      authorization_revision: scope.authorization_revision,
+      purge_revision: scope.purge_revision,
+      queried_at: plan.queried_at,
+      expires_at: plan.expires_at,
+      context: plan.context,
+      value: plan.value,
+      result_count: plan.count,
+      authorization_receipt_id: receipt?.receipt_id ?? null,
+    };
+    this.grants.set(evidenceRef, grant);
+    if (!isCount) this.pinGrantDependencies(evidenceRef, plan);
+    return { ...grant };
+  }
+
+  /** The shared receipt under one scope/revision pair, created on first use. */
+  private joinReceipt(
+    scope: ScopeRevisionRecord,
+    createdAt: string
+  ): AuthorizationReceipt {
+    const key = receiptKey(scope);
+    const existing = this.receiptsByScope.get(key);
+    if (existing !== undefined) return existing;
+    const receipt: AuthorizationReceipt = {
+      receipt_id: randomUUID(),
+      scope_binding: scope.scope_binding,
+      authorization_revision: scope.authorization_revision,
+      purge_revision: scope.purge_revision,
+      created_at: createdAt,
+    };
+    this.receipts.set(receipt.receipt_id, receipt);
+    this.receiptsByScope.set(key, receipt);
+    return receipt;
+  }
+
+  /**
+   * A row grant may only name a support this store holds, whose source version
+   * still accepts obligations. Refusing here is what makes "no new grant after
+   * a purge candidate stops accepting obligations" true at the write, not only
+   * at the replay.
+   */
+  private requireGrantable(supportId: string): void {
+    const support = this.supports.get(supportId);
+    if (support === undefined) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
+        `row grant names support ${supportId}, whose source version binding does not resolve`
+      );
+    }
+    const version = this.sourceVersions.get(support.source_version_id);
+    if (version?.obligations_stopped_at != null) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.UNAVAILABLE,
+        `row grant names support ${supportId}, whose source version stopped accepting obligations at ${version.obligations_stopped_at}`
+      );
+    }
+  }
+
+  /**
+   * Pin the row grant's obligations, including the extraction links as they
+   * stand now: a later extraction must not silently widen what a historical
+   * citation holds.
+   */
+  private pinGrantDependencies(
+    evidenceRef: string,
+    plan: NormalizedGrant
+  ): void {
+    const supports = new Map<string, EvidenceSupportRole>();
+    const extractions = new Set<string>();
+    for (const ref of plan.supports) {
+      supports.set(ref.support_id, ref.role);
+      for (const extractionRef of this.supportLinks.get(ref.support_id)?.keys() ?? []) {
+        extractions.add(pinnedExtractionKey(ref.support_id, extractionRef));
+      }
+    }
+    this.grantSupports.set(evidenceRef, supports);
+    this.grantExtractions.set(evidenceRef, extractions);
+  }
+
+  async readGrant(evidenceRef: string, at: string): Promise<EvidenceGrantRead> {
+    return decideGrantRead(this.grantFacts(evidenceRef), at);
+  }
+
+  /** The facts `decideGrantRead` decides from, gathered from the maps above. */
+  private grantFacts(evidenceRef: string): GrantReadFacts {
+    const grant = this.grants.get(evidenceRef);
+    if (grant === undefined) {
+      return {
+        grant: null,
+        scope: null,
+        receipt: null,
+        dependencies: [],
+        pinned: 0,
+      };
+    }
+    const scope = this.scopeRevisions.get(grant.scope_binding) ?? null;
+    const receipt =
+      grant.authorization_receipt_id === null
+        ? null
+        : this.receipts.get(grant.authorization_receipt_id) ?? null;
+    const pinned = this.grantSupports.get(evidenceRef) ?? new Map();
+    const dependencies: GrantDependencyFact[] = [...pinned.entries()]
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .flatMap(([supportId, role]) => {
+        const support = this.supports.get(supportId);
+        if (support === undefined) return [];
+        return [
+          {
+            role,
+            support,
+            obligations_stopped_at:
+              this.sourceVersions.get(support.source_version_id)
+                ?.obligations_stopped_at ?? null,
+          },
+        ];
+      });
+    return { grant, scope, receipt, dependencies, pinned: pinned.size };
+  }
+
+  async listGrantSupports(
+    evidenceRef: string
+  ): Promise<readonly GrantDependencyFact[]> {
+    return this.grantFacts(evidenceRef).dependencies;
+  }
+
+  async listGrantPinnedExtractions(
+    evidenceRef: string
+  ): Promise<readonly { support_id: string; extraction_ref: string }[]> {
+    return [...(this.grantExtractions.get(evidenceRef) ?? [])]
+      .sort()
+      .map((key) => ({
+        support_id: key.slice(0, key.indexOf("|")),
+        extraction_ref: key.slice(key.indexOf("|") + 1),
+      }));
+  }
+
+  /**
+   * Publish a scope's revisions, keeping whichever dimension this call left
+   * unmentioned. A first write must carry both: a scope admitted with an
+   * unknown purge state could never fail closed on a purge.
+   */
+  async setScopeRevisions(
+    scopeBinding: string,
+    revisions: { authorizationRevision?: string; purgeRevision?: string }
+  ): Promise<ScopeRevisionRecord> {
+    const scope = assertFilled(scopeBinding, "scope_binding");
+    const authorization = optionalRevision(
+      revisions.authorizationRevision,
+      "authorization_revision"
+    );
+    const purge = optionalRevision(revisions.purgeRevision, "purge_revision");
+    const existing = this.scopeRevisions.get(scope);
+    if (existing === undefined && (authorization === null || purge === null)) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+        `scope "${scope}" has no revisions on record, so its first write must carry both authorization_revision and purge_revision`
+      );
+    }
+    const next: ScopeRevisionRecord = {
+      scope_binding: scope,
+      authorization_revision: authorization ?? existing!.authorization_revision,
+      purge_revision: purge ?? existing!.purge_revision,
+    };
+    this.scopeRevisions.set(scope, next);
+    return { ...next };
+  }
+
+  async markSourceVersionRetired(
+    sourceVersionId: string,
+    retiredAt: string
+  ): Promise<void> {
+    this.stampSourceVersion("retired_at", sourceVersionId, retiredAt);
+  }
+
+  async collectSourceVersionPayload(
+    sourceVersionId: string,
+    collectedAt: string
+  ): Promise<void> {
+    this.stampSourceVersion("payload_collected_at", sourceVersionId, collectedAt);
+  }
+
+  async stopAcceptingObligations(
+    sourceVersionId: string,
+    at: string
+  ): Promise<void> {
+    this.stampSourceVersion("obligations_stopped_at", sourceVersionId, at);
+  }
+
+  private stampSourceVersion(
+    stamp: SourceVersionStamp,
+    sourceVersionId: string,
+    at: string
+  ): void {
+    const record = this.sourceVersions.get(
+      assertUuid(sourceVersionId, "source_version_id")
+    );
+    if (record === undefined) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+        `evidence store: cannot stamp ${stamp} on unknown source version ${sourceVersionId}`
+      );
+    }
+    this.sourceVersions.set(sourceVersionId, {
+      ...record,
+      [stamp]: instantText(at, stamp),
+    });
   }
 
   /**

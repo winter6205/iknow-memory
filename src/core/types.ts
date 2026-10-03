@@ -286,6 +286,368 @@ export interface IndexJobStore {
 }
 
 /**
+ * The named evidence exits (specs/structured-corpus-evidence.md §Replay and
+ * failure). Declared here rather than in prose because a host classifies a
+ * failure by this token, never by reading a message: an unresolved source
+ * binding, an ended finite reference, a purge and a revoked permission are
+ * four different facts to a reader, and the storage seam is the first place
+ * they can be told apart.
+ */
+export const EVIDENCE_FAILURE = {
+  /** A support's `location` does not resolve to its bound source version. */
+  UNSUPPORTED_SOURCE_BINDING: "unsupported_source_binding",
+  /** The request violates the stored evidence contract. */
+  MALFORMED_CONTRACT: "malformed_evidence_contract",
+  /** The value cannot fit the bounded 32 KiB envelope. */
+  TOO_LARGE: "evidence_too_large",
+  /** The finite reference lifetime ended. */
+  EXPIRED: "evidence_expired",
+  /** Purged, or the store cannot protect what it was asked to protect. */
+  UNAVAILABLE: "evidence_unavailable",
+  /** Current authorization for the grant's scope was revoked. */
+  ACCESS_DENIED: "access_denied",
+} as const;
+
+export type EvidenceFailureToken =
+  (typeof EVIDENCE_FAILURE)[keyof typeof EVIDENCE_FAILURE];
+
+/** Which half of the result identity a support or grant belongs to. */
+export const EVIDENCE_SUBJECT_KIND = {
+  ENTITY: "entity",
+  ASSERTION: "assertion",
+} as const;
+
+export type EvidenceSubjectKind =
+  (typeof EVIDENCE_SUBJECT_KIND)[keyof typeof EVIDENCE_SUBJECT_KIND];
+
+/**
+ * The two retention grant types. A row grant protects its returned value and
+ * its support/extraction dependencies; a count grant protects a bounded
+ * receipt and a shared authorization receipt and nothing else — so the kind
+ * decides which of those two things a read may touch.
+ */
+export const EVIDENCE_GRANT_KIND = {
+  ROW: "row",
+  COUNT: "count",
+} as const;
+
+export type EvidenceGrantKind =
+  (typeof EVIDENCE_GRANT_KIND)[keyof typeof EVIDENCE_GRANT_KIND];
+
+/** Why a row grant holds one support. */
+export const EVIDENCE_SUPPORT_ROLE = {
+  /** A support of the returned result itself. */
+  OCCURRENCE: "occurrence",
+  /** A display support of a relation endpoint, outside the result's own set. */
+  ENDPOINT_DISPLAY: "endpoint_display",
+} as const;
+
+export type EvidenceSupportRole =
+  (typeof EVIDENCE_SUPPORT_ROLE)[keyof typeof EVIDENCE_SUPPORT_ROLE];
+
+/**
+ * A company source locator — the closed three-field identity ADR 0088
+ * defines. Thread attachments are deliberately absent: this contract covers
+ * the permanent company corpus only.
+ */
+export interface CompanySourceLocator {
+  document_id: string;
+  version: string;
+  unit: number;
+}
+
+/**
+ * A half-open Unicode code-point interval inside one frozen unit. Absent means
+ * structured evidence, never a quotation; a quote is read through the source
+ * path and checked there.
+ */
+export interface EvidenceSpan {
+  start: number;
+  end: number;
+}
+
+/** One immutable source version, keyed by its logical source plus version key. */
+export interface SourceVersionRecord {
+  source_version_id: string;
+  source_ref: string;
+  source_version: string;
+  /** Lowercase hex SHA-256 of the original content. */
+  content_digest: string;
+  /** Retained reference to the original object. */
+  origin_object_ref: string;
+  parser_revision: string;
+  /** The frozen-unit manifest this version was interpreted under. */
+  unit_manifest: Record<string, unknown>;
+  created_at: string;
+  /** Left the published set — a data revision; it stops no grant. */
+  retired_at: string | null;
+  /** Its payload was collected — also a data revision, not a purge. */
+  payload_collected_at: string | null;
+  /**
+   * A purge candidate stopped accepting new obligations. Unlike the two
+   * stamps above this refuses NEW grants: nothing may pin evidence to a
+   * source that is being taken away.
+   */
+  obligations_stopped_at: string | null;
+}
+
+/** A source version's explicit mapping to one company locator. */
+export interface SourceLocatorBinding {
+  source_version_id: string;
+  document_id: string;
+  version: string;
+  unit: number;
+}
+
+/** The supplied identity of one source version; the store mints the id. */
+export type NewSourceVersion = Omit<SourceVersionRecord, "source_version_id"> & {
+  readonly source_version_id?: string;
+};
+
+/**
+ * One extracted occurrence of a result at one source location.
+ *
+ * `extractedAt` is caller-supplied like every other instant on this seam: one
+ * clock decides the write, so a replayed extraction cannot disagree with
+ * itself about when it happened.
+ */
+export interface SupportOccurrence {
+  readonly subject: EvidenceSubjectKind;
+  readonly result_id: string;
+  readonly source_ref: string;
+  readonly source_version: string;
+  readonly location: CompanySourceLocator;
+  readonly span?: EvidenceSpan | null;
+  readonly extraction_ref: string;
+  readonly extractedAt: string;
+}
+
+/** A support as persisted. Carries no display payload at all. */
+export interface SupportRecord {
+  support_id: string;
+  subject: EvidenceSubjectKind;
+  result_id: string;
+  source_ref: string;
+  source_version: string;
+  source_version_id: string;
+  location: CompanySourceLocator;
+  span: EvidenceSpan | null;
+  created_at: string;
+}
+
+/** One support named by a row grant, and why the grant holds it. */
+export interface EvidenceSupportRef {
+  readonly support_id: string;
+  readonly role: EvidenceSupportRole;
+}
+
+/**
+ * One retained dependency of a row grant, with the source version's obligation
+ * stamp beside it. The stamp is read, not inferred: a purge candidate that
+ * stopped accepting obligations is what withholds a row snapshot, and the
+ * reader has to see that fact rather than a silently empty support.
+ */
+export interface GrantDependencyFact {
+  readonly role: EvidenceSupportRole;
+  readonly support: SupportRecord;
+  readonly obligations_stopped_at: string | null;
+}
+
+/** The caller-validated half of a grant request. */
+interface GrantRequestBase {
+  readonly subject: EvidenceSubjectKind;
+  readonly operation: string;
+  readonly queryDigest: string;
+  readonly scopeBinding: string;
+  readonly readRevision: string;
+  /** The instant the query ran; the grant's lifetime is measured from it. */
+  readonly queriedAt: string;
+  readonly context: Readonly<Record<string, unknown>>;
+  /** The exact row or count receipt the query returned. */
+  readonly value: unknown;
+}
+
+export interface RowGrantRequest extends GrantRequestBase {
+  readonly kind: typeof EVIDENCE_GRANT_KIND.ROW;
+  readonly supports: readonly EvidenceSupportRef[];
+}
+
+export interface CountGrantRequest extends GrantRequestBase {
+  readonly kind: typeof EVIDENCE_GRANT_KIND.COUNT;
+  /** The returned count, zero included; it is a receipt field, not a set. */
+  readonly count: number;
+}
+
+export type GrantRequest = RowGrantRequest | CountGrantRequest;
+
+/**
+ * One finite grant. There is no renewal column: `expires_at` is computed once
+ * from `queried_at`, so a read can never move it.
+ */
+export interface EvidenceGrantRecord {
+  evidence_ref: string;
+  kind: EvidenceGrantKind;
+  subject: EvidenceSubjectKind;
+  operation: string;
+  query_digest: string;
+  scope_binding: string;
+  read_revision: string;
+  authorization_revision: string;
+  purge_revision: string;
+  queried_at: string;
+  expires_at: string;
+  context: Record<string, unknown>;
+  value: unknown;
+  result_count: number | null;
+  /** Set for count grants only: the shared bounded authorization receipt. */
+  authorization_receipt_id: string | null;
+}
+
+/** The live admission revisions of one trusted scope. */
+export interface ScopeRevisionRecord {
+  scope_binding: string;
+  authorization_revision: string;
+  purge_revision: string;
+}
+
+/**
+ * The shared `(scope_binding, authorization_revision, purge_revision)` receipt
+ * a count grant replays against. One row serves every reference admitted
+ * under that triple, so the receipt is stored once and joined, not copied.
+ */
+export interface AuthorizationReceipt {
+  receipt_id: string;
+  scope_binding: string;
+  authorization_revision: string;
+  purge_revision: string;
+  created_at: string;
+}
+
+/** Why a grant cannot be replayed, named so the caller never infers it. */
+export const EVIDENCE_DENIAL_REASON = {
+  UNKNOWN_REFERENCE: "unknown_reference",
+  EXPIRED: "expired",
+  PURGED: "purged",
+  OBLIGATIONS_STOPPED: "obligations_stopped",
+  AUTHORIZATION_REVOKED: "authorization_revoked",
+  DEPENDENCY_UNRESOLVED: "dependency_unresolved",
+  /** The reference's admission scope carries no revisions on record. */
+  SCOPE_UNKNOWN: "scope_unknown",
+} as const;
+
+export type EvidenceDenialReason =
+  (typeof EVIDENCE_DENIAL_REASON)[keyof typeof EVIDENCE_DENIAL_REASON];
+
+/**
+ * The read outcome. A denial always names a failure token, so an unavailable
+ * grant can never be mistaken for a granted empty value.
+ */
+export type EvidenceGrantRead =
+  | {
+      readonly state: "granted";
+      readonly grant: EvidenceGrantRecord;
+      /** The row grant's complete retained support set, by support UUID. */
+      readonly supports: readonly SupportRecord[];
+      readonly authorization: AuthorizationReceipt | null;
+    }
+  | {
+      readonly state: "denied";
+      readonly failure: EvidenceFailureToken;
+      readonly reason: EvidenceDenialReason;
+    };
+
+/**
+ * Immutable source/support storage plus finite row and count grants
+ * (specs/structured-corpus-evidence.md).
+ *
+ * Optional and additive like every other capability here: a chunk-only
+ * backend stays a valid `StorageBackend` and callers narrow with
+ * `supportsEvidenceStore`. Source versions are written and read by an ingest
+ * path that does not exist yet — this seam is the storage half of it, so the
+ * ingest wiring stays a separate change.
+ */
+export interface EvidenceStore {
+  /**
+   * Insert one immutable source version, or return the existing row when the
+   * same key carries identical immutable content. Reusing a version key for
+   * different content, a different parser revision, or a different manifest
+   * is refused — a changed unit manifest is a new version identity even when
+   * the bytes match.
+   */
+  registerSourceVersion(
+    record: NewSourceVersion
+  ): Promise<{ record: SourceVersionRecord; created: boolean }>;
+  /** Bind one company locator to a source version. */
+  bindSourceLocator(
+    binding: SourceLocatorBinding
+  ): Promise<SourceLocatorBinding>;
+  /**
+   * Record one extracted occurrence. Identity is (subject, result, source,
+   * version, canonical location, span-or-absent): a repeated extraction of
+   * that occurrence attaches another extraction link to the SAME support and
+   * creates nothing new, while a distinct version, location or span is a
+   * distinct support. An unresolvable source-version or locator binding is
+   * refused as `unsupported_source_binding`.
+   */
+  recordSupport(
+    occurrence: SupportOccurrence
+  ): Promise<{ support: SupportRecord; created: boolean }>;
+  getSupport(supportId: string): Promise<SupportRecord | null>;
+  /** Every extraction link of one support, oldest first. */
+  listSupportExtractions(supportId: string): Promise<string[]>;
+  /**
+   * Create one nonrenewable grant from a supplied owner-validated snapshot.
+   * Its lifetime is 365 days from `queriedAt`, fixed at write time. A row
+   * grant retains the exact row plus its support and extraction dependencies;
+   * a count grant retains the receipt and the shared authorization receipt
+   * only — no result membership and no source payload.
+   */
+  issueGrant(request: GrantRequest): Promise<EvidenceGrantRecord>;
+  /** Replay one grant at the caller's instant; never renews it. */
+  readGrant(evidenceRef: string, at: string): Promise<EvidenceGrantRead>;
+  /**
+   * The row grant's retained dependencies, by support UUID, with the reason
+   * each is held. Empty for a count grant: it retains no membership.
+   */
+  listGrantSupports(evidenceRef: string): Promise<readonly GrantDependencyFact[]>;
+  /**
+   * The extraction links the row grant pinned at issue time. A later
+   * extraction does not widen what a historical citation holds, which is why
+   * this is a read of the pinned set rather than of the support's links.
+   */
+  listGrantPinnedExtractions(
+    evidenceRef: string
+  ): Promise<readonly { support_id: string; extraction_ref: string }[]>;
+  /**
+   * Publish a scope's current admission revisions. A permission change or an
+   * explicit purge advances the corresponding revision and invalidates every
+   * count receipt admitted under the previous one; ordinary publication and
+   * payload GC never come through here, so they leave receipts intact. A
+   * first write must carry both revisions — a scope cannot be admitted with
+   * an unknown purge state.
+   */
+  setScopeRevisions(
+    scopeBinding: string,
+    revisions: { authorizationRevision?: string; purgeRevision?: string }
+  ): Promise<ScopeRevisionRecord>;
+  /** Leave the published set: a data revision that stops no grant. */
+  markSourceVersionRetired(
+    sourceVersionId: string,
+    retiredAt: string
+  ): Promise<void>;
+  /** Collect an unreferenced payload: a data revision that stops no grant. */
+  collectSourceVersionPayload(
+    sourceVersionId: string,
+    collectedAt: string
+  ): Promise<void>;
+  /** A purge candidate: no new grant may pin evidence to this version. */
+  stopAcceptingObligations(
+    sourceVersionId: string,
+    at: string
+  ): Promise<void>;
+}
+
+/**
  * Rotate-mode vocabulary for the embedding-generation ledger
  * (embedding generation rotate T1; specs/embedding-generation.md).
  *

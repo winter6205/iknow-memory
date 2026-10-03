@@ -6,7 +6,10 @@
  * declared `failureToken` as the structured `error` field of the isError
  * result it hands the host.
  */
-import { COMMUNITY_SUMMARY_INDEX_FAILURE } from "./types.js";
+import {
+  COMMUNITY_SUMMARY_INDEX_FAILURE,
+  type EvidenceFailureToken,
+} from "./types.js";
 import {
   INVALID_BUSINESS_QUERY,
   REAL_DB_NOT_WIRED,
@@ -43,7 +46,8 @@ export type GraphragFailureToken =
   | typeof SQL_NO_MATCHING_ROWS
   | typeof INVALID_BUSINESS_QUERY
   | typeof RETRIEVE_UNAVAILABLE
-  | typeof REAL_DB_NOT_WIRED;
+  | typeof REAL_DB_NOT_WIRED
+  | EvidenceFailureToken;
 
 export class GraphragError extends Error {
   constructor(

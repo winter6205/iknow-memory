@@ -74,7 +74,7 @@ import type {
 } from "../types.js";
 import type { EntityType } from "../extraction/entity-type.js";
 import type { SqlWindow } from "./wire-filters.js";
-import type { BusinessQueryExecutor } from "../business-query/sql-query-executor.js";
+import type { BusinessQueryPort } from "../business-query/sql-query-types.js";
 import {
   supportsNeighborChunks,
   supportsProjectionDrain,
@@ -196,7 +196,7 @@ export interface AssembleDeps {
    * the provisioning fact the `sql` 档 reads as the structured
    * `real_db_not_wired` exit — skip, not a degraded answer.
    */
-  businessQuery?: BusinessQueryExecutor;
+  businessQuery?: BusinessQueryPort;
 }
 
 interface AssemblyResult {

@@ -304,14 +304,35 @@ describe("retrieve — structured refusal over the real MCP boundary", () => {
         "submit_index_job",
       ]);
       const retrieve = tools.find((t) => t.name === "retrieve");
-      // The structured request rides the existing filters map: the advertised
-      // `filters` is an object whose values are no longer string-only.
+      // The structured request rides the existing filters map, so `filters` is
+      // an object whose values are not string-only. The ADVERTISED value schema
+      // is pinned here because that advertisement is what a host reads: if the
+      // value union ever collapses back to an unconstrained value, the published
+      // JSON Schema would stop saying values are strings and a schema-only host
+      // would believe `filters` accepts anything.
       const properties = (
         retrieve?.inputSchema as {
-          properties?: { filters?: { type?: string } };
+          properties?: {
+            filters?: {
+              type?: string;
+              additionalProperties?: unknown;
+            };
+          };
         }
       ).properties;
       expect(properties?.filters?.type).toBe("object");
+      expect(properties?.filters?.additionalProperties).toMatchObject({
+        anyOf: [
+          { type: "string" },
+          { type: "object" },
+        ],
+      });
+      // The outer object stays strict: an unknown top-level key is still a
+      // parse error, not a silently stripped field.
+      expect(
+        (retrieve?.inputSchema as { additionalProperties?: unknown })
+          .additionalProperties
+      ).toBe(false);
     } finally {
       await close();
     }

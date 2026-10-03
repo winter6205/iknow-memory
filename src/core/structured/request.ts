@@ -38,6 +38,7 @@
  * express them, which is stronger than validating them away.
  */
 import { ENTITY_TYPES } from "../extraction/entity-type.js";
+import { readUuidShape } from "./identity.js";
 import { StructuredQueryError, type StructuredErrorCode } from "./errors.js";
 
 /** The recognized token. A version suffix makes it an UNKNOWN token. */
@@ -168,13 +169,19 @@ const RELATIONSHIP_MEMBERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Canonical 8-4-4-4-12 hex, the same closed pattern the dashboard detail
- * route uses for PG `uuid` columns (which are case-insensitive). A
- * non-canonical spelling is `invalid_value` rather than a lookup miss: it is a
- * malformed filter, not an empty result.
+ * A `uuid`-kind field value is checked with the ONE primitive both structured
+ * boundaries share (`core/structured/identity.ts`), under the `preserve` case
+ * policy: PostgreSQL's `uuid` comparison is case-insensitive, so a value the
+ * caller spelled in uppercase still matches the stored lowercase row, and
+ * folding it here would change what the caller sent. The identity boundary
+ * uses the same shape check under `canonicalize`, because one entity's
+ * spellings must derive one id.
+ *
+ * The case policies are named inputs rather than two validators so the
+ * deliberate difference cannot silently collapse; a non-UUID spelling is
+ * `invalid_value` here rather than a lookup miss: it is a malformed filter,
+ * not an empty result.
  */
-const CANONICAL_UUID =
-  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 const ENCODER = new TextEncoder();
 
@@ -458,7 +465,7 @@ function readDeclaredValue(
       `field "${field}" takes an exact ${kind} value, got a ${typeof value}`
     );
   }
-  if (kind === "uuid" && !CANONICAL_UUID.test(value)) {
+  if (kind === "uuid" && readUuidShape(value, "preserve") === undefined) {
     refuse(
       "invalid_value",
       `field "${field}" requires a canonical UUID, got "${value}"`

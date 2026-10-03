@@ -44,6 +44,23 @@ const READINESS_PROBE_RE = /AS ready/;
 
 const TABLE_RE = /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(\w+)/gi;
 const INDEX_RE = /CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(\w+)/gi;
+/**
+ * The forward-compat columns. `CREATE TABLE IF NOT EXISTS` cannot add a column
+ * to a table that already exists, so these are the only mechanism by which a
+ * deployed store acquires one — and the probe short-circuits the block that
+ * emits them.
+ */
+const COLUMN_RE =
+  /ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+(\w+)/gi;
+/**
+ * A named `ADD CONSTRAINT`, paired with the table it lands on. The `.*?` is
+ * bounded to the statement: the constraint name always follows its own
+ * `ALTER TABLE <table>` inside one emitted statement, so the nearest match is
+ * the right one. The template-interpolated constraints (the structured
+ * identity shape CHECKs) arrive already substituted, which is what makes this
+ * derivation see them at all.
+ */
+const CONSTRAINT_RE = /ALTER\s+TABLE\s+(\w+)[\s\S]*?ADD\s+CONSTRAINT\s+(\w+)/gi;
 
 /**
  * A client shaped like `pg`'s that records every statement and bind value.
@@ -102,6 +119,29 @@ const emittedTables = (queries: RecordedQuery[]): string[] =>
 const emittedIndexes = (queries: RecordedQuery[]): string[] =>
   collect(queries, INDEX_RE);
 
+/**
+ * Every `[table, column]` the forward-compat ALTERs add, and every
+ * `[table, constraint]` the named ADD CONSTRAINTs land on. Both derived from
+ * the emitted SQL so they track the DDL rather than a second list.
+ */
+function collectPairs(
+  queries: RecordedQuery[],
+  re: RegExp
+): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [];
+  for (const { sql } of queries) {
+    for (const match of sql.matchAll(re)) {
+      pairs.push([match[1]!.toLowerCase(), match[2]!.toLowerCase()]);
+    }
+  }
+  return pairs;
+}
+
+const emittedColumns = (queries: RecordedQuery[]): Array<[string, string]> =>
+  collectPairs(queries, COLUMN_RE);
+const emittedConstraints = (queries: RecordedQuery[]): Array<[string, string]> =>
+  collectPairs(queries, CONSTRAINT_RE);
+
 /** Every table and index the full DDL path created. */
 async function emittedObjects(): Promise<{ tables: string[]; indexes: string[] }> {
   const queries = await runBootstrap(false);
@@ -118,19 +158,42 @@ function createStatementFor(name: string): RegExp {
 
 /**
  * The `required(name)` lists the probe actually asked about: `$1` is the table
- * list and `$2` the index list.
+ * list, `$2` the index list, and `$3`/`$4` the column tables/names — zipped
+ * POSITIONALLY, because PostgreSQL evaluates `unnest($3::text[], $4::text[])`
+ * as parallel arrays and pairs element i with element i. So the columns are
+ * returned as `table.column` keys, never as two independent lists a swap could
+ * hide inside.
  */
-async function probeLists(): Promise<{ tables: string[]; indexes: string[] }> {
+async function probeLists(): Promise<{
+  tables: string[];
+  indexes: string[];
+  columns: string[];
+  probeSql: string;
+}> {
   const queries = await runBootstrap(true);
   const probe = queries.find(({ sql }) => READINESS_PROBE_RE.test(sql));
   expect(probe, "readiness probe statement not emitted").toBeDefined();
   const tables = probe!.values?.[0];
   const indexes = probe!.values?.[1];
+  const columnTables = probe!.values?.[2];
+  const columnNames = probe!.values?.[3];
   expect(
     Array.isArray(tables) && Array.isArray(indexes),
     "readiness probe did not bind the table/index arrays"
   ).toBe(true);
-  return { tables: tables as string[], indexes: indexes as string[] };
+  expect(
+    Array.isArray(columnTables) && Array.isArray(columnNames),
+    "readiness probe did not bind the column table/name arrays"
+  ).toBe(true);
+  const columns = (columnTables as unknown[]).map(
+    (table, i) => `${String(table)}.${String((columnNames as unknown[])[i])}`
+  );
+  return {
+    tables: tables as string[],
+    indexes: indexes as string[],
+    columns,
+    probeSql: probe!.sql,
+  };
 }
 
 function assertListLockstep(
@@ -185,6 +248,66 @@ describe("BOOTSTRAP_TABLES / BOOTSTRAP_INDEXES lockstep with the bootstrap DDL",
     );
   });
 
+  it("the readiness probe asks for exactly the forward-compat columns the bootstrap ADDs", async () => {
+    // `CREATE TABLE IF NOT EXISTS` cannot upgrade a table that already exists,
+    // so a forward-compat ADD COLUMN is reachable ONLY through the probe: it
+    // short-circuits the very block that emits the ALTER. The tables/indexes
+    // guard could not see this class of object at all.
+    const emitted = emittedColumns(await runBootstrap(false));
+    expect(emitted.length, "no forward-compat ADD COLUMN was emitted").toBeGreaterThan(0);
+    const emittedKeys = emitted.map(([table, column]) => `${table}.${column}`);
+
+    const { columns } = await probeLists();
+    assertListLockstep(
+      "BOOTSTRAP_COLUMNS",
+      emittedKeys,
+      columns,
+      "a forward-compat ADD COLUMN column"
+    );
+  });
+
+  it("names every ADD CONSTRAINT either in the probe or on a table the run creates", async () => {
+    // A constraint is the one object class the probe cannot enumerate as a
+    // bind array — it is a name in the probe's SQL text — so it is checked as
+    // "is it detectable at all" instead.
+    //
+    // The rule: a named constraint needs a probe entry of its own ONLY when
+    // nothing else the probe already asks for reveals its absence. A table this
+    // run creates is absent from a deployed store together with its
+    // constraints, and the table's own probe entry already answers not-ready
+    // for it; likewise a constraint added in the same block as a forward-compat
+    // column is revealed by that column's entry. A constraint that rides
+    // NEITHER — a rename or a widened CHECK on a long-lived table — has no
+    // other signal at all, which is exactly why `entities_type_closed_check`
+    // is the one the probe names by hand (schema-lock.ts).
+    const queries = await runBootstrap(false);
+    const created = new Set(emittedTables(queries));
+    const constraints = emittedConstraints(queries);
+    expect(constraints.length, "no named ADD CONSTRAINT was emitted").toBeGreaterThan(
+      0
+    );
+
+    const { probeSql } = await probeLists();
+    const named = probeSql.toLowerCase();
+    const invisible = constraints
+      .filter(
+        ([table, name]) => !named.includes(name) && !created.has(table)
+      )
+      .map(([, name]) => name);
+    expect(
+      invisible,
+      "a named ADD CONSTRAINT on a table this bootstrap never creates and the " +
+        "probe never names — nothing can detect its absence on a deployed store"
+    ).toEqual([]);
+
+    // Pin the hand-named marker itself. Deliberate exception to this file's
+    // derive-don't-restate doctrine: `entities_type_closed_check` is a RENAME,
+    // so a store can carry the table, the column, and the LEGACY constraint all
+    // at once, and the name is the only observable difference. Deleting it
+    // would leave the destructive entities-type upgrade unable to re-run.
+    expect(named).toContain("entities_type_closed_check");
+  });
+
   it("the mock itself is pinned: ready must short-circuit before the DDL", async () => {
     // Guards the mock, not the product: if a generic arm ever shadows the
     // readiness arm again, the probe never observes the `ready` flag and
@@ -229,13 +352,23 @@ describe("a database missing one object the bootstrap creates", () => {
       const asked = [
         ...((values?.[0] as string[] | undefined) ?? []),
         ...((values?.[1] as string[] | undefined) ?? []),
+        // Columns ride the probe as two parallel arrays, so they are asked
+        // about as `table.column` — reading only $1/$2 here is what let a
+        // column go missing from the probe unnoticed by this file.
+        ...(values?.[2] as string[] | undefined ?? []).map(
+          (table, i) => `${table}.${(values?.[3] as string[])[i]}`
+        ),
       ];
       return { rows: [{ ready: asked.every((name) => !missing.has(name)) }] };
     });
   }
 
   it("reports not-ready and replays the DDL for every name the bootstrap creates", async () => {
-    const { tables, indexes } = await emittedObjects();
+    const queries = await runBootstrap(false);
+    const { tables, indexes } = {
+      tables: emittedTables(queries),
+      indexes: emittedIndexes(queries),
+    };
     const names = [...new Set([...tables, ...indexes])].sort();
     expect(names.length, "no objects were emitted").toBeGreaterThan(0);
 
@@ -246,6 +379,32 @@ describe("a database missing one object the bootstrap creates", () => {
         replays.length,
         `a database missing "${name}" was answered ready — the probe does not ` +
           `name it, so ${name} can never reach an already-provisioned store`
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("reports not-ready and replays the DDL for every forward-compat column", async () => {
+    // The column half of the same consequence, which the tables/indexes loop
+    // above structurally could not reach: a column is not a name the probe can
+    // be asked about on its own, it is a `table.column` pair.
+    const columns = emittedColumns(await runBootstrap(false)).map(
+      ([table, column]) => `${table}.${column}`
+    );
+    expect(columns.length, "no forward-compat columns were emitted").toBeGreaterThan(
+      0
+    );
+
+    for (const key of columns) {
+      const replays = (await runWithAbsent([key])).filter(({ sql }) =>
+        new RegExp(
+          String.raw`ALTER\s+TABLE\s+${key.split(".")[0]}\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+${key.split(".")[1]}\b`,
+          "i"
+        ).test(sql)
+      );
+      expect(
+        replays.length,
+        `a database missing "${key}" was answered ready — the probe does not ` +
+          `name the pair, so the forward-compat ALTER never runs there`
       ).toBeGreaterThan(0);
     }
   });

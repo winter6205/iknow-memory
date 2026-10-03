@@ -22,15 +22,24 @@
  */
 import type {
   ChunkRecord,
+  EvidenceGrantRead,
+  EvidenceGrantRecord,
+  EvidenceStore,
+  GrantDependencyFact,
+  GrantRequest,
   IndexJobClaimOptions,
   IndexJobInsertOutcome,
   IndexJobRecord,
   IndexJobStatus,
   IndexJobStore,
   IndexJobTerminalOutcome,
+  NewSourceVersion,
   RetrievedChunk,
+  ScopeRevisionRecord,
   SearchOptions,
   SourceDocRecord,
+  SourceLocatorBinding,
+  SourceVersionRecord,
   StorageChunkView,
   StorageCounts,
   StorageEntityView,
@@ -41,6 +50,8 @@ import type {
   StorageSourceDocSummary,
   StorageSourceDocView,
   StorageTimelineEvent,
+  SupportOccurrence,
+  SupportRecord,
 } from "../types.js";
 import {
   appendContentInvalidation,
@@ -73,6 +84,7 @@ import {
 } from "../../config.js";
 import { GraphragError } from "../errors.js";
 import {
+  EVIDENCE_FAILURE,
   SOURCE_DOC_STATUS,
   INDEX_JOB_STATUS,
   type ChunkUpsertOptions,
@@ -95,6 +107,33 @@ import {
   slotWriteWidths,
 } from "../embed-slots.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
+import { randomUUID } from "node:crypto";
+import {
+  assertFilled,
+  assertInstant,
+  assertUuid,
+  evidenceError,
+  normalizeLocatorBinding,
+  normalizeOccurrence,
+  normalizeSourceVersion,
+  type SourceVersionStamp,
+} from "./evidence-source.js";
+import { decideGrantRead, normalizeGrantRequest } from "./evidence-store.js";
+import {
+  bindSourceLocatorRow,
+  inEvidenceTransaction,
+  issueGrantRows,
+  readGrantDependenciesByRef,
+  readGrantFacts,
+  readGrantPinnedExtractions,
+  readScopeRevisions,
+  readSupportExtractionRefs,
+  readSupportRow,
+  recordSupportRow,
+  registerSourceVersionRow,
+  stampSourceVersionRow,
+  writeScopeRevisions,
+} from "./evidence-pg.js";
 import {
   CHUNK_BY_ID_SQL,
   CHUNK_COUNT_SQL,
@@ -603,6 +642,7 @@ export class PgvectorBackend
     CommunityIndexStateStorage,
     ProjectionDrainWaiter,
     IndexJobStore,
+    EvidenceStore,
     StorageReadPort
 {
   private pool: PgPool | undefined;
@@ -1940,6 +1980,175 @@ export class PgvectorBackend
         errorCode,
         SOURCE_DOC_STATUS.FAILED,
       ]);
+    });
+  }
+
+  /**
+   * The evidence seam. The methods are one-liners over evidence-pg.ts: the
+   * statements and the decisions both live there, so this file keeps only the
+   * pool access and the transaction wrapper the in-memory twin does not need.
+   */
+  async registerSourceVersion(
+    input: NewSourceVersion
+  ): Promise<{ record: SourceVersionRecord; created: boolean }> {
+    const plan = normalizeSourceVersion(input);
+    return wrapPgRead("registerSourceVersion", async () => {
+      const pool = await this.ensureReady();
+      return registerSourceVersionRow(pool, {
+        ...plan,
+        source_version_id: plan.source_version_id || randomUUID(),
+      });
+    });
+  }
+
+  async bindSourceLocator(
+    input: SourceLocatorBinding
+  ): Promise<SourceLocatorBinding> {
+    const binding = normalizeLocatorBinding(input);
+    return wrapPgRead("bindSourceLocator", async () => {
+      const pool = await this.ensureReady();
+      return bindSourceLocatorRow(pool, binding);
+    });
+  }
+
+  async recordSupport(
+    occurrence: SupportOccurrence
+  ): Promise<{ support: SupportRecord; created: boolean }> {
+    const plan = normalizeOccurrence(occurrence);
+    return wrapPgRead("recordSupport", async () => {
+      const pool = await this.ensureReady();
+      return recordSupportRow(pool, plan, randomUUID());
+    });
+  }
+
+  async getSupport(supportId: string): Promise<SupportRecord | null> {
+    const id = assertUuid(supportId, "support_id");
+    return wrapPgRead("getSupport", async () => {
+      const pool = await this.ensureReady();
+      return readSupportRow(pool, id);
+    });
+  }
+
+  async listSupportExtractions(supportId: string): Promise<string[]> {
+    const id = assertUuid(supportId, "support_id");
+    return wrapPgRead("listSupportExtractions", async () => {
+      const pool = await this.ensureReady();
+      return readSupportExtractionRefs(pool, id);
+    });
+  }
+
+  /**
+   * The grant and its obligations are one transaction, so a reference cannot
+   * commit without the dependencies it claims to protect.
+   */
+  async issueGrant(request: GrantRequest): Promise<EvidenceGrantRecord> {
+    const plan = normalizeGrantRequest(request);
+    return inEvidenceTransaction(
+      async () => (await this.ensureReady()).connect(),
+      (client) =>
+        issueGrantRows(client, {
+          grant: plan,
+          evidenceRef: randomUUID(),
+          receiptId: randomUUID(),
+        })
+    );
+  }
+
+  async readGrant(
+    evidenceRef: string,
+    at: string
+  ): Promise<EvidenceGrantRead> {
+    // `at` is validated before any read so a malformed instant is refused
+    // rather than silently compared against a NaN.
+    assertInstant(at, "at");
+    return wrapPgRead("readGrant", async () => {
+      const pool = await this.ensureReady();
+      return decideGrantRead(await readGrantFacts(pool, evidenceRef), at);
+    });
+  }
+
+  async listGrantSupports(
+    evidenceRef: string
+  ): Promise<readonly GrantDependencyFact[]> {
+    return wrapPgRead("listGrantSupports", async () => {
+      const pool = await this.ensureReady();
+      return readGrantDependenciesByRef(pool, evidenceRef);
+    });
+  }
+
+  async listGrantPinnedExtractions(
+    evidenceRef: string
+  ): Promise<readonly { support_id: string; extraction_ref: string }[]> {
+    return wrapPgRead("listGrantPinnedExtractions", async () => {
+      const pool = await this.ensureReady();
+      return readGrantPinnedExtractions(pool, evidenceRef);
+    });
+  }
+
+  async setScopeRevisions(
+    scopeBinding: string,
+    revisions: { authorizationRevision?: string; purgeRevision?: string }
+  ): Promise<ScopeRevisionRecord> {
+    const scope = assertFilled(scopeBinding, "scope_binding");
+    const authorization = revisions.authorizationRevision ?? null;
+    const purge = revisions.purgeRevision ?? null;
+    for (const [name, value] of [
+      ["authorizationRevision", authorization],
+      ["purgeRevision", purge],
+    ] as const) {
+      if (value !== null) assertFilled(value, name);
+    }
+    return wrapPgRead("setScopeRevisions", async () => {
+      const pool = await this.ensureReady();
+      const existing = await readScopeRevisions(pool, scope);
+      if (existing === null && (authorization === null || purge === null)) {
+        throw evidenceError(
+          EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+          `scope "${scope}" has no revisions on record, so its first write must carry both authorization_revision and purge_revision`
+        );
+      }
+      return writeScopeRevisions(pool, scope, authorization, purge);
+    });
+  }
+
+  async markSourceVersionRetired(
+    sourceVersionId: string,
+    retiredAt: string
+  ): Promise<void> {
+    await this.stampSourceVersion("retired_at", sourceVersionId, retiredAt);
+  }
+
+  async collectSourceVersionPayload(
+    sourceVersionId: string,
+    collectedAt: string
+  ): Promise<void> {
+    await this.stampSourceVersion(
+      "payload_collected_at",
+      sourceVersionId,
+      collectedAt
+    );
+  }
+
+  async stopAcceptingObligations(
+    sourceVersionId: string,
+    at: string
+  ): Promise<void> {
+    await this.stampSourceVersion(
+      "obligations_stopped_at",
+      sourceVersionId,
+      at
+    );
+  }
+
+  private async stampSourceVersion(
+    stamp: SourceVersionStamp,
+    sourceVersionId: string,
+    at: string
+  ): Promise<void> {
+    const id = assertUuid(sourceVersionId, "source_version_id");
+    return wrapPgRead("stampSourceVersion", async () => {
+      const pool = await this.ensureReady();
+      await stampSourceVersionRow(pool, stamp, id, at);
     });
   }
 

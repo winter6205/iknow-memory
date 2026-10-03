@@ -23,8 +23,6 @@ import {
   verifyAttemptGuard,
 } from "../maintenance/durable-work.js";
 import {
-  MAINTENANCE_WORK_KINDS,
-  MAINTENANCE_WORK_STATUS,
   MAX_AUTO_ATTEMPTS,
   WORK_ABSOLUTE_LIMIT_MS,
   WORK_LEASE_MS,
@@ -83,11 +81,9 @@ const JOB_COLUMNS =
  * constants. No request value ever reaches these strings — only module-level
  * numbers do, so interpolating them is not an injection surface.
  */
-export const ABSOLUTE_BOUND_SQL =
+const ABSOLUTE_BOUND_SQL =
   `attempt_started_at + interval '${WORK_ABSOLUTE_LIMIT_MS / 1000} seconds'`;
 const LEASE_SQL = `interval '${WORK_LEASE_MS / 1000} seconds'`;
-
-export { MAINTENANCE_WORK_KINDS, MAINTENANCE_WORK_STATUS, MAX_AUTO_ATTEMPTS };
 
 export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   private readonly pool: MaintenanceWorkPool;
@@ -327,6 +323,7 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
           failureCode: "lease_lost",
           finishedAt: stamp,
           reclaimed: true,
+          tolerateMissing: true,
         });
       }
       return rows.map((row) => ({ jobKey: String(row.job_key), reclaimed: true }));
@@ -422,15 +419,25 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
       return { result: "stale", record };
     }
     if (code === "execution_timeout") {
-      // The attempt ran past its absolute bound, so the attempt row records that
-      // — not the `lease_lost` a later reclaim would otherwise stamp over it.
+      // The spec's `failed` state is exactly this: the current attempt stopped
+      // with a typed cause, and an explicit retry is the remedy. Settling the job
+      // rather than leaving it `running` is what keeps the outcome in the attempt
+      // history — a job left running with an expired lease would be reclaimed,
+      // and the reclaim would overwrite this attempt's real cause with
+      // `lease_lost`.
+      const record = await this.writeSettled(
+        lease,
+        row,
+        { status: "failed", nextDelayMs: null, lastFailureCode: "execution_timeout" },
+        stamp
+      );
       await this.finishAttempt(lease, {
         jobKey: String(row.job_key),
         attemptNumber: Number(row.attempt_count),
         failureCode: "execution_timeout",
         finishedAt: stamp,
       });
-      return { result: "timed_out" };
+      return { result: "timed_out", record };
     }
     return { result: "lease_lost" };
   }
@@ -480,12 +487,13 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
       readonly failureCode: MaintenanceWorkFailureCode | null;
       readonly finishedAt: string;
       readonly reclaimed?: boolean;
+      readonly tolerateMissing?: boolean;
     }
   ): Promise<void> {
     const { rows } = await lease.query(
       `UPDATE maintenance_job_attempts
           SET failure_code = $3, finished_at = $4, reclaimed = $5
-        WHERE job_key = $1 AND attempt_number = $2
+        WHERE job_key = $1 AND attempt_number = $2 AND finished_at IS NULL
       RETURNING job_key`,
       [
         attempt.jobKey,
@@ -495,9 +503,10 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
         attempt.reclaimed ?? false,
       ]
     );
-    if (rows.length === 0) {
+    if (rows.length === 0 && !attempt.tolerateMissing) {
       // A settle whose attempt row is gone means the history cannot explain the
-      // outcome, so it must not be reported as a success.
+      // outcome, so it must not be reported as a success. A reclaim is exempt:
+      // the attempt may already carry a recorded terminal outcome.
       throw new MaintenanceStoreError(
         `maintenance attempt ${attempt.attemptNumber} missing for job ${attempt.jobKey}`,
         "backend_unavailable"

@@ -106,6 +106,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       attemptCount: target.attemptCount + 1,
       autoAttemptCount: target.autoAttemptCount + 1,
       nextAttemptAt: null,
+      lastFailureCode: null,
       fencingToken,
       leaseExpiresAt: leaseExpiryFrom(stamp),
       attemptStartedAt: stamp,
@@ -191,7 +192,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     const verdict = verifyAttemptGuard(toGuard(job), live, now, guard.fencingToken);
     const stamp = now.toISOString();
     if (!verdict.ok && verdict.code === "input_stale") {
-      const superseded = this.persist(job, "stale", stamp, null);
+      const superseded = this.persist(job, "stale", stamp, "input_stale");
       this.finishAttempt({
         jobKey: job.jobKey,
         attemptNumber: job.attemptCount,
@@ -201,9 +202,27 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       return { result: "stale", record: toRecord(superseded) };
     }
     if (!verdict.ok) {
-      return verdict.code === "execution_timeout"
-        ? { result: "timed_out" }
-        : { result: "lease_lost" };
+      if (verdict.code !== "execution_timeout") return { result: "lease_lost" };
+      // Same terminal shape as the SQL twin: settle the job so the attempt's
+      // real cause survives, instead of leaving it for a reclaim to overwrite.
+      const timedOut: StoredJob = {
+        ...job,
+        status: "failed",
+        lastFailureCode: "execution_timeout",
+        nextAttemptAt: null,
+        fencingToken: null,
+        leaseExpiresAt: null,
+        attemptStartedAt: null,
+        updatedAt: stamp,
+      };
+      this.jobs.set(timedOut.jobKey, timedOut);
+      this.finishAttempt({
+        jobKey: job.jobKey,
+        attemptNumber: job.attemptCount,
+        failureCode: "execution_timeout",
+        finishedAt: stamp,
+      });
+      return { result: "timed_out", record: toRecord(timedOut) };
     }
 
     const settled = this.applyOutcome(job, outcome, stamp);
@@ -229,13 +248,18 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       ) {
         continue;
       }
-      this.persist(job, "pending", stamp, job.lastFailureCode);
+      const reclaimed: StoredJob = {
+        ...this.persist(job, "pending", stamp, job.lastFailureCode),
+        nextAttemptAt: stamp,
+      };
+      this.jobs.set(reclaimed.jobKey, reclaimed);
       this.finishAttempt({
         jobKey: job.jobKey,
         attemptNumber: job.attemptCount,
         failureCode: "lease_lost",
         finishedAt: stamp,
         reclaimed: true,
+        tolerateMissing: true,
       });
       outcomes.push({ jobKey: job.jobKey, reclaimed: true });
     }
@@ -327,12 +351,15 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       readonly failureCode: MaintenanceAttemptRecord["failureCode"];
       readonly finishedAt: string;
       readonly reclaimed?: boolean;
+      readonly tolerateMissing?: boolean;
     }
   ): void {
     const history = this.attempts.get(attempt.jobKey) ?? [];
     const index = history.findIndex(
       (entry) => entry.attemptNumber === attempt.attemptNumber
     );
+    if (index >= 0 && history[index]!.finishedAt !== null) return;
+    if (index < 0 && attempt.tolerateMissing) return;
     if (index < 0) {
       // A settle whose attempt row is missing means the history is broken, and
       // reporting `settled` on top of it would report a success the ledger cannot

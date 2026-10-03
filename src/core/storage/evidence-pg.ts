@@ -405,10 +405,21 @@ async function insertSupport(
       created: true,
     };
   }
+  const occurrenceValues = [
+    support.subject,
+    support.result_id,
+    support.source_ref,
+    support.source_version,
+    support.location.document_id,
+    support.location.version,
+    support.location.unit,
+    support.span?.start ?? -1,
+    support.span?.end ?? -1,
+  ];
   const { rows } = await client.query(
     `SELECT ${SUPPORT_COLUMNS} FROM assertion_supports
-      WHERE ${OCCURRENCE_KEY} = ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-    supportValues(support, supportId)
+      WHERE (${OCCURRENCE_KEY}) = ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+    occurrenceValues
   );
   return {
     support: toSupportRecord(
@@ -478,26 +489,28 @@ export async function writeScopeRevisions(
   authorizationRevision: string | null,
   purgeRevision: string | null
 ): Promise<ScopeRevisionRecord> {
-  const { rows } = await client.query(
-    `INSERT INTO evidence_scope_revisions
-       (scope_binding, authorization_revision, purge_revision)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (scope_binding) DO UPDATE
-        SET authorization_revision =
-              COALESCE($4, evidence_scope_revisions.authorization_revision),
-            purge_revision =
-              COALESCE($5, evidence_scope_revisions.purge_revision)
-     RETURNING scope_binding, authorization_revision, purge_revision`,
-    [
-      scopeBinding,
-      authorizationRevision,
-      purgeRevision,
-      authorizationRevision,
-      purgeRevision,
-    ]
-  );
+  const result =
+    authorizationRevision === null || purgeRevision === null
+      ? await client.query(
+          `UPDATE evidence_scope_revisions
+              SET authorization_revision = COALESCE($2, authorization_revision),
+                  purge_revision = COALESCE($3, purge_revision)
+            WHERE scope_binding = $1
+            RETURNING scope_binding, authorization_revision, purge_revision`,
+          [scopeBinding, authorizationRevision, purgeRevision]
+        )
+      : await client.query(
+          `INSERT INTO evidence_scope_revisions
+             (scope_binding, authorization_revision, purge_revision)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (scope_binding) DO UPDATE
+              SET authorization_revision = EXCLUDED.authorization_revision,
+                  purge_revision = EXCLUDED.purge_revision
+           RETURNING scope_binding, authorization_revision, purge_revision`,
+          [scopeBinding, authorizationRevision, purgeRevision]
+        );
   return toScopeRevisions(
-    requireRow(rows, "the scope revision upsert")
+    requireRow(result.rows, "the scope revision write")
   );
 }
 

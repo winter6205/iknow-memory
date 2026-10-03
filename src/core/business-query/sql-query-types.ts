@@ -184,6 +184,15 @@ export interface BusinessQueryResult {
   window: { start: string; end: string };
 }
 
+/** Retrieval's structural seam for executing the one permitted SQL read. */
+export interface BusinessQueryPort {
+  query(request: {
+    template: string;
+    params: ContractsExpiringParams;
+    authorization?: SqlAuthorizationClaim;
+  }): Promise<BusinessQueryResult>;
+}
+
 /** A SQL exit that has to be visible to the host. */
 export interface SqlBusinessFailure {
   token: GraphragFailureToken;

@@ -7,8 +7,9 @@
  * production. The suite skips LOUDLY when no local Postgres answers, exactly
  * like the rest of tests/storage; that skip is not a pass.
  */
-import { afterAll, beforeAll, it } from "vitest";
+import { randomUUID } from "node:crypto";
 import pg from "pg";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { supportsEvidenceStore } from "../../src/core/storage/backend.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
@@ -79,6 +80,38 @@ describePg("PgvectorBackend evidence store", () => {
         table
       );
     }
+  });
+
+  it("preserves both dimensions under concurrent partial scope revision writes", async () => {
+    if (backend === undefined || !supportsEvidenceStore(backend)) {
+      throw new Error("the pg evidence store was not initialized");
+    }
+    const scopeBinding = `concurrent-revision-${randomUUID()}`;
+    await backend.setScopeRevisions(scopeBinding, {
+      authorizationRevision: "auth-1",
+      purgeRevision: "purge-1",
+    });
+
+    await Promise.all([
+      backend.setScopeRevisions(scopeBinding, {
+        authorizationRevision: "auth-2",
+      }),
+      backend.setScopeRevisions(scopeBinding, {
+        purgeRevision: "purge-2",
+      }),
+    ]);
+
+    const { rows } = await admin!.query<{
+      authorization_revision: string;
+      purge_revision: string;
+    }>(
+      `SELECT authorization_revision, purge_revision
+         FROM evidence_scope_revisions WHERE scope_binding = $1`,
+      [scopeBinding]
+    );
+    expect(rows).toEqual([
+      { authorization_revision: "auth-2", purge_revision: "purge-2" },
+    ]);
   });
 });
 

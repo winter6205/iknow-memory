@@ -224,3 +224,100 @@ export function stripSqlWindowFilter(
     SQL_WINDOW_END_FILTER_KEY
   );
 }
+
+/**
+ * The `filters` key carrying the bounded structured request
+ * (specs/structured-corpus-query §Request). Same routing contract as
+ * `search_mode`, with one difference that makes it stricter: this is the ONE
+ * filter key whose value is an object rather than a string, so it is resolved
+ * and stripped before any arm runs. A backend that turns every filter key into
+ * an exact-match term clause has no field to match an object against, and the
+ * leftover key would silently zero the arm instead of answering.
+ */
+export const STRUCTURED_QUERY_FILTER_KEY = "structured_query";
+
+/**
+ * The wire filter map. Every other key keeps the string-only exact-match
+ * contract; the retrieve tool's input schema is what enforces that, because a
+ * Zod record cannot type one member differently from the rest.
+ */
+export type RetrieveWireFilters = Record<string, unknown>;
+
+/**
+ * Presence of the structured request, unvalidated. Every refusal code belongs
+ * to `validateStructuredQueryRequest`, so this reader cannot become a second
+ * validator that drifts from the first.
+ */
+export type StructuredQueryFilterResolution =
+  | { kind: "absent" }
+  | { kind: "present"; request: unknown };
+
+/** Read the structured request without validating it. */
+export function readStructuredQueryFilter(
+  filters: RetrieveWireFilters | undefined
+): StructuredQueryFilterResolution {
+  if (filters === undefined || !(STRUCTURED_QUERY_FILTER_KEY in filters)) {
+    return { kind: "absent" };
+  }
+  return { kind: "present", request: filters[STRUCTURED_QUERY_FILTER_KEY] };
+}
+
+/**
+ * Resolution of the `filters` map once the structured key is removed.
+ *
+ * A refusal, not a silent drop. `structured_query` is the ONE key whose value
+ * is an object; every other key keeps the string-only exact-match contract, so
+ * a non-string under one of them is a filter the arms cannot apply. Returning
+ * it as `ok` would hand the arm a map missing an entry the caller sent, and the
+ * arm would answer a NARROWER question than the one asked with no refusal
+ * anywhere. This module owns no error vocabulary of its own (see the leaf
+ * note at the top), so it names the offending key and the handler refuses.
+ */
+export type StructuredQueryFilterStrip =
+  | { kind: "ok"; filters: Record<string, string> | undefined }
+  | { kind: "invalid"; key: string; received: string };
+
+/** Stable host-mappable reason token, aligned with the other routing keys. */
+export const INVALID_FILTER_VALUE_REASON = "invalid_filter_value";
+
+/** Build the thrown-error message; keeps the reason token out of magic strings. */
+export function invalidFilterValueMessage(
+  key: string,
+  received: string
+): string {
+  return (
+    `retrieve ${key} must be a string (or the object-valued ` +
+    `${STRUCTURED_QUERY_FILTER_KEY}), got a ${received} ` +
+    `(${INVALID_FILTER_VALUE_REASON})`
+  );
+}
+
+/**
+ * Strip the structured key and narrow to the exact-match map the arms consume.
+ *
+ * A request whose only filter was the structured key reads as no filters at
+ * all, so the arm call shape never differs from a request that carried none.
+ * Every other entry must be a string: one that is not is refused rather than
+ * dropped, because dropping it silently narrows the query.
+ */
+export function stripStructuredQueryFilter(
+  filters: RetrieveWireFilters | undefined
+): StructuredQueryFilterStrip {
+  if (filters === undefined) {
+    return { kind: "ok", filters: undefined };
+  }
+  const rest: Record<string, string> = {};
+  for (const [key, value] of Object.entries(filters)) {
+    if (key === STRUCTURED_QUERY_FILTER_KEY) {
+      continue;
+    }
+    if (typeof value !== "string") {
+      return { kind: "invalid", key, received: typeof value };
+    }
+    rest[key] = value;
+  }
+  return {
+    kind: "ok",
+    filters: Object.keys(rest).length > 0 ? rest : undefined,
+  };
+}

@@ -80,6 +80,17 @@ const BOOTSTRAP_TABLES = [
   // index_jobs, so the probe names them or they never reach a deployed store.
   "structured_entity_identities",
   "structured_relation_assertion_identities",
+  // The immutable source/support records and the finite grants: nine brand-new
+  // tables, same reason as index_jobs.
+  "source_versions",
+  "source_version_locators",
+  "assertion_supports",
+  "support_extractions",
+  "evidence_scope_revisions",
+  "evidence_authorization_receipts",
+  "evidence_grants",
+  "evidence_grant_supports",
+  "evidence_grant_extractions",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -111,6 +122,17 @@ const BOOTSTRAP_INDEXES = [
   "structured_relation_assertion_identities_tuple_idx",
   "structured_relation_assertion_identities_head_idx",
   "structured_relation_assertion_identities_tail_idx",
+  // structured corpus evidence: the occurrence key is the one index that makes
+  // a repeated extraction a second link instead of a second support, so a
+  // deployed store that never received it would let the duplicate through.
+  "source_versions_source_ref_source_version_idx",
+  "assertion_supports_source_version_idx",
+  "assertion_supports_result_idx",
+  "support_extractions_extraction_ref_idx",
+  "evidence_authorization_receipts_scope_revisions_idx",
+  "evidence_grants_expires_at_idx",
+  "evidence_grants_scope_binding_idx",
+  "evidence_grant_supports_support_id_idx",
 ] as const;
 
 /**

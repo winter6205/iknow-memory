@@ -350,6 +350,41 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
 
       const afterBound = new Date("2026-10-03T10:30:01.000Z");
       expect(await store.heartbeatWork(guard, afterBound)).toBe(false);
+
+      const timedOut = await settleWork(
+        { store, clock: () => afterBound },
+        guard,
+        { status: "ready" },
+        liveInputsOf("rules-3", [dependency({ sourceRef: "s8" })])
+      );
+      expect(timedOut).toMatchObject({ result: "timed_out" });
+
+      // The attempt's real cause must survive in the history. A job left running
+      // with an expired lease would be reclaimed, and the reclaim would stamp
+      // `lease_lost` over `execution_timeout`.
+      const settled = await admin.query<{
+        status: string;
+        last_failure_code: string;
+      }>(
+        `SELECT status, last_failure_code FROM maintenance_jobs WHERE job_key = $1`,
+        [job.jobKey]
+      );
+      expect(settled.rows[0]).toMatchObject({
+        status: "failed",
+        last_failure_code: "execution_timeout",
+      });
+      const history = await store.listAttempts(job.jobKey);
+      expect(history[0]).toMatchObject({
+        failureCode: "execution_timeout",
+        reclaimed: false,
+      });
+
+      // And a later reclaim must not overwrite it.
+      await store.reclaimExpiredWork(new Date("2026-10-03T11:00:00.000Z"));
+      expect((await store.listAttempts(job.jobKey))[0]).toMatchObject({
+        failureCode: "execution_timeout",
+        reclaimed: false,
+      });
     } finally {
       await pool.end();
     }

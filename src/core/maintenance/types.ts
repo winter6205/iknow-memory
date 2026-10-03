@@ -41,16 +41,6 @@ export const MAINTENANCE_WORK_STATUS = [
 
 export type MaintenanceWorkStatus = (typeof MAINTENANCE_WORK_STATUS)[number];
 
-/** States a job in which no attempt holds a lease. */
-export const MAINTENANCE_WORK_TERMINAL_STATUS = [
-  "ready",
-  "failed",
-  "stale",
-] as const;
-
-export type MaintenanceWorkTerminalStatus =
-  (typeof MAINTENANCE_WORK_TERMINAL_STATUS)[number];
-
 /** Whether an operator retry may return this job to `pending`. */
 export function isRetryableStatus(status: MaintenanceWorkStatus): boolean {
   return status === "failed" || status === "stale";
@@ -226,8 +216,13 @@ export type MaintenanceSettleOutcome =
 export type MaintenanceSettleResult =
   | { readonly result: "settled"; readonly record: MaintenanceJobRecord }
   | { readonly result: "lease_lost" }
-  | { readonly result: "timed_out" }
-  | { readonly result: "stale"; readonly record: MaintenanceJobRecord };
+  | { readonly result: "stale"; readonly record: MaintenanceJobRecord }
+  /**
+   * The attempt ran past its absolute bound. It carries the record because the
+   * job is settled as `failed` with `execution_timeout` — the spec's "current
+   * attempt stopped with a typed cause", with an explicit retry as the remedy.
+   */
+  | { readonly result: "timed_out"; readonly record: MaintenanceJobRecord };
 
 /** Reclaim outcome for one expired attempt. */
 export type MaintenanceReclaimOutcome =

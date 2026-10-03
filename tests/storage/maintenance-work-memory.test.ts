@@ -373,10 +373,24 @@ describe("MP4 — lease, fencing token, and dependency fence", () => {
 
     h.setNow(new Date("2026-10-03T10:30:01.000Z"));
     expect(await h.store.heartbeatWork(guard, h.now())).toBe(false);
-    expect(
-      await settleWork(h.deps, guard, { status: "ready" }, live)
-    ).toEqual({ result: "timed_out" });
-    expect((await h.store.getJob(job.jobKey))?.status).toBe("running");
+    const timedOut = await settleWork(h.deps, guard, { status: "ready" }, live);
+    expect(timedOut).toMatchObject({ result: "timed_out" });
+
+    // Settled, not left running: an attempt that outlived its bound stopped with a
+    // typed cause, and leaving the job `running` would let the next reclaim
+    // overwrite that cause with `lease_lost`.
+    const record = (await h.store.getJob(job.jobKey)) ?? null;
+    expect(record).toMatchObject({
+      status: "failed",
+      lastFailureCode: "execution_timeout",
+      nextAttemptAt: null,
+    });
+    const history = await h.store.listAttempts(job.jobKey);
+    expect(history[0]).toMatchObject({
+      attemptNumber: 1,
+      failureCode: "execution_timeout",
+      reclaimed: false,
+    });
   });
 
   it("settles a live attempt to ready exactly once", async () => {

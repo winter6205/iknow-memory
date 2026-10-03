@@ -51,7 +51,8 @@ jobs:
             --exclude tests/storage/bootstrap-columns.test.ts \
             --exclude tests/storage/pgvector-startup.test.ts \
             --exclude tests/storage/source-documents-pg.test.ts \
-            --exclude tests/storage/storage-reads-pg.test.ts
+            --exclude tests/storage/storage-reads-pg.test.ts \
+            --exclude tests/structured/identity-store-pg.test.ts
 
   test-es:
     runs-on: ubuntu-latest

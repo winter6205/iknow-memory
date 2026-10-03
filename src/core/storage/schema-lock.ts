@@ -91,6 +91,10 @@ const BOOTSTRAP_TABLES = [
   "evidence_grants",
   "evidence_grant_supports",
   "evidence_grant_extractions",
+  // Durable maintenance work ledger. These tables must be probed because
+  // bootstrap short-circuits before replaying their CREATE statements.
+  "maintenance_jobs",
+  "maintenance_job_attempts",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -133,6 +137,11 @@ const BOOTSTRAP_INDEXES = [
   "evidence_grants_expires_at_idx",
   "evidence_grants_scope_binding_idx",
   "evidence_grant_supports_support_id_idx",
+  // Durable maintenance claim, reclaim, source and attempt-history scans.
+  "maintenance_jobs_claim_idx",
+  "maintenance_jobs_expired_lease_idx",
+  "maintenance_jobs_source_idx",
+  "maintenance_job_attempts_history_idx",
 ] as const;
 
 /**

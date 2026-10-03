@@ -32,6 +32,7 @@ import {
   type SourceDocStatus,
 } from "../types.js";
 import { upSchemaProjection } from "./schema-projection.js";
+import { upSchemaMaintenanceWork } from "./schema-maintenance-work.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 
 /**
@@ -1052,6 +1053,7 @@ export async function upSchemaBootstrap(
     await createStructuredIdentities(client);
     await createEvidenceTables(client);
     await upSchemaProjection(client);
+    await upSchemaMaintenanceWork(client);
     // ALTER chunks back-pointers must come after `source_documents` exists
     // (FK target) and after `chunks` itself exists (caller's responsibility —
     // `PgvectorBackend.ensureTable` creates it before invoking us).

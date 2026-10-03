@@ -76,6 +76,10 @@ const BOOTSTRAP_TABLES = [
   // corpus-index-job T2: a brand-new table — CREATE IF NOT EXISTS alone never
   // reaches a deployed store once the probe says ready, so the probe names it.
   "index_jobs",
+  // QP3: the structured-query identity registry, brand-new tables — same rule as
+  // index_jobs, so the probe names them or they never reach a deployed store.
+  "structured_entity_identities",
+  "structured_relation_assertion_identities",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -102,6 +106,11 @@ const BOOTSTRAP_INDEXES = [
   "source_documents_source_ref_content_identity_idx",
   "index_jobs_source_ref_status_idx",
   "index_jobs_one_active_per_source_idx",
+  // QP3: forward-compat CREATE ... IF NOT EXISTS indexes — absent from a
+  // deployed store until the probe reports not-ready.
+  "structured_relation_assertion_identities_tuple_idx",
+  "structured_relation_assertion_identities_head_idx",
+  "structured_relation_assertion_identities_tail_idx",
 ] as const;
 
 /**

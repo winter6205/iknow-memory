@@ -34,6 +34,12 @@
  * `filters.community_level` (specs/community-level.md) is a routing control
  * too: missing → cap 2, positive integer string → that cap on every
  * community-summary read, anything else → typed INVALID_INPUT.
+ *
+ * `filters.structured_query` (specs/structured-corpus-query) is the bounded
+ * structured request, and the one filter key whose value is an object. It is
+ * resolved, validated against the closed request vocabulary, and stripped here
+ * before any arm runs; a structured request never runs the legacy business
+ * ledger, and every refusal leaves as a typed `iknow.structured_error`.
  */
 import { z } from "zod";
 import {
@@ -74,18 +80,24 @@ import {
 } from "../core/retrieval/search-mode.js";
 import {
   ENTITY_TYPE_FILTER_VALUES,
+  STRUCTURED_QUERY_FILTER_KEY,
   invalidCommunityLevelMessage,
   invalidEntityTypeMessage,
+  invalidFilterValueMessage,
   parseCommunityLevelFilter,
   parseEntityTypeFilter,
   stripCommunityLevelFilter,
   stripEntityTypeFilter,
 } from "../core/retrieval/wire-filters.js";
 import { GraphragError } from "../core/errors.js";
+import { StructuredQueryError } from "../core/structured/errors.js";
+import { validateStructuredQueryRequest } from "../core/structured/request.js";
 import type { BusinessQueryExecutor } from "../core/business-query/sql-query-executor.js";
 import {
   readSqlWindowFilter,
+  readStructuredQueryFilter,
   stripSqlWindowFilter,
+  stripStructuredQueryFilter,
 } from "../core/retrieval/wire-filters.js";
 
 const DEFAULT_LIMIT = 10;
@@ -121,7 +133,31 @@ export function createRetrieveInputSchema(
         return valid;
       }, "query must contain at least one non-whitespace character"),
     valid_at: z.string().datetime().optional(),
-    filters: z.record(z.string(), z.string()).optional(),
+    // `structured_query` is the one filter key whose value is an object (the
+    // bounded structured request). A Zod record cannot type one member
+    // differently from the rest, so the value union admits an object and the
+    // refine holds every OTHER key to the string-only exact-match contract.
+    //
+    // The union is a PUBLICATION decision as much as a parse one: `z.unknown()`
+    // would collapse the advertised JSON Schema to an unconstrained
+    // `additionalProperties: {}`, so a host reading only the published schema
+    // would believe `filters` accepts any value at all — exactly the boundary
+    // this change tightens. Naming the two accepted cases keeps the string case
+    // documented for that host, and the refine stays the runtime enforcer.
+    filters: z
+      .record(
+        z.string(),
+        z.union([z.string(), z.record(z.string(), z.unknown())])
+      )
+      .refine(
+        (filters) =>
+          Object.entries(filters).every(
+            ([key, value]) =>
+              key === STRUCTURED_QUERY_FILTER_KEY || typeof value === "string"
+          ),
+        `only filters.${STRUCTURED_QUERY_FILTER_KEY} may be an object; every other filter value must be a string`
+      )
+      .optional(),
     limit: z.number().int().min(1).max(100).optional(),
     preset: z.enum(RETRIEVE_PRESETS).optional(),
     wait_for_drain: z.boolean().optional(),
@@ -193,22 +229,49 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     input: RetrieveInput
   ): Promise<ToolResult> {
     validateRetrieveQuery(input, deps.inputValidationFailureCounter);
+    // `filters.structured_query` is a typed request, not a matching filter, and
+    // the one filter key whose value is an object. Read and strip it FIRST, so
+    // every control reader below sees the string-only exact-match map it has
+    // always seen; the request itself is validated once the bound 档 is known.
+    // A non-string under any OTHER key is refused here rather than dropped:
+    // dropping it would narrow the query without answering it.
+    const structured = readStructuredQueryFilter(input.filters);
+    const stripped = stripStructuredQueryFilter(input.filters);
+    if (stripped.kind === "invalid") {
+      throw new GraphragError(
+        invalidFilterValueMessage(stripped.key, stripped.received),
+        "INVALID_INPUT"
+      );
+    }
+    const stringFilters = stripped.filters;
     // Resolve the 档 before anything else so an invalid value is a typed
     // refusal, never a degraded or empty answer (plans/search-mode-retrieve
     // .md T1 acceptance). `search_mode` is routing, not matching: strip it
     // from the exact-match filters so arms and backends never see it.
-    const searchMode = parseSearchMode(input.filters);
+    const searchMode = parseSearchMode(stringFilters);
     if (searchMode.kind === "invalid") {
       throw new GraphragError(
         invalidSearchModeMessage(searchMode.value),
         "INVALID_INPUT"
       );
     }
+    // A structured request may not select or override the host-bound 档, so it
+    // is validated against the tier resolved above. A structurally valid
+    // request has no execution path yet, and the SPEC's answer for that is the
+    // typed `structured_search_unavailable` — never the legacy business
+    // ledger, which would answer a different question than the one asked.
+    if (structured.kind === "present") {
+      validateStructuredQueryRequest(structured.request, searchMode.mode);
+      throw new StructuredQueryError(
+        "structured query execution is not available on this backend",
+        "structured_search_unavailable"
+      );
+    }
     // Same contract for `filters.entity_type` (plans/entity-type-and-filter
     // .md T3): resolve before any arm runs; missing = all types, outside
     // the closed set = typed refusal, never a silent ignore. The arms see
     // only the value below — the key is stripped from the exact-match map.
-    const entityTypeFilter = parseEntityTypeFilter(input.filters);
+    const entityTypeFilter = parseEntityTypeFilter(stringFilters);
     if (entityTypeFilter.kind === "invalid") {
       throw new GraphragError(
         invalidEntityTypeMessage(entityTypeFilter.value),
@@ -218,7 +281,7 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     // Same contract for `filters.community_level` (specs/community-level
     // .md): resolve once per request, refuse typed otherwise — never a
     // silent all-level mix — and hand the arms only the number below.
-    const communityLevel = resolveCommunityLevel(input.filters);
+    const communityLevel = resolveCommunityLevel(stringFilters);
     // Routing keys are resolved and stripped HERE, once, for every 档
     // (review I2): each backend applies `filters` as exact-match term
     // clauses, so a left-over control key silently zeros the arm that
@@ -226,17 +289,17 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     // (`global`) still sees its switch:
     // as the typed control value below, never as a filter key.
     const control: SearchModeControl = {
-      cDropWindows: cDropWindowsEnabled(input.filters),
+      cDropWindows: cDropWindowsEnabled(stringFilters),
     };
     // The `sql` 档's expiry window is a routing control like every key
     // above: resolved here, stripped here, and validated only by the
     // executor — so the refusal of a malformed window happens before a
     // connection exists (spec §5c).
-    const sqlWindow = readSqlWindowFilter(input.filters);
+    const sqlWindow = readSqlWindowFilter(stringFilters);
     const matchFilters = stripSqlWindowFilter(
       stripCommunityLevelFilter(
         stripEntityTypeFilter(
-          stripCDropWindowsFilter(stripSearchModeFilter(input.filters))
+          stripCDropWindowsFilter(stripSearchModeFilter(stringFilters))
         )
       )
     );

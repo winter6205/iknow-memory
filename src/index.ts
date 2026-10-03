@@ -26,6 +26,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { ConfigError, loadEnv, type GraphragEnv } from "./config.js";
 import { createLogger, redactDiagnostic, writeStderr } from "./logging.js";
 import { failureTokenOf } from "./core/errors.js";
+import {
+  StructuredQueryError,
+  structuredErrorEnvelope,
+} from "./core/structured/errors.js";
 import { parseStdioEntry } from "./cli/stdio-entry.js";
 import {
   buildRegistry,
@@ -646,6 +650,18 @@ function registerOne(
           err instanceof Error ? err.message : err
         );
         logger.error("handler threw", { tool: tool.name, error: message });
+        // A structured-query refusal carries its own closed envelope
+        // (`iknow.structured_error`, spec §Typed errors) rather than the
+        // legacy named-token shape below: the host classifies from
+        // `error.code` + `error.retryable`, and a structured failure that
+        // degraded into prose or an empty success would be
+        // indistinguishable from a no-match.
+        if (err instanceof StructuredQueryError) {
+          return textResult(
+            JSON.stringify(structuredErrorEnvelope(err)),
+            true
+          );
+        }
         // A failure that declares a stable token publishes it as the JSON
         // body's `error` field, matching the read_source error results, so a
         // host classifies from structure rather than from prose. Only such a

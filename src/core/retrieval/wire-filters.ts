@@ -224,3 +224,61 @@ export function stripSqlWindowFilter(
     SQL_WINDOW_END_FILTER_KEY
   );
 }
+
+/**
+ * The `filters` key carrying the bounded structured request
+ * (specs/structured-corpus-query §Request). Same routing contract as
+ * `search_mode`, with one difference that makes it stricter: this is the ONE
+ * filter key whose value is an object rather than a string, so it is resolved
+ * and stripped before any arm runs. A backend that turns every filter key into
+ * an exact-match term clause has no field to match an object against, and the
+ * leftover key would silently zero the arm instead of answering.
+ */
+export const STRUCTURED_QUERY_FILTER_KEY = "structured_query";
+
+/**
+ * The wire filter map. Every other key keeps the string-only exact-match
+ * contract; the retrieve tool's input schema is what enforces that, because a
+ * Zod record cannot type one member differently from the rest.
+ */
+export type RetrieveWireFilters = Record<string, unknown>;
+
+/**
+ * Presence of the structured request, unvalidated. Every refusal code belongs
+ * to `validateStructuredQueryRequest`, so this reader cannot become a second
+ * validator that drifts from the first.
+ */
+export type StructuredQueryFilterResolution =
+  | { kind: "absent" }
+  | { kind: "present"; request: unknown };
+
+/** Read the structured request without validating it. */
+export function readStructuredQueryFilter(
+  filters: RetrieveWireFilters | undefined
+): StructuredQueryFilterResolution {
+  if (filters === undefined || !(STRUCTURED_QUERY_FILTER_KEY in filters)) {
+    return { kind: "absent" };
+  }
+  return { kind: "present", request: filters[STRUCTURED_QUERY_FILTER_KEY] };
+}
+
+/**
+ * Strip the structured key and narrow back to the exact-match map the arms
+ * consume. A request without the key is returned as-is, and a request whose
+ * only filter was the structured key reads as no filters at all, so the arm
+ * call shape never differs from a request that carried none.
+ */
+export function stripStructuredQueryFilter(
+  filters: RetrieveWireFilters | undefined
+): Record<string, string> | undefined {
+  if (filters === undefined || !(STRUCTURED_QUERY_FILTER_KEY in filters)) {
+    return filters as Record<string, string> | undefined;
+  }
+  const rest: Record<string, string> = {};
+  for (const [key, value] of Object.entries(filters)) {
+    if (key !== STRUCTURED_QUERY_FILTER_KEY && typeof value === "string") {
+      rest[key] = value;
+    }
+  }
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}

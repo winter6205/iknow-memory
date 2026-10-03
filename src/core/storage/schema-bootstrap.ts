@@ -639,6 +639,118 @@ async function createIndexJobs(client: SchemaBootstrapClient): Promise<void> {
 }
 
 /**
+ * The two persistent structured-result identity tables (structured corpus
+ * query, Q-ID).
+ *
+ * `structured_entity_identities` records the entity result identity — the
+ * EXISTING `entities.id` UUID, which the entity table mints and which this
+ * ticket deliberately does not re-derive. It is a registry row, not a second
+ * identity scheme: the FK is what makes "an entity result has its persistent
+ * UUID" checkable, and the type CHECK renders its literal list from
+ * `ENTITY_TYPES` exactly as `createEntities` does, so the registry's vocabulary
+ * cannot drift from the one the persist boundary already admits.
+ *
+ * `structured_relation_assertion_identities` holds one row per exact normalized
+ * tuple `(head_entity_id, relation_norm, tail_entity_id, valid_window)`. The
+ * `assertion_id` is DERIVED from that tuple (src/core/structured/identity.ts),
+ * so the primary key is itself the exact-tuple key: re-registering the same
+ * tuple resolves to the same id instead of a second row, and a CHANGED tuple
+ * derives a new id — a versioned correction, never a merge by overlap,
+ * similarity, or recency. `tuple_digest` is the sha256 of the canonical
+ * length-prefixed serialization, and its UNIQUE index (scoped by
+ * `identity_version`, so a corrected version cannot collide with the identity it
+ * corrects) is the independent database-side guard on that rule.
+ *
+ * `valid_from` / `valid_until` are `text`, not `timestamptz`: the canonical
+ * whole-second UTC string IS the identity input, and a timestamptz column would
+ * re-render through the session TimeZone, so a stored row could no longer be
+ * compared byte-for-byte against the serialization its id came from. The two
+ * shape CHECKs keep that canonical form, and the ordering CHECK uses an explicit
+ * `COLLATE "C"` comparison because both endpoints are fixed-width UTC — without
+ * it the comparison would follow the database's collation instead of byte order.
+ * `null` is the unbounded endpoint, so the ordering CHECK is satisfied whenever
+ * either side is null.
+ */
+async function createStructuredIdentities(
+  client: SchemaBootstrapClient
+): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS structured_entity_identities (
+      entity_id   uuid PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+      entity_type text NOT NULL
+    )`);
+  await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE structured_entity_identities
+        ADD CONSTRAINT structured_entity_identities_type_check
+        CHECK (entity_type IN (${sqlTextList(ENTITY_TYPES)}));
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS structured_relation_assertion_identities (
+      assertion_id     uuid PRIMARY KEY,
+      head_entity_id   uuid NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      relation_norm    text NOT NULL,
+      tail_entity_id   uuid NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+      valid_from       text NULL,
+      valid_until      text NULL,
+      tuple_digest     text NOT NULL,
+      identity_version integer NOT NULL,
+      created_at       timestamptz NOT NULL DEFAULT now()
+    )`);
+  for (const [column, constraint] of [
+    [
+      "valid_from",
+      "structured_relation_assertion_identities_from_shape_check",
+    ],
+    [
+      "valid_until",
+      "structured_relation_assertion_identities_until_shape_check",
+    ],
+  ] as const) {
+    await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE structured_relation_assertion_identities
+        ADD CONSTRAINT ${constraint}
+        CHECK (
+          ${column} IS NULL
+          OR ${column} ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$'
+        );
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
+  }
+  // Half-open and non-empty: with both endpoints present `from < until`, so an
+  // empty or reversed interval cannot reach the table even from a raw writer
+  // that skipped the normalizer.
+  await client.query(`
+    DO $$
+    BEGIN
+      ALTER TABLE structured_relation_assertion_identities
+        ADD CONSTRAINT structured_relation_assertion_identities_window_check
+        CHECK (
+          valid_from IS NULL
+          OR valid_until IS NULL
+          OR (valid_from COLLATE "C") < (valid_until COLLATE "C")
+        );
+    EXCEPTION
+      WHEN duplicate_object THEN NULL;
+    END $$`);
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS structured_relation_assertion_identities_tuple_idx
+      ON structured_relation_assertion_identities (identity_version, tuple_digest)`);
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS structured_relation_assertion_identities_head_idx
+      ON structured_relation_assertion_identities (head_entity_id)`);
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS structured_relation_assertion_identities_tail_idx
+      ON structured_relation_assertion_identities (tail_entity_id)`);
+}
+
+/**
  * Forward-compat ALTERs for the operator-console ledger.
  *
  * `chunks` is stage-1 owned; adding `source_doc_id` + `ordinal` keeps the
@@ -733,6 +845,7 @@ export async function upSchemaBootstrap(
     await createEmbeddingGeneration(client);
     await createSourceDocuments(client);
     await createIndexJobs(client);
+    await createStructuredIdentities(client);
     await upSchemaProjection(client);
     // ALTER chunks back-pointers must come after `source_documents` exists
     // (FK target) and after `chunks` itself exists (caller's responsibility —

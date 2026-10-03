@@ -24,6 +24,7 @@ import { computeMaintenanceJobKey } from "../../src/core/maintenance/durable-wor
 import {
   claimNextWork,
   liveInputsOf,
+  retryWork,
   scheduleWork,
   settleWork,
 } from "../../src/core/maintenance/service.js";
@@ -232,9 +233,38 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
     const before = await ledgerSnapshot(admin);
 
     const hits = await backend.search([1, 0, 0, 0, 0, 0, 0, 0], { limit: 5 });
-    expect(Array.isArray(hits)).toBe(true);
+    expect(hits).toEqual([]);
 
     expect(await ledgerSnapshot(admin)).toEqual(before);
+  });
+
+  it("M2 — concurrent duplicate schedules of one key still join a single job", async () => {
+    // The obvious `ON CONFLICT DO NOTHING` cannot answer this: a data-modifying
+    // CTE's SELECT branch reads the statement snapshot and cannot see the row a
+    // concurrent transaction commits, so the join would find nothing.
+    const work = request({ sourceRef: "s-race", sourceVersion: "v3" });
+    const pools = [poolOf(SCHEMA_URL), poolOf(SCHEMA_URL)];
+    try {
+      const results = await Promise.all(
+        pools.map((pool, index) =>
+          scheduleWork(
+            { store: new PgMaintenanceWorkStore(pool), clock: () => T0 },
+            operator,
+            work
+          )
+        )
+      );
+      const keys = new Set(results.map((r) => (("record" in r ? r.record.jobKey : null))));
+      expect(keys.size).toBe(1);
+      expect(results.filter((r) => "inserted" in r && r.inserted)).toHaveLength(1);
+
+      const counts = await admin.query<{ jobs: string }>(
+        `SELECT count(*) AS jobs FROM maintenance_jobs`
+      );
+      expect(counts.rows[0]).toMatchObject({ jobs: "1" });
+    } finally {
+      await Promise.all(pools.map((pool) => pool.end()));
+    }
   });
 
   it("M6 — an expired lease invalidates the old token before a new attempt runs", async () => {
@@ -280,6 +310,51 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
     }
   });
 
+  it("MP4 — a heartbeat cannot extend an attempt past the absolute bound on real Postgres", async () => {
+    // Only the false branch of the clamp was exercised before; nothing reached the
+    // LEAST(), so "cannot be extended" was proven solely by the memory twin.
+    const pool = poolOf(SCHEMA_URL);
+    try {
+      const job = await scheduleAt(
+        pool,
+        T0,
+        request({
+          sourceRef: "s8",
+          dependencies: [dependency({ sourceRef: "s8" })],
+        })
+      );
+      const store = new PgMaintenanceWorkStore(pool);
+      const guard = await store.claimWork(new Date(T0.getTime() + 1_000));
+      if (!guard) throw new Error("expected a claimable job");
+
+      for (let minute = 1; minute <= 29; minute += 1) {
+        const at = new Date(`2026-10-03T10:${String(minute).padStart(2, "0")}:30.000Z`);
+        expect(await store.heartbeatWork(guard, at), `minute ${minute}`).toBe(true);
+      }
+
+      const stored = await admin.query<{
+        lease_expires_at: string;
+        attempt_started_at: string;
+      }>(
+        `SELECT lease_expires_at, attempt_started_at
+           FROM maintenance_jobs WHERE job_key = $1`,
+        [job.jobKey]
+      );
+      const row = stored.rows[0]!;
+      const lease = new Date(row.lease_expires_at).getTime();
+      // The bound is relative to when the attempt actually started, not to T0.
+      const absolute = new Date(row.attempt_started_at).getTime() + 30 * 60_000;
+      // Clamped to the 30-minute absolute bound, not extended to now + 5 minutes.
+      expect(lease).toBe(absolute);
+      expect(lease).toBeLessThan(new Date("2026-10-03T10:34:30.000Z").getTime());
+
+      const afterBound = new Date("2026-10-03T10:30:01.000Z");
+      expect(await store.heartbeatWork(guard, afterBound)).toBe(false);
+    } finally {
+      await pool.end();
+    }
+  });
+
   it("M7 — three transient attempts exhaust into a visible failed with history intact", async () => {
     const pool = poolOf(SCHEMA_URL);
     try {
@@ -316,13 +391,39 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
       expect(record?.lastFailureCode).toBe("backend_unavailable");
       expect(record?.nextAttemptAt).toBeNull();
 
-      const history = await new PgMaintenanceWorkStore(pool).listAttempts(job.jobKey);
+      const store = new PgMaintenanceWorkStore(pool);
+      const history = await store.listAttempts(job.jobKey);
       expect(history.map((attempt) => attempt.attemptNumber)).toEqual([1, 2, 3]);
       expect(history.every((attempt) => attempt.failureCode === "backend_unavailable")).toBe(true);
       expect(new Set(history.map((attempt) => attempt.fencingToken)).size).toBe(3);
+
+      const refused = await retryWork({ store, clock: () => T0 }, "   ");
+      expect(refused).toHaveProperty("refused", true);
+
+      const retried = await retryWork({ store, clock: () => T0 }, job.jobKey);
+      expect(retried).not.toHaveProperty("refused");
+      if (!retried || "refused" in retried) throw new Error("expected a retried job");
+      expect(retried.status).toBe("pending");
+      expect(retried.autoAttemptCount).toBe(0);
+
+      const after = await store.claimWork(new Date(T0.getTime() + 60_000));
+      expect(after?.attemptNumber).toBe(4);
+      expect((await store.listAttempts(job.jobKey)).map((a) => a.attemptNumber)).toEqual([
+        1, 2, 3, 4,
+      ]);
     } finally {
       await pool.end();
     }
+  });
+
+  it("surfaces a driver fault as a typed failure code, never a raw pg error", async () => {
+    const dead = new PgMaintenanceWorkStore({
+      connect: () => Promise.reject(new Error("connection refused")),
+    });
+
+    await expect(dead.scheduleWork(request(), T0)).rejects.toMatchObject({
+      failureCode: "backend_unavailable",
+    });
   });
 });
 

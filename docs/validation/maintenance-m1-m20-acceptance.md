@@ -45,10 +45,12 @@ Both branches were exercised, not inferred — see the measured runs below.
 |---|---|---|
 | M1 crash after scheduling recovers exactly one logical job | MP2 | acceptance lane, real PG |
 | M1 no query-triggered writes | MP2 | acceptance lane, real PG `search` over the same schema |
+| M2 concurrent duplicate schedules join one job (join half) | MP2 | acceptance lane, real PG |
 | M6 expired lease invalidates the old token | MP4 | acceptance lane, real PG |
-| M7 three transient attempts exhaust into visible `failed` | MP3 | acceptance lane, real PG |
-| M4 obsolete attempt cannot publish or alter serving records | MP4 | **Partly** — the fence is proven; the serving-record half needs MP6's publication |
-| M2, M3, M5, M8–M20 | MP5–MP18 | **Not runnable.** Blocked on `E-SOURCE`, `Q-ID`, `EP2`, `EP8`, `EP9`–`EP10`, and on `QP1`'s frozen real corpus for the final measured pass |
+| M7 three transient attempts exhaust into visible `failed`, history intact, explicit retry adds attempt 4 | MP3 | acceptance lane, real PG |
+| MP4 a heartbeat cannot extend past the absolute bound | MP4 | acceptance lane, real PG (`LEAST` clamp in the stored row) |
+| M4 obsolete attempt cannot publish or alter serving records | MP4 | **Partly** — the fence is proven; there is no stage writer in this slice, and the serving-record half needs MP6's publication |
+| M2 (publication half), M3, M5, M8–M20 | MP5–MP18 | **Not runnable.** Blocked on `E-SOURCE`, `Q-ID`, `EP2`, `EP8`, `EP9`–`EP10`, and on `QP1`'s frozen real corpus for the final measured pass |
 
 ## Prerequisites
 
@@ -70,6 +72,10 @@ Both branches were exercised, not inferred — see the measured runs below.
 - No test path, flag, ID, or command in this record is invented: the only new flag is
   `MAINTENANCE_ACCEPTANCE`, introduced by this slice, and its three states are measured
   below.
+- The "crash" in the M1 arm is modelled by closing the scheduling store, not by killing
+  a process. Durability is still proven across store instances and pools; a real
+  `SIGKILL` arm would prove more, and is the shape `index-job-worker-gold-pg` already
+  uses for the legacy ledger.
 
 ## Measured runs
 
@@ -80,15 +86,15 @@ Real PostgreSQL 16.15 (Debian 16.15-1.pgdg12+2) with `vector` extension, contain
 $ GRAPHRAG_MEMORY_DB_URL=postgresql://postgres:postgres@localhost:5432/postgres \
   MAINTENANCE_ACCEPTANCE=1 npx vitest run tests/acceptance/maintenance-m-acceptance-pg.test.ts
  Test Files  1 passed (1)
-      Tests  5 passed (5)
+      Tests  8 passed (8)
 
 $ ... MAINTENANCE_ACCEPTANCE=1 ... 127.0.0.1:5999 (nothing listening)
  Test Files  1 failed (1)
       Tests  no tests
  EXIT=1
 
-$ ... (flag unset, database up)          → 5 skipped, exit 0
-$ ... (flag unset, database down)        → 5 skipped, exit 0
+$ ... (flag unset, database up)          → 8 skipped, exit 0
+$ ... (flag unset, database down)        → 8 skipped, exit 0
 ```
 
 Supporting regressions on the same revision, against the same real database:
@@ -103,7 +109,7 @@ $ npx vitest run tests/integration/index-jobs-pg.test.ts tests/integration/index
  Test Files  2 passed (2)   Tests   40 passed (40)
 
 $ npx vitest run tests/core/maintenance/durable-work.unit.test.ts tests/storage/maintenance-work-memory.test.ts
- Test Files  2 passed (2)   Tests   42 passed (42)
+ Test Files  2 passed (2)   Tests   46 passed (46)
 ```
 
 The 164 + 40 count matters for the boundary decision: the legacy index-job ledger's

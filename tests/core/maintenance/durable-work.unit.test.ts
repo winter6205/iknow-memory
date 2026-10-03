@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  absoluteDeadlineFrom,
   canonicalDependencyRevision,
   computeMaintenanceJobKey,
   leaseExpiryFrom,
@@ -9,8 +10,6 @@ import {
 } from "../../../src/core/maintenance/durable-work.js";
 import {
   MAX_AUTO_ATTEMPTS,
-  WORK_LEASE_MS,
-  WORK_ABSOLUTE_LIMIT_MS,
   type MaintenanceAttemptGuard,
   type MaintenanceDependency,
   type MaintenanceWorkRequest,
@@ -159,11 +158,14 @@ describe("nextRetryDelayMs", () => {
 describe("leaseExpiryFrom", () => {
   it("grants exactly the five-minute lease", () => {
     expect(leaseExpiryFrom("2026-10-03T10:00:00.000Z")).toBe("2026-10-03T10:05:00.000Z");
-    expect(WORK_LEASE_MS).toBe(5 * 60_000);
   });
+});
 
-  it("keeps the absolute execution limit at thirty minutes", () => {
-    expect(WORK_ABSOLUTE_LIMIT_MS).toBe(30 * 60_000);
+describe("absoluteDeadlineFrom", () => {
+  it("puts the absolute execution limit at thirty minutes", () => {
+    expect(absoluteDeadlineFrom("2026-10-03T10:00:00.000Z")).toBe(
+      "2026-10-03T10:30:00.000Z"
+    );
   });
 });
 
@@ -195,15 +197,15 @@ describe("verifyAttemptGuard", () => {
     ).toEqual({ ok: false, code: "lease_lost" });
   });
 
-  it("rejects a write after the lease expired", () => {
-    expect(
-      verifyAttemptGuard(
-        guard(),
-        live,
-        new Date("2026-10-03T10:05:00.001Z"),
-        guard().fencingToken
-      )
-    ).toEqual({ ok: false, code: "lease_lost" });
+  it("rejects a write at and after the lease expiry instant", () => {
+    // The SQL twin uses `lease_expires_at > $now`, so the boundary instant is
+    // already outside the lease. `+0.001Z` alone would let the twins disagree.
+    for (const instant of ["2026-10-03T10:05:00.000Z", "2026-10-03T10:05:00.001Z"]) {
+      expect(
+        verifyAttemptGuard(guard(), live, new Date(instant), guard().fencingToken),
+        instant
+      ).toEqual({ ok: false, code: "lease_lost" });
+    }
   });
 
   it("rejects a write past the absolute execution limit even with a heartbeat-extended lease", () => {
@@ -249,5 +251,21 @@ describe("verifyAttemptGuard", () => {
         guard().fencingToken
       )
     ).toEqual({ ok: false, code: "input_stale" });
+  });
+});
+
+describe("canonicalDependencyRevision — bucket set identity", () => {
+  it("does not let [a,b] and [ab] share one revision", () => {
+    expect(
+      canonicalDependencyRevision([dependency({ relationBuckets: ["a", "b"] })])
+    ).not.toBe(canonicalDependencyRevision([dependency({ relationBuckets: ["ab"] })]));
+  });
+
+  it("does not let a bucket list prefix another", () => {
+    expect(
+      canonicalDependencyRevision([dependency({ relationBuckets: ["a"] })])
+    ).not.toBe(
+      canonicalDependencyRevision([dependency({ relationBuckets: ["a", "b"] })])
+    );
   });
 });

@@ -25,6 +25,22 @@ dependency-vector recheck on settle.
 (`MP13`–`MP15`), and explicit purge (`MP16`–`MP17`). Each needs a source-lifecycle or
 evidence-plan primitive this slice does not own.
 
+**Explicitly not implemented, and not reachable from any entry point here:**
+
+- **Reader leases.** The spec's read side — a query or evidence read finishing
+  within 60 seconds or cancelling with a typed timeout, and the 10-minute cursor
+  deadline — belongs to the slice that implements the authorized read and
+  `M-STATUS` (`MP10`), which is where a reader actually exists.
+- **Intermediate/stage writes.** This slice has exactly one write per attempt, the
+  terminal settle, plus the heartbeat that renews its lease. There is no stage
+  writer, so MP4's "every stage and final write rechecks" is satisfied *for the
+  writes that exist*; the stage writer arrives with `MP5`'s staging isolation and
+  must route through the same `verifyAttemptGuard`. This is why M4 is only
+  partially provable here.
+- **The heartbeat cadence itself.** The spec caps a heartbeat at one per minute.
+  That is an obligation on whoever runs the heartbeat loop, and this slice ships
+  no loop — only the fence it would have to satisfy.
+
 ## Why a separate capability, not an extension of `index_jobs`
 
 The spec permits reusing durable storage "where it satisfies the contract". The
@@ -101,11 +117,19 @@ not a failure and never a success.
 
 ## Typed failures
 
+The spec names nine. This slice implements **eight**:
 `invalid_input`, `access_denied`, `input_stale`, `lease_lost`, `ruleset_unavailable`,
-`resource_exhausted`, `backend_unavailable`, `execution_timeout`. A refusal is a typed
-value, not a thrown error, because a bad request is an expected outcome of a public
-entry: the caller must tell `invalid_input` from `access_denied` without parsing a
-message. An unnamed actor is refused, never guessed.
+`resource_exhausted`, `backend_unavailable`, `execution_timeout`. The ninth,
+`unsupported_source_binding`, is the source-lifecycle refusal and arrives with `MP5`,
+which is where source binding is bound.
+
+A refusal is a typed value, not a thrown error, because a bad request is an expected
+outcome of a public entry: the caller must tell `invalid_input` from `access_denied`
+without parsing a message. An unnamed actor is refused, never guessed.
+
+A storage fault carries both vocabularies at once: `MaintenanceStoreError` extends
+`GraphragError` (this package's convention) and adds `failureCode`, so a worker can
+decide whether a fault is worth retrying without parsing an error message.
 
 ## Time
 

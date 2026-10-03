@@ -16,9 +16,23 @@
  * Statement surface is parameterless, so a Pool, a PoolClient, and the test
  * fakes all satisfy `SchemaClient` without a cast.
  */
+import {
+  MAINTENANCE_WORK_KINDS,
+  MAINTENANCE_WORK_STATUS,
+  MAX_AUTO_ATTEMPTS,
+} from "../maintenance/types.js";
 import type { SchemaClient } from "./schema-projection.js";
 
 export { type SchemaClient };
+
+/**
+ * The CHECK lists are rendered from the exported vocabularies rather than
+ * retyped, so the schema and the TypeScript union cannot disagree — a fifth work
+ * kind or status added to the vocabulary must not silently be rejected by the
+ * database.
+ */
+const sqlList = (values: readonly string[]): string =>
+  values.map((value) => `'${value}'`).join(",");
 
 /**
  * `maintenance_jobs`: one row per bound job key.
@@ -40,17 +54,18 @@ export async function upSchemaMaintenanceWork(client: SchemaClient): Promise<voi
     CREATE TABLE IF NOT EXISTS maintenance_jobs (
       job_key            text PRIMARY KEY,
       work_kind          text NOT NULL
-                          CHECK (work_kind IN ('extract_publish','conflict_check','projection_rebuild')),
+                          CHECK (work_kind IN (${sqlList(MAINTENANCE_WORK_KINDS)})),
       source_ref         text NOT NULL CHECK (length(source_ref) > 0),
       source_version     text NOT NULL CHECK (length(source_version) > 0),
       source_generation  bigint NOT NULL CHECK (source_generation >= 0),
       input_revision     text NOT NULL CHECK (length(input_revision) > 0),
       config_revision    text NOT NULL CHECK (length(config_revision) > 0),
       status             text NOT NULL DEFAULT 'pending'
-                          CHECK (status IN ('pending','running','ready','failed','stale')),
+                          CHECK (status IN (${sqlList(MAINTENANCE_WORK_STATUS)})),
       attempt_count      integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
       auto_attempt_count integer NOT NULL DEFAULT 0 CHECK (auto_attempt_count >= 0),
-      max_attempts       integer NOT NULL DEFAULT 3 CHECK (max_attempts > 0),
+      max_attempts       integer NOT NULL DEFAULT ${MAX_AUTO_ATTEMPTS}
+                          CHECK (max_attempts > 0),
       next_attempt_at    timestamptz,
       fencing_token      text,
       lease_expires_at   timestamptz,

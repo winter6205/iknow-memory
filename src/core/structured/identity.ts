@@ -28,11 +28,10 @@ import { createHash } from "node:crypto";
 import { ENTITY_TYPES, type EntityType } from "../extraction/entity-type.js";
 
 /**
- * Version of the tuple→UUID derivation. Part of the hashed serialization, so
- * bumping it makes the same tuple derive a DIFFERENT id instead of colliding
- * with the identity it would correct. A correction therefore creates a new
- * identity rather than mutating a registered one, and every registered row
- * records the version it was minted under.
+ * Version of the tuple→UUID derivation. It remains in the hashed serialization
+ * for compatibility with the existing v1 UUIDs. Only this algorithm version
+ * is currently supported; a future derivation change needs an explicit corpus
+ * migration rather than a caller-selected second ID for the same tuple.
  */
 export const RELATION_ASSERTION_IDENTITY_VERSION = 1;
 
@@ -409,9 +408,8 @@ function prefixedField(value: string): string {
  *
  * Every component — the domain tag, the version, both UUIDs, the norm and both
  * window endpoints — is length-prefixed, so the concatenation is decodable and
- * no value's content can be mistaken for a field boundary. The identity version
- * is inside the hashed bytes, which is what lets a future correction derive a
- * new id for the same tuple instead of colliding with this one.
+ * no value's content can be mistaken for a field boundary. The supported v1
+ * bytes stay frozen so existing tuple IDs remain stable.
  */
 export function serializeRelationAssertionTuple(
   tuple: RelationAssertionTuple
@@ -429,14 +427,10 @@ export function serializeRelationAssertionTuple(
 }
 
 function assertIdentityVersion(version: number): void {
-  if (
-    typeof version !== "number" ||
-    !Number.isSafeInteger(version) ||
-    version < 1
-  ) {
+  if (version !== RELATION_ASSERTION_IDENTITY_VERSION) {
     return refuse(
       "identity_version",
-      `${String(version)} is not a positive safe integer`
+      `only version ${RELATION_ASSERTION_IDENTITY_VERSION} is supported`
     );
   }
 }
@@ -517,6 +511,7 @@ export function normalizeRelationAssertion(
   input: RelationAssertionInput
 ): RelationAssertionTuple {
   const identityVersion = input.identityVersion ?? RELATION_ASSERTION_IDENTITY_VERSION;
+  assertIdentityVersion(identityVersion);
   return {
     headEntityId: normalizeEntityId(input.headEntityId),
     relationNorm: normalizeRelationNorm(input.relationNorm),

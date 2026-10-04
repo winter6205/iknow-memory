@@ -524,28 +524,33 @@ describe("exact normalized tuple identity", () => {
     );
   });
 
-  it("derives a different identity when the identity version is bumped", () => {
-    // A versioned identity correction must be able to create a NEW identity for
-    // the same tuple rather than colliding with (or being refused as) the
-    // already-registered v1 one.
-    const v1 = deriveRelationAssertionId(
-      tupleFor({ identityVersion: 1 })
+  it("refuses an unsupported identity version instead of minting a second tuple ID", () => {
+    refusalFor(
+      () =>
+        deriveRelationAssertionId(
+          tupleFor({ identityVersion: RELATION_ASSERTION_IDENTITY_VERSION + 1 })
+        ),
+      "identity_version"
     );
-    const v2 = deriveRelationAssertionId(
-      tupleFor({ identityVersion: RELATION_ASSERTION_IDENTITY_VERSION + 1 })
-    );
-    expect(v2).not.toBe(v1);
   });
 
-  it("records the version in the serialization so the derivation is auditable", () => {
-    expect(serializeRelationAssertionTuple(tupleFor())).toContain(
-      `${RELATION_ASSERTION_IDENTITY_VERSION}`
-    );
-    expect(
-      serializeRelationAssertionTuple(
-        tupleFor({ identityVersion: RELATION_ASSERTION_IDENTITY_VERSION + 1 })
-      )
-    ).not.toBe(serializeRelationAssertionTuple(tupleFor()));
+  it("pins supported v1 identity bytes and UUID for backward compatibility", () => {
+    const expectedBytes =
+      "34:iknow.structured_relation_identity2:v1" +
+      "36:11111111-1111-4111-8111-111111111111" +
+      "9:works_for" +
+      "36:22222222-2222-4222-8222-222222222222" +
+      "20:2024-01-01T00:00:00Z1:\u0000";
+    const expectedId = "22118cbf-d398-5e94-8db9-566ac35a6f02";
+    const defaultTuple = tupleFor();
+    const explicitV1 = tupleFor({
+      identityVersion: RELATION_ASSERTION_IDENTITY_VERSION,
+    });
+
+    expect(serializeRelationAssertionTuple(defaultTuple)).toBe(expectedBytes);
+    expect(serializeRelationAssertionTuple(explicitV1)).toBe(expectedBytes);
+    expect(deriveRelationAssertionId(defaultTuple)).toBe(expectedId);
+    expect(deriveRelationAssertionId(explicitV1)).toBe(expectedId);
   });
 });
 
@@ -651,6 +656,19 @@ describe("in-memory identity store", () => {
     expect(store.relationAssertionCount).toBe(0);
   });
 
+  it("refuses an unsupported identity version before touching the store", async () => {
+    const store = new InMemoryStructuredIdentityStore();
+    await expect(
+      store.registerRelationAssertion(
+        inputFor({ identityVersion: RELATION_ASSERTION_IDENTITY_VERSION + 1 })
+      )
+    ).rejects.toMatchObject({
+      name: "StructuredIdentityError",
+      field: "identity_version",
+    });
+    expect(store.relationAssertionCount).toBe(0);
+  });
+
   it("returns the normalized window it registered", async () => {
     const store = new InMemoryStructuredIdentityStore();
     const registered = await store.registerRelationAssertion(
@@ -715,8 +733,8 @@ describe("registered identity DDL", () => {
       .filter((s) => /CREATE\s+(UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS/i.test(s))
       .join("\n");
     // Tuple equality is enforced in the database, keyed on the canonical
-    // serialization's digest and scoped by identity version so a corrected
-    // identity version can never collide with the one it corrects.
+    // serialization's digest and scoped by the supported v1 derivation.
+    // Future algorithm versions require an explicit corpus migration.
     expect(indexes).toMatch(
       /CREATE\s+UNIQUE\s+INDEX\s+IF\s+NOT\s+EXISTS\s+structured_relation_assertion_identities_tuple_idx/i
     );

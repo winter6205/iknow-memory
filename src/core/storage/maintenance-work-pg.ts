@@ -39,6 +39,7 @@ import {
   type MaintenanceWorkStatus,
   type MaintenanceWorkStore,
 } from "../maintenance/types.js";
+import { recordSuppressedFailure } from "../errors.js";
 
 /** A leased connection. Satisfied by `pg.PoolClient` and by the test fakes. */
 export interface MaintenanceWorkLease {
@@ -353,8 +354,8 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
       } catch (error) {
         try {
           await lease.query("ROLLBACK");
-        } catch {
-          // The original failure is the one worth reporting.
+        } catch (rollbackError) {
+          recordSuppressedFailure(error, rollbackError);
         }
         throw error;
       }

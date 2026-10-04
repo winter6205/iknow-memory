@@ -846,6 +846,22 @@ describe("stripStructuredQueryFilter", () => {
     });
   });
 
+  it("preserves a JSON __proto__ filter key instead of silently dropping it", () => {
+    const filters = JSON.parse(
+      '{"structured_query":{"schema":"iknow.structured_query","schema_version":1,"subject":"entity","operation":"list"},"__proto__":"caller-value"}'
+    ) as Record<string, unknown>;
+
+    const stripped = stripStructuredQueryFilter(filters);
+
+    expect(stripped.kind).toBe("ok");
+    if (stripped.kind === "ok") {
+      expect(Object.hasOwn(stripped.filters ?? {}, "__proto__")).toBe(true);
+      expect((stripped.filters as Record<string, unknown>)?.["__proto__"]).toBe(
+        "caller-value"
+      );
+    }
+  });
+
   it("REFUSES a non-string value under a non-structured key instead of dropping it", () => {
     // Only `structured_query` is allowed an object. Anything else is a
     // non-string under a non-structured key, and it used to vanish: the

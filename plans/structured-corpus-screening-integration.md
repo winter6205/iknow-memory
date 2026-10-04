@@ -54,6 +54,63 @@ Status is filtered to the reader's authorized active sources and must not expose
 hidden-source counts or fields. Do not duplicate owner publication state per
 reader. Denied actors refuse before writes.
 
+### Concrete shared-authority seam
+
+Add `core/storage/structured-scope-uow.ts` as a storage-owned internal seam,
+supplied once by backend composition to publication and screening adapters.
+The maintenance service imports only domain contracts; it does not import PG
+clients or memory map implementations. The authorized context is created by
+trusted server composition/resolution, with `ownerScopeBinding`, `readerBinding`,
+`authorizedSourceRefs` and `authorizationRevision`; it is never parsed from model
+input. The reader binding selects a view, not another owner lifecycle.
+
+PostgreSQL's `withAuthorizedScope(context, callback)` acquires one pool client,
+opens one transaction, locks the owner scope and affected source rows in stable
+source order, and validates the authorized source subset. Its callback receives
+that same client and a read-only scoped input view. Candidate persistence,
+decision records, actual publication membership mutation, work settlement,
+revision updates and projection outbox writes all use that client. Callback
+success commits once; every refusal/exception rolls back once, retaining safe
+secondary rollback diagnostics. Public transaction-owning stores are never
+called inside this callback. The existing publication adapter moves its
+transaction owner to this shared seam; standalone APIs retain their behavior.
+
+Lock order is shared by all participants: owner scope, affected sources in stable
+order, then work/attempt and membership rows. Schedule, claim, heartbeat, settle
+and reclaim use the same owner/source lock helper before mutating owned jobs.
+Global claim first identifies candidate ownership without a job lock, then
+attempts the owner/source locks with SKIP LOCKED before claiming the job. Jobs
+outside publication ownership retain their standalone behavior. Replace the
+scope-after-job progress trigger with the same-client revision hook under these
+locks; do not introduce a scope/job lock inversion. Race tests run real claim,
+heartbeat, publication and decision paths, not only direct row mutations.
+
+Memory's `withAuthorizedScope(context, callback)` uses one shared serialization
+tail supplied to the actual publication, work, identity and Evidence authority.
+The callback receives an isolated scoped input view and domain-specific prepared
+mutation plans for publication membership, work, screening/decision evidence,
+revisions and outbox. All fallible validation and awaited preparation occur
+before visibility changes. After preparation, recheck live authority and fences,
+then synchronously commit every plan with no await or replace-live-map rollback.
+Direct work/identity/Evidence mutations cooperate with that same authority; a
+stale copied map cannot overwrite concurrent accepted writes.
+
+Both views expose `readAcceptedInputs(authorizedSourceRefs)` and
+`readMaintenanceInputs(authorizedSourceRefs)`. They return only active scoped
+sources, exact current subject/support memberships, assertion tuples, current
+extraction refs and attributed values, dependency inputs and actual desired/check
+work records. Empty/no-hit sources remain in the scoped source view. Required
+missing records refuse; no adapter-private copy constitutes authority. A caller
+cannot substitute a wider source array than the trusted context.
+
+Status builders consume this view inside the same UOW; the forthcoming Query
+adapter will also compile rows/count and issue Evidence grants there. Bind the
+reader's revisions to authorized inputs and authorization revision, so hidden
+source changes cannot expose counts or invalidate an unrelated reader's view.
+Tests inspect the existing publication, identity, Evidence and work stores after
+failure, and compare two disjoint reader subsets under one owner to prove shared
+authority, rollback and absence of hidden-source leakage.
+
 ## Ordered tasks
 
 1. **S1 — Freeze the API and failing-first parity driver** — `[decision]`
@@ -152,6 +209,9 @@ open until actual ingest, backend-ID mapping, measured limits and fin interactio
 
 ## Review status
 
-Architecture gate: pending. No source implementation is authorized by this draft
+Initial architecture gate: four yes, one unclear (bounded-context-guardian).
+The correction above specifies the shared PG-client/memory prepare-commit seam
+and authorized-source read subset; independent re-review is pending.
+No source implementation is authorized by this draft
 until the concrete shared-authority seams and five verdicts are recorded.
 This is main-session hard integration work, not a ready-for-agent test issue.

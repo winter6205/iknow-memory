@@ -113,6 +113,26 @@ authority, rollback and absence of hidden-source leakage.
 
 ## Ordered tasks
 
+0. **S0 — Unify actual authority before adding screening behavior** —
+   `[implementation]`, depends on the publication checkpoint and architecture gate.
+   The bounded first source task owns the shared storage UOW and cooperating
+   publication, work, identity and Evidence writers described above. It does
+   not yet implement candidates, decisions, or full M-STATUS. The independent
+   test engineer first selects `tests/storage/structured-scope-uow-memory.test.ts`
+   and `tests/acceptance/structured-scope-uow-pg.test.ts`, with strict command:
+
+   ```sh
+   STRUCTURED_SCOPE_UOW_ACCEPTANCE=1 GRAPHRAG_MEMORY_DB_URL=<isolated-development-dsn> npx vitest run tests/acceptance/structured-scope-uow-pg.test.ts
+   ```
+
+   Read-only exploration of publication checkpoint `b4e9af3` confirmed that the
+   current progress trigger takes job then scope locks, and publication's guard
+   also locks job before scope/source. Introducing the planned scope-first path
+   while retaining either writer order creates a deadlock cycle. Tests must use
+   actual work settle/claim and publication paths, and prove the shared memory
+   tail preserves concurrent identity, work and grant/source writes. S0 passes
+   only with those tests, prior publication regressions and strict PG evidence.
+
 1. **S1 — Freeze the API and failing-first parity driver** — `[decision]`
    Select `tests/acceptance/structured-screening-pg.test.ts` and shared
    `tests/storage/screening-contract.ts` plus `screening-memory.test.ts`.

@@ -75,11 +75,24 @@ secondary rollback diagnostics. Public transaction-owning stores are never
 called inside this callback. The existing publication adapter moves its
 transaction owner to this shared seam; standalone APIs retain their behavior.
 
-Lock order is shared by all participants: owner scope, affected sources in stable
-order, then work/attempt and membership rows. Schedule, claim, heartbeat, settle
-and reclaim use the same owner/source lock helper before mutating owned jobs.
+Lock order is shared by all participants: source-ownership reservations in stable
+source-reference order, owner scope, affected source rows in stable order, then
+work/attempt and membership rows. First owner assignment and all work mutation
+paths use the same storage-owned reservation policy. Discover ownership and the
+affected source set without write locks, reserve that set, then resolve ownership
+again before taking owner/source/job locks. An unowned path remains standalone
+only while its held reservation proves that the source is still unowned. If a
+scope change requires an unreserved source, roll back and restart before writes;
+never acquire an earlier-order reservation while holding owner or job locks.
+Permit at most three internal routing attempts; repeated ownership/source-set
+change refuses typed `input_stale` without mutation. A live execution deadline
+that expires first refuses `execution_timeout`. Preserve typed primary failures
+and safe rollback diagnostics on every aborted attempt.
+Schedule, claim, heartbeat, settle, retry and reclaim use the same reservation
+and owner/source lock helpers before mutating owned jobs.
 Global claim first identifies candidate ownership without a job lock, then
-attempts the owner/source locks with SKIP LOCKED before claiming the job. Jobs
+attempts nonblocking source reservation and owner/source locks before claiming
+and revalidating the job with SKIP LOCKED. Jobs
 outside publication ownership retain their standalone behavior. Replace the
 scope-after-job progress trigger with the same-client revision hook under these
 locks; do not introduce a scope/job lock inversion. Race tests run real claim,
@@ -130,7 +143,13 @@ authority, rollback and absence of hidden-source leakage.
    also locks job before scope/source. Introducing the planned scope-first path
    while retaining either writer order creates a deadlock cycle. Tests must use
    actual work settle/claim and publication paths, and prove the shared memory
-   tail preserves concurrent identity, work and grant/source writes. S0 passes
+   tail preserves concurrent identity, work and grant/source writes. Cover first
+   owner assignment against schedule, claim, heartbeat, retry, settle and reclaim,
+   including an already-running formerly unowned job; repeat in PG and memory.
+   Cover two concurrent first assignments, source-set changes during discovery,
+   repeated routing changes exhausting the bound, deadline expiry, and injected
+   rollback failures. No refused/restarted attempt leaves authoritative writes,
+   outbox effects or incorrect revision bumps. S0 passes
    only with those tests, prior publication regressions and strict PG evidence.
 
 1. **S1 — Freeze the API and failing-first parity driver** — `[decision]`
@@ -237,4 +256,20 @@ bounded-context-guardian, input-contract-tests, error-handling-enforcer,
 complexity-anti-drift, and minimal-change-verifier. The architecture gate passes.
 Source implementation may start after the verified publication checkpoint;
 this verdict is not evidence that screening or full M-STATUS exists yet.
-This is main-session hard integration work, not a ready-for-agent test issue.
+The operator now assigns all implementation and evaluation to other sessions.
+This plan is the handoff authority; the integration session performs planning
+and review only. Independent source-reservation re-review passed on 2026-10-04
+after adding first-assignment races and bounded typed routing exits:
+
+```text
+bounded-context-guardian: yes — storage owns reservation-first routing and the same-client revision hook.
+input-contract-tests: yes — PG/memory first assignment versus all six work mutations, retry exhaustion, deadline and rollback races are explicit.
+error-handling-enforcer: yes — input_stale/execution_timeout, no-mutation exits and primary rollback diagnostics are explicit.
+complexity-anti-drift: yes — one shared storage seam centralizes reservations and routing.
+minimal-change-verifier: yes — S0 authority/routing is separate from later screening behavior.
+```
+
+The corrected architecture gate passes. The future implementation session must
+freeze concrete context/input-view signatures and its deterministic test barrier
+before writing behavior. No S0 or screening source/tests were written in this
+planning turn.

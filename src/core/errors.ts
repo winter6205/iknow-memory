@@ -60,6 +60,70 @@ export class GraphragError extends Error {
   }
 }
 
+export interface SuppressedFailureContext {
+  readonly name: string;
+  readonly code?: string;
+}
+
+const SUPPRESSED_FAILURE_CONTEXT = new WeakMap<
+  object,
+  readonly SuppressedFailureContext[]
+>();
+const EMPTY_SUPPRESSED_FAILURE_CONTEXT: readonly SuppressedFailureContext[] =
+  Object.freeze([]);
+const SAFE_ERROR_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+const SAFE_SQLSTATE = /^[0-9A-Z]{5}$/;
+
+/**
+ * Retain only safe metadata for a secondary failure without replacing or
+ * mutating the original thrown object. Messages and stacks can contain SQL,
+ * parameters, or document content, so they are deliberately not captured.
+ */
+export function recordSuppressedFailure(
+  primary: unknown,
+  secondary: unknown
+): void {
+  if (
+    primary === null ||
+    (typeof primary !== "object" && typeof primary !== "function")
+  ) {
+    return;
+  }
+
+  const summary = suppressedFailureSummary(secondary);
+  const previous = SUPPRESSED_FAILURE_CONTEXT.get(primary) ?? [];
+  SUPPRESSED_FAILURE_CONTEXT.set(
+    primary,
+    Object.freeze([...previous, Object.freeze(summary)])
+  );
+}
+
+/** Retrieve safe secondary-failure metadata for structured diagnostic logging. */
+export function getSuppressedFailureContext(
+  error: unknown
+): readonly SuppressedFailureContext[] {
+  if (
+    error === null ||
+    (typeof error !== "object" && typeof error !== "function")
+  ) {
+    return EMPTY_SUPPRESSED_FAILURE_CONTEXT;
+  }
+  return SUPPRESSED_FAILURE_CONTEXT.get(error) ?? EMPTY_SUPPRESSED_FAILURE_CONTEXT;
+}
+
+function suppressedFailureSummary(error: unknown): SuppressedFailureContext {
+  const rawName = error instanceof Error ? error.name : typeof error;
+  const name = SAFE_ERROR_NAME.test(rawName) ? rawName : "Error";
+  const code =
+    error instanceof Error &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    SAFE_SQLSTATE.test(error.code)
+      ? error.code
+      : undefined;
+  return code === undefined ? { name } : { name, code };
+}
+
 /**
  * The named failure an error declares, if any. Classification reads this
  * field — never a substring of `message`, which is human-readable prose and

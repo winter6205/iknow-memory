@@ -59,6 +59,19 @@ export function canonicalDependencyRevision(
   return digest(canonical);
 }
 
+/** Whether a dependency vector contains the job's initiating source generation. */
+export function hasInitiatingDependency(
+  dependencies: readonly MaintenanceDependency[],
+  sourceRef: string,
+  sourceGeneration: number
+): boolean {
+  return dependencies.some(
+    (dependency) =>
+      dependency.sourceRef === sourceRef &&
+      dependency.generation === sourceGeneration
+  );
+}
+
 function digest(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
 }
@@ -188,6 +201,15 @@ export function verifyAttemptGuard(
 ): MaintenanceGuardVerdict {
   const ownership = verifyAttemptOwnership(guard, now, presentedToken);
   if (!ownership.ok) return ownership;
+  if (
+    !hasInitiatingDependency(
+      live.dependencies,
+      guard.sourceRef,
+      guard.sourceGeneration
+    )
+  ) {
+    return { ok: false, code: "input_stale" };
+  }
   if (live.configRevision !== guard.configRevision) {
     return { ok: false, code: "input_stale" };
   }

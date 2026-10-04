@@ -314,7 +314,12 @@ export function stripStructuredQueryFilter(
     if (typeof value !== "string") {
       return { kind: "invalid", key, received: typeof value };
     }
-    rest[key] = value;
+    Object.defineProperty(rest, key, {
+      configurable: true,
+      enumerable: true,
+      value,
+      writable: true,
+    });
   }
   return {
     kind: "ok",

@@ -9,6 +9,7 @@
 import {
   canonicalDependencyRevision,
   computeMaintenanceJobKey,
+  hasInitiatingDependency,
   isMaintenanceWorkKind,
 } from "./durable-work.js";
 import {
@@ -124,7 +125,17 @@ export function liveInputsOf(
 export { canonicalDependencyRevision, computeMaintenanceJobKey };
 
 function findInvalidField(request: MaintenanceWorkRequest): string | null {
-  return invalidIdentityField(request) ?? invalidDependencyField(request.dependencies);
+  const invalidIdentity = invalidIdentityField(request);
+  if (invalidIdentity) return invalidIdentity;
+  const invalidDependency = invalidDependencyField(request.dependencies);
+  if (invalidDependency) return invalidDependency;
+  return hasInitiatingDependency(
+    request.dependencies,
+    request.sourceRef,
+    request.sourceGeneration
+  )
+    ? null
+    : "dependencies must include the initiating sourceRef and sourceGeneration";
 }
 
 function invalidIdentityField(request: MaintenanceWorkRequest): string | null {

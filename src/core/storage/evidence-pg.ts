@@ -8,7 +8,7 @@
  * denied — are NOT here: they live in evidence-store.ts and both backends run
  * them, so a denied replay is denied for the same reason in either store.
  */
-import { GraphragError } from "../errors.js";
+import { GraphragError, recordSuppressedFailure } from "../errors.js";
 import {
   EVIDENCE_FAILURE,
   EVIDENCE_GRANT_KIND,
@@ -182,17 +182,25 @@ export async function inEvidenceTransaction<T>(
     await client.query("COMMIT", []);
     return out;
   } catch (err) {
+    let rollbackFailure: { readonly error: unknown } | undefined;
     if (started) {
-      // A failed ROLLBACK must not mask the failure that caused it.
       try {
         await client.query("ROLLBACK", []);
-      } catch {
-        /* the transaction is already unusable; the original error stands */
+      } catch (rollbackError) {
+        rollbackFailure = { error: rollbackError };
       }
     }
-    if (err instanceof GraphragError) throw err;
-    const message = err instanceof Error ? err.message : String(err);
-    throw new GraphragError(`evidence store write failed: ${message}`, "STORAGE_ERROR");
+    const primary =
+      err instanceof GraphragError
+        ? err
+        : new GraphragError(
+            `evidence store write failed: ${err instanceof Error ? err.message : String(err)}`,
+            "STORAGE_ERROR"
+          );
+    if (rollbackFailure !== undefined) {
+      recordSuppressedFailure(primary, rollbackFailure.error);
+    }
+    throw primary;
   } finally {
     client.release();
   }

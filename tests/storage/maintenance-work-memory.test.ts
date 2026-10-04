@@ -105,7 +105,7 @@ describe("MP2 — durable job key", () => {
       request({ workKind: "conflict_check" }),
       request({ workKind: "projection_rebuild" }),
       request({ sourceVersion: "v2" }),
-      request({ sourceGeneration: 2 }),
+      request({ sourceGeneration: 2, dependencies: [dependency({ generation: 2 })] }),
       request({ configRevision: "rules-4" }),
     ]) {
       const outcome = await scheduleWork(h.deps, operator, variant);
@@ -143,6 +143,17 @@ describe("MP2 — durable job key", () => {
     const claimable = await claimNextWork(h.deps);
     expect(claimable.guard).toBeNull();
     expect(claimable.reclaimed).toEqual([]);
+  });
+
+  it.each([
+    ["sourceRef", request({ dependencies: [dependency({ sourceRef: "other" })] })],
+    ["sourceGeneration", request({ dependencies: [dependency({ generation: 2 })] })],
+  ] as const)("refuses a dependency vector not bound to the initiating %s", async (_field, invalid) => {
+    const outcome = await scheduleWork(h.deps, operator, invalid);
+
+    expect(outcome).toMatchObject({ refused: "invalid_input" });
+    expect("record" in outcome).toBe(false);
+    expect((await claimNextWork(h.deps)).guard).toBeNull();
   });
 
   it("refuses a denied actor without scheduling", async () => {
@@ -340,6 +351,23 @@ describe("MP4 — lease, fencing token, and dependency fence", () => {
       { status: "ready" },
       liveInputsOf("rules-3", [dependency({ generation: 2 })])
     );
+
+    expect(result.result).toBe("stale");
+    expect((await h.store.getJob(job.jobKey))?.status).toBe("stale");
+  });
+
+  it.each([
+    ["sourceRef", { sourceRef: "other" }],
+    ["sourceGeneration", { sourceGeneration: 2 }],
+  ] as const)("marks an attempt stale when persisted initiating %s disagrees with its dependency vector", async (_field, changed) => {
+    const job = await scheduleDefault(h);
+    const guard = await claim(h);
+    const rows = (h.store as unknown as {
+      jobs: Map<string, Record<string, unknown>>;
+    }).jobs;
+    Object.assign(rows.get(job.jobKey)!, changed);
+
+    const result = await settleWork(h.deps, guard, { status: "ready" }, live);
 
     expect(result.result).toBe("stale");
     expect((await h.store.getJob(job.jobKey))?.status).toBe("stale");

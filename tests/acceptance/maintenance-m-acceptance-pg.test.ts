@@ -192,6 +192,28 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
     await survivorPool.end();
   });
 
+  it.each([
+    ["sourceRef", { dependencies: [dependency({ sourceRef: "other" })] }],
+    ["sourceGeneration", { dependencies: [dependency({ generation: 2 })] }],
+  ] as const)("refuses scheduling when the vector omits the initiating %s", async (_field, overrides) => {
+    const pool = poolOf(SCHEMA_URL);
+    try {
+      const outcome = await scheduleWork(
+        { store: new PgMaintenanceWorkStore(pool), clock: () => T0 },
+        operator,
+        request(overrides)
+      );
+
+      expect(outcome).toMatchObject({ refused: "invalid_input" });
+      const counts = await admin.query<{ jobs: string }>(
+        "SELECT count(*) AS jobs FROM maintenance_jobs"
+      );
+      expect(counts.rows[0]).toMatchObject({ jobs: "0" });
+    } finally {
+      await pool.end();
+    }
+  });
+
   it("treats a moved dependency vector as a different logical job", async () => {
     const pool = poolOf(SCHEMA_URL);
     const deps: MaintenanceWorkDeps = {
@@ -202,7 +224,12 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
       const base = await scheduleWork(
         deps,
         operator,
-        request({ sourceRef: "s2", sourceVersion: "v7", sourceGeneration: 3 })
+        request({
+          sourceRef: "s2",
+          sourceVersion: "v7",
+          sourceGeneration: 3,
+          dependencies: [dependency({ sourceRef: "s2", generation: 3 })],
+        })
       );
       if ("refused" in base) throw new Error(base.detail);
 
@@ -230,6 +257,44 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
     }
   });
 
+  it.each([
+    ["source_ref", "mutated-source"],
+    ["source_generation", "2"],
+  ] as const)("marks a persisted initiating %s mismatch stale before settlement", async (column, changedValue) => {
+    const pool = poolOf(SCHEMA_URL);
+    const store = new PgMaintenanceWorkStore(pool);
+    const deps: MaintenanceWorkDeps = { store, clock: () => T0 };
+    try {
+      const job = await scheduleAt(
+        pool,
+        T0,
+        request({
+          sourceRef: "s-vector",
+          sourceGeneration: 4,
+          dependencies: [dependency({ sourceRef: "s-vector", generation: 4 })],
+        })
+      );
+      const guard = await store.claimWork(T0);
+      if (!guard) throw new Error("expected a claimable job");
+      await admin.query(
+        `UPDATE maintenance_jobs SET ${column} = $2 WHERE job_key = $1`,
+        [job.jobKey, column === "source_generation" ? Number(changedValue) : changedValue]
+      );
+
+      const result = await settleWork(
+        deps,
+        guard,
+        { status: "ready" },
+        liveInputsOf("rules-3", [dependency({ sourceRef: "s-vector", generation: 4 })])
+      );
+
+      expect(result.result).toBe("stale");
+      expect((await store.getJob(job.jobKey))?.status).toBe("stale");
+    } finally {
+      await pool.end();
+    }
+  });
+
   it("writes nothing to the lifecycle ledger when the real query read path runs", async () => {
     const before = await ledgerSnapshot(admin);
 
@@ -243,7 +308,11 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
     // The obvious `ON CONFLICT DO NOTHING` cannot answer this: a data-modifying
     // CTE's SELECT branch reads the statement snapshot and cannot see the row a
     // concurrent transaction commits, so the join would find nothing.
-    const work = request({ sourceRef: "s-race", sourceVersion: "v3" });
+    const work = request({
+      sourceRef: "s-race",
+      sourceVersion: "v3",
+      dependencies: [dependency({ sourceRef: "s-race" })],
+    });
     const pools = [poolOf(SCHEMA_URL), poolOf(SCHEMA_URL)];
     try {
       const results = await Promise.all(
@@ -271,7 +340,11 @@ describeAcceptance("M acceptance — maintenance durable work", () => {
   it("M6 — an expired lease invalidates the old token before a new attempt runs", async () => {
     const pool = poolOf(SCHEMA_URL);
     try {
-      const job = await scheduleAt(pool, T0, request({ sourceRef: "s6" }));
+      const job = await scheduleAt(
+        pool,
+        T0,
+        request({ sourceRef: "s6", dependencies: [dependency({ sourceRef: "s6" })] })
+      );
       const depsAt = (at: Date): MaintenanceWorkDeps => ({
         store: new PgMaintenanceWorkStore(pool),
         clock: () => at,

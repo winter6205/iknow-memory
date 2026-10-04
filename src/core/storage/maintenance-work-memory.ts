@@ -38,6 +38,8 @@ import {
   type MaintenanceWorkStore,
 } from "../maintenance/types.js";
 
+import type { ScopedWorkInput } from "./structured-scope-types.js";
+
 interface StoredJob extends MaintenanceJobRecord {
   readonly dependencies: readonly MaintenanceDependency[];
   readonly fencingToken: string | null;
@@ -72,6 +74,25 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       )
       .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
       .map(toRecord);
+  }
+
+  /**
+   * The ledger rows of one authorized source set, ordered as the scoped input
+   * view promises. Status and screening decide buckets from these rows rather
+   * than from a summary, so a job this list omits must not be reported anywhere.
+   */
+  scopedWorkRecords(sourceRefs: readonly string[]): readonly ScopedWorkInput[] {
+    this.assertOpen();
+    const allowed = new Set(sourceRefs);
+    return [...this.jobs.values()]
+      .filter((job) => allowed.has(job.sourceRef))
+      .sort(
+        (left, right) =>
+          left.sourceRef.localeCompare(right.sourceRef) ||
+          left.updatedAt.localeCompare(right.updatedAt) ||
+          left.jobKey.localeCompare(right.jobKey)
+      )
+      .map(toScopedWorkRecord);
   }
 
   publicationDependenciesForGuard(
@@ -540,6 +561,26 @@ function toRecord(job: StoredJob): MaintenanceJobRecord {
     ...record
   } = job;
   return record;
+}
+
+/** The same ledger row as the scoped view's work record, dependencies included. */
+function toScopedWorkRecord(job: StoredJob): ScopedWorkInput {
+  return {
+    jobKey: job.jobKey,
+    workKind: job.workKind,
+    sourceRef: job.sourceRef,
+    sourceVersion: job.sourceVersion,
+    sourceGeneration: job.sourceGeneration,
+    inputRevision: job.inputRevision,
+    configRevision: job.configRevision,
+    status: job.status,
+    attemptCount: job.attemptCount,
+    autoAttemptCount: job.autoAttemptCount,
+    lastFailureCode: job.lastFailureCode,
+    nextAttemptAt: job.nextAttemptAt,
+    updatedAt: job.updatedAt,
+    dependencies: job.dependencies,
+  };
 }
 
 function samePublicationGuardInputs(

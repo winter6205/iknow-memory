@@ -34,6 +34,14 @@ import type {
 } from "../types.js";
 import type { InMemoryStructuredIdentityStore } from "../structured/identity-store.js";
 import type { InMemoryMaintenanceWorkStore } from "./maintenance-work-memory.js";
+import type { MemorySerializationPort } from "./structured-scope-uow.js";
+import type {
+  ScopeRevisionChange,
+  ScopeRevisionState,
+  ScopedExtractionInput,
+  ScopedMembershipInput,
+  ScopedSourceInput,
+} from "./structured-scope-types.js";
 import { canonicalDependencyRevision } from "../maintenance/durable-work.js";
 
 interface MemoryEvidenceAuthority {
@@ -133,12 +141,20 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
   private readonly outbox: PublicationOutboxPort;
   private lockTail: Promise<void> = Promise.resolve();
   private readonly removeProgressListener: () => void;
+  /**
+   * The queue the shared scope seam owns. Publication and the seam must queue on
+   * one tail or their writes interleave, so composition injects it rather than
+   * letting this adapter keep a private queue beside the seam's.
+   */
+  private readonly serialization?: MemorySerializationPort;
 
   constructor(
     private readonly authority: MemoryEvidenceAuthority,
-    outbox?: PublicationOutboxPort
+    outbox?: PublicationOutboxPort,
+    serialization?: MemorySerializationPort
   ) {
     this.outbox = outbox ?? new MemoryProjectionOutbox();
+    this.serialization = serialization;
     this.removeProgressListener =
       authority.maintenanceWorkStore.onProgressChange((sourceRef, generation) =>
         this.recordWorkProgress(sourceRef, generation)
@@ -444,6 +460,87 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
     this.scopes.clear();
   }
 
+  /**
+   * The seam's authority surface: ownership, revisions and the exact serving
+   * rows, read from the maps the publication methods write.
+   *
+   * These are projections rather than copies of the scope registry because a
+   * seam that read a snapshot taken before an accepted write would refuse work
+   * that legitimately landed, and a seam that wrote back a stale copy would
+   * erase it.
+   */
+  resolveOwnerScopeBinding(sourceRef: string): string | null {
+    for (const scope of this.scopes.values()) {
+      if (scope.sources.has(sourceRef)) return scope.scopeBinding;
+    }
+    return null;
+  }
+
+  scopeRevisions(scopeBinding: string): ScopeRevisionState | null {
+    const scope = this.scopes.get(scopeBinding);
+    if (scope === undefined) return null;
+    return {
+      readRevision: Number(scope.readRevision),
+      maintenanceRevision: Number(scope.maintenanceRevision),
+    };
+  }
+
+  scopedSourceRows(
+    scopeBinding: string,
+    sourceRefs: readonly string[]
+  ): ScopedSourceInput[] {
+    const scope = this.scopes.get(scopeBinding);
+    if (scope === undefined) return [];
+    const rows: ScopedSourceInput[] = [];
+    for (const sourceRef of sourceRefs) {
+      const source = scope.sources.get(sourceRef);
+      if (source !== undefined) rows.push(memoryScopedRow(source));
+    }
+    return rows;
+  }
+
+  scopedMembershipRows(
+    scopeBinding: string,
+    sourceRefs: readonly string[]
+  ): ScopedMembershipInput[] {
+    const scope = this.scopes.get(scopeBinding);
+    if (scope === undefined) return [];
+    const rows: ScopedMembershipInput[] = [];
+    for (const sourceRef of sourceRefs) {
+      const source = scope.sources.get(sourceRef);
+      if (source !== undefined && source.published !== null) {
+        rows.push(...memoryMembershipRows(source));
+      }
+    }
+    return rows;
+  }
+
+  scopedExtractionRows(
+    scopeBinding: string,
+    sourceRefs: readonly string[]
+  ): ScopedExtractionInput[] {
+    const scope = this.scopes.get(scopeBinding);
+    if (scope === undefined) return [];
+    const rows: ScopedExtractionInput[] = [];
+    for (const sourceRef of sourceRefs) {
+      const source = scope.sources.get(sourceRef);
+      if (source !== undefined && source.published !== null) {
+        rows.push(...memoryExtractionRows(source));
+      }
+    }
+    return rows;
+  }
+
+  advanceScopeRevision(
+    scopeBinding: string,
+    change: ScopeRevisionChange
+  ): void {
+    const scope = this.scopes.get(scopeBinding);
+    if (scope === undefined) return;
+    if (change.read) scope.readRevision += 1n;
+    if (change.maintenance) scope.maintenanceRevision += 1n;
+  }
+
   private requireCurrentSource(
     scopeBinding: string,
     sourceRef: string
@@ -576,6 +673,9 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
   }
 
   private async exclusive<T>(action: () => Promise<T>): Promise<T> {
+    if (this.serialization !== undefined) {
+      return this.serialization.exclusive(action);
+    }
     const previous = this.lockTail;
     let release!: () => void;
     this.lockTail = new Promise<void>((resolve) => {
@@ -785,6 +885,83 @@ function newSource(sourceRef: string, active: boolean): MemorySource {
     extractionBindings: new Map(),
     displayHistory: new Map(),
   };
+}
+
+/** The scope seam's row shape for one memory source. */
+function memoryScopedRow(source: MemorySource): ScopedSourceInput {
+  return {
+    sourceRef: source.sourceRef,
+    sourceVersion:
+      source.desired?.sourceVersion ?? source.published?.sourceVersion ?? null,
+    active: source.active,
+    generation: source.generation,
+    desired: source.desired === null ? null : { ...source.desired },
+    published:
+      source.published === null
+        ? null
+        : {
+            sourceVersion: source.published.sourceVersion,
+            extractionRevision: source.published.extractionRevision,
+          },
+  };
+}
+
+/**
+ * One row per served result with every support behind it, in membership order.
+ * Grouping here mirrors the PostgreSQL read so a reader sees the same row count
+ * from either twin.
+ */
+function memoryMembershipRows(source: MemorySource): ScopedMembershipInput[] {
+  const grouped = new Map<string, ScopedMembershipInput & {
+    supportIds: string[];
+    extractionRefs: string[];
+  }>();
+  for (const member of source.membership.values()) {
+    const key = `${member.subject}\u0000${member.resultId}`;
+    let entry = grouped.get(key);
+    if (entry === undefined) {
+      entry = {
+        sourceRef: source.sourceRef,
+        subject: member.subject,
+        resultId: member.resultId,
+        supportIds: [],
+        extractionRefs: [],
+      };
+      grouped.set(key, entry);
+    }
+    if (!entry.supportIds.includes(member.supportId)) {
+      entry.supportIds.push(member.supportId);
+    }
+    if (!entry.extractionRefs.includes(member.extractionRef)) {
+      entry.extractionRefs.push(member.extractionRef);
+    }
+  }
+  return [...grouped.values()];
+}
+
+/** The published extraction ref and the display values attributed to it. */
+function memoryExtractionRows(source: MemorySource): ScopedExtractionInput[] {
+  const published = source.published;
+  if (published === null) return [];
+  const binding = source.extractionBindings.get(
+    extractionBindingKey(published.sourceVersion, published.extractionRevision)
+  );
+  if (binding === undefined) return [];
+  const attributedValues = [...source.displayHistory.values()]
+    .filter((value) => value.extractionRevision === published.extractionRevision)
+    .map((value) => ({
+      supportId: value.supportId,
+      extractionRevision: value.extractionRevision,
+      canonicalName: value.canonicalName,
+      entityType: value.type,
+    }));
+  return [
+    {
+      sourceRef: source.sourceRef,
+      extractionRef: binding.extractionRef,
+      attributedValues,
+    },
+  ];
 }
 
 function incrementGeneration(generation: number): number {

@@ -53,6 +53,8 @@ import type {
   SupportOccurrence,
   SupportRecord,
 } from "../types.js";
+import { PgStructuredPublicationStorage } from "./publication-pg.js";
+import type { StructuredPublicationStorage } from "../maintenance/publication-types.js";
 import {
   appendContentInvalidation,
   CONTENT_INVALIDATIONS_METADATA_KEY,
@@ -645,6 +647,7 @@ export class PgvectorBackend
     EvidenceStore,
     StorageReadPort
 {
+  structuredPublication: StructuredPublicationStorage;
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
   private readonly poolConfig: PgvectorPoolConfig;
@@ -660,6 +663,12 @@ export class PgvectorBackend
     private readonly dimensions: number,
     options: PgvectorBackendOptions = {}
   ) {
+    this.structuredPublication = new PgStructuredPublicationStorage(
+      async () => {
+        const pool = await this.ensureReady();
+        return this.connectWithTimeout(pool);
+      }
+    );
     this.annMaxDimensions = options.annMaxDimensions;
     this.embedModel = options.embedModel;
     const defaults = readPgvectorPoolConfig();
@@ -2054,10 +2063,7 @@ export class PgvectorBackend
     );
   }
 
-  async readGrant(
-    evidenceRef: string,
-    at: string
-  ): Promise<EvidenceGrantRead> {
+  async readGrant(evidenceRef: string, at: string): Promise<EvidenceGrantRead> {
     // `at` is validated before any read so a malformed instant is refused
     // rather than silently compared against a NaN.
     assertInstant(at, "at");

@@ -22,6 +22,7 @@ export type {
   ParentWindowStorage,
   ParentWindowRow,
 } from "../retrieval/types.js";
+export type { StructuredPublicationStorage } from "../maintenance/publication-types.js";
 import { GraphragError } from "../errors.js";
 import type {
   EvidenceStore,
@@ -30,6 +31,7 @@ import type {
   SearchOptions,
   StorageBackend,
 } from "../types.js";
+import type { StructuredPublicationStorage } from "../maintenance/publication-types.js";
 import type {
   GraphArmStorage,
   EntityEmbeddingStorage,
@@ -52,7 +54,12 @@ import type {
  * while `neo4jArmSeed` only maps entity ids the graph engine already
  * ranked back onto chunks (#70).
  */
-export interface GraphRagStorageBackend extends StorageBackend {
+export interface StructuredPublicationBackend extends StorageBackend {
+  /** Optional atomic accepted-structured-corpus publication capability. */
+  structuredPublication?: StructuredPublicationStorage;
+}
+
+export interface GraphRagStorageBackend extends StructuredPublicationBackend {
   graphArmSeed?: GraphArmStorage;
   /** Optional Postgres entity-embedding seed/score read path. */
   entityEmbedding?: EntityEmbeddingStorage;
@@ -215,8 +222,9 @@ export function supportsCommunityReportLexical(
   candidate: unknown
 ): candidate is CommunityReportLexicalStorage {
   return (
-    typeof (candidate as Partial<CommunityReportLexicalStorage> | null | undefined)
-      ?.searchCommunitySummariesLexical === "function"
+    typeof (
+      candidate as Partial<CommunityReportLexicalStorage> | null | undefined
+    )?.searchCommunitySummariesLexical === "function"
   );
 }
 

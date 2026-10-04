@@ -65,8 +65,7 @@ const JOB_COLUMNS =
  * constants. No request value ever reaches these strings — only module-level
  * numbers do, so interpolating them is not an injection surface.
  */
-const ABSOLUTE_BOUND_SQL =
-  `attempt_started_at + interval '${WORK_ABSOLUTE_LIMIT_MS / 1000} seconds'`;
+const ABSOLUTE_BOUND_SQL = `attempt_started_at + interval '${WORK_ABSOLUTE_LIMIT_MS / 1000} seconds'`;
 const LEASE_SQL = `interval '${WORK_LEASE_MS / 1000} seconds'`;
 
 export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
@@ -98,10 +97,10 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
       const { rows } = await lease.query(
         `INSERT INTO maintenance_jobs
            (job_key, work_kind, source_ref, source_version, source_generation,
-            input_revision, config_revision, status, attempt_count,
+            input_revision, input_dependencies, config_revision, status, attempt_count,
             auto_attempt_count, max_attempts, next_attempt_at, last_failure_code,
             created_at, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'pending',0,0,$8,$9,NULL,$9,$9)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,'pending',0,0,$9,$10,NULL,$10,$10)
          ON CONFLICT (job_key) DO UPDATE SET updated_at = maintenance_jobs.updated_at
          RETURNING ${JOB_COLUMNS}, (xmax = 0) AS inserted`,
         [
@@ -111,6 +110,7 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
           request.sourceVersion,
           request.sourceGeneration,
           canonicalDependencyRevision(request.dependencies),
+          JSON.stringify(request.dependencies),
           request.configRevision,
           MAX_AUTO_ATTEMPTS,
           now.toISOString(),
@@ -171,7 +171,11 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
             FOR UPDATE SKIP LOCKED
             LIMIT 1)
          RETURNING ${JOB_COLUMNS}, fencing_token, lease_expires_at, attempt_started_at`,
-        [randomUUID(), new Date(now.getTime() + WORK_LEASE_MS).toISOString(), stamp]
+        [
+          randomUUID(),
+          new Date(now.getTime() + WORK_LEASE_MS).toISOString(),
+          stamp,
+        ]
       );
       const row = rows[0];
       if (!row) return null;
@@ -179,7 +183,12 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
         `INSERT INTO maintenance_job_attempts
            (job_key, attempt_number, fencing_token, started_at)
          VALUES ($1,$2,$3,$4)`,
-        [String(row.job_key), Number(row.attempt_count), String(row.fencing_token), stamp]
+        [
+          String(row.job_key),
+          Number(row.attempt_count),
+          String(row.fencing_token),
+          stamp,
+        ]
       );
       return toGuard(row);
     });
@@ -254,8 +263,14 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
       const row = await this.lockRunningJob(lease, guard.jobKey);
       if (!row) return { result: "lease_lost" };
 
-      const verdict = verifyAttemptGuard(toGuard(row), live, now, guard.fencingToken);
-      if (!verdict.ok) return this.refuseSettle(lease, row, verdict.code, stamp);
+      const verdict = verifyAttemptGuard(
+        toGuard(row),
+        live,
+        now,
+        guard.fencingToken
+      );
+      if (!verdict.ok)
+        return this.refuseSettle(lease, row, verdict.code, stamp);
 
       // MAX_AUTO_ATTEMPTS, not the row's `max_attempts`: the column is readable
       // and writable, and the retry budget must not be something an UPDATE can
@@ -310,7 +325,10 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
           tolerateMissing: true,
         });
       }
-      return rows.map((row) => ({ jobKey: String(row.job_key), reclaimed: true }));
+      return rows.map((row) => ({
+        jobKey: String(row.job_key),
+        reclaimed: true,
+      }));
     });
   }
 
@@ -412,7 +430,11 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
       const record = await this.writeSettled(
         lease,
         row,
-        { status: "failed", nextDelayMs: null, lastFailureCode: "execution_timeout" },
+        {
+          status: "failed",
+          nextDelayMs: null,
+          lastFailureCode: "execution_timeout",
+        },
         stamp
       );
       await this.finishAttempt(lease, {
@@ -451,7 +473,13 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
               updated_at = $5
         WHERE job_key = $1
       RETURNING ${JOB_COLUMNS}`,
-      [String(row.job_key), plan.status, nextAttemptAt, plan.lastFailureCode, stamp]
+      [
+        String(row.job_key),
+        plan.status,
+        nextAttemptAt,
+        plan.lastFailureCode,
+        stamp,
+      ]
     );
     const updated = rows[0];
     if (!updated) {
@@ -534,7 +562,8 @@ function toRecord(row: Record<string, unknown>): MaintenanceJobRecord {
     autoAttemptCount: Number(row.auto_attempt_count),
     maxAttempts: Number(row.max_attempts),
     nextAttemptAt: isoOrNull(row.next_attempt_at),
-    lastFailureCode: (row.last_failure_code as MaintenanceWorkFailureCode | null) ?? null,
+    lastFailureCode:
+      (row.last_failure_code as MaintenanceWorkFailureCode | null) ?? null,
     createdAt: isoOf(row.created_at),
     updatedAt: isoOf(row.updated_at),
   };
@@ -561,7 +590,8 @@ function toAttempt(row: Record<string, unknown>): MaintenanceAttemptRecord {
     jobKey: String(row.job_key),
     attemptNumber: Number(row.attempt_number),
     fencingToken: String(row.fencing_token),
-    failureCode: (row.failure_code as MaintenanceWorkFailureCode | null) ?? null,
+    failureCode:
+      (row.failure_code as MaintenanceWorkFailureCode | null) ?? null,
     startedAt: isoOf(row.started_at),
     finishedAt: isoOrNull(row.finished_at),
     reclaimed: row.reclaimed === true,

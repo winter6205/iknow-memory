@@ -51,6 +51,13 @@ import type {
   ParentWindowRow,
   ParentWindowStorage,
 } from "../retrieval/types.js";
+import { InMemoryStructuredIdentityStore } from "../structured/identity-store.js";
+import { InMemoryMaintenanceWorkStore } from "./maintenance-work-memory.js";
+import { MemoryStructuredPublicationStorage } from "./publication-memory.js";
+import type {
+  PublicationOutboxPort,
+  StructuredPublicationStorage,
+} from "../maintenance/publication-types.js";
 import {
   EVIDENCE_FAILURE,
   EVIDENCE_GRANT_KIND,
@@ -66,6 +73,7 @@ import {
   type ContentInvalidationRecord,
   type ContentInvalidationStorage,
   type LexicalStorageBackend,
+  type StructuredPublicationBackend,
 } from "./backend.js";
 import {
   lookupReadId,
@@ -162,10 +170,7 @@ function receiptKey(scope: ScopeRevisionRecord): string {
 }
 
 /** One pinned (support, extraction) pair. The separator is absent from both. */
-function pinnedExtractionKey(
-  supportId: string,
-  extractionRef: string
-): string {
+function pinnedExtractionKey(supportId: string, extractionRef: string): string {
   return `${supportId}|${extractionRef}`;
 }
 
@@ -204,6 +209,7 @@ function optionalRevision(value: unknown, field: string): string | null {
 export class MemoryBackend
   implements
     StorageBackend,
+    StructuredPublicationBackend,
     LexicalStorageBackend,
     ContentInvalidationStorage,
     ParentWindowStorage,
@@ -212,6 +218,14 @@ export class MemoryBackend
     EvidenceStore,
     StorageReadPort
 {
+  /** Shared identity registry used by the optional publication UOW. */
+  readonly structuredIdentityStore = new InMemoryStructuredIdentityStore();
+  /** Shared durable-work policy store used by the optional publication UOW. */
+  readonly maintenanceWorkStore = new InMemoryMaintenanceWorkStore();
+  /** Optional backend capability backed by these exact identity/evidence/work maps. */
+  structuredPublication: StructuredPublicationStorage;
+  private readonly publicationUow: MemoryStructuredPublicationStorage;
+
   private readonly store = new Map<string, ChunkRecord>();
   /**
    * Corpus-level C-ready singleton (the in-memory twin of
@@ -259,11 +273,11 @@ export class MemoryBackend
   private readonly receipts = new Map<string, AuthorizationReceipt>();
   private readonly receiptsByScope = new Map<string, AuthorizationReceipt>();
   /** evidence_ref → support_id → why the grant holds it. */
-  private readonly grantSupports = new Map<string, Map<string, EvidenceSupportRole>>();
-  private readonly grantExtractions = new Map<
+  private readonly grantSupports = new Map<
     string,
-    Set<string>
+    Map<string, EvidenceSupportRole>
   >();
+  private readonly grantExtractions = new Map<string, Set<string>>();
 
   /**
    * Lexical index, maintained on write rather than rebuilt on read.
@@ -277,7 +291,16 @@ export class MemoryBackend
   private readonly postings = new Map<string, Set<string>>();
   private totalLength = 0;
 
-  constructor(private readonly dimensions: number) {}
+  constructor(
+    private readonly dimensions: number,
+    options: { readonly publicationOutbox?: PublicationOutboxPort } = {}
+  ) {
+    this.publicationUow = new MemoryStructuredPublicationStorage(
+      this,
+      options.publicationOutbox
+    );
+    this.structuredPublication = this.publicationUow;
+  }
 
   /**
    * Validate then store each chunk. The whole batch is atomic: if any chunk
@@ -1032,6 +1055,147 @@ export class MemoryBackend
    * version, and returning the old row would attribute new parsing to a
    * version that never had it.
    */
+  /** Prepare source-version and locator rows for the shared publication UOW. */
+  preparePublicationSource(
+    input: NewSourceVersion,
+    bindings: readonly SourceLocatorBinding[]
+  ): {
+    readonly record: SourceVersionRecord;
+    commit(): void;
+  } {
+    const plan = normalizeSourceVersion(input);
+    const key = sourceVersionKey(plan.source_ref, plan.source_version);
+    const existingId = this.versionIdsByKey.get(key);
+    const record: SourceVersionRecord =
+      existingId === undefined
+        ? {
+            source_version_id: plan.source_version_id || randomUUID(),
+            source_ref: plan.source_ref,
+            source_version: plan.source_version,
+            content_digest: plan.content_digest,
+            origin_object_ref: plan.origin_object_ref,
+            parser_revision: plan.parser_revision,
+            unit_manifest: plan.unit_manifest,
+            created_at: plan.created_at,
+            retired_at: null,
+            payload_collected_at: null,
+            obligations_stopped_at: null,
+          }
+        : { ...this.sourceVersions.get(existingId)! };
+    if (existingId !== undefined && !sameImmutableVersion(record, plan)) {
+      throw evidenceError(
+        EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+        "publication source version conflicts with the immutable registered version"
+      );
+    }
+    const locatorPlans = bindings.map((binding) =>
+      normalizeLocatorBinding(binding)
+    );
+    for (const binding of locatorPlans) {
+      if (binding.source_version_id !== record.source_version_id) {
+        throw evidenceError(
+          EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
+          "publication locator names a different source version"
+        );
+      }
+    }
+    return {
+      record: { ...record },
+      commit: () => {
+        if (existingId === undefined) {
+          this.sourceVersions.set(record.source_version_id, record);
+          this.versionIdsByKey.set(key, record.source_version_id);
+        }
+        for (const binding of locatorPlans) {
+          this.locatorBindings.add(locatorKey(binding));
+        }
+      },
+    };
+  }
+
+  /**
+   * Prepare accepted evidence writes without touching the shared evidence maps.
+   * The synchronous commit is used only after identity, work, publication, and
+   * outbox state have all passed validation.
+   */
+  preparePublicationEvidence(occurrences: readonly SupportOccurrence[]): {
+    readonly supports: readonly SupportRecord[];
+    commit(): void;
+  } {
+    const occurrenceKeys = new Set<string>();
+    const planned = occurrences.map((occurrence) => {
+      const plan = normalizeOccurrence(occurrence);
+      const versionId = this.versionIdsByKey.get(
+        sourceVersionKey(plan.source_ref, plan.source_version)
+      );
+      if (versionId === undefined) {
+        throw evidenceError(
+          EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
+          "publication support names an unregistered source version"
+        );
+      }
+      if (
+        !this.locatorBindings.has(
+          locatorKey({ source_version_id: versionId, ...plan.location })
+        )
+      ) {
+        throw evidenceError(
+          EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
+          "publication support names an unbound source locator"
+        );
+      }
+      const occurrenceKey = supportOccurrenceKey(plan);
+      if (occurrenceKeys.has(occurrenceKey)) {
+        throw evidenceError(
+          EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+          "publication attempt repeats one immutable support occurrence"
+        );
+      }
+      occurrenceKeys.add(occurrenceKey);
+      const existingId = this.supportIdsByOccurrence.get(occurrenceKey);
+      const support: SupportRecord =
+        existingId === undefined
+          ? {
+              support_id: randomUUID(),
+              subject: plan.subject,
+              result_id: plan.result_id,
+              source_ref: plan.source_ref,
+              source_version: plan.source_version,
+              source_version_id: versionId,
+              location: plan.location,
+              span: plan.span,
+              created_at: plan.extracted_at,
+            }
+          : { ...this.supports.get(existingId)! };
+      return {
+        occurrenceKey,
+        plan,
+        support,
+        created: existingId === undefined,
+      };
+    });
+    return {
+      supports: planned.map(({ support }) => ({ ...support })),
+      commit: () => {
+        for (const item of planned) {
+          if (item.created) {
+            this.supports.set(item.support.support_id, item.support);
+            this.supportIdsByOccurrence.set(
+              item.occurrenceKey,
+              item.support.support_id
+            );
+          }
+          const links =
+            this.supportLinks.get(item.support.support_id) ?? new Map();
+          if (!links.has(item.plan.extraction_ref)) {
+            links.set(item.plan.extraction_ref, item.plan.extracted_at);
+            this.supportLinks.set(item.support.support_id, links);
+          }
+        }
+      },
+    };
+  }
+
   async registerSourceVersion(
     input: NewSourceVersion
   ): Promise<{ record: SourceVersionRecord; created: boolean }> {
@@ -1104,7 +1268,11 @@ export class MemoryBackend
         `support names source version "${plan.source_ref}/${plan.source_version}", which is not registered`
       );
     }
-    if (!this.locatorBindings.has(locatorKey({ source_version_id: versionId, ...plan.location }))) {
+    if (
+      !this.locatorBindings.has(
+        locatorKey({ source_version_id: versionId, ...plan.location })
+      )
+    ) {
       throw evidenceError(
         EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
         `source version ${versionId} does not bind locator ${plan.location.document_id}/${plan.location.version}/${plan.location.unit}`
@@ -1145,9 +1313,7 @@ export class MemoryBackend
 
   /** Oldest first, with the reference breaking ties so the order is total. */
   async listSupportExtractions(supportId: string): Promise<string[]> {
-    const links = this.supportLinks.get(
-      assertUuid(supportId, "support_id")
-    );
+    const links = this.supportLinks.get(assertUuid(supportId, "support_id"));
     if (links === undefined) return [];
     return [...links.entries()]
       .sort(
@@ -1256,7 +1422,9 @@ export class MemoryBackend
     const extractions = new Set<string>();
     for (const ref of plan.supports) {
       supports.set(ref.support_id, ref.role);
-      for (const extractionRef of this.supportLinks.get(ref.support_id)?.keys() ?? []) {
+      for (const extractionRef of this.supportLinks
+        .get(ref.support_id)
+        ?.keys() ?? []) {
         extractions.add(pinnedExtractionKey(ref.support_id, extractionRef));
       }
     }
@@ -1284,7 +1452,7 @@ export class MemoryBackend
     const receipt =
       grant.authorization_receipt_id === null
         ? null
-        : this.receipts.get(grant.authorization_receipt_id) ?? null;
+        : (this.receipts.get(grant.authorization_receipt_id) ?? null);
     const pinned = this.grantSupports.get(evidenceRef) ?? new Map();
     const dependencies: GrantDependencyFact[] = [...pinned.entries()]
       .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
@@ -1363,7 +1531,11 @@ export class MemoryBackend
     sourceVersionId: string,
     collectedAt: string
   ): Promise<void> {
-    this.stampSourceVersion("payload_collected_at", sourceVersionId, collectedAt);
+    this.stampSourceVersion(
+      "payload_collected_at",
+      sourceVersionId,
+      collectedAt
+    );
   }
 
   async stopAcceptingObligations(
@@ -1399,6 +1571,8 @@ export class MemoryBackend
    * `finally` blocks without caring about state.
    */
   async close(): Promise<void> {
+    this.publicationUow.close();
+    await this.maintenanceWorkStore.close();
     this.store.clear();
     this.docs.clear();
     this.postings.clear();

@@ -124,8 +124,8 @@ const CONFORMANCE: readonly ConformanceCase[] = [
     expect: null,
   },
   {
-    name: "accepts count with a read_revision and no list-only fields",
-    request: validRequest({ operation: "count", read_revision: 7 }),
+    name: "accepts count with an opaque read_revision and no list-only fields",
+    request: validRequest({ operation: "count", read_revision: "rev-118" }),
     expect: null,
   },
   {
@@ -569,6 +569,16 @@ const CONFORMANCE: readonly ConformanceCase[] = [
     expect: "malformed_structured_query",
   },
   {
+    name: "refuses read_revision on list as malformed_structured_query (count-only field)",
+    request: validRequest({ read_revision: "rev-118" }),
+    expect: "malformed_structured_query",
+  },
+  {
+    name: "refuses a numeric read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: 7 }),
+    expect: "invalid_value",
+  },
+  {
     name: "refuses a negative read_revision as invalid_value",
     request: validRequest({ operation: "count", read_revision: -1 }),
     expect: "invalid_value",
@@ -576,6 +586,41 @@ const CONFORMANCE: readonly ConformanceCase[] = [
   {
     name: "refuses a fractional read_revision as invalid_value",
     request: validRequest({ operation: "count", read_revision: 1.5 }),
+    expect: "invalid_value",
+  },
+  {
+    name: "refuses a zero read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: 0 }),
+    expect: "invalid_value",
+  },
+  {
+    name: "refuses a null read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: null }),
+    expect: "invalid_value",
+  },
+  {
+    name: "refuses a boolean read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: true }),
+    expect: "invalid_value",
+  },
+  {
+    name: "refuses an array read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: ["rev-118"] }),
+    expect: "invalid_value",
+  },
+  {
+    name: "refuses an object read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: { value: "rev-118" } }),
+    expect: "invalid_value",
+  },
+  {
+    name: "refuses an empty read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: "" }),
+    expect: "invalid_value",
+  },
+  {
+    name: "refuses a blank read_revision as invalid_value",
+    request: validRequest({ operation: "count", read_revision: "   " }),
     expect: "invalid_value",
   },
 
@@ -778,6 +823,16 @@ describe("validateStructuredQueryRequest — conformance table", () => {
     expect(validated.operation).toBe("count");
     expect(validated.limit).toBeUndefined();
     expect(validated.cursor).toBeUndefined();
+  });
+
+  it("preserves opaque count read_revision tokens exactly", () => {
+    for (const readRevision of ["rev-118", "0007:alpha", " rev-118 "]) {
+      const validated = validateStructuredQueryRequest(
+        validRequest({ operation: "count", read_revision: readRevision }),
+        SQL_TIER
+      );
+      expect(validated.readRevision).toBe(readRevision);
+    }
   });
 
   it("keeps eq and in distinguishable for execution", () => {
@@ -1337,8 +1392,8 @@ describe("the closed error vocabulary and the QP4 ownership boundary", () => {
         request: validRequest({ limit: 0 }),
       },
       {
-        site: "read_revision is negative",
-        request: validRequest({ read_revision: -1 }),
+        site: "read_revision is count-only",
+        request: validRequest({ read_revision: "rev-118" }),
       },
     ];
 

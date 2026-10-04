@@ -97,9 +97,7 @@ export function assertUuid(value: unknown, field: string): string {
 
 /** The lifecycle facts a source version's stamps carry. */
 export type SourceVersionStamp =
-  | "retired_at"
-  | "payload_collected_at"
-  | "obligations_stopped_at";
+  "retired_at" | "payload_collected_at" | "obligations_stopped_at";
 
 /** A typed contract refusal, carrying the token a host classifies on. */
 export function evidenceError(
@@ -121,7 +119,9 @@ export function assertFilled(
   return value;
 }
 
-export function isPlainRecord(value: unknown): value is Record<string, unknown> {
+export function isPlainRecord(
+  value: unknown
+): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -207,10 +207,7 @@ function jsonText(value: unknown, field: string): string {
  * subset: an extra `kind` or `page` key would give the same frozen unit a
  * second identity, which is the mistake the closed set exists to prevent.
  */
-function companyLocatorOf(
-  value: unknown,
-  field: string
-): CompanySourceLocator {
+function companyLocatorOf(value: unknown, field: string): CompanySourceLocator {
   if (!isPlainRecord(value) || !hasExactKeys(value, COMPANY_LOCATOR_KEYS)) {
     throw evidenceError(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
@@ -304,7 +301,9 @@ export function supportOccurrenceKey(support: NormalizedSupport): string {
 }
 
 /** Validate one extracted occurrence into its stored spelling. */
-export function normalizeOccurrence(input: SupportOccurrence): NormalizedSupport {
+export function normalizeOccurrence(
+  input: SupportOccurrence
+): NormalizedSupport {
   if (!isPlainRecord(input)) {
     throw evidenceError(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
@@ -322,7 +321,10 @@ export function normalizeOccurrence(input: SupportOccurrence): NormalizedSupport
     subject: subject as EvidenceSubjectKind,
     result_id: assertFilled(input.result_id, "support result_id"),
     source_ref: assertFilled(input.source_ref, "support source_ref"),
-    source_version: assertFilled(input.source_version, "support source_version"),
+    source_version: assertFilled(
+      input.source_version,
+      "support source_version"
+    ),
     location: companyLocatorOf(input.location, "support location"),
     span: spanOf(input.span, "support span"),
     extraction_ref: assertFilled(input.extraction_ref, "extraction_ref"),
@@ -347,6 +349,7 @@ export function normalizeSourceVersion(
     );
   }
   const manifest = input.unit_manifest;
+  const manifestJson = jsonText(manifest, "unit_manifest");
   return {
     source_version_id:
       input.source_version_id === undefined
@@ -361,7 +364,9 @@ export function normalizeSourceVersion(
     ),
     parser_revision: assertFilled(input.parser_revision, "parser_revision"),
     unit_manifest: manifest,
-    unit_manifest_canonical: jsonText(manifest, "unit_manifest"),
+    unit_manifest_canonical: canonicalJson(
+      JSON.parse(manifestJson) as Record<string, unknown>
+    ),
     created_at: instantText(input.created_at, "created_at"),
   };
 }
@@ -379,7 +384,8 @@ function contentDigestField(value: unknown): string {
 
 /** Validate one locator binding; the source version must already exist. */
 export function normalizeLocatorBinding(
-  input: SourceLocatorBinding): SourceLocatorBinding {
+  input: SourceLocatorBinding
+): SourceLocatorBinding {
   if (!isPlainRecord(input)) {
     throw evidenceError(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
@@ -423,16 +429,15 @@ export function locationOfColumns(
 }
 
 /** The span a stored row names, or `null` for the absent spelling. */
-export function spanOfColumns(row: Record<string, unknown>): EvidenceSpan | null {
+export function spanOfColumns(
+  row: Record<string, unknown>
+): EvidenceSpan | null {
   if (Number(row.span_start) === SPAN_ABSENT) return null;
   return { start: Number(row.span_start), end: Number(row.span_end) };
 }
 
 /** Serialized byte cost of a value plus its context, for the bounded envelope. */
-export function envelopeBytes(
-  value: unknown,
-  context: unknown
-): number {
+export function envelopeBytes(value: unknown, context: unknown): number {
   return Buffer.byteLength(
     JSON.stringify([jsonText(value, "evidence value"), context]),
     "utf8"

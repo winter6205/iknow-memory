@@ -102,12 +102,75 @@ function collisionRefusal(): never {
  */
 export class InMemoryStructuredIdentityStore implements StructuredIdentityStore {
   private readonly entities = new Map<string, RegisteredEntityIdentity>();
-  private readonly assertions = new Map<string, RegisteredRelationAssertionIdentity>();
+  private readonly assertions = new Map<
+    string,
+    RegisteredRelationAssertionIdentity
+  >();
   /** `identityVersion:tupleDigest` → assertionId; the exact-tuple key. */
   private readonly byTuple = new Map<string, string>();
 
   get relationAssertionCount(): number {
     return this.assertions.size;
+  }
+
+  /**
+   * Build a mutation for a larger memory unit of work. Validation and ID
+   * allocation happen now; `commit` only changes these same authoritative maps
+   * and is synchronous so publication can commit identity, evidence, work, and
+   * membership without yielding between them.
+   */
+  preparePublicationBatch(
+    entityInputs: readonly EntityIdentityInput[],
+    assertionInputs: readonly RelationAssertionInput[]
+  ): {
+    readonly entities: readonly RegisteredEntityIdentity[];
+    readonly assertions: readonly RegisteredRelationAssertionIdentity[];
+    commit(): void;
+  } {
+    const entities = new Map<string, RegisteredEntityIdentity>();
+    for (const input of entityInputs) {
+      const entity: RegisteredEntityIdentity = {
+        entityId: normalizeEntityId(input.entityId),
+        type: requireEntityType(input.type),
+      };
+      entities.set(entity.entityId, entity);
+    }
+
+    const assertions = new Map<string, RegisteredRelationAssertionIdentity>();
+    const tupleKeys = new Map<string, string>();
+    for (const input of assertionInputs) {
+      const tuple = normalizeRelationAssertion(input);
+      const assertionId = deriveRelationAssertionId(tuple);
+      const digest = relationAssertionTupleDigest(tuple);
+      const tupleKey = `${tuple.identityVersion}:${digest}`;
+      const earlierId = tupleKeys.get(tupleKey) ?? this.byTuple.get(tupleKey);
+      if (earlierId !== undefined && earlierId !== assertionId) {
+        collisionRefusal();
+      }
+      const existing = this.assertions.get(assertionId);
+      if (existing !== undefined && existing.tupleDigest !== digest) {
+        collisionRefusal();
+      }
+      tupleKeys.set(tupleKey, assertionId);
+      assertions.set(assertionId, toRegistered(assertionId, tuple));
+    }
+
+    return {
+      entities: [...entities.values()],
+      assertions: [...assertions.values()],
+      commit: () => {
+        for (const entity of entities.values()) {
+          this.entities.set(entity.entityId, entity);
+        }
+        for (const assertion of assertions.values()) {
+          this.assertions.set(assertion.assertionId, assertion);
+          this.byTuple.set(
+            `${assertion.identityVersion}:${assertion.tupleDigest}`,
+            assertion.assertionId
+          );
+        }
+      },
+    };
   }
 
   async registerEntity(
@@ -124,9 +187,7 @@ export class InMemoryStructuredIdentityStore implements StructuredIdentityStore 
     return entity;
   }
 
-  async findEntity(
-    entityId: string
-  ): Promise<RegisteredEntityIdentity | null> {
+  async findEntity(entityId: string): Promise<RegisteredEntityIdentity | null> {
     return this.entities.get(normalizeEntityId(entityId)) ?? null;
   }
 
@@ -185,9 +246,12 @@ interface StoredAssertionRow {
 }
 
 /** Postgres unique-violation; the constraint that carries exact-tuple equality. */
-const TUPLE_UNIQUE_CONSTRAINT = "structured_relation_assertion_identities_tuple_idx";
+const TUPLE_UNIQUE_CONSTRAINT =
+  "structured_relation_assertion_identities_tuple_idx";
 
-function toStoredAssertion(row: StoredAssertionRow): RegisteredRelationAssertionIdentity {
+function toStoredAssertion(
+  row: StoredAssertionRow
+): RegisteredRelationAssertionIdentity {
   return {
     assertionId: row.assertion_id,
     headEntityId: row.head_entity_id,
@@ -234,20 +298,20 @@ export class PgStructuredIdentityStore implements StructuredIdentityStore {
       [entityId, type]
     );
     const row = result.rows[0] as
-      | { entity_id: string; entity_type: string }
-      | undefined;
+      { entity_id: string; entity_type: string } | undefined;
     if (row === undefined) {
       throw new StructuredIdentityError(
         "structured identity refused entity: registration returned no row",
         "entity_id"
       );
     }
-    return { entityId: row.entity_id, type: requireEntityType(row.entity_type) };
+    return {
+      entityId: row.entity_id,
+      type: requireEntityType(row.entity_type),
+    };
   }
 
-  async findEntity(
-    entityId: string
-  ): Promise<RegisteredEntityIdentity | null> {
+  async findEntity(entityId: string): Promise<RegisteredEntityIdentity | null> {
     const result = await this.client.query(
       `SELECT entity_id, entity_type
          FROM structured_entity_identities
@@ -255,10 +319,12 @@ export class PgStructuredIdentityStore implements StructuredIdentityStore {
       [normalizeEntityId(entityId)]
     );
     const row = result.rows[0] as
-      | { entity_id: string; entity_type: string }
-      | undefined;
+      { entity_id: string; entity_type: string } | undefined;
     if (row === undefined) return null;
-    return { entityId: row.entity_id, type: requireEntityType(row.entity_type) };
+    return {
+      entityId: row.entity_id,
+      type: requireEntityType(row.entity_type),
+    };
   }
 
   async registerRelationAssertion(
@@ -295,7 +361,9 @@ export class PgStructuredIdentityStore implements StructuredIdentityStore {
     }
     // Conflict path: the same exact tuple is already registered. Read it back so
     // the caller sees the persisted identity, never a freshly derived one.
-    return (await this.findRelationAssertion(assertionId)) ?? collisionRefusal();
+    return (
+      (await this.findRelationAssertion(assertionId)) ?? collisionRefusal()
+    );
   }
 
   async findRelationAssertion(
@@ -317,6 +385,7 @@ function isTupleUniqueViolation(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;
   const candidate = err as { code?: unknown; constraint?: unknown };
   return (
-    candidate.code === "23505" && candidate.constraint === TUPLE_UNIQUE_CONSTRAINT
+    candidate.code === "23505" &&
+    candidate.constraint === TUPLE_UNIQUE_CONSTRAINT
   );
 }

@@ -25,6 +25,7 @@ import {
   MAX_AUTO_ATTEMPTS,
   type MaintenanceAttemptGuard,
   type MaintenanceAttemptRecord,
+  type MaintenanceDependency,
   type MaintenanceJobRecord,
   type MaintenanceLiveInputs,
   type MaintenanceReclaimOutcome,
@@ -32,11 +33,13 @@ import {
   type MaintenanceSettleOutcome,
   type MaintenanceSettleResult,
   type MaintenanceWorkRequest,
+  type MaintenanceWorkFailureCode,
   type MaintenanceWorkStatus,
   type MaintenanceWorkStore,
 } from "../maintenance/types.js";
 
 interface StoredJob extends MaintenanceJobRecord {
+  readonly dependencies: readonly MaintenanceDependency[];
   readonly fencingToken: string | null;
   readonly leaseExpiresAt: string | null;
   readonly attemptStartedAt: string | null;
@@ -45,7 +48,100 @@ interface StoredJob extends MaintenanceJobRecord {
 export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
   private readonly jobs = new Map<string, StoredJob>();
   private readonly attempts = new Map<string, MaintenanceAttemptRecord[]>();
+  private readonly progressListeners = new Set<
+    (sourceRef: string, generation: number) => void
+  >();
   private closed = false;
+
+  /** Internal observer for publication summaries backed by this same ledger. */
+  onProgressChange(
+    listener: (sourceRef: string, generation: number) => void
+  ): () => void {
+    this.progressListeners.add(listener);
+    return () => this.progressListeners.delete(listener);
+  }
+
+  publicationJobsForSource(
+    sourceRef: string,
+    generation: number
+  ): readonly MaintenanceJobRecord[] {
+    return [...this.jobs.values()]
+      .filter(
+        (job) =>
+          job.sourceRef === sourceRef && job.sourceGeneration === generation
+      )
+      .sort((left, right) => left.updatedAt.localeCompare(right.updatedAt))
+      .map(toRecord);
+  }
+
+  publicationDependenciesForGuard(
+    guard: MaintenanceAttemptGuard
+  ): readonly MaintenanceDependency[] | null {
+    const job = this.jobs.get(guard.jobKey);
+    if (job === undefined) return null;
+    return job.dependencies.map((dependency) => ({
+      ...dependency,
+      relationBuckets: [...dependency.relationBuckets],
+    }));
+  }
+
+  publicationGuardFailure(
+    guard: MaintenanceAttemptGuard,
+    now: Date
+  ): MaintenanceWorkFailureCode | null {
+    const job = this.jobs.get(guard.jobKey);
+    if (job === undefined || job.status !== "running") return "lease_lost";
+    const actual = toGuard(job);
+    const ownership = verifyAttemptOwnership(actual, now, guard.fencingToken);
+    if (!ownership.ok) return ownership.code;
+    if (!samePublicationGuardInputs(actual, guard)) return "input_stale";
+    const history = this.attempts.get(guard.jobKey);
+    if (!hasOpenPublicationAttempt(history, guard))
+      return "backend_unavailable";
+    return null;
+  }
+
+  preparePublicationReady(
+    guard: MaintenanceAttemptGuard,
+    now: Date,
+    completedAt: Date = now
+  ): { readonly failure: MaintenanceWorkFailureCode | null; commit(): void } {
+    const failure = this.publicationGuardFailure(guard, now);
+    const job = this.jobs.get(guard.jobKey);
+    if (failure !== null || job === undefined) {
+      return { failure: failure ?? "lease_lost", commit: () => undefined };
+    }
+    const history = this.attempts.get(guard.jobKey)!;
+    const historyIndex = history.findIndex(
+      (attempt) =>
+        attempt.attemptNumber === guard.attemptNumber &&
+        attempt.fencingToken === guard.fencingToken &&
+        attempt.finishedAt === null
+    );
+    const stamp = completedAt.toISOString();
+    return {
+      failure: null,
+      commit: () => {
+        this.jobs.set(job.jobKey, {
+          ...job,
+          status: "ready",
+          lastFailureCode: null,
+          nextAttemptAt: null,
+          fencingToken: null,
+          leaseExpiresAt: null,
+          attemptStartedAt: null,
+          updatedAt: stamp,
+        });
+        history[historyIndex] = {
+          ...history[historyIndex]!,
+          failureCode: null,
+          finishedAt: stamp,
+          reclaimed: false,
+        };
+        this.notifyProgress(job.sourceRef, job.sourceGeneration);
+      },
+    };
+  }
 
   async scheduleWork(
     request: MaintenanceWorkRequest,
@@ -64,6 +160,10 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       sourceVersion: request.sourceVersion,
       sourceGeneration: request.sourceGeneration,
       inputRevision: canonicalDependencyRevision(request.dependencies),
+      dependencies: request.dependencies.map((dependency) => ({
+        ...dependency,
+        relationBuckets: [...dependency.relationBuckets],
+      })),
       configRevision: request.configRevision,
       status: "pending",
       attemptCount: 0,
@@ -78,6 +178,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       attemptStartedAt: null,
     };
     this.jobs.set(jobKey, stored);
+    this.notifyProgress(stored.sourceRef, stored.sourceGeneration);
     return { record: toRecord(stored), inserted: true };
   }
 
@@ -122,6 +223,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       finishedAt: null,
       reclaimed: false,
     });
+    this.notifyProgress(claimed.sourceRef, claimed.sourceGeneration);
     return toGuard(claimed);
   }
 
@@ -146,12 +248,15 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     );
     if (!verdict.ok) return false;
 
-    const absolute = absoluteDeadlineFrom(job.attemptStartedAt ?? now.toISOString());
+    const absolute = absoluteDeadlineFrom(
+      job.attemptStartedAt ?? now.toISOString()
+    );
     this.jobs.set(job.jobKey, {
       ...job,
       leaseExpiresAt: earlier(leaseExpiryFrom(now.toISOString()), absolute),
       updatedAt: now.toISOString(),
     });
+    this.notifyProgress(job.sourceRef, job.sourceGeneration);
     return true;
   }
 
@@ -176,6 +281,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       updatedAt: stamp,
     };
     this.jobs.set(jobKey, retried);
+    this.notifyProgress(retried.sourceRef, retried.sourceGeneration);
     return toRecord(retried);
   }
 
@@ -189,7 +295,12 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     const job = this.jobs.get(guard.jobKey);
     if (!job || job.status !== "running") return { result: "lease_lost" };
 
-    const verdict = verifyAttemptGuard(toGuard(job), live, now, guard.fencingToken);
+    const verdict = verifyAttemptGuard(
+      toGuard(job),
+      live,
+      now,
+      guard.fencingToken
+    );
     const stamp = now.toISOString();
     if (!verdict.ok && verdict.code === "input_stale") {
       const superseded = this.persist(job, "stale", stamp, "input_stale");
@@ -199,6 +310,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
         failureCode: "input_stale",
         finishedAt: stamp,
       });
+      this.notifyProgress(job.sourceRef, job.sourceGeneration);
       return { result: "stale", record: toRecord(superseded) };
     }
     if (!verdict.ok) {
@@ -222,6 +334,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
         failureCode: "execution_timeout",
         finishedAt: stamp,
       });
+      this.notifyProgress(job.sourceRef, job.sourceGeneration);
       return { result: "timed_out", record: toRecord(timedOut) };
     }
 
@@ -232,11 +345,13 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
       failureCode: outcome.status === "failed" ? outcome.failureCode : null,
       finishedAt: stamp,
     });
+    this.notifyProgress(job.sourceRef, job.sourceGeneration);
     return { result: "settled", record: toRecord(settled) };
   }
 
   async reclaimExpiredWork(
-    now: Date): Promise<readonly MaintenanceReclaimOutcome[]> {
+    now: Date
+  ): Promise<readonly MaintenanceReclaimOutcome[]> {
     this.assertOpen();
     const stamp = now.toISOString();
     const outcomes: MaintenanceReclaimOutcome[] = [];
@@ -253,6 +368,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
         nextAttemptAt: stamp,
       };
       this.jobs.set(reclaimed.jobKey, reclaimed);
+      this.notifyProgress(job.sourceRef, job.sourceGeneration);
       this.finishAttempt({
         jobKey: job.jobKey,
         attemptNumber: job.attemptCount,
@@ -261,6 +377,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
         reclaimed: true,
         tolerateMissing: true,
       });
+      this.notifyProgress(job.sourceRef, job.sourceGeneration);
       outcomes.push({ jobKey: job.jobKey, reclaimed: true });
     }
     return outcomes;
@@ -340,22 +457,26 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     }
   }
 
+  private notifyProgress(sourceRef: string, generation: number): void {
+    for (const listener of this.progressListeners) {
+      listener(sourceRef, generation);
+    }
+  }
+
   private appendAttempt(attempt: MaintenanceAttemptRecord): void {
     const history = this.attempts.get(attempt.jobKey) ?? [];
     history.push(attempt);
     this.attempts.set(attempt.jobKey, history);
   }
 
-  private finishAttempt(
-    attempt: {
-      readonly jobKey: string;
-      readonly attemptNumber: number;
-      readonly failureCode: MaintenanceAttemptRecord["failureCode"];
-      readonly finishedAt: string;
-      readonly reclaimed?: boolean;
-      readonly tolerateMissing?: boolean;
-    }
-  ): void {
+  private finishAttempt(attempt: {
+    readonly jobKey: string;
+    readonly attemptNumber: number;
+    readonly failureCode: MaintenanceAttemptRecord["failureCode"];
+    readonly finishedAt: string;
+    readonly reclaimed?: boolean;
+    readonly tolerateMissing?: boolean;
+  }): void {
     const history = this.attempts.get(attempt.jobKey) ?? [];
     const index = history.findIndex(
       (entry) => entry.attemptNumber === attempt.attemptNumber
@@ -396,8 +517,12 @@ function shift(iso: string, ms: number): string {
  */
 function byQueueOrder(left: StoredJob, right: StoredJob): number {
   if (left.nextAttemptAt !== right.nextAttemptAt) {
-    const leftRank = left.nextAttemptAt === null ? -Infinity : Date.parse(left.nextAttemptAt);
-    const rightRank = right.nextAttemptAt === null ? -Infinity : Date.parse(right.nextAttemptAt);
+    const leftRank =
+      left.nextAttemptAt === null ? -Infinity : Date.parse(left.nextAttemptAt);
+    const rightRank =
+      right.nextAttemptAt === null
+        ? -Infinity
+        : Date.parse(right.nextAttemptAt);
     if (leftRank !== rightRank) return leftRank < rightRank ? -1 : 1;
   }
   if (left.createdAt !== right.createdAt) {
@@ -407,8 +532,45 @@ function byQueueOrder(left: StoredJob, right: StoredJob): number {
 }
 
 function toRecord(job: StoredJob): MaintenanceJobRecord {
-  const { fencingToken, leaseExpiresAt, attemptStartedAt, ...record } = job;
+  const {
+    fencingToken,
+    leaseExpiresAt,
+    attemptStartedAt,
+    dependencies,
+    ...record
+  } = job;
   return record;
+}
+
+function samePublicationGuardInputs(
+  actual: MaintenanceAttemptGuard,
+  presented: MaintenanceAttemptGuard
+): boolean {
+  const fields = [
+    "attemptNumber",
+    "sourceRef",
+    "sourceVersion",
+    "sourceGeneration",
+    "inputRevision",
+    "configRevision",
+    "leaseExpiresAt",
+    "attemptStartedAt",
+  ] as const satisfies readonly (keyof MaintenanceAttemptGuard)[];
+  return fields.every((field) => actual[field] === presented[field]);
+}
+
+function hasOpenPublicationAttempt(
+  history: readonly MaintenanceAttemptRecord[] | undefined,
+  guard: MaintenanceAttemptGuard
+): boolean {
+  return (
+    history?.some(
+      (attempt) =>
+        attempt.attemptNumber === guard.attemptNumber &&
+        attempt.fencingToken === guard.fencingToken &&
+        attempt.finishedAt === null
+    ) ?? false
+  );
 }
 
 function toGuard(job: StoredJob): MaintenanceAttemptGuard {

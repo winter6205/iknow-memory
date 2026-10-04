@@ -49,7 +49,9 @@ const sqlList = (values: readonly string[]): string =>
  * in `maintenance_job_attempts`. Keeping the live lease on the job row is what
  * makes claim and fence a single-row atomic update.
  */
-export async function upSchemaMaintenanceWork(client: SchemaClient): Promise<void> {
+export async function upSchemaMaintenanceWork(
+  client: SchemaClient
+): Promise<void> {
   await client.query(`
     CREATE TABLE IF NOT EXISTS maintenance_jobs (
       job_key            text PRIMARY KEY,
@@ -59,6 +61,8 @@ export async function upSchemaMaintenanceWork(client: SchemaClient): Promise<voi
       source_version     text NOT NULL CHECK (length(source_version) > 0),
       source_generation  bigint NOT NULL CHECK (source_generation >= 0),
       input_revision     text NOT NULL CHECK (length(input_revision) > 0),
+      input_dependencies jsonb NOT NULL DEFAULT '[]'::jsonb
+                          CHECK (jsonb_typeof(input_dependencies) = 'array'),
       config_revision    text NOT NULL CHECK (length(config_revision) > 0),
       status             text NOT NULL DEFAULT 'pending'
                           CHECK (status IN (${sqlList(MAINTENANCE_WORK_STATUS)})),
@@ -74,6 +78,8 @@ export async function upSchemaMaintenanceWork(client: SchemaClient): Promise<voi
       created_at         timestamptz NOT NULL,
       updated_at         timestamptz NOT NULL
     )`);
+  await client.query(`ALTER TABLE maintenance_jobs
+    ADD COLUMN IF NOT EXISTS input_dependencies jsonb NOT NULL DEFAULT '[]'::jsonb`);
   /**
    * Claim scan: oldest pending work whose retry deadline has passed. Partial on
    * `pending` so a running job — which reclaim owns, not claim — can never

@@ -33,6 +33,7 @@ import { createEvidenceTables } from "./schema-evidence.js";
 import { sqlTextList, sqlTextLiteral } from "./schema-sql.js";
 import type { SchemaBootstrapClient } from "./schema-sql.js";
 import { upSchemaMaintenanceWork } from "./schema-maintenance-work.js";
+import { upSchemaPublication } from "./schema-publication.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 export type { SchemaBootstrapClient } from "./schema-sql.js";
 
@@ -679,10 +680,7 @@ async function createStructuredIdentities(
       created_at       timestamptz NOT NULL DEFAULT now()
     )`);
   for (const [column, constraint] of [
-    [
-      "valid_from",
-      "structured_relation_assertion_identities_from_shape_check",
-    ],
+    ["valid_from", "structured_relation_assertion_identities_from_shape_check"],
     [
       "valid_until",
       "structured_relation_assertion_identities_until_shape_check",
@@ -827,6 +825,7 @@ export async function upSchemaBootstrap(
     await createEvidenceTables(client);
     await upSchemaProjection(client);
     await upSchemaMaintenanceWork(client);
+    await upSchemaPublication(client);
     // ALTER chunks back-pointers must come after `source_documents` exists
     // (FK target) and after `chunks` itself exists (caller's responsibility —
     // `PgvectorBackend.ensureTable` creates it before invoking us).

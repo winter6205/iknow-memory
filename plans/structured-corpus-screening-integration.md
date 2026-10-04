@@ -211,7 +211,10 @@ open until actual ingest, backend-ID mapping, measured limits and fin interactio
 
 Initial architecture gate: four yes, one unclear (bounded-context-guardian).
 The correction above specifies the shared PG-client/memory prepare-commit seam
-and authorized-source read subset; independent re-review is pending.
-No source implementation is authorized by this draft
-until the concrete shared-authority seams and five verdicts are recorded.
+and authorized-source read subset. Independent re-review of plan commit
+`3f0831f` returned five yes verdicts on 2026-10-04:
+bounded-context-guardian, input-contract-tests, error-handling-enforcer,
+complexity-anti-drift, and minimal-change-verifier. The architecture gate passes.
+Source implementation may start after the verified publication checkpoint;
+this verdict is not evidence that screening or full M-STATUS exists yet.
 This is main-session hard integration work, not a ready-for-agent test issue.

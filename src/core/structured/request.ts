@@ -17,8 +17,8 @@
  *     `unsupported_operator` — a string token outside its closed set.
  *   - `invalid_value` — the value violates the type or bound declared for it
  *     (non-canonical UUID, non-catalog entity type, an `in` list outside
- *     1–20 unique values, a limit/read_revision that is not a finite safe
- *     integer in range).
+ *     1–20 unique values, a limit that is not a finite safe integer in range,
+ *     or a count `read_revision` that is not a non-empty opaque string).
  *   - `request_too_large` — the encoded request exceeds 32 KiB.
  *
  * Two SPEC decisions are load-bearing and easy to get wrong:
@@ -142,8 +142,8 @@ export interface ValidatedStructuredQuery {
   limit: number | undefined;
   /** Opaque continuation token, unvalidated here — `invalid_cursor` is QP6's. */
   cursor: string | undefined;
-  /** Requested data revision; staleness is a QP6/QP7 typed refusal. */
-  readRevision: number | undefined;
+  /** Opaque count-only revision token; staleness is a QP7 typed refusal. */
+  readRevision: string | undefined;
 }
 
 /** Top-level members the SPEC declares. Anything else is refused. */
@@ -562,14 +562,13 @@ function readRelationship(
 interface OperationBounds {
   limit: number | undefined;
   cursor: string | undefined;
-  readRevision: number | undefined;
+  readRevision: string | undefined;
 }
 
 function readOperationMembers(
   members: Readonly<Record<string, unknown>>,
   operation: StructuredOperation
 ): OperationBounds {
-  const readRevision = readCounter(members["read_revision"], "read_revision", 0);
   if (operation === "count") {
     // Count is not a page: carrying the list-only controls is an illegal
     // combination, refused rather than ignored.
@@ -581,7 +580,17 @@ function readOperationMembers(
         );
       }
     }
-    return { limit: undefined, cursor: undefined, readRevision };
+    return {
+      limit: undefined,
+      cursor: undefined,
+      readRevision: readCountReadRevision(members),
+    };
+  }
+  if (Object.hasOwn(members, "read_revision")) {
+    refuse(
+      "malformed_structured_query",
+      'list rejects the count-only member "read_revision"'
+    );
   }
   const cursor = members["cursor"];
   if (cursor !== undefined && typeof cursor !== "string") {
@@ -595,15 +604,32 @@ function readOperationMembers(
       readCounter(members["limit"], "limit", 1, STRUCTURED_LIST_MAX_LIMIT) ??
       STRUCTURED_LIST_DEFAULT_LIMIT,
     cursor: cursor ?? undefined,
-    readRevision,
+    readRevision: undefined,
   };
+}
+
+/** A count may be guarded by the exact opaque revision emitted by a prior read. */
+function readCountReadRevision(
+  members: Readonly<Record<string, unknown>>
+): string | undefined {
+  if (!Object.hasOwn(members, "read_revision")) {
+    return undefined;
+  }
+  const value = members["read_revision"];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    refuse(
+      "invalid_value",
+      "structured_query.read_revision must be a non-empty opaque string"
+    );
+  }
+  return value;
 }
 
 /**
  * A counter the SPEC declares as a finite safe integer. Booleans, fractions,
  * negatives, and unsafe integers are all in one class here: they are not
  * accepted, not rounded, and not clamped. An absent member reads as absent,
- * which is how `limit` picks up its default and `read_revision` stays optional.
+ * which is how `limit` picks up its default.
  */
 function readCounter(
   value: unknown,

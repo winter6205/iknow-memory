@@ -55,10 +55,12 @@ const EMIT_SQL = `INSERT INTO projection_outbox
  */
 export async function emitProjectionIntents(
   client: OutboxClient,
-  subjects: readonly ProjectionSubject[]
+  subjects: readonly ProjectionSubject[],
+  beforeWrite?: () => Promise<void>
 ): Promise<number> {
   let queued = 0;
   for (const subject of dedupe(subjects)) {
+    await beforeWrite?.();
     const { rows } = await client.query(`${EMIT_SQL} RETURNING id`, [
       randomUUID(),
       subject.kind,

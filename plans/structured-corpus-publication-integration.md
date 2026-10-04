@@ -188,3 +188,34 @@ Reviewer: `/root/publication_architecture_gate`. Foundations pinned at
 implementation. Tests and shared API contract are authored first; one coupled
 IK implementer owns production files while an independent test engineer owns
 publication tests. No gate closes full Q/E/M acceptance.
+
+## WIP implementation checkpoint — 2026-10-04
+
+The optional publication capability is implemented in memory and PostgreSQL.
+The strict publication driver passed 29 cases against local real PostgreSQL;
+memory parity passed 28 cases. Maintenance PostgreSQL regressions passed 13
+cases and bootstrap column repair passed 3. Typecheck, build and `lint:s5`
+passed. This validates controlled boundary fixtures, not the draft public-corpus
+oracle, full M-STATUS, or final Q/E/M behavior acceptance.
+
+An initial full regression run produced 2833 passed, 19 failed and 322 skipped.
+Eighteen failures were inherited provider-environment contamination in config
+tests: the config file passed all 188 tests when provider variables were removed
+only from the test subprocess. One failure exposed a new DDL/readiness index
+lockstep mismatch. The unchanged lockstep test reproduced it (1 failed, 7 passed)
+and passed all 8 after explicit matching primary-key/index DDL was added.
+The fresh isolated full regression then passed 2852 tests with 322 skipped
+(exit 0). The subprocess removed provider variables without printing their
+values or modifying configuration files.
+The skipped real dependencies are unverified by that default run; strict
+publication and maintenance commands above provide their separate real-PG
+evidence. No production settings or credentials were changed.
+
+After the DDL correction, root independently reran the strict publication
+driver together with `tests/storage/evidence-store-pg.test.ts` and
+`tests/structured/identity-store-pg.test.ts`, using the isolated development DSN:
+61 passed (29 publication, 25 Evidence, 7 identity), zero skips, exit 0.
+
+The accepted screening plan owns the next shared scope UOW, owner/source/job
+lock ordering, reader-subset views and complete structural status. This WIP
+checkpoint is not a default-branch landing or rollout approval.

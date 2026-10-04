@@ -61,6 +61,13 @@ const BOOTSTRAP_COLUMNS = [
   // createCommunitySummaries, so it MUST be probed or deployed databases
   // never get the column (bootstrap-columns lockstep).
   ["community_summaries", "level"],
+  // Added to an already bootstrapped maintenance_jobs table by the work schema.
+  ["maintenance_jobs", "input_dependencies"],
+  ["structured_publication_display", "extraction_revision"],
+  ["structured_publication_extraction_bindings", "extraction_revision"],
+  ["structured_publication_extraction_bindings", "config_revision"],
+  ["structured_publication_extraction_bindings", "extraction_ref"],
+  ["structured_publication_extraction_bindings", "payload_digest"],
 ] as const;
 const BOOTSTRAP_TABLES = [
   "entities",
@@ -95,6 +102,12 @@ const BOOTSTRAP_TABLES = [
   // bootstrap short-circuits before replaying their CREATE statements.
   "maintenance_jobs",
   "maintenance_job_attempts",
+  "structured_publication_scopes",
+  "structured_publication_sources",
+  "structured_publication_membership",
+  "structured_publication_display",
+  "structured_publication_stages",
+  "structured_publication_extraction_bindings",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -142,6 +155,11 @@ const BOOTSTRAP_INDEXES = [
   "maintenance_jobs_expired_lease_idx",
   "maintenance_jobs_source_idx",
   "maintenance_job_attempts_history_idx",
+  "structured_publication_sources_scope_idx",
+  "structured_publication_membership_read_idx",
+  "structured_publication_stages_guard_idx",
+  "structured_publication_display_pkey",
+  "structured_publication_extraction_bindings_pkey",
 ] as const;
 
 /**
@@ -259,6 +277,27 @@ async function schemaBootstrapIsReady(
           WHERE n.nspname = current_schema()
             AND t.relname = 'entities'
             AND k.conname = 'entities_type_closed_check'
+       )
+       AND EXISTS (
+         SELECT 1
+           FROM pg_trigger tr
+           JOIN pg_class t ON t.oid = tr.tgrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND t.relname = 'maintenance_jobs'
+            AND tr.tgname = 'maintenance_jobs_publication_progress_trg'
+            AND NOT tr.tgisinternal
+       )
+       AND EXISTS (
+         SELECT 1
+           FROM pg_constraint k
+           JOIN pg_class t ON t.oid = k.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND t.relname = 'structured_publication_display'
+            AND k.conname = 'structured_publication_display_pkey'
+            AND pg_get_constraintdef(k.oid) =
+              'PRIMARY KEY (scope_binding, source_ref, support_id, extraction_revision)'
        ) AS ready`,
     [
       BOOTSTRAP_TABLES,

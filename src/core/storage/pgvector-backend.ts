@@ -54,6 +54,8 @@ import type {
   SupportRecord,
 } from "../types.js";
 import { PgStructuredPublicationStorage } from "./publication-pg.js";
+import { PgStructuredScopeUnitOfWork } from "./structured-scope-uow.js";
+import type { ScopeClientLease } from "./structured-scope-types.js";
 import type { StructuredPublicationStorage } from "../maintenance/publication-types.js";
 import {
   appendContentInvalidation,
@@ -648,6 +650,14 @@ export class PgvectorBackend
     StorageReadPort
 {
   structuredPublication: StructuredPublicationStorage;
+  /**
+   * The one write authority every accepted structured mutation cooperates on:
+   * composition hands it to the publication adapter, and the same seam mints the
+   * trusted contexts readers run under. Two authorities — one per adapter — is
+   * what let a publication and a work settlement hold the same rows in opposite
+   * orders.
+   */
+  readonly structuredScopeUnitOfWork: PgStructuredScopeUnitOfWork;
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
   private readonly poolConfig: PgvectorPoolConfig;
@@ -663,11 +673,18 @@ export class PgvectorBackend
     private readonly dimensions: number,
     options: PgvectorBackendOptions = {}
   ) {
+    // One lease, one client per structured transaction: the seam owns the
+    // transaction and the publication helpers read through that same client, so
+    // a write never spans two connections from this pool.
+    const structuredClientLease: ScopeClientLease = async () => {
+      const pool = await this.ensureReady();
+      return this.connectWithTimeout(pool);
+    };
+    this.structuredScopeUnitOfWork = new PgStructuredScopeUnitOfWork(
+      structuredClientLease
+    );
     this.structuredPublication = new PgStructuredPublicationStorage(
-      async () => {
-        const pool = await this.ensureReady();
-        return this.connectWithTimeout(pool);
-      }
+      this.structuredScopeUnitOfWork
     );
     this.annMaxDimensions = options.annMaxDimensions;
     this.embedModel = options.embedModel;

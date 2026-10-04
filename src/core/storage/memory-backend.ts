@@ -54,6 +54,10 @@ import type {
 import { InMemoryStructuredIdentityStore } from "../structured/identity-store.js";
 import { InMemoryMaintenanceWorkStore } from "./maintenance-work-memory.js";
 import { MemoryStructuredPublicationStorage } from "./publication-memory.js";
+import {
+  MemoryStructuredScopeTail,
+  MemoryStructuredScopeUnitOfWork,
+} from "./structured-scope-uow.js";
 import type {
   PublicationOutboxPort,
   StructuredPublicationStorage,
@@ -224,6 +228,14 @@ export class MemoryBackend
   readonly maintenanceWorkStore = new InMemoryMaintenanceWorkStore();
   /** Optional backend capability backed by these exact identity/evidence/work maps. */
   structuredPublication: StructuredPublicationStorage;
+  /**
+   * The one serialization queue behind every accepted structured write:
+   * publication, the work ledger and the scope seam all queue here, so no writer
+   * can commit while another is between its last validation and its commit.
+   */
+  private readonly scopeTail: MemoryStructuredScopeTail;
+  /** The shared write authority the publication and work adapters compose with. */
+  readonly structuredScopeUnitOfWork: MemoryStructuredScopeUnitOfWork;
   private readonly publicationUow: MemoryStructuredPublicationStorage;
 
   private readonly store = new Map<string, ChunkRecord>();
@@ -295,11 +307,19 @@ export class MemoryBackend
     private readonly dimensions: number,
     options: { readonly publicationOutbox?: PublicationOutboxPort } = {}
   ) {
+    this.scopeTail = new MemoryStructuredScopeTail();
     this.publicationUow = new MemoryStructuredPublicationStorage(
       this,
-      options.publicationOutbox
+      options.publicationOutbox,
+      this.scopeTail
     );
     this.structuredPublication = this.publicationUow;
+    this.structuredScopeUnitOfWork = new MemoryStructuredScopeUnitOfWork(
+      this.scopeTail,
+      this.publicationUow,
+      this.maintenanceWorkStore,
+      this
+    );
   }
 
   /**
@@ -1518,6 +1538,18 @@ export class MemoryBackend
     };
     this.scopeRevisions.set(scope, next);
     return { ...next };
+  }
+
+  /**
+   * The scope's current authorization revision, read by the shared write
+   * authority before it takes any lock.
+   *
+   * A unit of work that mints its context from one revision and then runs after
+   * the grant moved would be serving a corpus the tenant no longer authorizes,
+   * so this is the seam's deny-before-write check rather than a post-hoc filter.
+   */
+  authorizationRevision(scopeBinding: string): string | null {
+    return this.scopeRevisions.get(scopeBinding)?.authorization_revision ?? null;
   }
 
   async markSourceVersionRetired(

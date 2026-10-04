@@ -12,6 +12,16 @@
  * already the package's largest module and serves the ingest/read path, while
  * this capability is an opt-in lifecycle ledger that no read path touches. A
  * separate class also keeps the maintenance tables unreachable from a query.
+ *
+ * Lock order is the shared authority's, not a ledger-local one. The scope
+ * progress bump a job write triggers reaches `structured_publication_scopes`
+ * from inside the statement that writes the job, so a writer that took the job
+ * row first held the job and the scope in the opposite order to publication,
+ * which takes the scope before the job. Every mutation here now reserves the
+ * sources and locks owner scope and source rows — in publication's order —
+ * before it touches a job row, which makes that trigger's scope write reentrant
+ * instead of a deadlock. A source nobody owns keeps the standalone path: the
+ * reservation it holds is what proves nobody became the owner mid-write.
  */
 import { randomUUID } from "node:crypto";
 
@@ -23,6 +33,7 @@ import {
   verifyAttemptGuard,
 } from "../maintenance/durable-work.js";
 import {
+  MAINTENANCE_WORK_FAILURE_CODES,
   MAX_AUTO_ATTEMPTS,
   WORK_ABSOLUTE_LIMIT_MS,
   WORK_LEASE_MS,
@@ -39,7 +50,19 @@ import {
   type MaintenanceWorkStatus,
   type MaintenanceWorkStore,
 } from "../maintenance/types.js";
-import { recordSuppressedFailure } from "../errors.js";
+import { PgStructuredScopeUnitOfWork } from "./structured-scope-uow.js";
+import {
+  lockAffectedSources,
+  lockOwnerScope,
+  reserveSources,
+  resolveOwnership,
+  stableSourceRefs,
+} from "./structured-scope-locks-pg.js";
+import { structuredScopeError } from "./structured-scope-types.js";
+import type {
+  ScopeTransactionClient,
+  SourceOwnership,
+} from "./structured-scope-types.js";
 
 /** A leased connection. Satisfied by `pg.PoolClient` and by the test fakes. */
 export interface MaintenanceWorkLease {
@@ -55,6 +78,52 @@ export interface MaintenanceWorkPool {
   connect(): Promise<MaintenanceWorkLease>;
 }
 
+/**
+ * A seam client and a work lease are the same pooled connection seen through two
+ * query typings. Two connections would let one ledger write wait on a lock
+ * another of its own transactions holds, which is how the old scope-after-job
+ * progress path stalled behind a publication it was blocking itself.
+ */
+function asWorkLease(client: ScopeTransactionClient): MaintenanceWorkLease {
+  return client as MaintenanceWorkLease;
+}
+
+/**
+ * The store's own typed failure, so the ledger keeps one error vocabulary at its
+ * boundary. A fault this store raised is re-raised unchanged — a caller branches
+ * on `failureCode`, and re-wrapping it would rename the verdict. Anything else
+ * carries a code the ledger may not state, and `backend_unavailable` is the only
+ * honest reading of a storage fault with no name.
+ */
+function workStoreError(error: unknown): MaintenanceStoreError {
+  if (error instanceof MaintenanceStoreError) return error;
+  const scoped = structuredScopeError(error);
+  return new MaintenanceStoreError(
+    scoped.message,
+    workFailureCodeOf(scoped.code)
+  );
+}
+
+const WORK_FAILURE_CODES: ReadonlySet<string> = new Set(
+  MAINTENANCE_WORK_FAILURE_CODES
+);
+
+function workFailureCodeOf(
+  code: string
+): MaintenanceWorkFailureCode {
+  return WORK_FAILURE_CODES.has(code)
+    ? (code as MaintenanceWorkFailureCode)
+    : "backend_unavailable";
+}
+
+/**
+ * How many candidates one global claim inspects. Bounded because a contended
+ * candidate set must not turn a claim into a scan: giving up is honest, since a
+ * worker polls again and the reservation each candidate needs is released as
+ * soon as the losing transaction ends.
+ */
+const CLAIM_CANDIDATE_LIMIT = 5;
+
 const JOB_COLUMNS =
   "job_key, work_kind, source_ref, source_version, source_generation, " +
   "input_revision, config_revision, status, attempt_count, auto_attempt_count, " +
@@ -68,12 +137,32 @@ const JOB_COLUMNS =
 const ABSOLUTE_BOUND_SQL = `attempt_started_at + interval '${WORK_ABSOLUTE_LIMIT_MS / 1000} seconds'`;
 const LEASE_SQL = `interval '${WORK_LEASE_MS / 1000} seconds'`;
 
+/** One row of the claimable set, read before any job lock exists. */
+interface ClaimCandidate {
+  readonly jobKey: string;
+  readonly sourceRef: string;
+}
+
+/** What one nonblocking claim sweep ended with, and what it left to wait for. */
+interface ClaimPass {
+  readonly guard: MaintenanceAttemptGuard | null;
+  readonly head: ClaimCandidate | null;
+}
+
 export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   private readonly pool: MaintenanceWorkPool;
+  /**
+   * The transaction owner shared with publication. Composition may inject the
+   * backend's instance; the default one leases through this store's own guard so
+   * a pool fault still arrives as a typed ledger failure.
+   */
+  private readonly scope: PgStructuredScopeUnitOfWork;
   private closed = false;
 
-  constructor(pool: MaintenanceWorkPool) {
+  constructor(pool: MaintenanceWorkPool, scope?: PgStructuredScopeUnitOfWork) {
     this.pool = pool;
+    this.scope =
+      scope ?? new PgStructuredScopeUnitOfWork(() => this.lease());
   }
 
   /**
@@ -94,6 +183,11 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
     now: Date
   ): Promise<MaintenanceScheduleOutcome> {
     return this.transact(async (lease) => {
+      // Only the initiating source: the progress bump a schedule triggers is
+      // gated on the scope owning this job's own (source_ref, generation), so
+      // locking the dependency vector would serialize a schedule behind sources
+      // the write cannot reach.
+      await this.secureSourceAuthority(lease, [request.sourceRef]);
       const { rows } = await lease.query(
         `INSERT INTO maintenance_jobs
            (job_key, work_kind, source_ref, source_version, source_generation,
@@ -141,57 +235,70 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   }
 
   /**
-   * Claim and record the attempt in one transaction. `FOR UPDATE SKIP LOCKED`
-   * is what makes concurrent workers safe: the second steps over the row the
-   * first holds instead of blocking or claiming the same job.
+   * Claim and record the attempt. `FOR UPDATE SKIP LOCKED` is what makes
+   * concurrent workers safe: the second steps over the row the first holds
+   * instead of blocking or claiming the same job.
    *
    * Only `pending` rows are claimable. A running job whose lease expired belongs
    * to `reclaimExpiredWork`, and keeping the two apart is what guarantees the
    * reclaimer invalidates the old token before anybody claims a new attempt.
+   *
+   * The sweep takes candidates in queue order and reserves each without waiting,
+   * so a claim never queues behind a write it cannot predict. The head is the one
+   * exception and gets a second pass: a head whose reservation is refused is a
+   * source mid first-assignment, which is work rather than an empty queue, and a
+   * worker that reported none would let the oldest job starve behind repeated
+   * assignments. That pass runs in its own transaction, so it waits holding
+   * nothing but the reservation it is waiting for.
    */
   async claimWork(now: Date): Promise<MaintenanceAttemptGuard | null> {
-    return this.transact(async (lease) => {
-      const stamp = now.toISOString();
-      const { rows } = await lease.query(
-        `UPDATE maintenance_jobs SET
-           status = 'running',
-           attempt_count = attempt_count + 1,
-           auto_attempt_count = auto_attempt_count + 1,
-           fencing_token = $1,
-           lease_expires_at = $2,
-           attempt_started_at = $3,
-           last_failure_code = NULL,
-           next_attempt_at = NULL,
-           updated_at = $3
-         WHERE job_key = (
-           SELECT job_key FROM maintenance_jobs
-            WHERE status = 'pending'
-              AND (next_attempt_at IS NULL OR next_attempt_at <= $3)
-            ORDER BY next_attempt_at ASC NULLS FIRST, created_at ASC, job_key ASC
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1)
-         RETURNING ${JOB_COLUMNS}, fencing_token, lease_expires_at, attempt_started_at`,
-        [
-          randomUUID(),
-          new Date(now.getTime() + WORK_LEASE_MS).toISOString(),
-          stamp,
-        ]
-      );
-      const row = rows[0];
-      if (!row) return null;
-      await lease.query(
-        `INSERT INTO maintenance_job_attempts
-           (job_key, attempt_number, fencing_token, started_at)
-         VALUES ($1,$2,$3,$4)`,
-        [
-          String(row.job_key),
-          Number(row.attempt_count),
-          String(row.fencing_token),
-          stamp,
-        ]
-      );
-      return toGuard(row);
-    });
+    const { guard, head } = await this.transact((lease) =>
+      this.claimPass(lease, now)
+    );
+    if (guard !== null) return guard;
+    if (head === null) return null;
+    return this.transact((lease) => this.claimWaiting(lease, head, now));
+  }
+
+  /**
+   * One nonblocking sweep of the claimable set: the guard taken, or the head
+   * candidate that was refused a reservation, or neither when the queue is empty
+   * or every candidate was already taken by another worker.
+   */
+  private async claimPass(
+    lease: MaintenanceWorkLease,
+    now: Date
+  ): Promise<ClaimPass> {
+    const passed: string[] = [];
+    let head: ClaimCandidate | null = null;
+    for (let index = 0; index < CLAIM_CANDIDATE_LIMIT; index += 1) {
+      const candidate = await nextClaimCandidate(lease, now, passed);
+      if (!candidate) break;
+      if (await this.secureSourceAuthority(lease, [candidate.sourceRef], true)) {
+        const guard = await this.takeJob(lease, candidate, now);
+        if (guard) return { guard, head: null };
+      } else if (index === 0) {
+        head = candidate;
+      }
+      passed.push(candidate.jobKey);
+    }
+    return { guard: null, head };
+  }
+
+  /**
+   * Take the head candidate after waiting for its reservation. Waiting is correct
+   * only because the caller knows which job it wants and the order still begins
+   * with the reservation, so the wait ends when the assignment that held it does.
+   */
+  private async claimWaiting(
+    lease: MaintenanceWorkLease,
+    candidate: ClaimCandidate,
+    now: Date
+  ): Promise<MaintenanceAttemptGuard | null> {
+    if (!(await this.secureSourceAuthority(lease, [candidate.sourceRef]))) {
+      return null;
+    }
+    return this.takeJob(lease, candidate, now);
   }
 
   /**
@@ -203,8 +310,8 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
     guard: MaintenanceAttemptGuard,
     now: Date
   ): Promise<boolean> {
-    const lease = await this.lease();
-    try {
+    return this.transact(async (lease) => {
+      await this.secureSourceAuthority(lease, [guard.sourceRef]);
       const { rows } = await lease.query(
         `UPDATE maintenance_jobs
             SET lease_expires_at = LEAST($2::timestamptz + ${LEASE_SQL}, ${ABSOLUTE_BOUND_SQL}),
@@ -218,17 +325,17 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
         [guard.jobKey, now.toISOString(), guard.fencingToken]
       );
       return rows.length > 0;
-    } finally {
-      lease.release();
-    }
+    });
   }
 
   async retryWork(
     jobKey: string,
     now: Date
   ): Promise<MaintenanceJobRecord | null> {
-    const lease = await this.lease();
-    try {
+    return this.transact(async (lease) => {
+      const sourceRef = await jobSourceRef(lease, jobKey);
+      if (sourceRef === null) return null;
+      await this.secureSourceAuthority(lease, [sourceRef]);
       const { rows } = await lease.query(
         `UPDATE maintenance_jobs
             SET status = 'pending',
@@ -241,9 +348,7 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
         [jobKey, now.toISOString()]
       );
       return rows[0] ? toRecord(rows[0]) : null;
-    } finally {
-      lease.release();
-    }
+    });
   }
 
   /**
@@ -260,6 +365,7 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   ): Promise<MaintenanceSettleResult> {
     return this.transact(async (lease) => {
       const stamp = now.toISOString();
+      await this.secureSourceAuthority(lease, [guard.sourceRef]);
       const row = await this.lockRunningJob(lease, guard.jobKey);
       if (!row) return { result: "lease_lost" };
 
@@ -295,12 +401,24 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
    * Invalidate the token of every attempt whose lease ran out. Clearing
    * `fencing_token` is the invalidation: a stale worker's next write presents a
    * token the row no longer carries, so it is refused before any data write.
+   *
+   * The expired set is read without a job lock and only those keys are reclaimed,
+   * so the reservations for their sources are the first thing this transaction
+   * takes. Reclaim waits on those reservations rather than passing candidates
+   * over: an expired lease must be invalidated before anybody may claim again, and
+   * a reclaim that skipped a job would let two workers each believe they own it.
    */
   async reclaimExpiredWork(
     now: Date
   ): Promise<readonly MaintenanceReclaimOutcome[]> {
     return this.transact(async (lease) => {
       const stamp = now.toISOString();
+      const expired = await expiredRunningJobs(lease, stamp);
+      if (expired.length === 0) return [];
+      await this.secureSourceAuthority(
+        lease,
+        expired.map((job) => job.sourceRef)
+      );
       const { rows } = await lease.query(
         `UPDATE maintenance_jobs
             SET status = 'pending',
@@ -312,8 +430,9 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
           WHERE status = 'running'
             AND lease_expires_at IS NOT NULL
             AND lease_expires_at <= $1
+            AND job_key = ANY($2::text[])
         RETURNING job_key, attempt_count`,
-        [stamp]
+        [stamp, expired.map((job) => job.jobKey)]
       );
       for (const row of rows) {
         await this.finishAttempt(lease, {
@@ -356,32 +475,113 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   }
 
   /**
-   * Run `fn` inside one transaction, and never let a failing ROLLBACK mask the
-   * error that caused it.
+   * Take the ledger's place in the shared lock order: the source reservations in
+   * stable reference order, then each owner scope, then that scope's source rows.
+   *
+   * Ownership is resolved only after the reservations are held, which is what
+   * makes the map authoritative — a first assignment reserves the same advisory
+   * lock, so it cannot slip in between reading the owner and locking the scope. A
+   * source no scope owns takes no further lock and keeps the standalone path.
+   *
+   * `nonblocking` belongs to the global claim alone. It is false elsewhere, where
+   * the caller already knows which job it must write and waiting is correct; a
+   * blocking reservation cannot report false, so only the claim branches on it.
    */
-  private async transact<T>(
-    fn: (lease: MaintenanceWorkLease) => Promise<T>
-  ): Promise<T> {
-    const lease = await this.lease();
-    try {
-      await lease.query("BEGIN");
-      try {
-        const result = await fn(lease);
-        await lease.query("COMMIT");
-        return result;
-      } catch (error) {
-        try {
-          await lease.query("ROLLBACK");
-        } catch (rollbackError) {
-          recordSuppressedFailure(error, rollbackError);
-        }
-        throw error;
-      }
-    } finally {
-      lease.release();
+  private async secureSourceAuthority(
+    lease: MaintenanceWorkLease,
+    sourceRefs: readonly string[],
+    nonblocking = false
+  ): Promise<boolean> {
+    const refs = stableSourceRefs([...new Set(sourceRefs)]);
+    if (refs.length === 0) return true;
+    if (!(await reserveSources(lease, refs, nonblocking))) return false;
+    for (const [scopeBinding, owned] of ownersByScope(
+      await resolveOwnership(lease, refs)
+    )) {
+      await lockOwnerScope(lease, scopeBinding);
+      await lockAffectedSources(lease, scopeBinding, owned);
     }
+    return true;
   }
 
+  /**
+   * Take one candidate whose authority the caller already holds, re-validating it
+   * with `SKIP LOCKED`. Returns null — never a wait — when another worker took the
+   * row in between, so the caller moves on to the next candidate.
+   */
+  private async takeJob(
+    lease: MaintenanceWorkLease,
+    candidate: ClaimCandidate,
+    now: Date
+  ): Promise<MaintenanceAttemptGuard | null> {
+    const stamp = now.toISOString();
+    const { rows } = await lease.query(
+      `UPDATE maintenance_jobs SET
+           status = 'running',
+           attempt_count = attempt_count + 1,
+           auto_attempt_count = auto_attempt_count + 1,
+           fencing_token = $1,
+           lease_expires_at = $2,
+           attempt_started_at = $3,
+           last_failure_code = NULL,
+           next_attempt_at = NULL,
+           updated_at = $3
+         WHERE job_key = (
+           SELECT job_key FROM maintenance_jobs
+            WHERE job_key = $4
+              AND status = 'pending'
+              AND (next_attempt_at IS NULL OR next_attempt_at <= $3)
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1)
+         RETURNING ${JOB_COLUMNS}, fencing_token, lease_expires_at, attempt_started_at`,
+      [randomUUID(), new Date(now.getTime() + WORK_LEASE_MS).toISOString(), stamp, candidate.jobKey]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    await lease.query(
+      `INSERT INTO maintenance_job_attempts
+           (job_key, attempt_number, fencing_token, started_at)
+         VALUES ($1,$2,$3,$4)`,
+      [
+        String(row.job_key),
+        Number(row.attempt_count),
+        String(row.fencing_token),
+        stamp,
+      ]
+    );
+    return toGuard(row);
+  }
+
+  /**
+   * Run `fn` inside one transaction of the shared authority. The seam owns BEGIN,
+   * COMMIT and the single ROLLBACK, which keeps the primary failure and records
+   * only safe metadata for a rollback that itself failed.
+   */
+  private transact<T>(
+    fn: (lease: MaintenanceWorkLease) => Promise<T>
+  ): Promise<T> {
+    // Checked before leasing so a closed store refuses identically whether it owns
+    // its authority or was handed the backend's.
+    if (this.closed) {
+      throw new MaintenanceStoreError(
+        "maintenance work store used after close",
+        "backend_unavailable"
+      );
+    }
+    return this.scope.runTransaction((client) => fn(asWorkLease(client)), {
+      fail: workStoreError,
+    });
+  }
+
+  /**
+   * The job row, fenced, taken LAST.
+   *
+   * This is where the old order inverted: the row used to be locked here before
+   * any scope or source lock existed, while publication locks the scope and then
+   * the job, and the two deadlocked. The caller holds the reservation, the owner
+   * scope and the source rows before reaching this statement, so the progress
+   * bump this write triggers finds the scope row already ours.
+   */
   private async lockRunningJob(
     lease: MaintenanceWorkLease,
     jobKey: string
@@ -546,6 +746,91 @@ export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Owner scopes with the sources they own, ordered by scope binding.
+ *
+ * The order matters wherever one statement reaches several scopes — reclaim
+ * does — because two writers that group the same scopes differently can each hold
+ * one and wait for the other's.
+ */
+function ownersByScope(
+  ownership: readonly SourceOwnership[]
+): Map<string, string[]> {
+  const grouped = new Map<string, string[]>();
+  for (const entry of ownership) {
+    const scopeBinding = entry.ownerScopeBinding;
+    if (scopeBinding === null) continue;
+    const owned = grouped.get(scopeBinding);
+    if (owned) owned.push(entry.sourceRef);
+    else grouped.set(scopeBinding, [entry.sourceRef]);
+  }
+  return new Map(
+    [...grouped].sort(([left], [right]) => left.localeCompare(right))
+  );
+}
+
+/**
+ * The oldest claimable job, read with no lock of any kind.
+ *
+ * Candidates this pass already passed over are excluded: a contended candidate
+ * stays at the head of the same order, so re-reading it would return the same row
+ * and the scan would stop early instead of claiming the next job.
+ */
+async function nextClaimCandidate(
+  lease: MaintenanceWorkLease,
+  now: Date,
+  passed: readonly string[]
+): Promise<ClaimCandidate | null> {
+  const { rows } = await lease.query(
+    `SELECT job_key, source_ref FROM maintenance_jobs
+      WHERE status = 'pending'
+        AND (next_attempt_at IS NULL OR next_attempt_at <= $1)
+        AND NOT (job_key = ANY($2::text[]))
+      ORDER BY next_attempt_at ASC NULLS FIRST, created_at ASC, job_key ASC
+      LIMIT 1`,
+    [now.toISOString(), [...passed]]
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return { jobKey: String(row.job_key), sourceRef: String(row.source_ref) };
+}
+
+/** Every running job whose lease ran out, read before any job lock exists. */
+async function expiredRunningJobs(
+  lease: MaintenanceWorkLease,
+  stamp: string
+): Promise<ClaimCandidate[]> {
+  const { rows } = await lease.query(
+    `SELECT job_key, source_ref FROM maintenance_jobs
+      WHERE status = 'running'
+        AND lease_expires_at IS NOT NULL
+        AND lease_expires_at <= $1
+      ORDER BY job_key ASC`,
+    [stamp]
+  );
+  return rows.map((row) => ({
+    jobKey: String(row.job_key),
+    sourceRef: String(row.source_ref),
+  }));
+}
+
+/**
+ * The source a retry reaches, read without a job lock. An operator retry names
+ * only the job key, and the authority to lock is decided by the source that job
+ * belongs to, so the lock order still begins with the reservation.
+ */
+async function jobSourceRef(
+  lease: MaintenanceWorkLease,
+  jobKey: string
+): Promise<string | null> {
+  const { rows } = await lease.query(
+    "SELECT source_ref FROM maintenance_jobs WHERE job_key = $1",
+    [jobKey]
+  );
+  const row = rows[0];
+  return row ? String(row.source_ref) : null;
 }
 
 function toRecord(row: Record<string, unknown>): MaintenanceJobRecord {

@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 
-import { recordSuppressedFailure } from "../errors.js";
 import {
   StructuredPublicationError,
   normalizePublicationFacts,
@@ -52,29 +51,33 @@ import {
   normalizeSourceVersion,
 } from "./evidence-source.js";
 import type { NewSourceVersion, SupportRecord } from "../types.js";
-import { advisoryLockKey } from "./schema-lock.js";
+import type { PgStructuredScopeUnitOfWork } from "./structured-scope-uow.js";
+import { reservationLockParameter } from "./structured-scope-locks-pg.js";
+import type { ScopeTransactionClient } from "./structured-scope-types.js";
 
+/**
+ * The leased client a structured write runs on. `release` is the pool's, but the
+ * shared seam owns when it is called, so publication no longer leases its own
+ * connection or decides its own rollback.
+ */
 interface PublicationClient extends EvidenceClient {
   release(): void;
 }
 
-export interface PublicationClientLease {
-  (): Promise<PublicationClient>;
+/**
+ * A seam client and a publication client are the same pooled connection seen
+ * through two query surfaces, so one unit of work never holds two connections
+ * while waiting on a lock another of its own transactions owns.
+ */
+function asPublicationClient(client: ScopeTransactionClient): PublicationClient {
+  return client as PublicationClient;
 }
 
-interface PublicationSourceRow {
-  scope_binding: string;
-  source_ref: string;
-  active: boolean;
-  generation: string | number;
-  desired_source_version: string | null;
-  desired_extraction_revision: string | number | null;
-  desired_config_revision: string | null;
-  published_source_version: string | null;
-  published_extraction_revision: string | number | null;
-  published_generation: string | number | null;
-}
-
+/**
+ * The maintenance job row as PostgreSQL returns it. Publication reads the whole
+ * row to re-verify a running attempt against the database clock, so the columns
+ * it converts by hand stay loosely typed here.
+ */
 interface JobRow extends Record<string, any> {
   job_key: string;
   work_kind: string;
@@ -91,9 +94,22 @@ interface JobRow extends Record<string, any> {
   attempt_finished_at?: Date | string | null;
 }
 
-/** PostgreSQL implementation using the same transaction client for every authority. */
+interface PublicationSourceRow {
+  scope_binding: string;
+  source_ref: string;
+  active: boolean;
+  generation: string | number;
+  desired_source_version: string | null;
+  desired_extraction_revision: string | number | null;
+  desired_config_revision: string | null;
+  published_source_version: string | null;
+  published_extraction_revision: string | number | null;
+  published_generation: string | number | null;
+}
+
+/** PostgreSQL implementation using the shared authorized scope unit of work. */
 export class PgStructuredPublicationStorage implements StructuredPublicationStorage {
-  constructor(private readonly leaseClient: PublicationClientLease) {}
+  constructor(private readonly scope: PgStructuredScopeUnitOfWork) {}
 
   async declareDesired(
     input: DeclarePublicationDesiredInput
@@ -496,16 +512,11 @@ export class PgStructuredPublicationStorage implements StructuredPublicationStor
     sourceRef: string,
     guard: MaintenanceAttemptGuard
   ): Promise<{ source: PublicationSourceRow }> {
-    const guardRow = await lockAndVerifyJob(client, guard);
-    if (
-      guardRow.work_kind !== "extract_publish" ||
-      guardRow.source_ref !== sourceRef
-    ) {
-      throw new StructuredPublicationError(
-        "input_stale",
-        "attempt is bound to another source or work kind"
-      );
-    }
+    // Shared lock order: reservation -> owner scope -> source -> job. The job is
+    // taken last so this writer never holds a job row while waiting a scope;
+    // holding job-before-scope here is what deadlocked publish against the work
+    // ledger (settle/reclaim/retry take scope before job).
+    await lockSourceBindings(client, [sourceRef]);
     await lockScope(client, scopeBinding);
     const source = await lockSource(client, scopeBinding, sourceRef);
     if (
@@ -516,6 +527,16 @@ export class PgStructuredPublicationStorage implements StructuredPublicationStor
       throw new StructuredPublicationError(
         "input_stale",
         "source is no longer active with a desired pair"
+      );
+    }
+    const guardRow = await lockAndVerifyJob(client, guard);
+    if (
+      guardRow.work_kind !== "extract_publish" ||
+      guardRow.source_ref !== sourceRef
+    ) {
+      throw new StructuredPublicationError(
+        "input_stale",
+        "attempt is bound to another source or work kind"
       );
     }
     if (
@@ -538,29 +559,10 @@ export class PgStructuredPublicationStorage implements StructuredPublicationStor
     body: (client: PublicationClient) => Promise<T>,
     readOnly = false
   ): Promise<T> {
-    const client = await this.leaseClient();
-    let started = false;
-    try {
-      await client.query(
-        readOnly ? "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY" : "BEGIN"
-      );
-      started = true;
-      const result = await body(client);
-      await client.query("COMMIT");
-      return result;
-    } catch (error) {
-      const primary = publicationError(error);
-      if (started) {
-        try {
-          await client.query("ROLLBACK");
-        } catch (rollbackError) {
-          recordSuppressedFailure(primary, rollbackError);
-        }
-      }
-      throw primary;
-    } finally {
-      client.release();
-    }
+    return this.scope.runTransaction(
+      (client) => body(asPublicationClient(client)),
+      { readOnly, fail: publicationError }
+    );
   }
 }
 
@@ -605,6 +607,10 @@ async function lockAndPlanSourceMutations(
     "INSERT INTO structured_publication_scopes (scope_binding) VALUES ($1) ON CONFLICT DO NOTHING",
     [request.scopeBinding]
   );
+  // Reservations precede the scope lock so this path shares the ledger's order
+  // (reservation -> owner scope -> source -> job); taking the scope first while
+  // a concurrent work write holds the reservation and waits the scope inverts it.
+  await lockSourceBindings(client, request.authorizedSourceRefs);
   const scope = await lockScope(client, request.scopeBinding);
   if (!scope.scope_binding) {
     throw new StructuredPublicationError(
@@ -612,7 +618,6 @@ async function lockAndPlanSourceMutations(
       "publication scope row is missing"
     );
   }
-  await lockSourceBindings(client, request.authorizedSourceRefs);
   await assertSingleOwnerScope(
     client,
     request.scopeBinding,
@@ -835,7 +840,7 @@ async function lockSourceBindings(
   const keys = [...sourceRefs].sort((left, right) => left.localeCompare(right));
   for (const sourceRef of keys) {
     await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [
-      advisoryLockKey(`structured-publication-source:${sourceRef}`).toString(),
+      reservationLockParameter(sourceRef),
     ]);
   }
 }
@@ -1258,13 +1263,28 @@ async function registerFactIdentities(
 ): Promise<void> {
   const identityStore = new PgStructuredIdentityStore(client);
   const entityInputs = new Map<string, EntityIdentityInput>();
+  const entityVertexNames = new Map<string, string>();
   const assertionInputs = new Map<string, RelationAssertionInput>();
   for (const fact of facts) {
     if (fact.fact.identity.kind === "entity") {
       entityInputs.set(fact.resultId, fact.fact.identity.input);
+      entityVertexNames.set(fact.resultId, fact.displayName ?? fact.resultId);
     } else {
       assertionInputs.set(fact.resultId, fact.fact.identity.input);
     }
+  }
+  // An accepted entity fact is what makes the graph vertex real: publishing it
+  // materializes `entities` before `structured_entity_identities` and the
+  // membership rows that reference it, so a published fact never hangs off a
+  // vertex only a later extraction step would supply. Existing vertices keep
+  // their canonical name and embedding — only the closed-set type is refreshed.
+  for (const [entityId, input] of entityInputs) {
+    await ensureGraphEntityVertex(
+      client,
+      entityId,
+      input.type,
+      entityVertexNames.get(entityId) ?? entityId
+    );
   }
   for (const entity of entityInputs.values()) {
     await lockAndVerifyJob(client, guard);
@@ -1274,6 +1294,20 @@ async function registerFactIdentities(
     await lockAndVerifyJob(client, guard);
     await identityStore.registerRelationAssertion(assertion);
   }
+}
+
+async function ensureGraphEntityVertex(
+  client: PublicationClient,
+  entityId: string,
+  entityType: string,
+  canonicalName: string
+): Promise<void> {
+  await client.query(
+    `INSERT INTO entities (id, canonical_name, type)
+          VALUES ($1, $2, $3)
+     ON CONFLICT (id) DO UPDATE SET type = EXCLUDED.type`,
+    [entityId, canonicalName, entityType]
+  );
 }
 
 async function assertOrRecordExtractionBinding(

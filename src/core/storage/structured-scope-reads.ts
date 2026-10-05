@@ -264,6 +264,26 @@ export async function readPgScopedSourceRows(
   return scoped;
 }
 
+/**
+ * The same source rows without the presence requirement, for lock-free routing
+ * discovery. A source another scope owns, or a declaration's row that does not
+ * exist yet, contributes nothing to the comparison token instead of a refusal
+ * here: this read only supplies a "did anything move" fingerprint, and the run's
+ * actual verdict belongs to the ownership check and the source locks that follow.
+ */
+export async function readPgObservedSourceRows(
+  client: ScopeTransactionClient,
+  scopeBinding: string,
+  sourceRefs: readonly string[]
+): Promise<ScopedSourceInput[]> {
+  if (sourceRefs.length === 0) return [];
+  const { rows } = await client.query(ACCEPTED_SOURCE_SQL, [
+    scopeBinding,
+    [...sourceRefs],
+  ]);
+  return rows.map(toScopedSourceRow);
+}
+
 export async function buildPgAcceptedSnapshot(
   client: ScopeTransactionClient,
   context: AuthorizedScopeContext,

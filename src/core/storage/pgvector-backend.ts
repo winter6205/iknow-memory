@@ -54,6 +54,7 @@ import type {
   SupportRecord,
 } from "../types.js";
 import { PgStructuredPublicationStorage } from "./publication-pg.js";
+import { PgMaintenanceWorkStore } from "./maintenance-work-pg.js";
 import { PgStructuredScopeUnitOfWork } from "./structured-scope-uow.js";
 import type { ScopeClientLease } from "./structured-scope-types.js";
 import type { StructuredPublicationStorage } from "../maintenance/publication-types.js";
@@ -658,6 +659,13 @@ export class PgvectorBackend
    * orders.
    */
   readonly structuredScopeUnitOfWork: PgStructuredScopeUnitOfWork;
+  /**
+   * The durable-work ledger, composed over the same seam rather than over a
+   * private one: a work write must take the lock order publication takes, and a
+   * ledger that minted its own authority could not be recognized by a context
+   * this composition minted.
+   */
+  readonly maintenanceWorkStore: PgMaintenanceWorkStore;
   private pool: PgPool | undefined;
   private initPromise: Promise<void> | undefined;
   private readonly poolConfig: PgvectorPoolConfig;
@@ -684,6 +692,10 @@ export class PgvectorBackend
       structuredClientLease
     );
     this.structuredPublication = new PgStructuredPublicationStorage(
+      this.structuredScopeUnitOfWork
+    );
+    this.maintenanceWorkStore = new PgMaintenanceWorkStore(
+      { connect: () => structuredClientLease() },
       this.structuredScopeUnitOfWork
     );
     this.annMaxDimensions = options.annMaxDimensions;
@@ -2176,6 +2188,10 @@ export class PgvectorBackend
   }
 
   async close(): Promise<void> {
+    // The ledger leases through this backend's pool, so it has to be closed
+    // first: a write after close would otherwise re-open a pool on a backend
+    // that has already reported itself closed.
+    await this.maintenanceWorkStore.close();
     if (!this.pool) return;
     try {
       await this.pool.end();

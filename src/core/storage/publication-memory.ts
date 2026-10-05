@@ -34,13 +34,14 @@ import type {
 } from "../types.js";
 import type { InMemoryStructuredIdentityStore } from "../structured/identity-store.js";
 import type { InMemoryMaintenanceWorkStore } from "./maintenance-work-memory.js";
-import type { MemorySerializationPort } from "./structured-scope-uow.js";
-import type {
-  ScopeRevisionChange,
-  ScopeRevisionState,
-  ScopedExtractionInput,
-  ScopedMembershipInput,
-  ScopedSourceInput,
+import {
+  MemoryStructuredScopeTail,
+  type MemorySerializationPort,
+  type ScopeRevisionChange,
+  type ScopeRevisionState,
+  type ScopedExtractionInput,
+  type ScopedMembershipInput,
+  type ScopedSourceInput,
 } from "./structured-scope-types.js";
 import { canonicalDependencyRevision } from "../maintenance/durable-work.js";
 
@@ -139,14 +140,13 @@ class MemoryProjectionOutbox implements PublicationOutboxPort {
 export class MemoryStructuredPublicationStorage implements StructuredPublicationStorage {
   private readonly scopes = new Map<string, MemoryScope>();
   private readonly outbox: PublicationOutboxPort;
-  private lockTail: Promise<void> = Promise.resolve();
   private readonly removeProgressListener: () => void;
   /**
    * The queue the shared scope seam owns. Publication and the seam must queue on
    * one tail or their writes interleave, so composition injects it rather than
    * letting this adapter keep a private queue beside the seam's.
    */
-  private readonly serialization?: MemorySerializationPort;
+  private readonly serialization: MemorySerializationPort;
 
   constructor(
     private readonly authority: MemoryEvidenceAuthority,
@@ -154,7 +154,7 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
     serialization?: MemorySerializationPort
   ) {
     this.outbox = outbox ?? new MemoryProjectionOutbox();
-    this.serialization = serialization;
+    this.serialization = serialization ?? new MemoryStructuredScopeTail();
     this.removeProgressListener =
       authority.maintenanceWorkStore.onProgressChange((sourceRef, generation) =>
         this.recordWorkProgress(sourceRef, generation)
@@ -535,8 +535,17 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
     scopeBinding: string,
     change: ScopeRevisionChange
   ): void {
+    if (!change.read && !change.maintenance) return;
     const scope = this.scopes.get(scopeBinding);
-    if (scope === undefined) return;
+    if (scope === undefined) {
+      // EXIT: validate and the commit slice's token recheck refuse an
+      // unregistered scope before any commit, so this is an assertion and not a
+      // rollback — the memory lane has none. Same typed code as the PG UPDATE.
+      throw new StructuredPublicationError(
+        "maintenance_status_unavailable",
+        "publication scope revision was not advanced"
+      );
+    }
     if (change.read) scope.readRevision += 1n;
     if (change.maintenance) scope.maintenanceRevision += 1n;
   }
@@ -672,21 +681,8 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
     }
   }
 
-  private async exclusive<T>(action: () => Promise<T>): Promise<T> {
-    if (this.serialization !== undefined) {
-      return this.serialization.exclusive(action);
-    }
-    const previous = this.lockTail;
-    let release!: () => void;
-    this.lockTail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      return await action();
-    } finally {
-      release();
-    }
+  private exclusive<T>(action: () => Promise<T>): Promise<T> {
+    return this.serialization.exclusive(action);
   }
 }
 

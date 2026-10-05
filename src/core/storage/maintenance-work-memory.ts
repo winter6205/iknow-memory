@@ -38,7 +38,11 @@ import {
   type MaintenanceWorkStore,
 } from "../maintenance/types.js";
 
-import type { ScopedWorkInput } from "./structured-scope-types.js";
+import {
+  MemoryStructuredScopeTail,
+  type MemorySerializationPort,
+  type ScopedWorkInput,
+} from "./structured-scope-types.js";
 
 interface StoredJob extends MaintenanceJobRecord {
   readonly dependencies: readonly MaintenanceDependency[];
@@ -53,7 +57,23 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
   private readonly progressListeners = new Set<
     (sourceRef: string, generation: number) => void
   >();
+  /**
+   * The queue the shared scope seam owns. Every ledger mutation runs inside one
+   * slice of it, so this store cannot commit between another writer's last
+   * validation and its commit. Composition injects it; without one the store
+   * keeps a private chain, which is the declared standalone behavior and shares
+   * nothing with the composed authority.
+   */
+  private readonly serialization: MemorySerializationPort;
   private closed = false;
+
+  constructor(serialization?: MemorySerializationPort) {
+    this.serialization = serialization ?? new MemoryStructuredScopeTail();
+  }
+
+  private exclusive<T>(action: () => Promise<T>): Promise<T> {
+    return this.serialization.exclusive(action);
+  }
 
   /** Internal observer for publication summaries backed by this same ledger. */
   onProgressChange(
@@ -168,6 +188,71 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     request: MaintenanceWorkRequest,
     now: Date
   ): Promise<MaintenanceScheduleOutcome> {
+    return this.exclusive(async () => this.scheduleWorkLocked(request, now));
+  }
+
+  async getJob(jobKey: string): Promise<MaintenanceJobRecord | null> {
+    this.assertOpen();
+    const job = this.jobs.get(jobKey);
+    return job ? toRecord(job) : null;
+  }
+
+  async claimWork(now: Date): Promise<MaintenanceAttemptGuard | null> {
+    return this.exclusive(async () => this.claimWorkLocked(now));
+  }
+
+  /**
+   * A heartbeat fences on ownership only — token, lease, and the absolute
+   * attempt bound — because it carries no re-read of canonical lifecycle state.
+   * The dependency vector is rechecked where the live inputs are actually
+   * available, which is `settleWork`.
+   */
+  async heartbeatWork(
+    guard: MaintenanceAttemptGuard,
+    now: Date
+  ): Promise<boolean> {
+    return this.exclusive(async () => this.heartbeatWorkLocked(guard, now));
+  }
+
+  async retryWork(
+    jobKey: string,
+    now: Date
+  ): Promise<MaintenanceJobRecord | null> {
+    return this.exclusive(async () => this.retryWorkLocked(jobKey, now));
+  }
+
+  async settleWork(
+    guard: MaintenanceAttemptGuard,
+    outcome: MaintenanceSettleOutcome,
+    live: MaintenanceLiveInputs,
+    now: Date
+  ): Promise<MaintenanceSettleResult> {
+    return this.exclusive(async () =>
+      this.settleWorkLocked(guard, outcome, live, now)
+    );
+  }
+
+  async reclaimExpiredWork(
+    now: Date
+  ): Promise<readonly MaintenanceReclaimOutcome[]> {
+    return this.exclusive(async () => this.reclaimExpiredWorkLocked(now));
+  }
+
+  async listAttempts(
+    jobKey: string
+  ): Promise<readonly MaintenanceAttemptRecord[]> {
+    this.assertOpen();
+    return [...(this.attempts.get(jobKey) ?? [])];
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+
+  private scheduleWorkLocked(
+    request: MaintenanceWorkRequest,
+    now: Date
+  ): MaintenanceScheduleOutcome {
     this.assertOpen();
     const jobKey = computeMaintenanceJobKey(request);
     const existing = this.jobs.get(jobKey);
@@ -203,13 +288,7 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     return { record: toRecord(stored), inserted: true };
   }
 
-  async getJob(jobKey: string): Promise<MaintenanceJobRecord | null> {
-    this.assertOpen();
-    const job = this.jobs.get(jobKey);
-    return job ? toRecord(job) : null;
-  }
-
-  async claimWork(now: Date): Promise<MaintenanceAttemptGuard | null> {
+  private claimWorkLocked(now: Date): MaintenanceAttemptGuard | null {
     this.assertOpen();
     const stamp = now.toISOString();
     const target = [...this.jobs.values()]
@@ -248,16 +327,10 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     return toGuard(claimed);
   }
 
-  /**
-   * A heartbeat fences on ownership only — token, lease, and the absolute
-   * attempt bound — because it carries no re-read of canonical lifecycle state.
-   * The dependency vector is rechecked where the live inputs are actually
-   * available, which is `settleWork`.
-   */
-  async heartbeatWork(
+  private heartbeatWorkLocked(
     guard: MaintenanceAttemptGuard,
     now: Date
-  ): Promise<boolean> {
+  ): boolean {
     this.assertOpen();
     const job = this.jobs.get(guard.jobKey);
     if (!job || job.status !== "running") return false;
@@ -281,16 +354,16 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     return true;
   }
 
-  async retryWork(
+  private retryWorkLocked(
     jobKey: string,
     now: Date
-  ): Promise<MaintenanceJobRecord | null> {
+  ): MaintenanceJobRecord | null {
     this.assertOpen();
     const job = this.jobs.get(jobKey);
     if (!job) return null;
     // null, not a success-shaped record, for a job that is not retryable — the
-    // SQL twin's `WHERE status IN ('failed','stale')` returns no row here, and the
-    // two implementations must answer identically.
+    // SQL twin's `WHERE status IN ('failed','stale')` returns no row here, and
+    // the two implementations must answer identically.
     if (!isRetryableStatus(job.status)) return null;
     const stamp = now.toISOString();
     const retried: StoredJob = {
@@ -306,12 +379,12 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     return toRecord(retried);
   }
 
-  async settleWork(
+  private settleWorkLocked(
     guard: MaintenanceAttemptGuard,
     outcome: MaintenanceSettleOutcome,
     live: MaintenanceLiveInputs,
     now: Date
-  ): Promise<MaintenanceSettleResult> {
+  ): MaintenanceSettleResult {
     this.assertOpen();
     const job = this.jobs.get(guard.jobKey);
     if (!job || job.status !== "running") return { result: "lease_lost" };
@@ -370,9 +443,9 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     return { result: "settled", record: toRecord(settled) };
   }
 
-  async reclaimExpiredWork(
+  private reclaimExpiredWorkLocked(
     now: Date
-  ): Promise<readonly MaintenanceReclaimOutcome[]> {
+  ): readonly MaintenanceReclaimOutcome[] {
     this.assertOpen();
     const stamp = now.toISOString();
     const outcomes: MaintenanceReclaimOutcome[] = [];
@@ -404,22 +477,6 @@ export class InMemoryMaintenanceWorkStore implements MaintenanceWorkStore {
     return outcomes;
   }
 
-  async listAttempts(
-    jobKey: string
-  ): Promise<readonly MaintenanceAttemptRecord[]> {
-    this.assertOpen();
-    return [...(this.attempts.get(jobKey) ?? [])];
-  }
-
-  async close(): Promise<void> {
-    this.closed = true;
-  }
-
-  /**
-   * Terminal or retrying status for a settled attempt, and the live lease
-   * released in every case — a settled job holds no token, so nothing can write
-   * through an attempt that already finished.
-   */
   /**
    * Terminal or retrying status for a settled attempt, and the live lease
    * released in every case — a settled job holds no token, so nothing can write

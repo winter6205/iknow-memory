@@ -24,6 +24,8 @@
  * store does not have.
  */
 import type { EntityType } from "../extraction/entity-type.js";
+import { MemoryStructuredScopeTail } from "../storage/structured-scope-types.js";
+import type { MemorySerializationPort } from "../storage/structured-scope-types.js";
 import {
   deriveRelationAssertionId,
   normalizeEntityId,
@@ -108,9 +110,26 @@ export class InMemoryStructuredIdentityStore implements StructuredIdentityStore 
   >();
   /** `identityVersion:tupleDigest` → assertionId; the exact-tuple key. */
   private readonly byTuple = new Map<string, string>();
+  /**
+   * The queue the shared scope seam owns. Registration mutates the same
+   * authoritative maps a larger unit of work commits into, so a direct
+   * `registerRelationAssertion` has to queue on the same tail publication and
+   * the work ledger use — otherwise it could land between another writer's last
+   * validation and its commit. Composition injects it; without one the store
+   * keeps a private chain, the declared standalone behavior.
+   */
+  private readonly serialization: MemorySerializationPort;
+
+  constructor(serialization?: MemorySerializationPort) {
+    this.serialization = serialization ?? new MemoryStructuredScopeTail();
+  }
 
   get relationAssertionCount(): number {
     return this.assertions.size;
+  }
+
+  private exclusive<T>(action: () => Promise<T>): Promise<T> {
+    return this.serialization.exclusive(action);
   }
 
   /**
@@ -176,6 +195,30 @@ export class InMemoryStructuredIdentityStore implements StructuredIdentityStore 
   async registerEntity(
     input: EntityIdentityInput
   ): Promise<RegisteredEntityIdentity> {
+    return this.exclusive(async () => this.registerEntityLocked(input));
+  }
+
+  async findEntity(entityId: string): Promise<RegisteredEntityIdentity | null> {
+    return this.entities.get(normalizeEntityId(entityId)) ?? null;
+  }
+
+  async registerRelationAssertion(
+    input: RelationAssertionInput
+  ): Promise<RegisteredRelationAssertionIdentity> {
+    return this.exclusive(async () =>
+      this.registerRelationAssertionLocked(input)
+    );
+  }
+
+  async findRelationAssertion(
+    assertionId: string
+  ): Promise<RegisteredRelationAssertionIdentity | null> {
+    return this.assertions.get(assertionId) ?? null;
+  }
+
+  private registerEntityLocked(
+    input: EntityIdentityInput
+  ): RegisteredEntityIdentity {
     // A registered entity's type is a display attribute, not part of its
     // identity (the entity UUID is), so re-registering after a legitimate type
     // change refreshes the mirrored value and never the id.
@@ -187,13 +230,9 @@ export class InMemoryStructuredIdentityStore implements StructuredIdentityStore 
     return entity;
   }
 
-  async findEntity(entityId: string): Promise<RegisteredEntityIdentity | null> {
-    return this.entities.get(normalizeEntityId(entityId)) ?? null;
-  }
-
-  async registerRelationAssertion(
+  private registerRelationAssertionLocked(
     input: RelationAssertionInput
-  ): Promise<RegisteredRelationAssertionIdentity> {
+  ): RegisteredRelationAssertionIdentity {
     const tuple = normalizeRelationAssertion(input);
     const assertionId = deriveRelationAssertionId(tuple);
     const digest = relationAssertionTupleDigest(tuple);
@@ -217,12 +256,6 @@ export class InMemoryStructuredIdentityStore implements StructuredIdentityStore 
     this.assertions.set(assertionId, registered);
     this.byTuple.set(tupleKey, assertionId);
     return registered;
-  }
-
-  async findRelationAssertion(
-    assertionId: string
-  ): Promise<RegisteredRelationAssertionIdentity | null> {
-    return this.assertions.get(assertionId) ?? null;
   }
 }
 

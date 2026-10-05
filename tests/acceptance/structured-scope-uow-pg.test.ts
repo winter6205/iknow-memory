@@ -55,11 +55,15 @@ import {
 } from "../../src/core/structured/identity.js";
 import { PgMaintenanceWorkStore } from "../../src/core/storage/maintenance-work-pg.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
+import { reservationLockParameter } from "../../src/core/storage/structured-scope-locks-pg.js";
+import { STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS } from "../../src/core/storage/structured-scope-types.js";
 import { withAuthorizedScope } from "../../src/core/storage/structured-scope-uow.js";
+import type { PgStructuredScopeUnitOfWork } from "../../src/core/storage/structured-scope-uow.js";
 import type {
   AuthorizedScopeContext,
   AuthorizedScopeContextInput,
-  AuthorizedScopeUnitOfWork,
+  AuthorizedScopeWork,
+  ScopeTransactionClient,
   ScopeWorkHandle,
 } from "../../src/core/storage/structured-scope-types.js";
 import type { ChunkRecord } from "../../src/core/types.js";
@@ -136,12 +140,30 @@ let admin: pg.Client;
 let identity: StructuredIdentityStore;
 let work: MaintenanceWorkStore;
 let publication: StructuredPublicationStorage;
-let authority: AuthorizedScopeUnitOfWork;
+let authority: PgStructuredScopeUnitOfWork;
 let clock: PublicationTestClock;
 
 const createdFaults: { name: string; table: string }[] = [];
 const createdJobs: string[] = [];
 let serial = 0;
+// The routing-exhaustion case owns a second pool and a gate client; both are
+// tracked so a suite teardown can close them even if the case aborts.
+let routingSecondBackend: PgvectorBackend | null = null;
+let routingGateClient: pg.Client | null = null;
+
+/**
+ * Closes a tracked peer and yields the empty slot. A close that fails is a
+ * connection this run never released, so it propagates: a teardown that reports
+ * success over a leaked pool is a false clean bill, and only a peer that was
+ * never opened is a non-event.
+ */
+async function closeRoutingPeer(
+  peer: PgvectorBackend | pg.Client | null
+): Promise<null> {
+  if (peer === null) return null;
+  await (peer instanceof PgvectorBackend ? peer.close() : peer.end());
+  return null;
+}
 
 type AuthorizedScopeInput = AuthorizedScopeContextInput;
 
@@ -360,6 +382,16 @@ async function countRows(query: string, values?: readonly unknown[]): Promise<nu
   return Number(result.rows[0]?.count ?? "0");
 }
 
+/** The same count inside a caller's own transaction, where its writes are visible. */
+async function countRowsOnClient(
+  client: ScopeTransactionClient,
+  query: string,
+  values?: readonly unknown[]
+): Promise<number> {
+  const result = await client.query(query, values);
+  return Number(String(result.rows[0]?.count ?? "0"));
+}
+
 function readOutboxCount(): Promise<number> {
   return countRows("SELECT count(*)::text AS count FROM projection_outbox");
 }
@@ -411,6 +443,14 @@ async function seedGraphEntities(entityIds: readonly string[]): Promise<void> {
 /**
  * Faults are gated on the exact subject or job they must break and fire once, so a
  * leftover trigger can never fail a later scenario's write.
+ *
+ * `atCommit` makes the failure land in COMMIT instead of in the statement that
+ * touched the row: a DEFERRABLE INITIALLY DEFERRED trigger runs when the
+ * transaction commits, so every statement before it has already been applied and
+ * only the rollback can undo them. `scopeBinding` then narrows the gate to one
+ * scope row's own read-revision advance, which is the one write the deferred
+ * seam makes — so a fault configured that way cannot fire before that write ran,
+ * and its firing is proof the write happened.
  */
 async function injectFault(options: {
   table:
@@ -421,23 +461,38 @@ async function injectFault(options: {
   milliseconds?: number;
   subjectId?: string;
   jobKey?: string;
+  scopeBinding?: string;
+  atCommit?: boolean;
+  errcode?: string;
 }): Promise<void> {
   serial += 1;
   const base = `scope_uow_fault_${serial}`;
   const functionName = `${base}_function`;
   const triggerName = `${base}_trigger`;
   const sequenceName = `${base}_sequence`;
+  const errcode = options.errcode ?? "P0001";
+  if (!/^[0-9A-Z]{5}$/.test(errcode)) {
+    throw new Error("an injected SQLSTATE reached the fault DDL unvalidated");
+  }
   await pool.query(`CREATE SEQUENCE "${pgHarness.schema}"."${sequenceName}"`);
-  const gate =
+  const gate = [
     options.table === "projection_outbox" && options.subjectId !== undefined
-      ? `NEW.subject_id = '${options.subjectId}'::uuid AND `
-      : options.table === "maintenance_jobs" && options.jobKey !== undefined
-        ? `NEW.job_key = '${options.jobKey}' AND `
-        : "";
-  const fired = `${gate}nextval('${pgHarness.schema}.${sequenceName}'::regclass) = 1`;
+      ? `NEW.subject_id = '${options.subjectId}'::uuid`
+      : null,
+    options.table === "maintenance_jobs" && options.jobKey !== undefined
+      ? `NEW.job_key = '${options.jobKey}'`
+      : null,
+    options.table === "structured_publication_scopes" &&
+    options.scopeBinding !== undefined
+      ? `NEW.scope_binding = '${options.scopeBinding}' AND NEW.read_revision = OLD.read_revision + 1`
+      : null,
+  ]
+    .filter((condition): condition is string => condition !== null)
+    .join(" AND ");
+  const fired = `${gate === "" ? "" : `${gate} AND `}nextval('${pgHarness.schema}.${sequenceName}'::regclass) = 1`;
   const action =
     options.mode === "fail"
-      ? `RAISE EXCEPTION '%', '${INJECTED_DETAIL}' USING ERRCODE = 'P0001';`
+      ? `RAISE EXCEPTION '%', '${INJECTED_DETAIL}' USING ERRCODE = '${errcode}';`
       : `PERFORM pg_sleep(${((options.milliseconds ?? 250) / 1000).toFixed(3)});`;
   await pool.query(`
     CREATE FUNCTION "${pgHarness.schema}"."${functionName}"()
@@ -452,9 +507,16 @@ async function injectFault(options: {
     END;
     $scope_uow_fault$`);
   await pool.query(`
-    CREATE TRIGGER "${triggerName}"
-    BEFORE INSERT OR UPDATE ON "${options.table}"
-    FOR EACH ROW EXECUTE FUNCTION "${pgHarness.schema}"."${functionName}"()`);
+    CREATE ${options.atCommit === true ? "CONSTRAINT " : ""}TRIGGER "${triggerName}"
+      ${
+        options.atCommit === true
+          ? `AFTER UPDATE ON "${options.table}"
+       DEFERRABLE INITIALLY DEFERRED
+       FOR EACH ROW`
+          : `BEFORE INSERT OR UPDATE ON "${options.table}"
+       FOR EACH ROW`
+      }
+      EXECUTE FUNCTION "${pgHarness.schema}"."${functionName}"()`);
   createdFaults.push({ name: triggerName, table: options.table });
 }
 
@@ -536,6 +598,9 @@ async function registerVersion(
     parser_revision: "frozen-html-units-v1",
     unit_manifest: { units: 5, parser_revision: "frozen-html-units-v1" },
     created_at: clock().toISOString(),
+    retired_at: null,
+    payload_collected_at: null,
+    obligations_stopped_at: null,
   });
   const locator = {
     document_id: `${sourceRef}-document`,
@@ -557,9 +622,10 @@ async function declareDesired(
   scopeBinding: string,
   authorizedSourceRefs: readonly string[],
   seeded: SeededVersion,
-  extractionRevision: number
+  extractionRevision: number,
+  store: StructuredPublicationStorage = publication
 ): Promise<{ readonly generation: number }> {
-  return publication.declareDesired({
+  return store.declareDesired({
     scopeBinding,
     authorizedSourceRefs,
     sourceRef: seeded.record.source_ref,
@@ -674,6 +740,132 @@ function farDeadline(): string {
   return new Date(Date.now() + 10 * 60_000).toISOString();
 }
 
+const ROUTING_GATE_REVISION_BASE = 900;
+const ROUTING_BARRIER_TIMEOUT_MS = 20_000;
+/** Six observations at 20s each is the barrier's worst case, so this case's own
+ * ceiling has to admit it rather than inherit the suite's 45s. */
+const ROUTING_EXHAUSTION_TIMEOUT_MS = 6 * ROUTING_BARRIER_TIMEOUT_MS + 30_000;
+/** Class 58, so the refusal below cannot be confused with a statement failure. */
+const COMMIT_WINDOW_SQLSTATE = "58000";
+
+/** One 64-bit advisory key per attempt, as a signed decimal bigint string. */
+function routingGateKey(scopeBinding: string, attempt: number): string {
+  return createHash("sha256")
+    .update(`routing-commit-gate:${scopeBinding}:${attempt}`, "utf8")
+    .digest()
+    .readBigInt64BE()
+    .toString();
+}
+
+function numericLockKey(key: string): string {
+  if (!/^-?\d+$/.test(key)) {
+    throw new Error("an advisory lock key reached the barrier DDL unvalidated");
+  }
+  return key;
+}
+
+/**
+ * Tags one pool's sessions so the barrier can recognise its own contention in
+ * pg_stat_activity instead of inferring it from how many waiters there are.
+ */
+function taggedSchemaUrl(applicationName: string): string {
+  const separator = SCHEMA_URL.includes("?") ? "&" : "?";
+  return `${SCHEMA_URL}${separator}application_name=${applicationName}`;
+}
+
+/** pg_locks stores one bigint advisory key as its two unsigned 32-bit columns. */
+function advisoryLockIdentity(key: string): string {
+  const value = BigInt.asUintN(64, BigInt(key));
+  return `${Number(value >> 32n)}:${Number(value & 0xffffffffn)}`;
+}
+
+/**
+ * Every backend this run can park: the advisory key it waits on, the session
+ * tag that separates the second connection from the refused unit of work, and
+ * the transaction identity that tells one refused attempt from the next.
+ */
+async function readAdvisoryWaiters(): Promise<
+  readonly { readonly identity: string; readonly key: string; readonly session: string }[]
+> {
+  const result = await pool.query<{
+    pid: number;
+    classid: number;
+    objid: number;
+    xact_start: string | null;
+    application_name: string;
+  }>(
+    `SELECT l.pid, l.classid, l.objid, a.xact_start::text AS xact_start,
+            a.application_name
+       FROM pg_locks l
+       JOIN pg_stat_activity a ON a.pid = l.pid
+      WHERE l.locktype = 'advisory' AND l.granted = false
+      ORDER BY l.pid`
+  );
+  return result.rows.map((row) => ({
+    identity: `${Number(row.pid)}@${row.xact_start ?? "no-transaction"}`,
+    key: `${Number(row.classid)}:${Number(row.objid)}`,
+    session: row.application_name,
+  }));
+}
+
+/**
+ * Waits for an observed lock state, never for a duration: the loop can only
+ * pass once PostgreSQL itself reports the fact the barrier depends on.
+ */
+async function pollUntilObserved(
+  observation: string,
+  observed: () => Promise<boolean>
+): Promise<void> {
+  const until = Date.now() + ROUTING_BARRIER_TIMEOUT_MS;
+  for (;;) {
+    if (await observed()) return;
+    if (Date.now() > until) {
+      throw new Error(`routing exhaustion barrier never observed: ${observation}`);
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * Holds each second-connection transaction open just before its commit, so the
+ * refused unit of work is already parked on the source reservation when the
+ * change becomes visible. Only this run's gate revisions park here.
+ */
+async function installRoutingCommitGate(
+  gateKeys: readonly string[]
+): Promise<string> {
+  serial += 1;
+  const base = `scope_uow_routing_gate_${serial}`;
+  const functionName = `${base}_function`;
+  const triggerName = `${base}_trigger`;
+  const branches = gateKeys
+    .map((key, index) => {
+      const revision = ROUTING_GATE_REVISION_BASE + index + 1;
+      return [
+        `${index === 0 ? "IF" : "ELSIF"} NEW.desired_extraction_revision = ${revision} THEN`,
+        `      PERFORM pg_advisory_xact_lock(${numericLockKey(key)});`,
+      ].join("\n");
+    })
+    .join("\n    ");
+  await pool.query(`
+    CREATE FUNCTION "${pgHarness.schema}"."${functionName}"()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $scope_uow_routing_gate$
+    BEGIN
+      ${branches}
+      END IF;
+      RETURN NEW;
+    END;
+    $scope_uow_routing_gate$`);
+  await pool.query(`
+    CREATE TRIGGER "${triggerName}"
+    AFTER UPDATE ON structured_publication_sources
+    FOR EACH ROW EXECUTE FUNCTION "${pgHarness.schema}"."${functionName}"()`);
+  createdFaults.push({ name: triggerName, table: "structured_publication_sources" });
+  return triggerName;
+}
+
 describe("authorized scope unit of work — PostgreSQL acceptance", () => {
   beforeAll(async () => {
     admin = pgHarness.createClient(SCHEMA_URL);
@@ -688,7 +880,7 @@ describe("authorized scope unit of work — PostgreSQL acceptance", () => {
 
     const composed = backend as PgvectorBackend & {
       structuredPublication?: StructuredPublicationStorage;
-      structuredScopeUnitOfWork?: AuthorizedScopeUnitOfWork;
+      structuredScopeUnitOfWork?: PgStructuredScopeUnitOfWork;
     };
     const composedPublication = composed.structuredPublication;
     const composedAuthority = composed.structuredScopeUnitOfWork;
@@ -705,6 +897,8 @@ describe("authorized scope unit of work — PostgreSQL acceptance", () => {
 
   afterAll(async () => {
     try {
+      routingSecondBackend = await closeRoutingPeer(routingSecondBackend);
+      routingGateClient = await closeRoutingPeer(routingGateClient);
       if (!pgHarness.schema.startsWith(`${SCHEMA_PREFIX}_`)) {
         throw new Error("refusing to drop a schema outside this run's prefix");
       }
@@ -2092,6 +2286,263 @@ describe("authorized scope unit of work — PostgreSQL acceptance", () => {
     // visible by the generation and current-subject assertions above.
     expect(await readOutboxCount()).toBe(outboxBefore);
   });
+
+  it("refuses a typed stale input at its routing bound, keeps the concurrent owner's committed change, and rolls back the writes an admitted attempt issued", async () => {
+    expect(STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS).toBe(3);
+    const churnRef = unique("routing-bound-source");
+    const siblingRef = unique("routing-bound-sibling");
+    const scopeBinding = unique("routing-bound-scope");
+    const churnSeeded = await registerVersion(churnRef, "v1");
+    const siblingSeeded = await registerVersion(siblingRef, "v1");
+    await admitScope(scopeBinding, "auth-1");
+    const authorizedSourceRefs = [churnRef, siblingRef];
+    const churnGeneration = (
+      await declareDesired(scopeBinding, authorizedSourceRefs, churnSeeded, 1)
+    ).generation;
+    const siblingGeneration = (
+      await declareDesired(scopeBinding, authorizedSourceRefs, siblingSeeded, 1)
+    ).generation;
+    const revisionsBefore = await readRevisionPair(scopeBinding);
+    const refusedDesiredRevision = 7;
+    const refusedIntentId = randomUUID();
+    const refusedIntentSubject = randomUUID();
+    const gateKeys = Array.from(
+      { length: STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS },
+      (_, index) => routingGateKey(scopeBinding, index + 1)
+    );
+    const gateIdentities = gateKeys.map((key) => advisoryLockIdentity(key));
+    const reservationIdentities = new Set(
+      authorizedSourceRefs.map((sourceRef) =>
+        advisoryLockIdentity(reservationLockParameter(sourceRef))
+      )
+    );
+    // A second connection with its own pool, so the concurrent owner commits
+    // outside the lease the refused unit of work holds. Its sessions carry a
+    // tag, which is how the barrier tells its own contention apart.
+    const churnApplicationName = `scope_uow_routing_churn_${(serial += 1)}`;
+    routingSecondBackend = new PgvectorBackend(
+      taggedSchemaUrl(churnApplicationName),
+      DIMENSIONS,
+      {
+        annMaxDimensions: 2000,
+      }
+    );
+    await routingSecondBackend.initialize();
+    const secondPublication = routingSecondBackend.structuredPublication;
+    routingGateClient = pgHarness.createClient(SCHEMA_URL);
+    const gate = routingGateClient;
+    const openChanges: Promise<unknown>[] = [];
+    let refused: Promise<string | undefined> | null = null;
+    let code: string | undefined;
+    // One counter over both phases: phase one pins how many attempts reached the
+    // callback, phase two pins how many reached it after routing admitted one.
+    let callbackInvocations = 0;
+    const startChurn = (next: number) =>
+      declareDesired(
+        scopeBinding,
+        authorizedSourceRefs,
+        churnSeeded,
+        ROUTING_GATE_REVISION_BASE + next,
+        secondPublication
+      );
+    const refusedContext = () =>
+      context({
+        actorId: ACTOR,
+        ownerScopeBinding: scopeBinding,
+        readerBinding: "reader-1",
+        authorizedSourceRefs,
+        authorizationRevision: "auth-1",
+        deadlineAt: farDeadline(),
+      });
+    const issueRefusedWrites = async (work: AuthorizedScopeWork) => {
+      await work.readAcceptedInputs(authorizedSourceRefs);
+      await work.readMaintenanceInputs(authorizedSourceRefs);
+      await work.client.query(
+        `UPDATE structured_publication_sources
+            SET desired_extraction_revision = $3
+          WHERE scope_binding = $1 AND source_ref = $2`,
+        [scopeBinding, siblingRef, refusedDesiredRevision]
+      );
+      await work.client.query(
+        `INSERT INTO projection_outbox (id, subject_kind, subject_id)
+         VALUES ($1::uuid, 'entity', $2::uuid)`,
+        [refusedIntentId, refusedIntentSubject]
+      );
+      work.bumpRevisions({ read: true, maintenance: true });
+    };
+
+    try {
+      await gate.connect();
+      for (const key of gateKeys) {
+        await gate.query("SELECT pg_advisory_lock($1::bigint)", [key]);
+      }
+      await installRoutingCommitGate(gateKeys);
+
+      // The first change takes the reservation and parks at its gate before the
+      // unit of work exists, so attempt 1 is observed parked instead of racing an
+      // unblocked attempt through to a commit.
+      let change = startChurn(1);
+      openChanges.push(change);
+
+      // The churn commits a source-set change inside every attempt's reservation
+      // wait, so revalidation sees a token the discovery read did not and each
+      // attempt is discarded before its callback runs. The counter below measures
+      // that instead of assuming it.
+      refused = codeOf(
+        authority.withAuthorizedScope(refusedContext(), async (work) => {
+          callbackInvocations += 1;
+          return issueRefusedWrites(work);
+        })
+      );
+
+      const parks: string[] = [];
+      let committedGeneration = churnGeneration;
+      for (
+        let attempt = 1;
+        attempt <= STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS;
+        attempt += 1
+      ) {
+        const current = change;
+        await pollUntilObserved(
+          `the second connection parked on attempt ${attempt}'s commit gate`,
+          async () => {
+            const waiters = await readAdvisoryWaiters();
+            return waiters.some((waiter) => waiter.key === gateIdentities[attempt - 1]);
+          }
+        );
+        // A refused attempt is parked on a reservation this transaction holds,
+        // so its discovery is committed-visible and its revalidation is not. The
+        // park is a session the second connection does not own, and this change
+        // is the only one armed, so the waiter set cannot gain a member between
+        // two polls and an identity already recorded is a different attempt.
+        await pollUntilObserved(
+          `attempt ${attempt} parked on the source reservation the second connection holds`,
+          async () => {
+            const fresh = (await readAdvisoryWaiters()).filter(
+              (waiter) =>
+                reservationIdentities.has(waiter.key) &&
+                waiter.session !== churnApplicationName &&
+                !parks.includes(waiter.identity)
+            );
+            if (fresh.length === 0) return false;
+            parks.push(...fresh.map((waiter) => waiter.identity));
+            return true;
+          }
+        );
+        // Armed only after the park is recorded, so its reservation request is
+        // queued ahead of the next attempt and cannot win the reservation first.
+        if (attempt < STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS) {
+          change = startChurn(attempt + 1);
+          openChanges.push(change);
+        }
+        await gate.query("SELECT pg_advisory_unlock($1::bigint)", [gateKeys[attempt - 1]]);
+        committedGeneration = (await current).generation;
+      }
+      code = await refused;
+
+      // Phase one verdict: the bound was reached, every attempt was discarded at
+      // revalidation before its callback, and the concurrent owner's committed
+      // change survived. No write of this unit of work was ever issued here, so
+      // the no-mutation oracle is phase two's to carry.
+      expect(code).toBe("input_stale");
+      expect(callbackInvocations).toBe(0);
+      expect(parks).toHaveLength(STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS);
+      expect(new Set(parks).size).toBe(STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS);
+      const after = await publication.readSnapshot({ scopeBinding });
+      expect(sourceRow(after, churnRef)).toMatchObject({
+        active: true,
+        generation: committedGeneration,
+        desired: {
+          sourceVersion: "v1",
+          extractionRevision:
+            ROUTING_GATE_REVISION_BASE + STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS,
+        },
+      });
+      expect(committedGeneration).toBeGreaterThan(churnGeneration);
+      expect(await readRevisionPair(scopeBinding)).toEqual({
+        read: revisionsBefore.read,
+        maintenance: String(
+          Number(revisionsBefore.maintenance) + STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS
+        ),
+      });
+
+      // Phase two: the gate revisions are retired and every churned change has
+      // committed and released its reservation, so the next attempt finds
+      // nothing to re-route around. Its writes are issued for real, read back
+      // inside the same transaction, and then the commit itself fails — which is
+      // the only way a rollback that leaves no trace can be observed removing
+      // something that was there.
+      await clearFaults();
+      const outboxBeforeRefusedWrite = await readOutboxCount();
+      const revisionsBeforeRefusedWrite = await readRevisionPair(scopeBinding);
+      await injectFault({
+        table: "structured_publication_scopes",
+        mode: "fail",
+        scopeBinding,
+        atCommit: true,
+        errcode: COMMIT_WINDOW_SQLSTATE,
+      });
+      const issued = { siblingDesired: "not-issued", intentRows: 0 };
+      let commitWindow: unknown;
+
+      try {
+        await authority.withAuthorizedScope(refusedContext(), async (work) => {
+          callbackInvocations += 1;
+          await issueRefusedWrites(work);
+          // This transaction reads its own writes, so a non-zero count and the
+          // refused revision are the proof the two writes were issued, not the
+          // reason the counts below are zero.
+          const sibling = await work.client.query(
+            `SELECT desired_extraction_revision::text AS desired_extraction_revision
+               FROM structured_publication_sources
+              WHERE scope_binding = $1 AND source_ref = $2`,
+            [scopeBinding, siblingRef]
+          );
+          issued.siblingDesired = String(
+            sibling.rows[0]?.desired_extraction_revision ?? "absent"
+          );
+          issued.intentRows = await countRowsOnClient(
+            work.client,
+            "SELECT count(*)::text AS count FROM projection_outbox WHERE id = $1::uuid",
+            [refusedIntentId]
+          );
+        });
+      } catch (error) {
+        commitWindow = error;
+      }
+
+      expect(callbackInvocations).toBe(1);
+      expect(issued).toEqual({
+        siblingDesired: String(refusedDesiredRevision),
+        intentRows: 1,
+      });
+      expect(errorCodeOf(commitWindow)).toBe("backend_unavailable");
+      // The injected SQLSTATE is this run's only source, so it names the failure
+      // as the commit-window raise rather than any earlier step.
+      expect(sqlStateOf(commitWindow)).toBe(COMMIT_WINDOW_SQLSTATE);
+      const afterRefusal = await publication.readSnapshot({ scopeBinding });
+      expect(sourceRow(afterRefusal, siblingRef)).toMatchObject({
+        active: true,
+        generation: siblingGeneration,
+        desired: { sourceVersion: "v1", extractionRevision: 1 },
+        published: null,
+      });
+      expect(await countOutboxIntent(refusedIntentId)).toBe(0);
+      expect(await readOutboxCount()).toBe(outboxBeforeRefusedWrite);
+      expect(await readRevisionPair(scopeBinding)).toEqual(revisionsBeforeRefusedWrite);
+    } finally {
+      for (const key of gateKeys) {
+        await gate
+          .query("SELECT pg_advisory_unlock($1::bigint)", [key])
+          .catch(() => undefined);
+      }
+      await Promise.allSettled(openChanges);
+      await refused?.catch(() => undefined);
+      await clearFaults();
+      routingSecondBackend = await closeRoutingPeer(routingSecondBackend);
+      routingGateClient = await closeRoutingPeer(routingGateClient);
+    }
+  }, ROUTING_EXHAUSTION_TIMEOUT_MS);
 
   it("keeps concurrent owners, claims, settlements and publications lock-compatible", async () => {
     const scopes = [unique("lock-scope-a"), unique("lock-scope-b")];

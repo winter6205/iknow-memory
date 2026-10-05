@@ -352,6 +352,57 @@ export interface ScopedInputView {
   ): Promise<MaintenanceInputSnapshot>;
 }
 
+/**
+ * The transaction-owning half of the shared authority, with none of its
+ * context-minting power.
+ *
+ * A work store needs to run a transaction in the composed authority's lock
+ * order, and nothing else. Typing its dependency as this port instead of the
+ * whole seam is what makes a standalone ledger structurally unable to mint a
+ * trusted context, so no code path can hand out a second write authority.
+ */
+export interface ScopeTransactionOwner {
+  runTransaction<R>(
+    body: (client: ScopeTransactionClient) => Promise<R>,
+    options?: {
+      readonly readOnly?: boolean;
+      readonly fail?: (error: unknown) => Error;
+    }
+  ): Promise<R>;
+}
+
+/** The one queue every accepted memory write cooperates on. */
+export interface MemorySerializationPort {
+  exclusive<T>(action: () => Promise<T>): Promise<T>;
+}
+
+/**
+ * A single serialization tail.
+ *
+ * It is a one-slot chain rather than a mutex because memory writes await an
+ * outbox or extraction preparation: holding a synchronous lock across an await
+ * would deadlock the event loop's only writer. Queuing here keeps the visible
+ * effect identical — one writer at a time, in arrival order — while still
+ * allowing preparation to be asynchronous.
+ */
+export class MemoryStructuredScopeTail implements MemorySerializationPort {
+  private tail: Promise<void> = Promise.resolve();
+
+  async exclusive<T>(action: () => Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  }
+}
+
 /** The one transaction client a seam run owns. `pg.PoolClient` satisfies it. */
 export interface ScopeTransactionClient {
   query(

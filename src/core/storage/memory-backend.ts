@@ -223,9 +223,9 @@ export class MemoryBackend
     StorageReadPort
 {
   /** Shared identity registry used by the optional publication UOW. */
-  readonly structuredIdentityStore = new InMemoryStructuredIdentityStore();
+  readonly structuredIdentityStore: InMemoryStructuredIdentityStore;
   /** Shared durable-work policy store used by the optional publication UOW. */
-  readonly maintenanceWorkStore = new InMemoryMaintenanceWorkStore();
+  readonly maintenanceWorkStore: InMemoryMaintenanceWorkStore;
   /** Optional backend capability backed by these exact identity/evidence/work maps. */
   structuredPublication: StructuredPublicationStorage;
   /**
@@ -308,6 +308,15 @@ export class MemoryBackend
     options: { readonly publicationOutbox?: PublicationOutboxPort } = {}
   ) {
     this.scopeTail = new MemoryStructuredScopeTail();
+    // One tail, injected into every memory writer that touches the structured
+    // authoritative maps. A store that kept a queue of its own would commit
+    // between another writer's last validation and its commit.
+    this.structuredIdentityStore = new InMemoryStructuredIdentityStore(
+      this.scopeTail
+    );
+    this.maintenanceWorkStore = new InMemoryMaintenanceWorkStore(
+      this.scopeTail
+    );
     this.publicationUow = new MemoryStructuredPublicationStorage(
       this,
       options.publicationOutbox,

@@ -17,6 +17,7 @@
  * transaction-owning stores are never called from inside a callback.
  */
 import {
+  MemoryStructuredScopeTail,
   STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS,
   StructuredScopeError,
   mintAuthorizedScopeContext,
@@ -31,10 +32,12 @@ import type {
   AuthorizedScopeUnitOfWork,
   AuthorizedScopeWork,
   MaintenanceInputSnapshot,
+  MemorySerializationPort,
   PreparedMemoryScopeWork,
   ScopeRevisionChange,
   ScopeRevisionState,
   ScopeTransactionClient,
+  ScopeTransactionOwner,
   ScopeWorkHandle,
   ScopedExtractionInput,
   ScopedInputView,
@@ -60,6 +63,8 @@ import {
 import {
   buildPgAcceptedSnapshot,
   buildPgMaintenanceSnapshot,
+  readPgObservedSourceRows,
+  readPgScopedWork,
 } from "./structured-scope-reads.js";
 
 /** Internal signal that this attempt must be discarded before any write. */
@@ -178,15 +183,16 @@ function sameOwnership(
 
 /**
  * The state a routing attempt may not observe move: ownership plus each
- * source's generation, desired pair and activity, plus the scope counters.
- * Every accepted write changes at least one of these, so a comparison here is
- * what turns "someone else wrote while I prepared" into a restart instead of a
- * lost update.
+ * source's generation, desired pair and activity, plus the work ledger, plus the
+ * scope counters. Every accepted write changes at least one of these, so a
+ * comparison here is what turns "someone else wrote while I prepared" into a
+ * restart instead of a lost update.
  */
 function fingerprint(
   ownership: readonly SourceOwnership[],
   rows: readonly ScopedSourceInput[],
-  revisions: ScopeRevisionState | null
+  revisions: ScopeRevisionState | null,
+  work: readonly ScopedWorkInput[]
 ): string {
   const sources = rows
     .map(
@@ -194,7 +200,19 @@ function fingerprint(
         `${row.sourceRef}=${row.generation}:${row.active}:${row.desired?.extractionRevision ?? "-"}:${row.desired?.sourceVersion ?? "-"}`
     )
     .join(";");
-  return `${ownership.map((entry) => `${entry.sourceRef}@${entry.ownerScopeBinding ?? "none"}`).join(",")}|${sources}|${revisions === null ? "none" : `${revisions.readRevision}/${revisions.maintenanceRevision}`}`;
+  // The ledger's own columns, plus updatedAt: every job write that changes
+  // status or a counter also stamps updatedAt from the same clock value that
+  // computes its lease, so a heartbeat whose clock has not advanced moves
+  // neither. A lease-only write is out of scope by decision.
+  // inputRevision already covers the dependency vector, so it stands in for
+  // the dependencies themselves.
+  const jobs = work
+    .map(
+      (record) =>
+        `${record.jobKey}=${record.workKind}:${record.sourceRef}:${record.sourceGeneration}:${record.status}:${record.attemptCount}:${record.autoAttemptCount}:${record.lastFailureCode ?? "-"}:${record.nextAttemptAt ?? "-"}:${record.updatedAt}:${record.inputRevision}:${record.configRevision}`
+    )
+    .join(";");
+  return `${ownership.map((entry) => `${entry.sourceRef}@${entry.ownerScopeBinding ?? "none"}`).join(",")}|${sources}|${jobs}|${revisions === null ? "none" : `${revisions.readRevision}/${revisions.maintenanceRevision}`}`;
 }
 
 /**
@@ -366,28 +384,18 @@ function assertCurrentAuthorization(
 }
 
 /**
- * The PostgreSQL seam: one pool client, one transaction, one lock order, one
- * commit.
+ * The transaction half of the PostgreSQL seam, with no context-minting power.
+ *
+ * This is what a component that only needs the shared lock order — the durable
+ * work ledger — depends on. It deliberately does not implement
+ * `AuthorizedScopeUnitOfWork`, so a ledger constructed without the composed
+ * authority can still run a transaction but can never mint a trusted context and
+ * therefore can never become a second write authority.
  */
-export class PgStructuredScopeUnitOfWork
-  implements
-    StructuredScopeUnitOfWork<AuthorizedScopeWork>,
-    AuthorizedScopeUnitOfWork
-{
-  private readonly clock: () => Date;
-
+export class PgScopeTransactionRunner implements ScopeTransactionOwner {
   constructor(
-    private readonly leaseClient: () => Promise<ScopeTransactionClient>,
-    now: () => Date = () => new Date()
-  ) {
-    this.clock = now;
-  }
-
-  createAuthorizedContext(
-    input: AuthorizedScopeContextInput
-  ): AuthorizedScopeContext {
-    return mintAuthorizedScopeContext(input, this);
-  }
+    protected readonly leaseClient: () => Promise<ScopeTransactionClient>
+  ) {}
 
   /**
    * One client, one transaction, commit once, roll back once with diagnostics.
@@ -425,6 +433,51 @@ export class PgStructuredScopeUnitOfWork
     } finally {
       client.release();
     }
+  }
+}
+
+/**
+ * The PostgreSQL counterpart of the memory observation: a resolved ownership map
+ * and one token over everything a routing attempt may not observe moving.
+ */
+interface PgRoutingObservation {
+  readonly ownership: readonly SourceOwnership[];
+  readonly token: string;
+}
+
+/**
+ * A scope this run registers is the zero pair a fresh scope row is given, so an
+ * absent scope is not a revision change the run caused by registering it.
+ */
+const UNREGISTERED_SCOPE_REVISIONS: ScopeRevisionState = {
+  readRevision: 0,
+  maintenanceRevision: 0,
+};
+
+/**
+ * The PostgreSQL seam: one pool client, one transaction, one lock order, one
+ * commit.
+ */
+export class PgStructuredScopeUnitOfWork
+  extends PgScopeTransactionRunner
+  implements
+    StructuredScopeUnitOfWork<AuthorizedScopeWork>,
+    AuthorizedScopeUnitOfWork
+{
+  private readonly clock: () => Date;
+
+  constructor(
+    leaseClient: () => Promise<ScopeTransactionClient>,
+    now: () => Date = () => new Date()
+  ) {
+    super(leaseClient);
+    this.clock = now;
+  }
+
+  createAuthorizedContext(
+    input: AuthorizedScopeContextInput
+  ): AuthorizedScopeContext {
+    return mintAuthorizedScopeContext(input, this);
   }
 
   async withAuthorizedScope<R>(
@@ -506,6 +559,15 @@ export class PgStructuredScopeUnitOfWork
    * of writing under a stale ownership map. The second resolution happens while
    * the reservations are held, which is what makes the map authoritative for the
    * owner and source locks that follow.
+   *
+   * Ownership alone is not enough on its own: on PostgreSQL a source's owner is
+   * assigned once and never moves, so a source-set or ledger change committed
+   * while this attempt waited for its reservations is invisible to it. The
+   * revalidation after the source locks closes that window, and it is placed
+   * there because that is the first read that observes state settled under the
+   * held locks: every reservation is taken, the owner scope and the affected
+   * source rows are locked, and no later statement in this transaction can see
+   * a different committed state.
    */
   private async routeOwnership(
     client: ScopeTransactionClient,
@@ -514,14 +576,14 @@ export class PgStructuredScopeUnitOfWork
     options?: AuthorizedScopeRunOptions
   ): Promise<ScopeRevisionState | null> {
     const discovered = await this.runTransaction(
-      (readClient) => resolveOwnership(readClient, refs),
+      (readClient) => this.observeRouting(readClient, context, refs, options),
       { readOnly: true }
     );
     if (!(await reserveSources(client, refs))) {
       throw new ScopeRoutingConflict("source reservation was contended");
     }
     const reserved = await resolveOwnership(client, refs);
-    if (!sameOwnership(discovered, reserved)) {
+    if (!sameOwnership(discovered.ownership, reserved)) {
       throw new ScopeRoutingConflict(
         "ownership changed between discovery and reservation"
       );
@@ -542,7 +604,53 @@ export class PgStructuredScopeUnitOfWork
       refsToLock(reserved, context, options)
     );
     assertAuthorizedSourcesActive(lockedRows);
+    const revalidated = await this.observeRouting(
+      client,
+      context,
+      refs,
+      options
+    );
+    if (revalidated.token !== discovered.token) {
+      // EXIT: a source-set, work-ledger or revision change committed by another
+      // connection after discovery discards this attempt before the callback
+      // runs, so it leaves no write, outbox effect or revision bump; the bounded
+      // loop re-routes and, past STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS, refuses
+      // input_stale.
+      throw new ScopeRoutingConflict(
+        "the scope, its sources or its work ledger changed between discovery and the source locks"
+      );
+    }
     return revisions;
+  }
+
+  /**
+   * One snapshot of the state a routing attempt may not observe moving, read the
+   * same way at discovery and at revalidation so a token difference is a change
+   * someone else committed rather than two reads asking different questions.
+   * Every read here is lock-free: the token must not introduce a lock of its own
+   * into the one shared order.
+   */
+  private async observeRouting(
+    client: ScopeTransactionClient,
+    context: AuthorizedScopeContext,
+    refs: readonly string[],
+    options?: AuthorizedScopeRunOptions
+  ): Promise<PgRoutingObservation> {
+    const ownership = await resolveOwnership(client, refs);
+    return {
+      ownership,
+      token: fingerprint(
+        ownership,
+        await readPgObservedSourceRows(
+          client,
+          context.ownerScopeBinding,
+          refsToLock(ownership, context, options)
+        ),
+        (await currentScopeRevisions(client, context.ownerScopeBinding)) ??
+          UNREGISTERED_SCOPE_REVISIONS,
+        await readPgScopedWork(client, refs)
+      ),
+    };
   }
 }
 
@@ -581,42 +689,11 @@ export interface MemoryScopeAuthorizationAuthority {
   authorizationRevision(scopeBinding: string): string | null;
 }
 
-/** The one queue every accepted memory write cooperates on. */
-export interface MemorySerializationPort {
-  exclusive<T>(action: () => Promise<T>): Promise<T>;
-}
-
-/**
- * A single serialization tail.
- *
- * It is a one-slot chain rather than a mutex because memory writes await an
- * outbox or extraction preparation: holding a synchronous lock across an await
- * would deadlock the event loop's only writer. Queuing here keeps the visible
- * effect identical — one writer at a time, in arrival order — while still
- * allowing preparation to be asynchronous.
- */
-export class MemoryStructuredScopeTail implements MemorySerializationPort {
-  private tail: Promise<void> = Promise.resolve();
-
-  async exclusive<T>(action: () => Promise<T>): Promise<T> {
-    const previous = this.tail;
-    let release!: () => void;
-    this.tail = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      return await action();
-    } finally {
-      release();
-    }
-  }
-}
-
 /** One observation of the authority, taken with or without the tail held. */
 interface MemoryObservation {
   readonly ownership: readonly SourceOwnership[];
   readonly rows: readonly ScopedSourceInput[];
+  readonly work: readonly ScopedWorkInput[];
   readonly revisions: ScopeRevisionState | null;
   readonly token: string;
 }
@@ -706,6 +783,10 @@ export class MemoryStructuredScopeUnitOfWork
     });
     return this.tail.exclusive(async () => {
       if (this.observe(context.ownerScopeBinding, refs).token !== held.token) {
+        // EXIT: a scope, source-set or work-ledger change since this attempt
+        // validated discards the attempt before any prepared commit runs; the
+        // bounded loop retries and, past STRUCTURED_SCOPE_MAX_ROUTING_ATTEMPTS,
+        // refuses input_stale with no mutation.
         throw new ScopeRoutingConflict(
           "the authority accepted another write during preparation"
         );
@@ -729,14 +810,17 @@ export class MemoryStructuredScopeUnitOfWork
       ownerScopeBinding: this.publication.resolveOwnerScopeBinding(sourceRef),
     }));
     const rows = this.publication.scopedSourceRows(scopeBinding, refs);
+    const work = this.work.scopedWorkRecords(refs);
     return {
       ownership,
       rows,
+      work,
       revisions: this.publication.scopeRevisions(scopeBinding),
       token: fingerprint(
         ownership,
         rows,
-        this.publication.scopeRevisions(scopeBinding)
+        this.publication.scopeRevisions(scopeBinding),
+        work
       ),
     };
   }
@@ -843,6 +927,7 @@ export {
   currentScopeRevisions,
   lockAffectedSources,
   lockOwnerScope,
+  MemoryStructuredScopeTail,
   resolveOwnership,
   stableSourceRefs,
   StructuredScopeError,
@@ -856,9 +941,11 @@ export type {
   AuthorizedScopeUnitOfWork,
   AuthorizedScopeWork,
   MaintenanceInputSnapshot,
+  MemorySerializationPort,
   PreparedMemoryScopeWork,
   ScopeRevisionChange,
   ScopeTransactionClient,
+  ScopeTransactionOwner,
   ScopeWorkHandle,
   ScopedExtractionInput,
   ScopedInputView,

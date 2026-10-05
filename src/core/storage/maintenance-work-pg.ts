@@ -50,7 +50,7 @@ import {
   type MaintenanceWorkStatus,
   type MaintenanceWorkStore,
 } from "../maintenance/types.js";
-import { PgStructuredScopeUnitOfWork } from "./structured-scope-uow.js";
+import { PgScopeTransactionRunner } from "./structured-scope-uow.js";
 import {
   lockAffectedSources,
   lockOwnerScope,
@@ -61,6 +61,7 @@ import {
 import { structuredScopeError } from "./structured-scope-types.js";
 import type {
   ScopeTransactionClient,
+  ScopeTransactionOwner,
   SourceOwnership,
 } from "./structured-scope-types.js";
 
@@ -152,17 +153,19 @@ interface ClaimPass {
 export class PgMaintenanceWorkStore implements MaintenanceWorkStore {
   private readonly pool: MaintenanceWorkPool;
   /**
-   * The transaction owner shared with publication. Composition may inject the
-   * backend's instance; the default one leases through this store's own guard so
-   * a pool fault still arrives as a typed ledger failure.
+   * The transaction owner shared with publication. Composition injects the
+   * backend's own instance, so a work write and a publication write take the
+   * same lock order under one seam. A store constructed without it keeps the
+   * plan's declared standalone behavior on a runner that can only open and close
+   * a transaction — it cannot mint a context, so it cannot become a second
+   * write authority.
    */
-  private readonly scope: PgStructuredScopeUnitOfWork;
+  private readonly scope: ScopeTransactionOwner;
   private closed = false;
 
-  constructor(pool: MaintenanceWorkPool, scope?: PgStructuredScopeUnitOfWork) {
+  constructor(pool: MaintenanceWorkPool, scope?: ScopeTransactionOwner) {
     this.pool = pool;
-    this.scope =
-      scope ?? new PgStructuredScopeUnitOfWork(() => this.lease());
+    this.scope = scope ?? new PgScopeTransactionRunner(() => this.lease());
   }
 
   /**

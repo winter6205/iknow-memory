@@ -812,9 +812,6 @@ function summarizeMemoryMaintenance(
     sourcesInScope: active.length,
     publishedSources: active.filter((source) => source.published !== null)
       .length,
-    desiredIndexBuckets: active.length,
-    conflictCheckBuckets: active.length,
-    conflictStatus: "pending",
   };
 }
 
@@ -1130,9 +1127,6 @@ function emptySnapshot(scopeBinding: string): PublicationSnapshot {
     maintenance: {
       sourcesInScope: 0,
       publishedSources: 0,
-      desiredIndexBuckets: 0,
-      conflictCheckBuckets: 0,
-      conflictStatus: "pending",
     },
   };
 }

@@ -22,6 +22,12 @@
  */
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
+import { z } from "zod";
+import {
+  createEvidenceDispatcher,
+  EVIDENCE_PRIVATE_METHOD,
+  supportsEvidenceScopeAuthority,
+} from "./core/storage/evidence-dispatch.js";
 
 import { ConfigError, loadEnv, type GraphragEnv } from "./config.js";
 import { createLogger, redactDiagnostic, writeStderr } from "./logging.js";
@@ -610,6 +616,27 @@ export async function createServer(): Promise<McpServer> {
 
   for (const tool of registry.values()) {
     registerOne(server, tool, logger);
+  }
+
+  // The private Evidence capability is a custom JSON-RPC request method, not a
+  // registered tool, so `tools/list` above is unchanged by its presence. It is
+  // registered only when the selected storage carries the authorized-scope
+  // seam: without that seam there is nothing to mint a trusted context with, and
+  // an Evidence call must be refused rather than answered from another authority.
+  const evidenceAuthority = supportsEvidenceScopeAuthority(deps.storage);
+  if (evidenceAuthority !== undefined) {
+    const dispatcher = createEvidenceDispatcher({
+      authority: evidenceAuthority,
+      binding: process.env,
+    });
+    server.server.setRequestHandler(
+      EVIDENCE_PRIVATE_METHOD,
+      { params: z.unknown() },
+      async (request: unknown) =>
+        (await dispatcher.handle(request)) as unknown as {
+          [key: string]: unknown;
+        }
+    );
   }
 
   logger.info("server constructed", {

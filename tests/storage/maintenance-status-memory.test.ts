@@ -16,6 +16,10 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 
 import {
+  MAINTENANCE_RULESET_REVISION,
+  MAINTENANCE_STRUCTURAL_COVERAGE,
+} from "../../src/core/maintenance/maintenance-status.js";
+import {
   claimNextWork,
   scheduleWork,
   settleWork,
@@ -31,6 +35,10 @@ import type {
   StructuredPublicationStorage,
 } from "../../src/core/maintenance/publication-types.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
+import {
+  MemoryScreeningStorage,
+  type MemoryScreeningCheckRecord,
+} from "../../src/core/storage/screening-memory.js";
 import { MemoryMaintenanceStatusStorage } from "../../src/core/storage/structured-status-reads.js";
 import { MemoryStructuredScopeUnitOfWork } from "../../src/core/storage/structured-scope-uow.js";
 import type { AuthorizedScopeContext } from "../../src/core/storage/structured-scope-types.js";
@@ -56,6 +64,7 @@ interface Scenario {
   readonly publication: StructuredPublicationStorage;
   readonly authority: MemoryStructuredScopeUnitOfWork;
   readonly status: MemoryMaintenanceStatusStorage;
+  readonly screening: MemoryScreeningStorage;
   readonly deps: {
     readonly store: MaintenanceWorkStore;
     readonly clock: () => Date;
@@ -80,13 +89,15 @@ function createScenario(): Scenario {
   const clock = createPublicationTestClock(new Date());
   const authority: MemoryStructuredScopeUnitOfWork =
     backend.structuredScopeUnitOfWork;
+  const screening = new MemoryScreeningStorage(authority);
   return {
     backend,
     clock,
     work: backend.maintenanceWorkStore,
     publication: backend.structuredPublication,
     authority,
-    status: new MemoryMaintenanceStatusStorage(authority),
+    screening,
+    status: new MemoryMaintenanceStatusStorage(authority, screening),
     deps: { store: backend.maintenanceWorkStore, clock: () => clock() },
   };
 }
@@ -782,6 +793,219 @@ const port: MaintenanceStatusTestPort = {
 };
 
 describeMaintenanceStatusContract(async () => port);
+
+/**
+ * The lane's persisted check rows, as the store holds them.
+ *
+ * A status that reports the normative constants cannot be told apart from one
+ * that reads the store, so a case has to be able to place a record the public
+ * screen API would never mint. Reaching the map directly is the same device
+ * `seedMissingRequiredState` uses to erase a desired input.
+ */
+function storedChecksOf(
+  screening: MemoryScreeningStorage
+): Map<string, MemoryScreeningCheckRecord> {
+  const held = (
+    screening as unknown as { readonly checks?: Map<string, MemoryScreeningCheckRecord> }
+  ).checks;
+  if (held === undefined) {
+    // EXIT: the screening store no longer holds check records where this lane
+    // reads them. The fixture throws, so a case cannot plant a disagreement
+    // into nothing and read the refusal back as a real one.
+    throw new Error("the memory screening store holds no check records to read");
+  }
+  return held;
+}
+
+/** Place one check record the store holds, as a prior ruleset release would. */
+function plantCheck(
+  screening: MemoryScreeningStorage,
+  record: {
+    readonly scopeBinding: string;
+    readonly checkId: string;
+    readonly sourceRef: string;
+    readonly rulesetRevision: string;
+    readonly coverage: string;
+  }
+): void {
+  storedChecksOf(screening).set(`${record.scopeBinding}|${record.checkId}`, {
+    checkId: record.checkId,
+    sourceRef: record.sourceRef,
+    rulesetRevision: record.rulesetRevision,
+    coverage: record.coverage,
+    candidateCount: 0,
+  });
+}
+
+/** One published source whose current pair a screen may run against. */
+async function seedScreenableScope(
+  label: string
+): Promise<{ readonly scope: MaintenanceStatusScope; readonly scenario: Scenario }> {
+  const sourceRef = unique(`${label}-source`);
+  const { scope, scenario, generations } = await newScope(label, [sourceRef]);
+  await publishVersion(scenario, {
+    scopeBinding: scope.scopeBinding,
+    sourceRef,
+    generation: generations.get(sourceRef)!,
+    accepted: [],
+  });
+  return { scope, scenario };
+}
+
+/** Run one real screen against a published source and settle its attempt. */
+async function stageRealScreen(
+  scope: MaintenanceStatusScope,
+  scenario: Scenario,
+  sourceRef: string,
+  generation: number
+): Promise<void> {
+  const guard = await claimOwnAttempt(scenario, {
+    workKind: "conflict_check",
+    sourceRef,
+    generation,
+    dependencies: checkDependencies(sourceRef, generation),
+  });
+  await scenario.screening.stageScreen({
+    context: scope.context,
+    guard,
+    relationBuckets: [RELATION],
+    relationCatalogVersion: 0,
+    relationCatalogEntries: [],
+    acceptedAssertions: [],
+    liveSources: new Map([
+      [sourceRef, { active: true, generation, publishedExtractionRevision: 1 }],
+    ]),
+    liveConfigRevision: CONFIG_REVISION,
+    guardFailure: (attempt, now) => scenario.work.publicationGuardFailure(attempt, now),
+    scheduledDependencies: (attempt) =>
+      scenario.work.publicationDependenciesForGuard(attempt),
+    now: () => scenario.clock(),
+  });
+  await settle(
+    scenario,
+    guard,
+    "ready",
+    checkDependencies(sourceRef, generation)
+  );
+}
+
+describe("memory status reads its screening records back", () => {
+  it("reports the ruleset a published check was stored under, not the normative one", async () => {
+    const sourceRef = unique("stored-ruleset-source");
+    const { scope, scenario, generations } = await newScope("stored-ruleset", [
+      sourceRef,
+    ]);
+    await publishVersion(scenario, {
+      scopeBinding: scope.scopeBinding,
+      sourceRef,
+      generation: generations.get(sourceRef)!,
+      accepted: [],
+    });
+    // A single record, and a ruleset other than the normative one: a status
+    // still reporting the constant here is quoting a constant instead of
+    // reading what the scope persisted.
+    plantCheck(scenario.screening, {
+      scopeBinding: scope.scopeBinding,
+      checkId: unique("stored-ruleset-check"),
+      sourceRef,
+      rulesetRevision: "structural-alternatives:7",
+      coverage: "structural_candidates_only",
+    });
+    const observed = await port.readStatus(scope);
+    expect(observed.rulesetRevision).toBe("structural-alternatives:7");
+    expect(observed.coverage).toBe("structural_candidates_only");
+  });
+
+  it("reports the ruleset and coverage one real screen persisted", async () => {
+    const sourceRef = unique("real-screen-source");
+    const { scope, scenario, generations } = await newScope("real-screen", [
+      sourceRef,
+    ]);
+    await publishVersion(scenario, {
+      scopeBinding: scope.scopeBinding,
+      sourceRef,
+      generation: generations.get(sourceRef)!,
+      accepted: [],
+    });
+    await stageRealScreen(scope, scenario, sourceRef, generations.get(sourceRef)!);
+    const observed = await port.readStatus(scope);
+    expect(observed.rulesetRevision).toBe(MAINTENANCE_RULESET_REVISION);
+    expect(observed.coverage).toBe(MAINTENANCE_STRUCTURAL_COVERAGE);
+  });
+
+  it("refuses when one scope's check records disagree on the ruleset revision", async () => {
+    const sourceRef = unique("disagreeing-source");
+    const { scope, scenario, generations } = await newScope("disagreeing-ruleset", [
+      sourceRef,
+    ]);
+    await publishVersion(scenario, {
+      scopeBinding: scope.scopeBinding,
+      sourceRef,
+      generation: generations.get(sourceRef)!,
+      accepted: [],
+    });
+    plantCheck(scenario.screening, {
+      scopeBinding: scope.scopeBinding,
+      checkId: unique("disagreeing-old"),
+      sourceRef,
+      rulesetRevision: "structural-alternatives:0",
+      coverage: "structural_candidates_only",
+    });
+    plantCheck(scenario.screening, {
+      scopeBinding: scope.scopeBinding,
+      checkId: unique("disagreeing-new"),
+      sourceRef,
+      rulesetRevision: "structural-alternatives:9",
+      coverage: "structural_candidates_only",
+    });
+    await expect(port.readStatus(scope)).rejects.toMatchObject({
+      code: "maintenance_status_unavailable",
+    });
+  });
+
+  it("refuses when one scope's check records disagree on the coverage", async () => {
+    const sourceRef = unique("disagreeing-coverage-source");
+    const { scope, scenario, generations } = await newScope("disagreeing-coverage", [
+      sourceRef,
+    ]);
+    await publishVersion(scenario, {
+      scopeBinding: scope.scopeBinding,
+      sourceRef,
+      generation: generations.get(sourceRef)!,
+      accepted: [],
+    });
+    plantCheck(scenario.screening, {
+      scopeBinding: scope.scopeBinding,
+      checkId: unique("disagreeing-coverage-narrow"),
+      sourceRef,
+      rulesetRevision: MAINTENANCE_RULESET_REVISION,
+      coverage: "structural_candidates_only",
+    });
+    plantCheck(scenario.screening, {
+      scopeBinding: scope.scopeBinding,
+      checkId: unique("disagreeing-coverage-wide"),
+      sourceRef,
+      rulesetRevision: MAINTENANCE_RULESET_REVISION,
+      coverage: "structural_candidates_and_retirements",
+    });
+    await expect(port.readStatus(scope)).rejects.toMatchObject({
+      code: "maintenance_status_unavailable",
+    });
+  });
+
+  it("reports no record for a source this scope never screened", async () => {
+    const { scope, scenario } = await seedScreenableScope("unscreened-source");
+    plantCheck(scenario.screening, {
+      scopeBinding: scope.scopeBinding,
+      checkId: unique("unscreened-check"),
+      sourceRef: unique("a-source-outside-the-scope"),
+      rulesetRevision: "structural-alternatives:7",
+      coverage: "structural_candidates_only",
+    });
+    const observed = await port.readStatus(scope);
+    expect(observed.rulesetRevision).toBe(MAINTENANCE_RULESET_REVISION);
+  });
+});
 
 describe("memory status reporting contract", () => {
   it("reports every bucket name for a scope that fills all ten", async () => {

@@ -38,8 +38,11 @@
  * `filters.structured_query` (specs/structured-corpus-query) is the bounded
  * structured request, and the one filter key whose value is an object. It is
  * resolved, validated against the closed request vocabulary, and stripped here
- * before any arm runs; a structured request never runs the legacy business
- * ledger, and every refusal leaves as a typed `iknow.structured_error`.
+ * before any arm runs. A structurally valid request is answered by the
+ * INJECTED `structuredReader` as a `structured_result` sibling beside an empty
+ * `chunks`; an instance without that reader refuses the typed
+ * `structured_search_unavailable`. Either way it never runs the legacy
+ * business ledger, and every refusal leaves as a typed `iknow.structured_error`.
  */
 import { z } from "zod";
 import {
@@ -92,6 +95,11 @@ import {
 import { GraphragError } from "../core/errors.js";
 import { StructuredQueryError } from "../core/structured/errors.js";
 import { validateStructuredQueryRequest } from "../core/structured/request.js";
+import {
+  STRUCTURED_RESULT_KEY,
+  buildStructuredResult,
+  type StructuredQueryReader,
+} from "../core/structured/result.js";
 import type { BusinessQueryExecutor } from "../core/business-query/sql-query-executor.js";
 import {
   readSqlWindowFilter,
@@ -222,6 +230,14 @@ export interface RetrieveDeps {
    * the structured `real_db_not_wired` (not provisioned) exit.
    */
   businessQuery?: BusinessQueryExecutor;
+  /**
+   * Reader for the bounded `filters.structured_query` request, present only
+   * when this instance is provisioned with the structured backend. Absent is
+   * the SPEC's `structured_search_unavailable` trigger ("backend capability
+   * unavailable") — it is NOT a fall-through to `businessQuery`, which answers
+   * a different question than the one the request asked.
+   */
+  structuredReader?: StructuredQueryReader;
 }
 
 export function createRetrieveHandler(deps: RetrieveDeps) {
@@ -256,15 +272,16 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
       );
     }
     // A structured request may not select or override the host-bound 档, so it
-    // is validated against the tier resolved above. A structurally valid
-    // request has no execution path yet, and the SPEC's answer for that is the
-    // typed `structured_search_unavailable` — never the legacy business
-    // ledger, which would answer a different question than the one asked.
+    // is validated against the tier resolved above. It is answered by the
+    // injected reader and returns HERE: a structured read cites structured
+    // rows, and no arm runs behind it. In particular it must never fall
+    // through to the legacy business ledger below, which would answer a
+    // different question than the one asked.
     if (structured.kind === "present") {
-      validateStructuredQueryRequest(structured.request, searchMode.mode);
-      throw new StructuredQueryError(
-        "structured query execution is not available on this backend",
-        "structured_search_unavailable"
+      return await runStructuredRequest(
+        structured.request,
+        searchMode.mode,
+        deps
       );
     }
     // Same contract for `filters.entity_type` (plans/entity-type-and-filter
@@ -355,6 +372,44 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
 
     return textResult(JSON.stringify(envelope));
   };
+}
+
+/**
+ * Answer one bounded structured request, or refuse it typed.
+ *
+ * The order is the contract: validate, prove the backend exists, read, build.
+ * Validating first means an unprovisioned instance still refuses an invalid
+ * request with the request's own code, so the capability exit never shadows a
+ * caller mistake. Proving the reader second means "no reader" is never
+ * mistaken for "no rows" — an absent reader is a typed refusal, not an empty
+ * success and not a ledger query.
+ */
+async function runStructuredRequest(
+  request: unknown,
+  boundTier: string,
+  deps: RetrieveDeps
+): Promise<ToolResult> {
+  // The validator's RETURN value is the execution input; calling it for its
+  // throw alone would leave the producer re-deriving what it just proved.
+  const validated = validateStructuredQueryRequest(request, boundTier);
+  const reader = deps.structuredReader;
+  if (reader === undefined) {
+    throw new StructuredQueryError(
+      "structured query execution is not available on this backend",
+      "structured_search_unavailable"
+    );
+  }
+  const outcome = await reader.readStructuredQuery(validated);
+  // Empty `chunks` is honest for the same reason the sql arm's is: no document
+  // passage was or could be retrieved on this route. `structured_result` is a
+  // body key beside it — not a second content block — because every tool
+  // result in this server goes through the single-block `textResult`.
+  return textResult(
+    JSON.stringify({
+      chunks: [],
+      [STRUCTURED_RESULT_KEY]: buildStructuredResult(validated, outcome),
+    })
+  );
 }
 
 function validateRetrieveQuery(

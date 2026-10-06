@@ -24,10 +24,13 @@ import {
   parseEvidenceRequest,
   readPrivateEvidence,
   type EvidenceEnvelope,
+  type EvidenceRefusalReason,
   type EvidenceScope,
   type EvidenceSupportsRequest,
   type EvidenceSupportsResult,
 } from "../../src/core/storage/evidence-read.js";
+import { SUPPORT_CONTRACT_VIOLATION } from "../../src/core/storage/evidence-continuation.js";
+import { MAX_EVIDENCE_BYTES } from "../../src/core/storage/evidence-store.js";
 import {
   mintAuthorizedScopeContext,
   StructuredScopeError,
@@ -106,7 +109,10 @@ interface RecordingClient {
   release(): void;
 }
 
-function recordingClient(supportCount = SUPPORT_COUNT): RecordingClient {
+function recordingClient(
+  supportCount = SUPPORT_COUNT,
+  extractionRef: (index: number) => string = (index) => `extraction-${index + 1}`
+): RecordingClient {
   const statements: string[] = [];
   const rows = (sql: string): { rows: unknown[] } => {
     if (sql.includes("FROM evidence_grants")) return { rows: [grantRow()] };
@@ -140,7 +146,7 @@ function recordingClient(supportCount = SUPPORT_COUNT): RecordingClient {
       return {
         rows: Array.from({ length: supportCount }, (_, index) => ({
           support_id: supportId(index + 1),
-          extraction_ref: `extraction-${index + 1}`,
+          extraction_ref: extractionRef(index),
         })),
       };
     }
@@ -222,12 +228,13 @@ function supportsRequest(
 
 async function dispatch(
   request: EvidenceSupportsRequest,
-  input: AuthorizedScopeContextInput = contextInput()
+  input: AuthorizedScopeContextInput = contextInput(),
+  extractionRef?: (index: number) => string
 ): Promise<{
   readonly envelope: EvidenceEnvelope;
   readonly client: RecordingClient;
 }> {
-  const client = recordingClient();
+  const client = recordingClient(SUPPORT_COUNT, extractionRef);
   const scope = recordingScope(client);
   const envelope = await readPrivateEvidence(
     scope,
@@ -339,32 +346,193 @@ describe("T14 EP4 supports dispatch: the selector reaches the continuation", () 
     expect(seen).toEqual([...seen].sort((left, right) => left - right));
   });
 
-  it("never emits the supports-not-read refusal on the row-grant path", async () => {
+  it("never emits the supports-not-read refusal, and answers each request as listed", async () => {
     const first = (await dispatch(supportsRequest())).envelope as EvidenceSupportsResult;
-    const requests: EvidenceSupportsRequest[] = [
-      supportsRequest(),
-      supportsRequest({ cursor: first.next_cursor }),
-      supportsRequest({ support_id: supportId(1) }),
-      supportsRequest({ support_id: supportId(SUPPORT_COUNT) }),
-      supportsRequest({ cursor: "not-a-cursor-this-build-mints" }),
-      supportsRequest({ support_id: "not-a-uuid" }),
-      supportsRequest({ support_id: "99999999-9999-4999-8999-999999999999" }),
-      supportsRequest({ cursor: first.next_cursor, support_id: supportId(1) }),
+    const cases: readonly {
+      readonly label: string;
+      readonly request: EvidenceSupportsRequest;
+      readonly reason: EvidenceRefusalReason | null;
+    }[] = [
+      { label: "no selector", request: supportsRequest(), reason: null },
+      {
+        label: "the cursor the first page minted",
+        request: supportsRequest({ cursor: first.next_cursor }),
+        reason: null,
+      },
+      {
+        label: "the first support",
+        request: supportsRequest({ support_id: supportId(1) }),
+        reason: null,
+      },
+      {
+        label: "the last support",
+        request: supportsRequest({ support_id: supportId(SUPPORT_COUNT) }),
+        reason: null,
+      },
+      {
+        label: "a cursor this build did not mint",
+        request: supportsRequest({ cursor: "not-a-cursor-this-build-mints" }),
+        reason: EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+      },
+      {
+        label: "a selector that is not a uuid",
+        request: supportsRequest({ support_id: "not-a-uuid" }),
+        reason: EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+      },
+      {
+        label: "a support of another grant",
+        request: supportsRequest({ support_id: "99999999-9999-4999-8999-999999999999" }),
+        reason: EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+      },
+      {
+        label: "both selectors at once",
+        request: supportsRequest({ cursor: first.next_cursor, support_id: supportId(1) }),
+        reason: EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+      },
     ];
-    const reasons: string[] = [];
-    for (const request of requests) {
+    for (const { label, request, reason } of cases) {
+      let refused: EvidenceRefusalError | undefined;
       try {
         await dispatch(request);
       } catch (error) {
+        refused = error as EvidenceRefusalError;
+        expect(refused, label).toBeInstanceOf(EvidenceRefusalError);
+        expect(CLOSED_FAILURE_CODES, label).toContain(refused.code);
+      }
+      if (reason === null) {
+        expect(refused, `${label} was refused`).toBeUndefined();
+        continue;
+      }
+      expect(refused?.reason, label).toBe(reason);
+      expect(CLOSED_REASONS, label).toContain(refused?.reason);
+      expect(refused?.reason).not.toBe(
+        EVIDENCE_REFUSAL_REASON.SUPPORTS_CONTINUATION_NOT_READ
+      );
+    }
+  });
+
+  it("tells the three folded contract faults apart locally, on one wire token", async () => {
+    const first = (await dispatch(supportsRequest())).envelope as EvidenceSupportsResult;
+    const faults: readonly {
+      readonly label: string;
+      readonly request: EvidenceSupportsRequest;
+      readonly contract: string;
+    }[] = [
+      {
+        label: "a selector that is not a uuid",
+        request: supportsRequest({ support_id: "not-a-uuid" }),
+        contract: SUPPORT_CONTRACT_VIOLATION.SELECTOR_NOT_UUID,
+      },
+      {
+        label: "two selectors at once",
+        request: supportsRequest({ cursor: first.next_cursor, support_id: supportId(1) }),
+        contract: SUPPORT_CONTRACT_VIOLATION.SELECTORS_MUTUALLY_EXCLUSIVE,
+      },
+      {
+        label: "a selector outside the grant",
+        request: supportsRequest({ support_id: "99999999-9999-4999-8999-999999999999" }),
+        contract: SUPPORT_CONTRACT_VIOLATION.SELECTOR_NOT_A_MEMBER,
+      },
+    ];
+    const seen = new Set<string>();
+    for (const { label, request, contract } of faults) {
+      const refused = await refusalOf(request);
+      // The published token is one, and stays one: the frozen set is not widened
+      // to separate these three.
+      expect(refused.reason, label).toBe(EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD);
+      expect(refused.contract, label).toBe(contract);
+      seen.add(String(refused.contract));
+    }
+    expect(seen.size).toBe(faults.length);
+  });
+
+  it("bounds the envelope it emits, which is wider than the continuation's own bound", async () => {
+    // EXIT: the continuation measures its granted payload, which carries an
+    // internal `state` where the emitted envelope carries the wire schema and
+    // version. The two bounds therefore differ by a constant, and there is a band
+    // of pages that fit the continuation and still overrun the emitted envelope.
+    // That band is the whole reach of this arm's own check, so it is measured here
+    // rather than asserted: a filler one byte shorter must be granted, and the
+    // refusal above it must name this arm's message, not the continuation's.
+    const outcomeAt = async (
+      filler: number
+    ): Promise<
+      | { readonly kind: "granted"; readonly bytes: number }
+      | {
+          readonly kind: "refused";
+          readonly reason: EvidenceRefusalReason;
+          readonly contract: string | undefined;
+          readonly message: string;
+        }
+    > => {
+      try {
+        const { envelope } = await dispatch(
+          supportsRequest(),
+          contextInput(),
+          (index) => (index === 0 ? "f".repeat(filler) : `extraction-${index + 1}`)
+        );
+        return { kind: "granted", bytes: Buffer.byteLength(JSON.stringify(envelope), "utf8") };
+      } catch (error) {
         const refused = error as EvidenceRefusalError;
-        expect(refused).toBeInstanceOf(EvidenceRefusalError);
-        expect(CLOSED_FAILURE_CODES).toContain(refused.code);
-        expect(CLOSED_REASONS).toContain(refused.reason);
-        reasons.push(refused.reason);
+        return {
+          kind: "refused",
+          reason: refused.reason,
+          contract: refused.contract,
+          message: refused.message,
+        };
+      }
+    };
+    const dispatchOwns = (
+      outcome: Awaited<ReturnType<typeof outcomeAt>>
+    ): boolean =>
+      outcome.kind === "refused" &&
+      outcome.reason === EVIDENCE_REFUSAL_REASON.ENVELOPE_TOO_LARGE &&
+      outcome.contract === undefined;
+    let low = 0;
+    let high = MAX_EVIDENCE_BYTES * 2;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if ((await outcomeAt(middle)).kind === "granted") low = middle + 1;
+      else high = middle;
+    }
+    const lastGranted = low - 1;
+    low = 0;
+    high = lastGranted + 1;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (dispatchOwns(await outcomeAt(middle))) high = middle;
+      else low = middle + 1;
+    }
+    const lastGrantedPage = await outcomeAt(lastGranted);
+    const firstRefused = await outcomeAt(low);
+    expect(lastGrantedPage.kind).toBe("granted");
+    expect(
+      (lastGrantedPage as { bytes: number }).bytes
+    ).toBeLessThanOrEqual(MAX_EVIDENCE_BYTES);
+    expect(dispatchOwns(firstRefused)).toBe(true);
+    expect(firstRefused.message).toContain("emitted support page");
+    // Past the band the continuation's own measure is the one that refuses, and it
+    // says so on the same folded token.
+    let overLow = low;
+    let overHigh = MAX_EVIDENCE_BYTES * 2;
+    while (overLow < overHigh) {
+      const middle = Math.floor((overLow + overHigh) / 2);
+      const probe = await outcomeAt(middle);
+      if (
+        probe.kind === "refused" &&
+        probe.contract === SUPPORT_CONTRACT_VIOLATION.ENVELOPE
+      ) {
+        overHigh = middle;
+      } else {
+        overLow = middle + 1;
       }
     }
-    expect(reasons.length).toBeGreaterThan(0);
-    expect(reasons).not.toContain(EVIDENCE_REFUSAL_REASON.SUPPORTS_CONTINUATION_NOT_READ);
+    const overPage = await outcomeAt(overLow);
+    expect(overPage.kind).toBe("refused");
+    expect(
+      overPage.kind === "refused" ? overPage.contract : undefined
+    ).toBe(SUPPORT_CONTRACT_VIOLATION.ENVELOPE);
+    expect(overPage.message).toContain("continuation page serializes to");
   });
 
   it("refuses a non-uuid support_id with an in-set code instead of throwing", async () => {

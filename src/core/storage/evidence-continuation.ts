@@ -86,6 +86,34 @@ export const CONTRACT_VIOLATION = "contract_violation";
 
 export type SupportDenialReason = EvidenceDenialReason | typeof CONTRACT_VIOLATION;
 
+/**
+ * Which contract a `contract_violation` broke.
+ *
+ * `contract_violation` is one token for a dozen facts, and the wire vocabulary is
+ * frozen: a non-uuid selector, two selectors at once and a selector outside the
+ * grant all answer `unknown_field`. The distinction is kept here instead, on the
+ * arm that has to carry it, and the caller folds it onto the frozen token at its
+ * own boundary rather than publishing it. A fact with no member of its own is
+ * named by the member that describes the contract it broke.
+ */
+export const SUPPORT_CONTRACT_VIOLATION = {
+  SELECTORS_MUTUALLY_EXCLUSIVE: "selectors_mutually_exclusive",
+  SELECTOR_NOT_UUID: "selector_not_uuid",
+  SELECTOR_NOT_A_MEMBER: "selector_not_a_member",
+  SELECTOR_PAST_THE_END: "selector_past_the_end",
+  CURSOR_OVER_THE_ENVELOPE: "cursor_over_the_envelope",
+  CURSOR_NOT_MINTED: "cursor_not_minted",
+  CURSOR_VERSION: "cursor_version",
+  CURSOR_NOT_BOUND_HERE: "cursor_not_bound_here",
+  CURSOR_POSITION_NOT_PINNED: "cursor_position_not_pinned",
+  REQUEST_FIELD: "request_field",
+  GRANT_HAS_NO_MEMBERSHIP: "grant_has_no_membership",
+  ENVELOPE: "envelope",
+} as const;
+
+export type SupportContractViolation =
+  (typeof SUPPORT_CONTRACT_VIOLATION)[keyof typeof SUPPORT_CONTRACT_VIOLATION];
+
 export interface EvidenceSupportGranted {
   readonly state: "granted";
   readonly evidence_ref: string;
@@ -98,13 +126,32 @@ export interface EvidenceSupportGranted {
   readonly selected: boolean;
 }
 
-export interface EvidenceSupportDenied {
-  readonly state: "denied";
-  readonly failure: EvidenceFailureToken;
-  readonly reason: SupportDenialReason;
-  /** Names the violated contract. It never carries a support, a locator or a value. */
-  readonly detail: string;
-}
+/**
+ * A denial, split on what it can say.
+ *
+ * A refusal about the grant keeps its own denial reason, which is already a member
+ * of the closed set. A refusal about the request has no token for the fact it
+ * found, so it names `contract_violation` and carries `violation` — the contract it
+ * broke — beside it. The union is what makes that mandatory rather than optional:
+ * `refused()` cannot be given a violation and `contractRefused()` cannot omit one.
+ */
+export type EvidenceSupportDenied =
+  | {
+      readonly state: "denied";
+      readonly failure: EvidenceFailureToken;
+      readonly reason: EvidenceDenialReason;
+      /** Names the violated contract. It never carries a support, a locator or a value. */
+      readonly detail: string;
+    }
+  | {
+      readonly state: "denied";
+      readonly failure: EvidenceFailureToken;
+      readonly reason: typeof CONTRACT_VIOLATION;
+      /** Which contract this request broke; the reason token cannot say it. */
+      readonly violation: SupportContractViolation;
+      /** Names the violated contract. It never carries a support, a locator or a value. */
+      readonly detail: string;
+    };
 
 export type EvidenceSupportRead = EvidenceSupportGranted | EvidenceSupportDenied;
 
@@ -122,12 +169,28 @@ interface ContinuationCursorPayload {
   readonly after: string;
 }
 
+/**
+ * Two refusals, because the wire has one reason token for both kinds of fact.
+ *
+ * A refusal about the grant keeps its own denial reason. A refusal about the
+ * request names the contract it broke, because no member of the closed set means
+ * "the request is not on the contract". Two functions rather than one overloaded
+ * one, so a violation cannot be forgotten: naming it is the call, not an argument.
+ */
 function refused(
   failure: EvidenceFailureToken,
-  reason: SupportDenialReason,
+  reason: EvidenceDenialReason,
   detail: string
 ): EvidenceSupportDenied {
   return { state: "denied", failure, reason, detail };
+}
+
+function contractRefused(
+  failure: EvidenceFailureToken,
+  violation: SupportContractViolation,
+  detail: string
+): EvidenceSupportDenied {
+  return { state: "denied", failure, reason: CONTRACT_VIOLATION, violation, detail };
 }
 
 // EXIT: the cursor is base64url over the canonical payload, so a caller cannot
@@ -188,9 +251,9 @@ function resolveSelectors(
   const cursor = presentSelector(request.cursor);
   const supportId = presentSelector(request.supportId);
   if (cursor !== null && supportId !== null) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.SELECTORS_MUTUALLY_EXCLUSIVE,
       "a continuation cursor and a selected support_id are mutually exclusive; a request may name one or the other, never both"
     );
   }
@@ -200,9 +263,9 @@ function resolveSelectors(
   // an exception. A value that is not a uuid cannot name a member of any grant,
   // so it is refused on its own shape and before the grant is read.
   if (!isUuid(supportId)) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.SELECTOR_NOT_UUID,
       "the selected support_id is not the uuid spelling this build issues, so it cannot name a member of any grant"
     );
   }
@@ -214,9 +277,9 @@ function resolveSelectors(
 function resolveCursorSelector(cursor: string): ResolvedSelectors | EvidenceSupportDenied {
   const bytes = Buffer.byteLength(cursor, "utf8");
   if (bytes > MAX_EVIDENCE_BYTES) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.TOO_LARGE,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.CURSOR_OVER_THE_ENVELOPE,
       `the continuation cursor is ${bytes} bytes, over the ${MAX_EVIDENCE_BYTES} byte request envelope`
     );
   }
@@ -251,44 +314,44 @@ function verifyCursor(
   const grant = facts.grant!;
   const decoded = decodeCursor(raw);
   if (decoded === null) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.CURSOR_NOT_MINTED,
       "the continuation cursor is not a cursor this build mints; it is refused rather than decoded on a best-effort basis"
     );
   }
   if (decoded.v !== EVIDENCE_CONTINUATION_CURSOR_VERSION) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.CURSOR_VERSION,
       `the continuation cursor speaks version ${decoded.v}; this build implements ${EVIDENCE_CONTINUATION_CURSOR_VERSION}`
     );
   }
   if (decoded.ref !== grant.evidence_ref) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.CURSOR_NOT_BOUND_HERE,
       "a continuation cursor is bound to one evidence reference and cannot be presented with another"
     );
   }
   if (decoded.scope !== grant.scope_binding) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.CURSOR_NOT_BOUND_HERE,
       "the continuation cursor's scope is not the scope this grant was admitted under"
     );
   }
   if (decoded.exp !== grant.expires_at) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.CURSOR_NOT_BOUND_HERE,
       "the continuation cursor's expiry does not match the grant's fixed expiry, so it cannot be a cursor of this grant"
     );
   }
   if (!pinned.some((entry) => entry.support.support_id === decoded.after)) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.CURSOR_POSITION_NOT_PINNED,
       "the continuation cursor's position is not a support this grant pinned"
     );
   }
@@ -391,9 +454,9 @@ function grantedOutcome(
     // EXIT: a page that cannot fit the bounded envelope withholds the whole
     // page. Dropping a descriptor to make it fit would hand back a sequence the
     // caller cannot tell is short, so the page is refused instead.
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.TOO_LARGE,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.ENVELOPE,
       `the continuation page serializes to ${bytes} bytes, over the ${MAX_EVIDENCE_BYTES} byte envelope`
     );
   }
@@ -416,9 +479,9 @@ function requireRowGrant(
     // EXIT: a count grant retains a receipt and no membership, so any supports
     // read of it is refused. It is not answered with an empty page, which a
     // caller could not distinguish from a row grant with no supports.
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.GRANT_HAS_NO_MEMBERSHIP,
       "a count grant retains no support membership, so it cannot serve a supports read"
     );
   }
@@ -445,16 +508,16 @@ export async function decideSupportContinuation(
   // branch answers with a value. A missing reference and an unreadable instant
   // are both the request's fault and neither reveals anything about the grant.
   if (typeof request.evidenceRef !== "string" || request.evidenceRef.trim() === "") {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.REQUEST_FIELD,
       "the continuation names no evidence reference, so it cannot be resolved to a grant"
     );
   }
   if (!isInstantText(request.at)) {
-    return refused(
+    return contractRefused(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      CONTRACT_VIOLATION,
+      SUPPORT_CONTRACT_VIOLATION.REQUEST_FIELD,
       "the continuation's at is not an RFC 3339 instant this build can read"
     );
   }
@@ -537,9 +600,9 @@ function selectPage(
     const member = pinned.find((entry) => entry.support.support_id === selectors.supportId);
     if (member === undefined) {
       return {
-        failure: refused(
+        failure: contractRefused(
           EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-          CONTRACT_VIOLATION,
+          SUPPORT_CONTRACT_VIOLATION.SELECTOR_NOT_A_MEMBER,
           "the selected support_id is not a member of this grant, so the grant cannot resolve it"
         ),
       };
@@ -565,9 +628,9 @@ function boundedSlice(
   const members = pinned.slice(start, start + MAX_EVIDENCE_SUPPORTS_PER_PAGE);
   if (members.length === 0) {
     return {
-      failure: refused(
+      failure: contractRefused(
         EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-        CONTRACT_VIOLATION,
+        SUPPORT_CONTRACT_VIOLATION.SELECTOR_PAST_THE_END,
         "this continuation position is past the end of the grant's pinned membership; there is no page to return"
       ),
     };

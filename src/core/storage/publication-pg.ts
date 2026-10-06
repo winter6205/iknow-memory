@@ -489,9 +489,6 @@ export class PgStructuredPublicationStorage implements StructuredPublicationStor
           publishedSources: sources.filter(
             (source) => source.active && source.published !== null
           ).length,
-          desiredIndexBuckets: activeCount,
-          conflictCheckBuckets: activeCount,
-          conflictStatus: "pending",
         };
         return {
           scopeBinding,
@@ -1733,9 +1730,6 @@ function emptySnapshot(scopeBinding: string): PublicationSnapshot {
     maintenance: {
       sourcesInScope: 0,
       publishedSources: 0,
-      desiredIndexBuckets: 0,
-      conflictCheckBuckets: 0,
-      conflictStatus: "pending",
     },
   };
 }

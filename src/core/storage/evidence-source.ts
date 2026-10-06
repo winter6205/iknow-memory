@@ -311,8 +311,7 @@ export function supportOccurrenceKey(support: NormalizedSupport): string {
  * `docs/validation/2026-10-06-t12-qp10-post-ingest-id-freeze-record.md` at IK
  * `0ad17f2`. Changing it now would not error: `recordSupportRow` conflicts on
  * the occurrence key, so the new derivation is discarded and the old row
- * returned. That splits the table into two id spaces that no stored column
- * could tell apart.
+ * returned.
  */
 export const SUPPORT_ID_NAMESPACE = "6f6b1c2e-9a4d-5f38-b7c1-0d2e3f4a5b6c";
 

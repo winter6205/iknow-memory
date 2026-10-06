@@ -13,6 +13,7 @@ import { supportsEvidenceStore } from "../../src/core/storage/backend.js";
 import {
   contentDigestOf,
   normalizeOccurrence,
+  SUPPORT_ID_NAMESPACE,
   supportIdOf,
 } from "../../src/core/storage/evidence-source.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
@@ -71,6 +72,14 @@ describe("MemoryBackend evidence store", () => {
 });
 
 describe("support id derivation", () => {
+  it("keeps the frozen T12 namespace, which nothing at runtime would reject", () => {
+    // The expected side is a literal on purpose: deriving it from the constant
+    // would assert nothing. `recordSupportRow` conflicts on the occurrence key
+    // rather than on `support_id`, so a perturbed namespace re-derives every id
+    // while every write still succeeds — this is the only place that fails.
+    expect(SUPPORT_ID_NAMESPACE).toBe("6f6b1c2e-9a4d-5f38-b7c1-0d2e3f4a5b6c");
+  });
+
   const seed = {
     source_ref: "derive-source",
     source_version: "v1",

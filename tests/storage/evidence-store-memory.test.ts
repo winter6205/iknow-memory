@@ -10,8 +10,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { supportsEvidenceStore } from "../../src/core/storage/backend.js";
+import {
+  contentDigestOf,
+  normalizeOccurrence,
+  supportIdOf,
+} from "../../src/core/storage/evidence-source.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
-import type { EvidenceStore } from "../../src/core/types.js";
+import { EVIDENCE_SUBJECT_KIND, type EvidenceStore } from "../../src/core/types.js";
 import { runEvidenceStoreContract } from "./evidence-store-contract.js";
 
 const TEST_DIM = 8;
@@ -62,6 +67,69 @@ describe("MemoryBackend evidence store", () => {
       })
       .then(() => null, (caught) => caught as { failureToken?: string });
     expect(err?.failureToken).toBe("unsupported_source_binding");
+  });
+});
+
+describe("support id derivation", () => {
+  const seed = {
+    source_ref: "derive-source",
+    source_version: "v1",
+    content_digest: contentDigestOf("derive-content"),
+    origin_object_ref: "objects/derive/original.pdf",
+    parser_revision: "parser-v1",
+    unit_manifest: { units: 1 },
+    created_at: "2026-02-01T00:00:00.000Z",
+  };
+  const locator = { document_id: "derive-doc", version: "frozen-v1", unit: 1 };
+  const occurrence = {
+    subject: EVIDENCE_SUBJECT_KIND.ENTITY,
+    result_id: "derive-result",
+    source_ref: seed.source_ref,
+    source_version: seed.source_version,
+    location: locator,
+    span: null,
+    extraction_ref: "derive-extraction-1",
+    extractedAt: "2026-02-02T00:00:00.000Z",
+  } as const;
+
+  const seeded = async (): Promise<MemoryBackend> => {
+    const store = new MemoryBackend(TEST_DIM);
+    const { record } = await store.registerSourceVersion(seed);
+    await store.bindSourceLocator({
+      source_version_id: record.source_version_id,
+      ...locator,
+    });
+    return store;
+  };
+
+  it("derives one id per occurrence, without consulting any stored state", () => {
+    const plan = normalizeOccurrence(occurrence);
+    // Two independent calls over the same occurrence: a minted id could not be
+    // recomputed offline to reconcile a row built on another path.
+    expect(supportIdOf(plan)).toBe(supportIdOf(plan));
+    const moved = normalizeOccurrence({
+      ...occurrence,
+      span: { start: 0, end: 4 },
+    });
+    expect(
+      supportIdOf(moved),
+      "a different occurrence is a different support"
+    ).not.toBe(supportIdOf(plan));
+  });
+
+  it("mints the same id in independent stores and across both write paths", async () => {
+    const viaRecordSupport = await (await seeded()).recordSupport(occurrence);
+    const viaSecondStore = await (await seeded()).recordSupport(occurrence);
+    const publication = (await seeded()).preparePublicationEvidence([
+      occurrence,
+    ]);
+    const viaPublication = publication.supports[0]!;
+    publication.commit();
+
+    expect(viaSecondStore.support.support_id).toBe(
+      viaRecordSupport.support.support_id
+    );
+    expect(viaPublication.support_id).toBe(viaRecordSupport.support.support_id);
   });
 });
 

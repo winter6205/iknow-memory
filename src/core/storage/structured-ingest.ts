@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import {
   evidenceError,
   normalizeLocatorBinding,
   normalizeOccurrence,
   normalizeSourceVersion,
+  supportIdOf,
   supportOccurrenceKey,
 } from "./evidence-source.js";
 import {
@@ -69,22 +70,6 @@ export interface StructuredIngestOutcome {
 }
 
 const DECLARING_RUN: AuthorizedScopeRunOptions = { authorizeNewSources: true };
-
-/**
- * Frozen RFC 4122 namespace for the occurrence→support-id derivation. It is a
- * one-way door: `recordSupportRow` conflicts on the occurrence key rather than
- * on `support_id`, so changing this value re-derives every support id while no
- * insert fails, and `assertion_supports` would silently split into two disjoint
- * id spaces that no stored column could tell apart.
- *
- * Frozen by ticket T12 (QP10) in
- * `docs/validation/2026-10-06-t12-qp10-post-ingest-id-freeze-record.md` at IK
- * `0ad17f2`. Changing it now would not error: `recordSupportRow` conflicts on
- * the occurrence key, so the new derivation is discarded and the old row
- * returned. That splits the table into two id spaces that no stored column
- * could tell apart.
- */
-export const SUPPORT_ID_NAMESPACE = "6f6b1c2e-9a4d-5f38-b7c1-0d2e3f4a5b6c";
 
 const asEvidenceClient = (
   client: AuthorizedScopeWork["client"]
@@ -222,40 +207,4 @@ export async function ingestStructuredSource(
     },
     DECLARING_RUN
   );
-}
-
-function supportIdOf(support: {
-  readonly subject: string;
-  readonly result_id: string;
-  readonly source_ref: string;
-  readonly source_version: string;
-  readonly location: {
-    readonly document_id: string;
-    readonly version: string;
-    readonly unit: number;
-  };
-  readonly span: EvidenceSpan | null;
-}): string {
-  const key = supportOccurrenceKey(
-    support as Parameters<typeof supportOccurrenceKey>[0]
-  );
-  return uuidV5(SUPPORT_ID_NAMESPACE, key);
-}
-
-function uuidV5(namespace: string, name: string): string {
-  const bytes = createHash("sha1")
-    .update(Buffer.from(namespace.replace(/-/g, ""), "hex"))
-    .update(name, "utf8")
-    .digest()
-    .subarray(0, 16);
-  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-  const hex = bytes.toString("hex");
-  return [
-    hex.slice(0, 8),
-    hex.slice(8, 12),
-    hex.slice(12, 16),
-    hex.slice(16, 20),
-    hex.slice(20, 32),
-  ].join("-");
 }

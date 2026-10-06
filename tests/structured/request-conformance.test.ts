@@ -1041,6 +1041,12 @@ describe("createRetrieveHandler — structured request routing", () => {
   });
 
   it("refuses a valid structured request as structured_search_unavailable and never executes the ledger", async () => {
+    // This handler has NO structured reader and a PROVISIONED ledger, so the
+    // code observed here is the SPEC's capability trigger — "backend capability
+    // unavailable" — and not the retired "no execution path exists" exit. The
+    // ledger assertions below are the load-bearing half and are unchanged: a
+    // structured request must never reach the sql arm, whether or not a reader
+    // is injected.
     const code = await refusalCodeOf(async () => {
       await handler({
         query: "acme contracts",

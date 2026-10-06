@@ -108,6 +108,9 @@ const BOOTSTRAP_TABLES = [
   "structured_publication_display",
   "structured_publication_stages",
   "structured_publication_extraction_bindings",
+  // MP11: a brand-new derived-generation table — same rule as index_jobs, so the
+  // probe names it or it never reaches a deployed store.
+  "structured_projection_generations",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -160,6 +163,7 @@ const BOOTSTRAP_INDEXES = [
   "structured_publication_stages_guard_idx",
   "structured_publication_display_pkey",
   "structured_publication_extraction_bindings_pkey",
+  "structured_projection_generations_scope_idx",
 ] as const;
 
 /**

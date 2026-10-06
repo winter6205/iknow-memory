@@ -23,6 +23,7 @@ import type {
 } from "../maintenance/publication-types.js";
 import type {
   MaintenanceAttemptGuard,
+  MaintenanceDependency,
   MaintenanceWorkStatus,
 } from "../maintenance/types.js";
 import type { ProjectionSubject } from "./projection-outbox.js";
@@ -118,9 +119,34 @@ interface MemoryScope {
   readRevision: bigint;
   maintenanceRevision: bigint;
   readonly sources: Map<string, MemorySource>;
+  /**
+   * MP11: derived generations keyed by their COMPLETE dependency revision.
+   *
+   * These live in the store's own rows rather than beside them, because a
+   * rebuild's generation is authoritative state — the thing MP12's serving
+   * guard reads — not a cache the rebuild adapter keeps to itself.
+   */
+  readonly derivedGenerations: Map<string, MemoryDerivedGeneration>;
 }
 
-class MemoryProjectionOutbox implements PublicationOutboxPort {
+/**
+ * One persisted derived generation. The key is the canonical digest of the
+ * complete dependency vector, which is what makes a repeat rebuild of unchanged
+ * state find its own row instead of creating a second derived artifact.
+ */
+export interface MemoryDerivedGeneration {
+  readonly dependencyRevision: string;
+  readonly publicationRevision: string;
+  readonly dependencies: readonly MaintenanceDependency[];
+  readonly subjects: readonly ProjectionSubject[];
+}
+
+/**
+ * The default in-memory outbox: a set of pending `kind:id` intents, so the
+ * rebuild and publication adapters enqueue through one port and a rebuild's
+ * intent is observable as the same subject set publication would produce.
+ */
+export class MemoryProjectionOutbox implements PublicationOutboxPort {
   private readonly pending = new Set<string>();
 
   async prepareIntents(
@@ -133,6 +159,16 @@ class MemoryProjectionOutbox implements PublicationOutboxPort {
     return () => {
       for (const intent of intents) this.pending.add(intent);
     };
+  }
+
+  /**
+   * The queue the projector would drain, as `kind:id`.
+   *
+   * A set, mirroring the partial UNIQUE index the PostgreSQL outbox enforces:
+   * re-enqueuing a subject that is already queued contributes no second intent.
+   */
+  pendingIntents(): readonly string[] {
+    return [...this.pending].sort();
   }
 }
 
@@ -483,6 +519,34 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
       readRevision: Number(scope.readRevision),
       maintenanceRevision: Number(scope.maintenanceRevision),
     };
+  }
+
+  /**
+   * MP11: the derived generation recorded at an exact dependency revision.
+   *
+   * Keyed by the complete dependency digest rather than read "latest", so a
+   * rebuild that re-derives the same state finds its own row and a rebuild at
+   * moved state cannot silently reuse an older generation.
+   */
+  derivedGeneration(
+    scopeBinding: string,
+    dependencyRevision: string
+  ): MemoryDerivedGeneration | undefined {
+    return this.scopes.get(scopeBinding)?.derivedGenerations.get(
+      dependencyRevision
+    );
+  }
+
+  recordDerivedGeneration(
+    scopeBinding: string,
+    generation: MemoryDerivedGeneration
+  ): void {
+    const scope = this.scopes.get(scopeBinding);
+    if (scope === undefined) return;
+    scope.derivedGenerations.set(
+      generation.dependencyRevision,
+      generation
+    );
   }
 
   scopedSourceRows(
@@ -866,6 +930,7 @@ function newScope(scopeBinding: string): MemoryScope {
     readRevision: 0n,
     maintenanceRevision: 0n,
     sources: new Map(),
+    derivedGenerations: new Map(),
   };
 }
 

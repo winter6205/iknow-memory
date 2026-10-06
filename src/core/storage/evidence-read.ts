@@ -57,11 +57,13 @@ import {
   type EvidenceSupportDescriptor,
   type EvidenceSupportDenied,
   type EvidenceSupportGranted,
+  type SupportContractViolation,
 } from "./evidence-continuation.js";
 import {
   decideGrantRead,
   MAX_EVIDENCE_BYTES,
   type EvidenceClient,
+  type GrantReadFacts,
 } from "./evidence-store.js";
 import { envelopeBytes } from "./evidence-source.js";
 import {
@@ -168,7 +170,14 @@ export class EvidenceRefusalError extends Error {
   constructor(
     readonly code: string,
     readonly reason: EvidenceRefusalReason,
-    message: string
+    message: string,
+    /**
+     * Which contract the request broke, when the reason token cannot name it.
+     *
+     * Local only: the wire mapping reads `code`, `reason` and `message`, so this
+     * is carried in this build and never published. See `supportRefusal`.
+     */
+    readonly contract?: SupportContractViolation
   ) {
     super(message);
     this.name = "EvidenceRefusalError";
@@ -191,6 +200,14 @@ export interface EvidenceRefusal {
   readonly code: string;
   readonly reason: EvidenceRefusalReason;
   readonly message: string;
+  /**
+   * Which contract this request broke, when `reason` cannot name it.
+   *
+   * Local only. `EvidenceErrorEnvelope` is built from `code`, `reason` and
+   * `message` alone, so this field distinguishes facts the frozen wire vocabulary
+   * folds together without adding a token to it.
+   */
+  readonly contract?: SupportContractViolation;
 }
 
 /** The failure arm of the wire envelope. It carries no row field at all. */
@@ -345,14 +362,10 @@ export function parseEvidenceRequest(input: unknown): EvidenceRequest {
 /**
  * A selector's own shape, refused before it can name anything.
  *
- * An absent, null or empty selector is the absence of that selector and is passed
- * down untouched: which spelling means "none" is frozen in the continuation, and a
- * second rule here would be a second answer to the same question. Anything that is
- * neither absent, null nor a string is refused here, because the continuation reads
- * a selector as text — a number or an object would leave its entry point as an
- * exception instead of answering with a refusal. A selector that passes this check
- * reaches the action layer; there is no path on which a listed key is read here
- * and then dropped, which is why the contract's selectors are listed at all.
+ * Which spelling means "none" is frozen in the continuation, so absent, null and
+ * empty pass down untouched and no second rule is written here. What is left is a
+ * non-text selector: the continuation reads a selector as text, so a number or an
+ * object would leave its entry point as an exception instead of a refusal.
  */
 function optionalSelector(value: unknown, key: string): string | null | undefined {
   if (value === undefined) return undefined;
@@ -444,6 +457,11 @@ function callerRefusal(
   return null;
 }
 
+/** What the scope's callback hands back: one rendered envelope, or one refusal. */
+type ScopeOutcome =
+  | { readonly granted: EvidenceReadResult | EvidenceSupportsResult }
+  | { readonly refused: EvidenceRefusal };
+
 /**
  * Run one authorized Evidence read.
  *
@@ -465,10 +483,7 @@ export async function readPrivateEvidence(
   }
   const outcome = await scope.withAuthorizedScope(
     context,
-    async (work: AuthorizedScopeWork): Promise<
-      | { readonly granted: EvidenceReadResult | EvidenceSupportsResult }
-      | { readonly refused: EvidenceRefusal }
-    > => {
+    async (work: AuthorizedScopeWork): Promise<ScopeOutcome> => {
       const client = work.client as unknown as EvidenceClient;
       const facts = await readGrantFacts(client, request.evidence_ref);
       const decision = decideGrantRead(facts, at);
@@ -477,53 +492,8 @@ export async function readPrivateEvidence(
       }
       const permission = callerRefusal(context, decision);
       if (permission !== null) return { refused: permission };
-
       if (request.action === EVIDENCE_ACTION.SUPPORTS) {
-        if (decision.grant.kind === EVIDENCE_GRANT_KIND.COUNT) {
-          return {
-            refused: {
-              code: EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-              reason: EVIDENCE_REFUSAL_REASON.COUNT_GRANT_HAS_NO_SUPPORTS,
-              message:
-                "a count grant retains no membership, so it has no supports to read",
-            },
-          };
-        }
-        // The selectors are handed over as named, never resolved here: whether two
-        // of them can appear together, and which one a caller may name at all, is
-        // decided before the grant is read by the continuation's own order.
-        const page = await decideSupportContinuation(
-          facts,
-          {
-            evidenceRef: request.evidence_ref,
-            at,
-            caller: {
-              scopeBinding: context.ownerScopeBinding,
-              authorizedSourceRefs: context.authorizedSourceRefs,
-            },
-            cursor: request.cursor,
-            supportId: request.support_id,
-          },
-          async (evidenceRef, supportIds) =>
-            readGrantPinnedExtractionsForSupports(client, evidenceRef, supportIds)
-        );
-        if (page.state === "denied") return { refused: supportRefusal(page) };
-        const bytes = envelopeBytes(page.supports, {
-          total_supports: page.total_supports,
-          next_cursor: page.next_cursor,
-        });
-        if (bytes > MAX_EVIDENCE_BYTES) {
-          return {
-            refused: {
-              code: EVIDENCE_FAILURE.TOO_LARGE,
-              reason: EVIDENCE_REFUSAL_REASON.ENVELOPE_TOO_LARGE,
-              message:
-                `the support page and its continuation fields are ${bytes} bytes, ` +
-                `over the ${MAX_EVIDENCE_BYTES} byte envelope`,
-            },
-          };
-        }
-        return { granted: renderSupports(page) };
+        return supportPageOutcome({ client, facts, decision, context, request, at });
       }
       const bytes = envelopeBytes(decision.grant.value, decision.grant.context);
       if (bytes > MAX_EVIDENCE_BYTES) {
@@ -544,10 +514,84 @@ export async function readPrivateEvidence(
     throw new EvidenceRefusalError(
       outcome.refused.code,
       outcome.refused.reason,
-      outcome.refused.message
+      outcome.refused.message,
+      outcome.refused.contract
     );
   }
   return outcome.granted;
+}
+
+/** Everything the supports arm needs, so it is passed as one decision's inputs. */
+interface SupportPageRead {
+  readonly client: EvidenceClient;
+  readonly facts: GrantReadFacts;
+  readonly decision: Extract<EvidenceGrantRead, { state: "granted" }>;
+  readonly context: AuthorizedScopeContext;
+  readonly request: EvidenceSupportsRequest;
+  readonly at: string;
+}
+
+/**
+ * The supports arm, from the granted row grant to one page.
+ *
+ * A count grant is refused here rather than paged, because this arm is the only
+ * place that knows the request asked for membership rather than for the value.
+ */
+async function supportPageOutcome({
+  client,
+  facts,
+  decision,
+  context,
+  request,
+  at,
+}: SupportPageRead): Promise<ScopeOutcome> {
+  if (decision.grant.kind === EVIDENCE_GRANT_KIND.COUNT) {
+    return {
+      refused: {
+        code: EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+        reason: EVIDENCE_REFUSAL_REASON.COUNT_GRANT_HAS_NO_SUPPORTS,
+        message: "a count grant retains no membership, so it has no supports to read",
+      },
+    };
+  }
+  // The selectors are handed over as named, never resolved here: whether two
+  // of them can appear together, and which one a caller may name at all, is
+  // decided before the grant is read by the continuation's own order.
+  const page = await decideSupportContinuation(
+    facts,
+    {
+      evidenceRef: request.evidence_ref,
+      at,
+      caller: {
+        scopeBinding: context.ownerScopeBinding,
+        authorizedSourceRefs: context.authorizedSourceRefs,
+      },
+      cursor: request.cursor,
+      supportId: request.support_id,
+    },
+    async (evidenceRef, supportIds) =>
+      readGrantPinnedExtractionsForSupports(client, evidenceRef, supportIds)
+  );
+  if (page.state === "denied") return { refused: supportRefusal(page) };
+  const envelope = renderSupports(page);
+  // EXIT: this measures the envelope that is emitted, not the page the
+  // continuation measured. The continuation bounds its own granted payload,
+  // which carries an internal `state` where the emitted envelope carries the
+  // wire schema and version, so the emitted one is the larger of the two by a
+  // constant and only this one is the bound on what the caller receives.
+  const bytes = Buffer.byteLength(JSON.stringify(envelope), "utf8");
+  if (bytes > MAX_EVIDENCE_BYTES) {
+    return {
+      refused: {
+        code: EVIDENCE_FAILURE.TOO_LARGE,
+        reason: EVIDENCE_REFUSAL_REASON.ENVELOPE_TOO_LARGE,
+        message:
+          `the emitted support page is ${bytes} bytes, over the ` +
+          `${MAX_EVIDENCE_BYTES} byte envelope`,
+      },
+    };
+  }
+  return { granted: envelope };
 }
 
 /**
@@ -556,20 +600,30 @@ export async function readPrivateEvidence(
  * The continuation answers every fault with a value and names the fact in one of
  * two ways: a denial reason, or `contract_violation` for a request that violates
  * the contract. Denial reasons are already members of the closed reason set and
- * pass through untouched. `contract_violation` is folded onto the member that
- * already means "this request is not on the contract" rather than opened as a new
- * one: the failure token alongside it already separates a malformed selector from
- * an oversized page, and the continuation's detail says which contract was broken
- * without carrying a support, a locator or a value.
+ * pass through untouched.
+ *
+ * `contract_violation` covers a dozen facts and the frozen vocabulary has one
+ * token left for all of them, so it is folded onto the member that already means
+ * "this request is not on the contract" rather than opened as a new one — and the
+ * fact itself is carried on `contract`, which this build keeps and the wire does
+ * not publish. A non-uuid selector, two selectors at once and a selector outside
+ * the grant are three different faults in this file even though a caller reads one
+ * `unknown_field`. The detail says which contract was broken and still carries no
+ * support, a locator or a value.
  */
 function supportRefusal(denied: EvidenceSupportDenied): EvidenceRefusal {
-  const reason =
-    denied.reason === CONTRACT_VIOLATION
-      ? denied.failure === EVIDENCE_FAILURE.TOO_LARGE
+  if (denied.reason !== CONTRACT_VIOLATION) {
+    return { code: denied.failure, reason: denied.reason, message: denied.detail };
+  }
+  return {
+    code: denied.failure,
+    reason:
+      denied.failure === EVIDENCE_FAILURE.TOO_LARGE
         ? EVIDENCE_REFUSAL_REASON.ENVELOPE_TOO_LARGE
-        : EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD
-      : denied.reason;
-  return { code: denied.failure, reason, message: denied.detail };
+        : EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+    contract: denied.violation,
+    message: denied.detail,
+  };
 }
 
 /** Assemble the success arm. The only place a retained value is emitted. */

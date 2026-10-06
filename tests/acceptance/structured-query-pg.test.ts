@@ -119,7 +119,11 @@ function opaqueDigest(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-admin = driver.harness.createClient(SCHEMA_URL);
+// Constructed inline rather than through the shared harness so the CI
+// exclude guard, which recognises a postgres lane by `new pg.Client(`, can see
+// this file. A lane the guard cannot see is a lane `test-fast` would run
+// without a database, and this one refuses rather than skips.
+admin = new pg.Client({ connectionString: SCHEMA_URL });
 await admin.connect();
 await driver.harness.resetSchema(admin);
 backend = new PgvectorBackend(SCHEMA_URL, DIMENSIONS, { annMaxDimensions: 2000 });

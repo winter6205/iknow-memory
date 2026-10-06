@@ -52,7 +52,17 @@ jobs:
             --exclude tests/storage/pgvector-startup.test.ts \
             --exclude tests/storage/source-documents-pg.test.ts \
             --exclude tests/storage/storage-reads-pg.test.ts \
-            --exclude tests/structured/identity-store-pg.test.ts
+            --exclude tests/structured/identity-store-pg.test.ts \
+            --exclude tests/acceptance/maintenance-m-acceptance-pg.test.ts \
+            --exclude tests/acceptance/structured-maintenance-status-pg.test.ts \
+            --exclude tests/acceptance/structured-publication-pg.test.ts \
+            --exclude tests/acceptance/structured-publish-atomicity-pg.test.ts \
+            --exclude tests/acceptance/structured-query-pg.test.ts \
+            --exclude tests/acceptance/structured-screening-candidates-pg.test.ts \
+            --exclude tests/acceptance/structured-screening-decisions-pg.test.ts \
+            --exclude tests/acceptance/structured-withdrawal-pg.test.ts \
+            --exclude tests/storage/evidence-continuation-pg.test.ts \
+            --exclude tests/storage/evidence-store-pg.test.ts
 
   test-es:
     runs-on: ubuntu-latest

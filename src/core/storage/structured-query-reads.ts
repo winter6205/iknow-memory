@@ -16,11 +16,14 @@
  *    SET. Grouping by result id is what keeps `count` equal to the distinct
  *    stored subject set instead of a support fan-out.
  *
- * 3. **The cursor is verified against the reads that received it.** Version,
- *    query digest, subject, owner binding, reader binding, read revision and the
- *    fixed expiry are all re-checked here, so editing a cursor's text achieves
- *    nothing, and a maintenance-progress revision — which does NOT move
- *    `read_revision` — leaves a live cursor live.
+ * 3. **The cursor is authenticated, and verified against the reads that
+ *    received it.** Version, query digest, subject, owner binding, reader
+ *    binding, read revision and the fixed expiry are all re-checked here, and
+ *    the payload as a whole carries a MAC over the deployment's cursor key, so
+ *    editing a cursor's text achieves nothing — INCLUDING its position, which
+ *    is otherwise the one field no transaction can re-derive. A
+ *    maintenance-progress revision — which does NOT move `read_revision` —
+ *    leaves a live cursor live.
  *
  * 4. **No wall-clock filter and no two-hop traversal.** `valid_window` is carried
  *    out and never compared to now; the relationship predicate binds the anchor
@@ -45,12 +48,16 @@ import {
 import { STRUCTURED_LIST_DEFAULT_LIMIT } from "../structured/request.js";
 import type { ValidatedStructuredQuery } from "../structured/request.js";
 import {
+  STRUCTURED_RESULT_COUNT_COVERAGE,
+  STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER,
   STRUCTURED_RESULT_MAX_BYTES,
   type StructuredEndpointRecord,
-  STRUCTURED_RESULT_COUNT_COVERAGE,
+  type StructuredListRead,
   type StructuredMaintenanceRecord,
   type StructuredReadOutcome,
+  type StructuredRowRecord,
   type StructuredSupportRecord,
+  structuredResultEnvelopeBytes,
 } from "../structured/result.js";
 import { stableSourceRefs } from "./structured-scope-locks-pg.js";
 import {
@@ -72,9 +79,11 @@ import {
 import {
   decodeStructuredQueryCursor,
   encodeStructuredQueryCursor,
+  requireCursorKey,
   STRUCTURED_QUERY_CURSOR_LIFETIME_MS,
   STRUCTURED_QUERY_CURSOR_VERSION,
   structuredQueryDigest,
+  type StructuredQueryCursorKey,
 } from "./structured-query-cursor.js";
 
 // The envelope, inline-provenance and count-coverage bounds are already decided
@@ -248,7 +257,15 @@ export interface StructuredQueryReadPlan {
 export interface StructuredQueryStorage {
   readStructuredQuery(
     context: AuthorizedScopeContext,
-    request: ValidatedStructuredQuery
+    request: ValidatedStructuredQuery,
+    /**
+     * A NARROWING seam: the subset of `context.authorizedSourceRefs` this read
+     * is confined to. Omitted means the whole authorized set. A value naming a
+     * source the trusted context does not carry is `authorization_denied` — the
+     * guard that refuses it is `authorizedSubset` above, and this argument is
+     * what makes that guard reachable rather than vacuous.
+     */
+    requestedSourceRefs?: readonly string[]
   ): Promise<StructuredQueryReadPlan>;
 }
 
@@ -341,7 +358,14 @@ function requireOwnContext(
   );
 }
 
-/** Narrow a requested set to the trusted authorized subset, refusing anything wider. */
+/**
+ * Narrow a requested set to the trusted authorized subset, refusing anything wider.
+ *
+ * A caller may NARROW its read (read one of its authorized sources) but never
+ * widen it. The check is live only because the requested set is a caller-supplied
+ * second argument; passing the context's own array back as the request is what
+ * made the refusal branch unreachable.
+ */
 function authorizedSubset(
   context: AuthorizedScopeContext,
   requested: readonly string[]
@@ -438,7 +462,8 @@ function resolveContinuation(
   context: AuthorizedScopeContext,
   readRevision: string,
   queryDigest: string,
-  now: Date
+  now: Date,
+  key: StructuredQueryCursorKey
 ): StructuredQueryContinuation {
   const nowMs = now.getTime();
   if (request.cursor === undefined) {
@@ -449,10 +474,14 @@ function resolveContinuation(
       ).toISOString(),
     };
   }
-  const decoded = decodeStructuredQueryCursor(request.cursor);
+  // A cursor this deployment did not sign is refused BEFORE any field is read.
+  // That ordering is the whole point of the signature: `aft` is the one field no
+  // check below can re-derive, so an unsigned position is never interpreted.
+  const decoded = decodeStructuredQueryCursor(request.cursor, key);
   if (decoded === null) {
-    // EXIT: the text is not a cursor this build mints. It is refused whole,
-    // because a cursor whose half was understood is a position never issued.
+    // EXIT: the text is not a cursor this build mints under this deployment's
+    // key. It is refused whole, because a cursor whose half was understood is a
+    // position never issued.
     throw new StructuredQueryError(
       "the continuation cursor is not a cursor this build issues",
       "invalid_cursor"
@@ -495,17 +524,21 @@ function mintCursor(input: {
   readonly readRevision: string;
   readonly expiresAt: string;
   readonly after: string;
+  readonly key: StructuredQueryCursorKey;
 }): string {
-  return encodeStructuredQueryCursor({
-    v: STRUCTURED_QUERY_CURSOR_VERSION,
-    q: input.queryDigest,
-    s: input.subject,
-    o: input.context.ownerScopeBinding,
-    r: input.context.readerBinding,
-    rev: input.readRevision,
-    exp: input.expiresAt,
-    aft: input.after,
-  });
+  return encodeStructuredQueryCursor(
+    {
+      v: STRUCTURED_QUERY_CURSOR_VERSION,
+      q: input.queryDigest,
+      s: input.subject,
+      o: input.context.ownerScopeBinding,
+      r: input.context.readerBinding,
+      rev: input.readRevision,
+      exp: input.expiresAt,
+      aft: input.after,
+    },
+    input.key
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -784,6 +817,8 @@ interface AssemblyInput {
   readonly supports: StructuredQuerySupportReader;
   readonly now: Date;
   readonly startedAtMs: number;
+  /** Authenticates every cursor this read mints and verifies every one it accepts. */
+  readonly cursorKey: StructuredQueryCursorKey;
 }
 
 /**
@@ -805,7 +840,8 @@ async function assembleRead(
     context,
     readRevision,
     queryDigest,
-    input.now
+    input.now,
+    input.cursorKey
   );
   const queriedAt = wholeSecondStamp(input.now.getTime());
   const maintenance = maintenanceRecord(input.maintenance);
@@ -843,30 +879,30 @@ async function assembleRead(
   const start =
     continuation.after === null ? 0 : lowerBound(matched, continuation.after) + 1;
   const selected = matched.slice(start, start + limit);
-  const moreRemain = matched.length > start + selected.length;
   const { rows } = await buildRows(selected, displays, input);
   const bounded = boundPageToEnvelope(rows, {
-    maintenance,
-    queryDigest,
-    scopeBinding: context.ownerScopeBinding,
-    readRevision,
-    queriedAt,
+    request,
+    start,
+    selected: selected.length,
+    matched: matched.length,
+    context: {
+      maintenance,
+      queryDigest,
+      scopeBinding: context.ownerScopeBinding,
+      readRevision,
+      queriedAt,
+    },
+    mint: (after) =>
+      mintCursor({
+        queryDigest,
+        subject,
+        context,
+        readRevision,
+        expiresAt: continuation.expiresAt,
+        after,
+        key: input.cursorKey,
+      }),
   });
-  const lastEmitted = bounded.rows[bounded.rows.length - 1];
-  // The cursor names the last row ACTUALLY emitted. That is what makes reducing
-  // the page at a row boundary lossless: the next page resumes from the row the
-  // caller last saw, not from one it never received.
-  const nextCursor =
-    lastEmitted !== undefined && (moreRemain || bounded.rows.length < selected.length)
-      ? mintCursor({
-          queryDigest,
-          subject,
-          context,
-          readRevision,
-          expiresAt: continuation.expiresAt,
-          after: lastEmitted.id,
-        })
-      : null;
   assertReaderLease(input);
   return {
     ...shared,
@@ -874,7 +910,10 @@ async function assembleRead(
     subject,
     operation: "list",
     rows: bounded.rows,
-    nextCursor,
+    // The cursor names the last row ACTUALLY emitted. That is what makes reducing
+    // the page at a row boundary lossless: the next page resumes from the row the
+    // caller last saw, not from one it never received.
+    nextCursor: bounded.nextCursor,
     count: null,
     grants: rowGrants(shared, bounded.rows),
   };
@@ -1124,8 +1163,22 @@ interface EnvelopeContext {
   readonly queriedAt: string;
 }
 
+/** What the reduction needs to know about the page it is cutting. */
+interface PageBoundInput {
+  readonly request: ValidatedStructuredQuery;
+  readonly context: EnvelopeContext;
+  /** Where this page begins inside the whole matched set. */
+  readonly start: number;
+  /** How many groups the request's own `limit` selected. */
+  readonly selected: number;
+  /** How many groups matched the request in total. */
+  readonly matched: number;
+  /** The cursor this read would mint for a given last-emitted row id. */
+  readonly mint: (after: string) => string;
+}
+
 /**
- * Reduce a list page at ROW boundaries until the encoded response fits.
+ * Reduce a list page at ROW boundaries until the emitted envelope fits.
  *
  * Dropping a trailing row can never skip one, because the cursor is minted from
  * the last row actually emitted — so the caller resumes exactly where the envelope
@@ -1133,35 +1186,78 @@ interface EnvelopeContext {
  * never an empty successful result, because an empty page cannot be told apart
  * from a genuinely empty result set.
  *
- * The measure is this plan's own encoded form, which the wire projection
- * re-measures exactly on the projected envelope. Refusing slightly early is the
- * safe direction; the projection stays the final authority.
+ * The measure is the PROJECTED envelope, measured by the same function that
+ * later re-measures the emitted one. An approximation of that shape would drift
+ * — a camelCase copy of the context, a `null` cursor, a row without its evidence
+ * half — and a page the approximation accepted would be refused whole by the
+ * projection, turning a resumable page into a hard refusal. The cursor is
+ * measured as the one this read would actually mint, not as `null`, because a
+ * real page carries one.
+ *
+ * The cut is made from the FULL page downward, so the emitted page is the
+ * largest prefix that fits: one row is dropped per iteration and the first
+ * fitting prefix is kept, which is the minimum possible loss.
  */
 function boundPageToEnvelope(
   rows: readonly StructuredQueryRowPlan[],
-  context: EnvelopeContext
-): { readonly rows: readonly StructuredQueryRowPlan[] } {
-  let bounded = rows;
-  while (bounded.length > 0 && encodedPlanBytes(bounded, context) > STRUCTURED_RESULT_MAX_BYTES) {
-    bounded = bounded.slice(0, bounded.length - 1);
+  input: PageBoundInput
+): {
+  readonly rows: readonly StructuredQueryRowPlan[];
+  readonly nextCursor: string | null;
+} {
+  for (let keep = rows.length; keep > 0; keep -= 1) {
+    const page = rows.slice(0, keep);
+    const lastEmitted = page[page.length - 1]!;
+    // More to walk means the caller needs a way back to the rest: either the
+    // matched set outran this page, or the envelope dropped rows out of it.
+    const moreRemain = input.matched > input.start + keep || keep < input.selected;
+    const nextCursor = moreRemain ? input.mint(lastEmitted.id) : null;
+    if (projectedBytes(page, nextCursor, input) <= STRUCTURED_RESULT_MAX_BYTES) {
+      return { rows: page, nextCursor };
+    }
   }
-  if (bounded.length === 0 && rows.length > 0) {
+  if (rows.length > 0) {
     throw new StructuredQueryError(
       `one structured row exceeds the ${STRUCTURED_RESULT_MAX_BYTES} byte response envelope; narrow the request`,
       "result_too_large"
     );
   }
-  return { rows: bounded };
+  return { rows: [], nextCursor: null };
 }
 
-function encodedPlanBytes(
-  rows: readonly StructuredQueryRowPlan[],
-  context: EnvelopeContext
+/**
+ * The byte count of the envelope this page WOULD emit.
+ *
+ * `evidence_ref` is minted after this transaction, so it is measured at the
+ * reserved width the producer enforces on it — the ceiling that makes this an
+ * upper bound rather than a guess.
+ */
+function projectedBytes(
+  page: readonly StructuredQueryRowPlan[],
+  nextCursor: string | null,
+  input: PageBoundInput
 ): number {
-  return Buffer.byteLength(
-    JSON.stringify({ ...context, rows, next_cursor: null }),
-    "utf8"
+  const outcome: StructuredListRead = {
+    kind: "list",
+    context: {
+      queryDigest: input.context.queryDigest,
+      scopeBinding: input.context.scopeBinding,
+      readRevision: input.context.readRevision,
+      evidenceRef: "",
+      maintenance: input.context.maintenance,
+    },
+    rows: page.map(asMeasuredRow),
+    nextCursor,
+  };
+  return structuredResultEnvelopeBytes(
+    input.request,
+    outcome,
+    new Date(input.context.queriedAt)
   );
+}
+
+function asMeasuredRow(row: StructuredQueryRowPlan): StructuredRowRecord {
+  return { ...row, evidenceRef: STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER };
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,19 +1450,33 @@ export class PgStructuredQuerySupportReader implements StructuredQuerySupportRea
  * repeatable-read snapshot is what makes the page, the count and the maintenance
  * summary agree: a publication that commits between two of them is invisible to
  * all three rather than visible to only some of them.
+ *
+ * `cursorKey` is REQUIRED and undefaulted. A deployment that cannot authenticate
+ * its own continuations cannot tell a resumed page from a forged position, so the
+ * alternative to supplying a key is not a weaker check — it is a reader that must
+ * refuse every cursor, which is why there is no default to fall back to.
  */
 export class PgStructuredQueryStorage implements StructuredQueryStorage {
   constructor(
     private readonly scope: AuthorizedScopeUnitOfWork & ScopeTransactionOwner,
+    cursorKey: StructuredQueryCursorKey,
     private readonly now: () => Date = () => new Date()
-  ) {}
+  ) {
+    this.cursorKey = requireCursorKey(cursorKey);
+  }
+
+  private readonly cursorKey: StructuredQueryCursorKey;
 
   async readStructuredQuery(
     context: AuthorizedScopeContext,
-    request: ValidatedStructuredQuery
+    request: ValidatedStructuredQuery,
+    requestedSourceRefs?: readonly string[]
   ): Promise<StructuredQueryReadPlan> {
     requireOwnContext(this.scope, context);
-    const refs = authorizedSubset(context, context.authorizedSourceRefs);
+    const refs = authorizedSubset(
+      context,
+      requestedSourceRefs ?? context.authorizedSourceRefs
+    );
     const startedAt = this.now().getTime();
     try {
       return await this.scope.runTransaction(
@@ -1393,6 +1503,7 @@ export class PgStructuredQueryStorage implements StructuredQueryStorage {
             supports: new PgStructuredQuerySupportReader(client),
             now: this.now(),
             startedAtMs: startedAt,
+            cursorKey: this.cursorKey,
           });
         },
         // The transaction re-types an error it does not recognise as a scope
@@ -1453,22 +1564,34 @@ const NO_SCREENING_EVIDENCE: MemoryStructuredQueryScreeningPort = {
  * This authority's `withAuthorizedScope` is the twin of the transaction owner,
  * not the free PostgreSQL one: it serializes on the shared tail and advances no
  * revision, because this callback calls neither `prepare` nor `bumpRevisions`.
+ *
+ * `cursorKey` is REQUIRED for the same reason it is on the strict lane: it is
+ * what makes a position in this lane's cursors a claim the server can check.
  */
 export class MemoryStructuredQueryStorage implements StructuredQueryStorage {
+  private readonly cursorKey: StructuredQueryCursorKey;
+
   constructor(
     private readonly scope: MemoryStructuredQueryAuthority,
     private readonly tuples: StructuredQueryTupleReader,
     private readonly supports: StructuredQuerySupportReader,
     private readonly screening: MemoryStructuredQueryScreeningPort = NO_SCREENING_EVIDENCE,
+    cursorKey: StructuredQueryCursorKey,
     private readonly now: () => Date = () => new Date()
-  ) {}
+  ) {
+    this.cursorKey = requireCursorKey(cursorKey);
+  }
 
   async readStructuredQuery(
     context: AuthorizedScopeContext,
-    request: ValidatedStructuredQuery
+    request: ValidatedStructuredQuery,
+    requestedSourceRefs?: readonly string[]
   ): Promise<StructuredQueryReadPlan> {
     requireOwnContext(this.scope, context);
-    const refs = authorizedSubset(context, context.authorizedSourceRefs);
+    const refs = authorizedSubset(
+      context,
+      requestedSourceRefs ?? context.authorizedSourceRefs
+    );
     const startedAt = this.now().getTime();
     try {
       return await this.scope.withAuthorizedScope(
@@ -1501,6 +1624,7 @@ export class MemoryStructuredQueryStorage implements StructuredQueryStorage {
             supports: this.supports,
             now: this.now(),
             startedAtMs: startedAt,
+            cursorKey: this.cursorKey,
           });
         },
         { additionalSourceRefs: [] }

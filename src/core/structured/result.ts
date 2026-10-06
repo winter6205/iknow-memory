@@ -468,6 +468,64 @@ export function buildStructuredResult(
   outcome: StructuredReadOutcome,
   now: Date = new Date()
 ): StructuredResultEnvelope {
+  const envelope = projectStructuredResult(request, outcome, now);
+  // The one fit decision, on the whole sibling, after the page is complete.
+  // There is deliberately no "drop the last row until it fits" path: the page
+  // a snapshot was taken from must be the page the caller can re-read.
+  const bytes = encodedSize(envelope);
+  if (bytes > STRUCTURED_RESULT_MAX_BYTES) {
+    throw new StructuredQueryError(
+      `structured result is ${bytes} UTF-8 bytes, over the ` +
+        `${STRUCTURED_RESULT_MAX_BYTES} bound; narrow the request`,
+      "result_too_large"
+    );
+  }
+  return envelope;
+}
+
+/**
+ * The same measure `buildStructuredResult` applies, without the refusal.
+ *
+ * This exists so a reader that must decide how many rows a page may carry asks
+ * THIS module rather than re-deriving the wire shape. A second copy of the
+ * envelope silently under-measures whatever it forgets — the schema members,
+ * the evidence half of every row, the snake_case provenance keys — and a page
+ * that "fit" the copy is refused whole by the projection that measures the real
+ * one. One projection, one measure, two callers.
+ *
+ * The caller's `evidence_ref` values are supplied by the grant issuer, which
+ * runs AFTER a read transaction, so a reader sizing a page cannot know them.
+ * It measures with `STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER` instead, and
+ * this module enforces the matching ceiling — which is what makes the
+ * placeholder an upper bound rather than a guess.
+ */
+export function structuredResultEnvelopeBytes(
+  request: ValidatedStructuredQuery,
+  outcome: StructuredReadOutcome,
+  now: Date
+): number {
+  return encodedSize(projectStructuredResult(request, outcome, now));
+}
+
+/**
+ * How wide one emitted `evidence_ref` may be, in ENCODED bytes.
+ *
+ * This is a reservation, not a suggestion: a reference wider than the
+ * reservation is refused here rather than measured optimistically somewhere
+ * upstream. It is what lets a reader size a page before its references exist.
+ */
+export const STRUCTURED_RESULT_EVIDENCE_REF_RESERVED_BYTES = 64;
+
+/** A reference of exactly the reserved width, for measuring an unminted page. */
+export const STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER = "0".repeat(
+  STRUCTURED_RESULT_EVIDENCE_REF_RESERVED_BYTES
+);
+
+function projectStructuredResult(
+  request: ValidatedStructuredQuery,
+  outcome: StructuredReadOutcome,
+  now: Date
+): StructuredResultEnvelope {
   const instant = wholeSecondInstant(now);
   const queriedAt = wholeSecondStamp(instant);
   const expiresAt = wholeSecondStamp(
@@ -475,21 +533,9 @@ export function buildStructuredResult(
   );
   const context = readContext(outcome.context, outcome.kind);
   const maintenance = readMaintenance(outcome.context.maintenance);
-  const envelope =
-    outcome.kind === "list"
-      ? buildList(request, outcome, context, queriedAt, expiresAt, maintenance)
-      : buildCount(request, outcome, context, queriedAt, expiresAt, maintenance);
-  // The one fit decision, on the whole sibling, after the page is complete.
-  // There is deliberately no "drop the last row until it fits" path: the page
-  // a snapshot was taken from must be the page the caller can re-read.
-  if (encodedSize(envelope) > STRUCTURED_RESULT_MAX_BYTES) {
-    throw new StructuredQueryError(
-      `structured result is ${encodedSize(envelope)} UTF-8 bytes, over the ` +
-        `${STRUCTURED_RESULT_MAX_BYTES} bound; narrow the request`,
-      "result_too_large"
-    );
-  }
-  return envelope;
+  return outcome.kind === "list"
+    ? buildList(request, outcome, context, queriedAt, expiresAt, maintenance)
+    : buildCount(request, outcome, context, queriedAt, expiresAt, maintenance);
 }
 
 function buildList(
@@ -601,12 +647,32 @@ function readRow(
     head: readEndpoint(row.head),
     relation_norm: readText(row.relationNorm, "relation_norm"),
     tail: readEndpoint(row.tail),
-    valid_window: {
-      from: readWindowBound(row.validWindow.from, "valid_window.from"),
-      until: readWindowBound(row.validWindow.until, "valid_window.until"),
-    },
+    valid_window: readValidWindow(row.validWindow),
     ...evidence,
   };
+}
+
+/**
+ * A stored window is checked, never rewritten — and it must also ORDER.
+ *
+ * Both bounds are checked for shape and neither is normalized, so a reversed or
+ * zero-length interval passes the shape check while describing no instant at
+ * all. The consumer refuses `start >= end`, so such a window would arrive there
+ * as an opaque contract refusal instead of this producer's typed one, and the
+ * caller would learn nothing about which of the two it sent was wrong.
+ */
+function readValidWindow(window: {
+  readonly from: string | null;
+  readonly until: string | null;
+}): { readonly from: string | null; readonly until: string | null } {
+  const from = readWindowBound(window.from, "valid_window.from");
+  const until = readWindowBound(window.until, "valid_window.until");
+  if (from !== null && until !== null && from >= until) {
+    refuseBackend(
+      `valid_window does not order: from ${from} is not before until ${until}`
+    );
+  }
+  return { from, until };
 }
 
 function readRowEvidence(
@@ -615,12 +681,30 @@ function readRowEvidence(
 ): StructuredResultRowEvidence {
   const bounded = boundProvenance(row.supports);
   return {
-    evidence_ref: readText(row.evidenceRef, "evidence_ref"),
+    evidence_ref: readEvidenceRef(row.evidenceRef),
     evidence_expires_at: expiresAt,
     provenance: bounded.entries,
     provenance_complete: bounded.complete,
     provenance_next_ref: bounded.nextRef,
   };
+}
+
+/**
+ * A reference must fit the reservation a reader sizes its page against.
+ *
+ * A grant reference is minted after the read transaction that measured the
+ * page, so the page's bound depends on this ceiling holding. Without it the
+ * reserved width would be an assumption, and an unusually long reference would
+ * push the emitted envelope past what the reader checked.
+ */
+function readEvidenceRef(value: string): string {
+  const ref = readText(value, "evidence_ref");
+  if (JSON.stringify(ref).length - 2 > STRUCTURED_RESULT_EVIDENCE_REF_RESERVED_BYTES) {
+    refuseBackend(
+      `evidence_ref is wider than the ${STRUCTURED_RESULT_EVIDENCE_REF_RESERVED_BYTES} byte reservation`
+    );
+  }
+  return ref;
 }
 
 function readEndpoint(

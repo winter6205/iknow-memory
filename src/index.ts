@@ -57,6 +57,25 @@ import { BUSINESS_LEDGER_AUTHORIZED_SCOPES } from "./core/business-query/sql-que
 import type { BusinessLedgerConfig } from "./core/business-query/sql-query-types.js";
 import { readSourceTool } from "./tools/read_source.js";
 import {
+  PgStructuredQueryStorage,
+  type StructuredQueryReadPlan,
+  type StructuredQueryRowPlan,
+} from "./core/storage/structured-query-reads.js";
+import {
+  resolveQueryScope,
+  type QueryScopeEnv,
+} from "./core/storage/structured-query-scope.js";
+import type {
+  StructuredEntityRowRecord,
+  StructuredRelationRowRecord,
+  StructuredQueryReader,
+  StructuredReadContext,
+} from "./core/structured/result.js";
+import type {
+  AuthorizedScopeUnitOfWork,
+  ScopeTransactionOwner,
+} from "./core/storage/structured-scope-types.js";
+import {
   extractTool,
   type ExtractDeps,
   type ExtractPool,
@@ -185,6 +204,125 @@ interface ServerDeps {
    * provisioned) exit — see specs/search-mode-business-sql-contract.md §7.
    */
   businessLedger?: BusinessLedgerConfig;
+  /**
+   * Query cursor signing key, read from `IKNOW_QUERY_CURSOR_KEY`. REQUIRED by
+   * the structured reader and deliberately undefaulted there: a cursor states
+   * where a result set continues, and an unsigned one is a value the caller
+   * may choose. Absent is therefore an unprovisioned capability, which the
+   * retrieve tool reports as `structured_search_unavailable` — the SPEC's
+   * capability trigger — rather than minting unsigned tokens.
+   */
+  queryCursorKey?: string;
+}
+
+/**
+ * Bind a storage-level Query reader to the tool's per-request reader.
+ *
+ * The storage reader needs an authorized context on every call, while the tool
+ * passes only the validated request — so the context is resolved ONCE here, at
+ * composition, and re-used for every request this process serves. That is the
+ * per-session decision P1-D1 recorded: the read revision a cursor binds is read
+ * inside each request's transaction, so the per-request half of the authority is
+ * still per-request even though the scope is not.
+ *
+ * An unprovisioned scope yields `undefined`, which reaches the tool as an absent
+ * reader and is reported as `structured_search_unavailable` — the SPEC's
+ * capability trigger. It never yields a context with a guessed owner or an empty
+ * source set, which would report an authorized empty corpus for a deployment
+ * that meant to expose one.
+ */
+function buildStructuredQueryReader(
+  authority: AuthorizedScopeUnitOfWork & ScopeTransactionOwner,
+  cursorKey: string,
+  env: QueryScopeEnv
+): StructuredQueryReader | undefined {
+  const resolved = resolveQueryScope(authority, env);
+  if ("refusal" in resolved) {
+    return undefined;
+  }
+  const storage = new PgStructuredQueryStorage(
+    authority,
+    Buffer.from(cursorKey, "utf8")
+  );
+  return {
+    readStructuredQuery: async (request) => {
+      const plan = await storage.readStructuredQuery(resolved.context, request);
+      return plan.kind === "list"
+        ? {
+            kind: "list",
+            context: readContextOf(plan),
+            rows: plan.rows.map(readRowOf),
+            nextCursor: plan.nextCursor,
+          }
+        : {
+            kind: "count",
+            context: readContextOf(plan),
+            count: plan.count ?? 0,
+          };
+    },
+  };
+}
+
+/** Project the storage plan's context onto the producer's own shape. */
+function readContextOf(plan: StructuredQueryReadPlan): StructuredReadContext {
+  return {
+    queryDigest: plan.queryDigest,
+    scopeBinding: plan.scopeBinding,
+    readRevision: plan.readRevision,
+    evidenceRef: "",
+    maintenance: plan.maintenance,
+  };
+}
+
+/**
+ * Project one planned row onto the producer's row record.
+ *
+ * The row's citable reference is the grant reference, and P1-I6's issuer is not
+ * wired on this path. So a row arrives here WITHOUT one, and the honest reading
+ * is that the result cannot be cited: a reference invented here would look
+ * citable to a reader and be a lie to anyone who tried to resolve it. The
+ * producer's own `readEvidenceRef` therefore refuses the empty reference, which
+ * is the SPEC's typed outcome rather than a partial success.
+ *
+ * Wiring `issueGrantRows` here is the remaining P1-I6 unit; it needs a write
+ * transaction, so it cannot be folded into the read path this seam already owns.
+ */
+function readRowOf(
+  row: StructuredQueryRowPlan
+): StructuredEntityRowRecord | StructuredRelationRowRecord {
+  // The row's citable reference is its grant's, and `plan.grants[i]` carries no
+  // reference yet: P1-I6's issuer has not run, so the field is absent BY TYPE
+  // rather than merely empty. The empty string here is therefore not a
+  // placeholder value — it is what makes the producer's `readEvidenceRef` refuse
+  // the row with a typed code instead of printing a reference no one granted.
+  // Wiring `issueGrantRows` is the remaining P1-I6 unit; it needs a write
+  // transaction, so it cannot fold into the read path this seam already owns.
+  return { ...row, evidenceRef: "" } as
+    | StructuredEntityRowRecord
+    | StructuredRelationRowRecord;
+}
+
+/**
+ * Read the authorized-scope seam a Query reader needs off the selected storage.
+ *
+ * Structural, for the same reason the evidence dispatcher's guard is: the
+ * chunks-only `StorageBackend` contract is not widened to carry a structured
+ * seam, so a backend that has one is recognized by its shape and a backend that
+ * does not yields `undefined` — which is the unprovisioned reading, not a
+ * reason to fall back to another authority.
+ */
+function supportsStructuredQueryScope(
+  candidate: unknown
+): (AuthorizedScopeUnitOfWork & ScopeTransactionOwner) | undefined {
+  const seam = (
+    candidate as { structuredScopeUnitOfWork?: unknown } | null | undefined
+  )?.structuredScopeUnitOfWork;
+  const unit = seam as Partial<AuthorizedScopeUnitOfWork> | undefined;
+  const owner = seam as Partial<ScopeTransactionOwner> | undefined;
+  return typeof unit?.createAuthorizedContext === "function" &&
+    typeof owner?.runTransaction === "function"
+    ? (seam as AuthorizedScopeUnitOfWork & ScopeTransactionOwner)
+    : undefined;
 }
 
 /**
@@ -224,6 +362,7 @@ export function buildRetrieveDeps(
     | "graphRanker"
     | "reranker"
     | "businessLedger"
+    | "queryCursorKey"
   >,
   debug: boolean
 ): RetrieveDeps {
@@ -250,6 +389,24 @@ export function buildRetrieveDeps(
     ...(deps.businessLedger !== undefined
       ? { businessQuery: new BusinessQueryExecutor(deps.businessLedger) }
       : {}),
+    // The structured reader rides the scope seam the backends already expose,
+    // so it inherits the same authorized-context mint rather than a second one.
+    // The seam is read structurally, the way the evidence dispatcher reads its
+    // own, because `StorageBackend` is chunks-only and the seam is an optional
+    // extension. Key and seam are required together: a key with no seam has
+    // nothing to read, and a seam with no key cannot sign a cursor.
+    ...(() => {
+      const authority = supportsStructuredQueryScope(deps.storage);
+      if (authority === undefined || deps.queryCursorKey === undefined) {
+        return {};
+      }
+      const reader = buildStructuredQueryReader(
+        authority,
+        deps.queryCursorKey,
+        process.env
+      );
+      return reader === undefined ? {} : { structuredReader: reader };
+    })(),
     debug,
   };
 }
@@ -448,6 +605,12 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
             authorizedScopes: BUSINESS_LEDGER_AUTHORIZED_SCOPES,
           },
         }
+      : {}),
+    // Read straight from the environment rather than through the config loader:
+    // it authenticates cursors this process mints, so it is deployment state
+    // like the evidence identity binding, not a retrieval tuning knob.
+    ...(process.env.IKNOW_QUERY_CURSOR_KEY !== undefined
+      ? { queryCursorKey: process.env.IKNOW_QUERY_CURSOR_KEY }
       : {}),
   };
 }

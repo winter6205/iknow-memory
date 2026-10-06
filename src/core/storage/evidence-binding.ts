@@ -78,6 +78,14 @@ export const TRUSTED_BINDING_VERSION = "1";
 export interface TrustedIdentityBinding {
   readonly actorId: string;
   readonly ownerScopeBinding: string;
+  /**
+   * Carried and minted, but never compared on the read path. Authority there is
+   * `ownerScopeBinding` + `sourceRefs` + `authorizationRevision`, which decide
+   * it completely; this field names the reader inside the owner's lifecycle for
+   * view selection. Stated here so a later reader does not mistake an unchecked
+   * field for a missing check, and so turning it into a gate is a decision
+   * rather than a patch.
+   */
   readonly readerBinding: string;
   readonly sourceRefs: readonly string[];
   readonly authorizationRevision: string;

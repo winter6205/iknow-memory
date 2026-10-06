@@ -680,6 +680,63 @@ source_versions`
     });
   });
 
+  it("R4 refuses a narrower subset on the right scope and names no source", async () => {
+    // The row grant pins one support on SOURCE_A1 and one on SOURCE_A2. An
+    // identity on the *right* scope holding only SOURCE_A1 therefore passes the
+    // owner-scope check and is refused by the subset check alone, which is the
+    // only thing that makes this case different from the scope case above.
+    const broad = contextFor(SCOPE_A, [SOURCE_A1, SOURCE_A2], AUTH_REV);
+    const broadEnvelope = await readPrivateEvidence(
+      authority,
+      broad,
+      parseEvidenceRequest({
+        schema: "iknow.evidence_request",
+        schema_version: 1,
+        action: EVIDENCE_ACTION.READ,
+        evidence_ref: ROW_REF,
+      }),
+      AT
+    );
+    const granted = broadEnvelope as EvidenceReadResult;
+    expect(granted.value).toEqual(ROW_VALUE);
+    expect(granted.kind).toBe("row");
+
+    const narrow = contextFor(SCOPE_A, [SOURCE_A1], AUTH_REV);
+    let caught: unknown;
+    try {
+      await readPrivateEvidence(
+        authority,
+        narrow,
+        parseEvidenceRequest({
+          schema: "iknow.evidence_request",
+          schema_version: 1,
+          action: EVIDENCE_ACTION.READ,
+          evidence_ref: ROW_REF,
+        }),
+        AT
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught, "the narrower identity must be refused").toBeInstanceOf(Error);
+    expect(caught).toMatchObject({
+      code: EVIDENCE_FAILURE.ACCESS_DENIED,
+      reason: EVIDENCE_REFUSAL_REASON.SOURCE_OUTSIDE_AUTHORIZED_SUBSET,
+    });
+
+    // EXIT: a source ref is a citation, so the refusal must not name the one
+    // that is outside the subset. This is the whole point of the arm, and it is
+    // the arm the review found naming `t13-source-a2` to the very caller it was
+    // withholding from.
+    const message = (caught as { message: string }).message;
+    expect(message).not.toContain(SOURCE_A2);
+    expect(message).not.toContain(SOURCE_A1);
+    expect(message).toContain("outside this identity's authorized subset");
+    for (const fragment of [granted.value, granted.context]) {
+      expect(message).not.toContain(JSON.stringify(fragment));
+    }
+  });
+
   it("R4 refuses a context this composition did not mint", async () => {
     const forged = {
       actorId: "t13-forged",

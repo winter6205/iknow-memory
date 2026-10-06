@@ -331,12 +331,16 @@ function callerRefusal(
     .map((support) => support.source_ref)
     .filter((ref) => !allowed.has(ref));
   if (outside.length > 0) {
+    // EXIT: the refusal says that a source is outside the subset and never which
+    // one. A source ref is a citation, so naming it would disclose exactly what
+    // this arm exists to withhold — how many are outside is not disclosed either,
+    // because the count is a fact about the grant this caller may not read.
     return {
       code: EVIDENCE_FAILURE.ACCESS_DENIED,
       reason: EVIDENCE_REFUSAL_REASON.SOURCE_OUTSIDE_AUTHORIZED_SUBSET,
       message:
-        "the reference retains sources outside this identity's authorized " +
-        `subset: ${[...new Set(outside)].sort().join(", ")}`,
+        "the reference retains at least one source outside this identity's " +
+        "authorized subset",
     };
   }
   return null;

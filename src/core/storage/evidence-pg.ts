@@ -815,17 +815,57 @@ export async function stampSourceVersionRow(
   }
 }
 
+/**
+ * One statement shape for the grant's pinned extraction links. Passing
+ * `supportIds` pushes the membership filter into PostgreSQL; omitting it
+ * returns the whole grant. Reading `evidence_grant_extractions` rather than
+ * `support_extractions` is what keeps a later extraction from widening what a
+ * read says about a historical citation.
+ */
+async function selectGrantPinnedExtractions(
+  client: EvidenceClient,
+  evidenceRef: string,
+  supportIds: readonly string[] | null
+): Promise<Array<{ support_id: string; extraction_ref: string }>> {
+  const { rows } =
+    supportIds === null
+      ? await client.query(
+          `SELECT support_id, extraction_ref FROM evidence_grant_extractions
+            WHERE evidence_ref = $1 ORDER BY support_id, extraction_ref`,
+          [evidenceRef]
+        )
+      : await client.query(
+          `SELECT support_id, extraction_ref FROM evidence_grant_extractions
+            WHERE evidence_ref = $1 AND support_id = ANY($2::uuid[])
+            ORDER BY support_id, extraction_ref`,
+          [evidenceRef, [...supportIds]]
+        );
+  return rows as Array<{ support_id: string; extraction_ref: string }>;
+}
+
 /** The extraction links a row grant pinned at issue time. */
 export async function readGrantPinnedExtractions(
   client: EvidenceClient,
   evidenceRef: string
 ): Promise<Array<{ support_id: string; extraction_ref: string }>> {
-  const { rows } = await client.query(
-    `SELECT support_id, extraction_ref FROM evidence_grant_extractions
-      WHERE evidence_ref = $1 ORDER BY support_id, extraction_ref`,
-    [evidenceRef]
-  );
-  return rows as Array<{ support_id: string; extraction_ref: string }>;
+  return selectGrantPinnedExtractions(client, evidenceRef, null);
+}
+
+/**
+ * The pinned extraction links of the named supports only, keyed by support id
+ * with an empty list for a support that pinned none.
+ */
+export async function readGrantPinnedExtractionsForSupports(
+  client: EvidenceClient,
+  evidenceRef: string,
+  supportIds: readonly string[]
+): Promise<ReadonlyMap<string, readonly string[]>> {
+  const bySupport = new Map<string, string[]>(supportIds.map((id) => [id, []]));
+  if (supportIds.length === 0) return bySupport;
+  for (const row of await selectGrantPinnedExtractions(client, evidenceRef, supportIds)) {
+    bySupport.get(row.support_id)?.push(row.extraction_ref);
+  }
+  return bySupport;
 }
 
 /** Which support ids a grant names, with the reason it holds each. */

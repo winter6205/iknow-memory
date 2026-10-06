@@ -77,9 +77,12 @@ const DECLARING_RUN: AuthorizedScopeRunOptions = { authorizeNewSources: true };
  * insert fails, and `assertion_supports` would silently split into two disjoint
  * id spaces that no stored column could tell apart.
  *
- * PROVISIONAL, not frozen: ticket T12 (QP10) freezes post-ingest
- * backend-assigned identifiers and records the agreed value here. Until T12
- * lands this constant is pending its one-way-door decision.
+ * Frozen by ticket T12 (QP10) in
+ * `docs/validation/2026-10-06-t12-qp10-post-ingest-id-freeze-record.md` at IK
+ * `0ad17f2`. Changing it now would not error: `recordSupportRow` conflicts on
+ * the occurrence key, so the new derivation is discarded and the old row
+ * returned. That splits the table into two id spaces that no stored column
+ * could tell apart.
  */
 export const SUPPORT_ID_NAMESPACE = "6f6b1c2e-9a4d-5f38-b7c1-0d2e3f4a5b6c";
 

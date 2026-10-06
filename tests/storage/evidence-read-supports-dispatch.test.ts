@@ -66,6 +66,11 @@ function supportId(index: number): string {
   return `00000000-0000-4000-9000-${index.toString().padStart(12, "0")}`;
 }
 
+/** The one-based ordinal a support id names, so a row can be checked against itself. */
+function supportIdIndex(id: string): number {
+  return Number(id.slice(id.lastIndexOf("-") + 1));
+}
+
 function supportRow(index: number): Record<string, unknown> {
   return {
     support_id: supportId(index),
@@ -77,8 +82,11 @@ function supportRow(index: number): Record<string, unknown> {
     document_id: `doc-supports-dispatch-${index}`,
     unit_version: "frozen-v1",
     unit: index,
-    span_start: -1,
-    span_end: -1,
+    // Half the membership carries a span and half spells it absent, so a first
+    // page that mixes the two is the one place both arms of `spanOfColumns` are
+    // observable at once.
+    span_start: index % 2 === 1 ? -1 : index * 10,
+    span_end: index % 2 === 1 ? -1 : index * 10 + 4,
     created_at: "2026-02-01T00:00:00.000Z",
   };
 }
@@ -226,15 +234,24 @@ function supportsRequest(
   }) as EvidenceSupportsRequest;
 }
 
+/**
+ * The seam a caller of this module can observe.
+ *
+ * `client` is a parameter rather than an internal detail so that a case which
+ * asserts on which statements were issued passes the very client the dispatch
+ * runs against. A seam constructed here and dropped into a helper that builds
+ * its own is a seam nothing is ever read from, and its statement list stays
+ * empty no matter what the dispatch does.
+ */
 async function dispatch(
   request: EvidenceSupportsRequest,
   input: AuthorizedScopeContextInput = contextInput(),
-  extractionRef?: (index: number) => string
+  extractionRef?: (index: number) => string,
+  client: RecordingClient = recordingClient(SUPPORT_COUNT, extractionRef)
 ): Promise<{
   readonly envelope: EvidenceEnvelope;
   readonly client: RecordingClient;
 }> {
-  const client = recordingClient(SUPPORT_COUNT, extractionRef);
   const scope = recordingScope(client);
   const envelope = await readPrivateEvidence(
     scope,
@@ -245,14 +262,17 @@ async function dispatch(
   return { envelope, client };
 }
 
+/** The refusal a request earns, and the client the dispatch actually ran on. */
 async function refusalOf(
   request: EvidenceSupportsRequest,
-  input?: AuthorizedScopeContextInput
-): Promise<EvidenceRefusalError> {
+  input?: AuthorizedScopeContextInput,
+  client?: RecordingClient
+): Promise<{ readonly refused: EvidenceRefusalError; readonly client: RecordingClient }> {
+  const observed = client ?? recordingClient(SUPPORT_COUNT);
   try {
-    await dispatch(request, input);
+    await dispatch(request, input, undefined, observed);
   } catch (error) {
-    return error as EvidenceRefusalError;
+    return { refused: error as EvidenceRefusalError, client: observed };
   }
   throw new Error("the dispatch granted a request this lane expects to be refused");
 }
@@ -306,19 +326,158 @@ describe("T14 EP4 supports dispatch: the selector reaches the continuation", () 
     expect(page.total_supports).toBe(SUPPORT_COUNT);
   });
 
-  it("refuses a request carrying both selectors, before the grant is read", async () => {
+  it("carries the support's own descriptor onto the wire, field by field", async () => {
+    // `renderSupports` passes `page.supports` through whole and copies nothing, so
+    // the only thing this file can prove about a descriptor is that each member
+    // came off the row the membership statement returned. The fixture is built to
+    // make a swap detectable: the roles differ (support 11 is the endpoint
+    // display, 1-10 are occurrences) and the spans differ (odd supports spell the
+    // span absent, even ones carry one), so a role or a span landing on the wrong
+    // row -- or a descriptor rebuilt from the wrong row entirely -- shows up here
+    // instead of on a caller's wire.
+    const { envelope } = await dispatch(supportsRequest());
+    const page = envelope as EvidenceSupportsResult;
+    // The endpoint display is the eleventh support and the page is eight wide, so
+    // the role that is not an occurrence is only reachable on a second envelope.
+    // Checking the first page alone would never see it, and a `role` rebuilt from
+    // the count rather than from the row would pass this case.
+    const selected = (await dispatch(
+      supportsRequest({ support_id: supportId(SUPPORT_COUNT) })
+    )).envelope as EvidenceSupportsResult;
+    const everyEntry = [...page.supports, ...selected.supports];
+    expect(everyEntry).toHaveLength(PAGE_SIZE + 1);
+    for (const entry of everyEntry) {
+      const ordinal = supportIdIndex(entry.support_id);
+      expect(entry.role, `support ${ordinal} role`).toBe(
+        ordinal === SUPPORT_COUNT
+          ? EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY
+          : EVIDENCE_SUPPORT_ROLE.OCCURRENCE
+      );
+      expect(entry.subject, `support ${ordinal} subject`).toBe(
+        EVIDENCE_SUBJECT_KIND.ENTITY
+      );
+      expect(entry.result_id, `support ${ordinal} result_id`).toBe(
+        "result-supports-dispatch"
+      );
+      expect(entry.source_ref, `support ${ordinal} source_ref`).toBe(SOURCE_REF);
+      expect(entry.source_version, `support ${ordinal} source_version`).toBe("v1");
+      expect(entry.source_version_id, `support ${ordinal} source_version_id`).toBe(
+        "11111111-1111-4111-8111-111111111111"
+      );
+      expect(entry.location, `support ${ordinal} location`).toEqual({
+        document_id: `doc-supports-dispatch-${ordinal}`,
+        version: "frozen-v1",
+        unit: ordinal,
+      });
+      // The absent span is spelled `null` on the wire, not as a half-open range
+      // of -1..-1 and not omitted -- a caller cannot tell an absent span from a
+      // zero-length one otherwise.
+      expect(entry.span, `support ${ordinal} span`).toEqual(
+        ordinal % 2 === 1
+          ? null
+          : { start: ordinal * 10, end: ordinal * 10 + 4 }
+      );
+    }
+  });
+
+  it("emits the endpoint display's role even when it is not the page's last member", async () => {
+    // The page is eight supports wide and the endpoint display is the eleventh,
+    // so the role that distinguishes an endpoint from an occurrence crosses the
+    // page boundary here. A page built from the count rather than from the roles
+    // would not carry it, and this case is the one that notices.
+    const { envelope } = await dispatch(supportsRequest());
+    const page = envelope as EvidenceSupportsResult;
+    expect(page.supports.map((entry) => entry.role)).toEqual(
+      Array.from({ length: PAGE_SIZE }, () => EVIDENCE_SUPPORT_ROLE.OCCURRENCE)
+    );
+    const last = (await dispatch(
+      supportsRequest({ support_id: supportId(SUPPORT_COUNT) })
+    )).envelope as EvidenceSupportsResult;
+    expect(last.supports[0]?.role).toBe(EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY);
+  });
+
+  it("reads a null and an empty selector as the same 'no selector' the absent one is", async () => {
+    // `optionalSelector` has three returns -- `undefined`, `null` and the string --
+    // and only the first two are "none" here. Both halves are pinned, because
+    // neither is observable from the other:
+    //
+    //   * the three returns are pinned on the parsed request, which is the only
+    //     place they differ. A `null` arm rewritten to return `""` still reaches
+    //     the continuation as "absent", so the dispatch arm below cannot see it.
+    //   * the fold that makes `null` and `""` and absent all answer with a first
+    //     page is pinned on the envelope, which is the only place a fold that
+    //     stopped treating a blank selector as absent would be visible.
+    const absent = supportsRequest();
+    expect(absent.cursor).toBeUndefined();
+    expect(absent.support_id).toBeUndefined();
+    const nulled = supportsRequest({ cursor: null, support_id: null });
+    expect(nulled.cursor).toBeNull();
+    expect(nulled.support_id).toBeNull();
+    const blank = supportsRequest({ cursor: "", support_id: "" });
+    expect(blank.cursor).toBe("");
+    expect(blank.support_id).toBe("");
+
+    for (const spelled of [null, ""]) {
+      const { envelope } = await dispatch(supportsRequest({ cursor: spelled }));
+      const page = envelope as EvidenceSupportsResult;
+      expect(page.selected, `cursor ${JSON.stringify(spelled)}`).toBe(false);
+      expect(page.supports.map((entry) => entry.support_id), "first page").toEqual(
+        Array.from({ length: PAGE_SIZE }, (_, index) => supportId(index + 1))
+      );
+      expect(page.next_cursor, "a blank selector is not a position").not.toBeNull();
+    }
+    // The same holds for the other selector, and for a request that names one
+    // blank and one real: only the real one is ever read.
+    for (const spelled of [null, ""]) {
+      const support = (await dispatch(
+        supportsRequest({ support_id: spelled as string | null })
+      )).envelope as EvidenceSupportsResult;
+      expect(support.selected, `support_id ${JSON.stringify(spelled)}`).toBe(false);
+    }
+    const selected = (await dispatch(
+      supportsRequest({ cursor: null, support_id: supportId(SUPPORT_COUNT) })
+    )).envelope as EvidenceSupportsResult;
+    expect(selected.selected).toBe(true);
+    expect(selected.supports.map((entry) => entry.support_id)).toEqual([
+      supportId(SUPPORT_COUNT),
+    ]);
+  });
+
+  it("refuses a request carrying both selectors, and reads no extraction link for it", async () => {
     const first = (await dispatch(supportsRequest())).envelope as EvidenceSupportsResult;
+    // EXIT: the selector pair is refused by the continuation, which `readPrivateEvidence`
+    // calls *after* `readGrantFacts` has already run -- so this build's own order is
+    // grant-then-continuation, and this test pins what that order actually does rather
+    // than the grant-first wording the earlier revision of this case claimed.
+    //
+    // What the refusal does withhold is the membership: the continuation returns before
+    // `selectPage` runs, so the pinned supports are never read even though the grant row
+    // and its scope revisions were. The statement list below is the client the dispatch
+    // really ran against, so an implementation that resolved the page before refusing
+    // would leave `evidence_grant_supports` in it and fail here.
     const client = recordingClient();
-    const scope = recordingScope(client);
-    const refused = await refusalOf(
-      supportsRequest({ cursor: first.next_cursor, support_id: supportId(1) })
+    const { refused } = await refusalOf(
+      supportsRequest({ cursor: first.next_cursor, support_id: supportId(1) }),
+      undefined,
+      client
     );
     expect(refused).toBeInstanceOf(EvidenceRefusalError);
     expect(refused.code).toBe(EVIDENCE_FAILURE.MALFORMED_CONTRACT);
     expect(refused.message).toContain("mutually exclusive");
     expect(refused.message).not.toContain(SOURCE_REF);
-    expect(client.statements.filter((sql) => sql.includes("evidence_grants"))).toEqual([]);
-    expect(scope).toBeDefined();
+    // The grant facts are read first, so this is not an "before any read" claim --
+    // that correction is the whole reason the case is renamed.
+    expect(
+      client.statements.filter((sql) => sql.includes("FROM evidence_grants"))
+    ).not.toEqual([]);
+    // What the refusal does withhold is the extraction links: `resolveSelectors`
+    // answers before `selectPage` and before the page's own reader is ever called,
+    // so no page -- not even a partial one -- is assembled from the membership.
+    // A continuation that resolved the page first and refused afterwards would
+    // leave `evidence_grant_extractions` in this list and fail here.
+    expect(
+      client.statements.filter((sql) => sql.includes("FROM evidence_grant_extractions"))
+    ).toEqual([]);
   });
 
   it("reads the grant, the membership and the extraction links on the scope's own client", async () => {
@@ -436,7 +595,7 @@ describe("T14 EP4 supports dispatch: the selector reaches the continuation", () 
     ];
     const seen = new Set<string>();
     for (const { label, request, contract } of faults) {
-      const refused = await refusalOf(request);
+      const { refused } = await refusalOf(request);
       // The published token is one, and stays one: the frozen set is not widened
       // to separate these three.
       expect(refused.reason, label).toBe(EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD);
@@ -536,7 +695,7 @@ describe("T14 EP4 supports dispatch: the selector reaches the continuation", () 
   });
 
   it("refuses a non-uuid support_id with an in-set code instead of throwing", async () => {
-    const refused = await refusalOf(supportsRequest({ support_id: "not-a-uuid" }));
+    const { refused } = await refusalOf(supportsRequest({ support_id: "not-a-uuid" }));
     expect(refused).toBeInstanceOf(EvidenceRefusalError);
     expect(refused.code).toBe(EVIDENCE_FAILURE.MALFORMED_CONTRACT);
     expect(CLOSED_REASONS).toContain(refused.reason);
@@ -590,7 +749,7 @@ describe("T14 EP4 supports dispatch: the selector reaches the continuation", () 
   });
 
   it("still refuses an identity the caller's authorized subset does not cover", async () => {
-    const refused = await refusalOf(
+    const { refused } = await refusalOf(
       supportsRequest(),
       contextInput({ authorizedSourceRefs: ["another-source"] })
     );

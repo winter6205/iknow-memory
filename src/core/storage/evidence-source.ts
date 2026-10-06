@@ -51,6 +51,22 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
 
+/**
+ * Whether a value is already the uuid spelling this build accepts. A caller
+ * that must answer a bad value with a refusal rather than an exception tests
+ * this first, instead of calling `assertUuid` and catching what it throws.
+ */
+export function isUuid(value: unknown): value is string {
+  return typeof value === "string" && UUID_RE.test(value);
+}
+
+/** Whether a value is an RFC 3339 instant this build can read. */
+export function isInstantText(value: unknown): value is string {
+  if (typeof value !== "string" || !ISO_INSTANT_RE.test(value)) return false;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) && Math.abs(ms) <= MAX_INSTANT_MS;
+}
+
 /** A validated occurrence, flattened to what the tables actually store. */
 export interface NormalizedSupport {
   readonly subject: EvidenceSubjectKind;

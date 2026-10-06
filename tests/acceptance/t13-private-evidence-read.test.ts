@@ -17,6 +17,7 @@ import {
   readPrivateEvidence,
   type EvidenceReadResult,
   type EvidenceRefusalReason,
+  type EvidenceSupportsResult,
 } from "../../src/core/storage/evidence-read.js";
 import {
   createEvidenceDispatcher,
@@ -127,6 +128,14 @@ const VERSION_A2 = "b2000000-0000-4000-8000-000000000002";
 const VERSION_STOPPED = "b3000000-0000-4000-8000-000000000003";
 const VERSION_B1 = "b4000000-0000-4000-8000-000000000004";
 const RECEIPT_ID = "c1000000-0000-4000-8000-000000000001";
+// EXIT: one page carries at most eight descriptors, so the paged grant pins nine.
+// A grant with two supports could only ever answer its last page and would prove
+// nothing about a cursor.
+const PAGED_REF = "88888888-8888-4888-8888-888888888888";
+const PAGED_SUPPORTS: readonly string[] = Array.from(
+  { length: 9 },
+  (_, index) => `d1000000-0000-4000-8000-00000000000${index + 1}`
+);
 
 const ROW_VALUE: Record<string, unknown> = {
   entity: {
@@ -246,6 +255,20 @@ const CASES: readonly FrozenCase[] = [
     cleanup: CLEANUP_CONTRACT,
     notRun: [],
   }),
+  frozenCase({
+    id: "R5",
+    owner: "T13",
+    scenario:
+      "a row grant's supports request pages its pinned membership, selects one named support, and refuses two selectors at once",
+    scenarioSource:
+      "the SUPPORTS action of the internal evidence capability, decided by evidence-continuation.ts and reached through this read's dispatch layer",
+    boundary:
+      "real PostgreSQL: the page, the selected support and both refusals all run on the authorized-scope client, inside the one transaction that read the grant facts",
+    expectedSource:
+      "the nine pinned support ids seeded in this file, in the stable uuid order the continuation freezes; the refusal tokens are the frozen EVIDENCE_FAILURE and EVIDENCE_REFUSAL_REASON sets",
+    cleanup: CLEANUP_CONTRACT,
+    notRun: [],
+  }),
 ];
 
 let backend: PgvectorBackend;
@@ -334,6 +357,15 @@ async function seed(client: pg.Client): Promise<void> {
     [SUPPORT_A2, SOURCE_A2, VERSION_A2, "fin-t13-entity-alpha", "v1"],
     [SUPPORT_STOPPED, SOURCE_A2, VERSION_STOPPED, "fin-t13-entity-alpha", "v2"],
     [SUPPORT_UNRESOLVED, SOURCE_A2, VERSION_A2, "fin-t13-entity-alpha", "v1"],
+    ...PAGED_SUPPORTS.map(
+      (supportId, index): [string, string, string, string, string] => [
+        supportId,
+        index % 2 === 0 ? SOURCE_A1 : SOURCE_A2,
+        index % 2 === 0 ? VERSION_A1 : VERSION_A2,
+        "fin-t13-entity-alpha",
+        "v1",
+      ]
+    ),
   ] as const) {
     await client.query(
       `INSERT INTO ${Q("assertion_supports")} (support_id, subject, result_id, source_ref, source_version, source_version_id, document_id, unit_version, unit, span_start, span_end, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
@@ -377,6 +409,8 @@ async function seed(client: pg.Client): Promise<void> {
   };
   await grant(ROW_REF, "row", live, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
   await pin(ROW_REF, [SUPPORT_A1, SUPPORT_A2]);
+  await grant(PAGED_REF, "row", live, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
+  await pin(PAGED_REF, PAGED_SUPPORTS);
   await grant(COUNT_REF, "count", live, COUNT_CONTEXT, COUNT_VALUE, COUNT_NUMBER, RECEIPT_ID, AUTH_REV);
   await grant(EXPIRED_REF, "row", expired, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
   await pin(EXPIRED_REF, [SUPPORT_A1]);
@@ -821,6 +855,102 @@ source_versions`
     expect(supportsEvidenceScopeAuthority({})).toBeUndefined();
     expect(supportsEvidenceScopeAuthority(undefined)).toBeUndefined();
     expect(supportsEvidenceScopeAuthority(null)).toBeUndefined();
+  });
+
+  it("R5 pages, selects and refuses two selectors on one row grant", async () => {
+    const context = contextFor(SCOPE_A, [SOURCE_A1, SOURCE_A2], AUTH_REV);
+    const page = (patch: Record<string, unknown>) =>
+      readPrivateEvidence(
+        authority,
+        context,
+        parseEvidenceRequest({
+          schema: "iknow.evidence_request",
+          schema_version: 1,
+          action: EVIDENCE_ACTION.SUPPORTS,
+          evidence_ref: PAGED_REF,
+          ...patch,
+        }),
+        AT
+      );
+
+    statements.length = 0;
+    recording = true;
+    const first = (await page({})) as EvidenceSupportsResult;
+    recording = false;
+    expect(first.schema).toBe("iknow.evidence_result");
+    expect(first.evidence_ref).toBe(PAGED_REF);
+    expect(first.total_supports).toBe(PAGED_SUPPORTS.length);
+    expect(first.supports.map((entry) => entry.support_id)).toEqual(
+      PAGED_SUPPORTS.slice(0, 8)
+    );
+    expect(first.selected).toBe(false);
+    expect(first.next_cursor).not.toBeNull();
+    // A page carries no retained value or context: it is descriptors of the
+    // citations the grant pinned, so the row is not disclosed beside them.
+    expect(first).not.toHaveProperty("value");
+    expect(first).not.toHaveProperty("context");
+
+    // EXIT: between the grant read and the pinned extraction links this dispatch
+    // issues no transaction control statement, and the last statement on the wire
+    // is the seam's own COMMIT. A continuation that leased its own connection
+    // would open and close a bracket inside that span, so the fence is observed,
+    // not assumed.
+    const grantRead = statements.findIndex((text) => text.includes("FROM evidence_grants"));
+    const extractionRead = statements.findIndex((text) =>
+      text.includes("FROM evidence_grant_extractions")
+    );
+    expect(grantRead).toBeGreaterThanOrEqual(0);
+    expect(extractionRead).toBeGreaterThan(grantRead);
+    expect(
+      statements
+        .slice(grantRead, extractionRead + 1)
+        .some((text) => /^(BEGIN|COMMIT|ROLLBACK|RELEASE)/.test(text))
+    ).toBe(false);
+    expect(statements.at(-1)).toBe("COMMIT");
+
+    const second = (await page({ cursor: first.next_cursor })) as EvidenceSupportsResult;
+    expect(second.supports.map((entry) => entry.support_id)).toEqual(
+      PAGED_SUPPORTS.slice(8)
+    );
+    expect(second.next_cursor).toBeNull();
+    expect(second.expires_at).toBe(first.expires_at);
+
+    // The ninth support is past the first page, so selection has to reach into
+    // the grant's own membership rather than into the page it would have returned.
+    const selected = (await page({
+      support_id: PAGED_SUPPORTS[8],
+    })) as EvidenceSupportsResult;
+    expect(selected.selected).toBe(true);
+    expect(selected.supports.map((entry) => entry.support_id)).toEqual([
+      PAGED_SUPPORTS[8],
+    ]);
+    expect(selected.next_cursor).toBeNull();
+
+    const reasons: string[] = [];
+    let mutual: { message: string } | undefined;
+    // EXIT: one refusal at a time. These reads share the scope's advisory lock,
+    // so starting them together would queue four transactions behind one lock and
+    // starve the pool this lane leases from.
+    for (const patch of [
+      { cursor: first.next_cursor, support_id: PAGED_SUPPORTS[0] },
+      { support_id: "not-a-uuid" },
+      { support_id: "99999999-9999-4999-8999-999999999999" },
+      { cursor: "not-a-cursor-this-build-mints" },
+    ]) {
+      try {
+        await page(patch);
+        expect.unreachable();
+      } catch (error) {
+        const typed = error as { code: string; reason: string; message: string };
+        expect(Object.values(EVIDENCE_FAILURE)).toContain(typed.code);
+        expect(Object.values(EVIDENCE_REFUSAL_REASON)).toContain(typed.reason);
+        reasons.push(typed.reason);
+        if (typed.message.includes("mutually exclusive")) mutual = typed;
+      }
+    }
+    expect(reasons).not.toContain(EVIDENCE_REFUSAL_REASON.SUPPORTS_CONTINUATION_NOT_READ);
+    expect(mutual?.message).toContain("mutually exclusive");
+    expect(mutual?.message).not.toContain(SOURCE_A1);
   });
 
   it("publishes every frozen case with its not-run register", () => {

@@ -302,4 +302,35 @@ export class MemoryScreeningStorage {
     return count;
   }
 
+  /**
+   * One published conflict exactly as this store holds it.
+   *
+   * A decision is validated against these values rather than against the
+   * request's own claims, which is why the decision path reads them here rather
+   * than being handed them. Returning `undefined` for a candidate this scope
+   * does not hold is what makes an unknown target refusable without a write.
+   */
+  readConflict(
+    scopeBinding: string,
+    candidateId: string
+  ):
+    | {
+        readonly checkId: string;
+        readonly supportIds: readonly string[];
+        readonly assertionIds: readonly string[];
+        readonly inputRevision: string;
+        readonly relationCatalogVersion: number;
+      }
+    | undefined {
+    const stored = this.candidates.get(candidateKey(scopeBinding, candidateId));
+    if (stored === undefined) return undefined;
+    return {
+      checkId: stored.checkId,
+      supportIds: stored.supportIds,
+      assertionIds: stored.assertionIds,
+      inputRevision: stored.full.inputRevision,
+      relationCatalogVersion: stored.full.relationCatalogVersion,
+    };
+  }
+
 }

@@ -54,3 +54,58 @@ export async function upSchemaScreening(client: SchemaClient): Promise<void> {
     CREATE INDEX IF NOT EXISTS structured_screening_checks_scope_idx
       ON structured_screening_checks (scope_binding, source_ref)`);
 }
+
+/**
+ * The decision table and the visibility effect it applies.
+ *
+ * The decision row is append-only evidence: who decided, what they decided,
+ * why, and the exact supports and assertions they named. It is never updated
+ * or deleted by a later decision, so "preserve evidence" is a property of the
+ * schema rather than of a code path that remembers to keep history.
+ *
+ * The conflict table is separate because a decision resolves a conflict by
+ * changing which rows are current, and that is state rather than evidence. It
+ * carries one row per (candidate, support) with the visibility the decision
+ * gave it, so a later decision against the same conflict is a compare against a
+ * value the store holds rather than a re-derivation from a request.
+ */
+export async function upSchemaScreeningDecisions(
+  client: SchemaClient
+): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS structured_screening_decisions (
+      decision_id text PRIMARY KEY CHECK (length(btrim(decision_id)) > 0),
+      scope_binding text NOT NULL,
+      candidate_id text NOT NULL
+        REFERENCES structured_screening_candidates(candidate_id) ON DELETE CASCADE,
+      check_id uuid NOT NULL,
+      outcome text NOT NULL
+        CHECK (outcome IN ('keep_both', 'retire_support', 'supersede_assertion')),
+      reason text NOT NULL CHECK (length(btrim(reason)) > 0),
+      actor_id text NOT NULL CHECK (length(btrim(actor_id)) > 0),
+      retire_support_ids jsonb NOT NULL CHECK (jsonb_typeof(retire_support_ids) = 'array'),
+      retain_support_ids jsonb NOT NULL CHECK (jsonb_typeof(retain_support_ids) = 'array'),
+      assertion_ids jsonb NOT NULL CHECK (jsonb_typeof(assertion_ids) = 'array'),
+      expected_input_revision text NOT NULL,
+      expected_relation_catalog_version integer NOT NULL,
+      content_digest text NOT NULL CHECK (content_digest ~ '^[0-9a-f]{64}$'),
+      decided_at timestamptz NOT NULL
+    )`);
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS structured_screening_conflict_visibility (
+      scope_binding text NOT NULL,
+      candidate_id text NOT NULL
+        REFERENCES structured_screening_candidates(candidate_id) ON DELETE CASCADE,
+      support_id uuid NOT NULL,
+      assertion_id uuid NOT NULL,
+      current boolean NOT NULL,
+      resolved_by text NOT NULL,
+      outcome text NOT NULL
+        CHECK (outcome IN ('keep_both', 'retire_support', 'supersede_assertion')),
+      decided_at timestamptz NOT NULL,
+      PRIMARY KEY (scope_binding, candidate_id, support_id)
+    )`);
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS structured_screening_decisions_scope_idx
+      ON structured_screening_decisions (scope_binding, candidate_id)`);
+}

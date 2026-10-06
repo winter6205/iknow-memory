@@ -13,8 +13,15 @@
  * The expiry is carried, never recomputed. A continuation reads `exp` off the
  * cursor it was given, so a caller walking a long result set cannot extend its
  * own window one page at a time.
+ *
+ * The payload is AUTHENTICATED, not merely encoded. Encoding is what stops a
+ * caller reading the position out of the text; signing is what stops it
+ * putting a position of its own choosing back in. The other seven fields are
+ * all re-verified against the reads of the receiving transaction, and `aft` is
+ * not — it is a claim about where the result set ends, and it is applied raw —
+ * so it is covered by the MAC instead.
  */
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 
 import { canonicalJson } from "./evidence-source.js";
 import type {
@@ -110,33 +117,87 @@ function canonicalFilter(
 }
 
 /**
- * Encode one cursor.
+ * The key that authenticates a cursor.
  *
- * The text is base64url over canonical JSON, so a caller cannot read a position
- * out of it or hand-build one: every field it would need is verified against the
- * transaction that receives it before the position is used.
+ * A position is a CLAIM about where a result set ends, not a fact the reader can
+ * re-derive: every other field is checked against the transaction and then the
+ * position is applied raw. Without a signature, a caller who base64-decodes a
+ * cursor and rewrites `aft` passes every remaining check and silently resumes
+ * past rows it never received — a complete-looking page with a hole in it.
+ * Signing the whole canonical payload is what makes "this build minted this,
+ * at this position" a checkable fact rather than an assumption.
+ *
+ * The key is INJECTED, never defaulted, and `requireCursorKey` refuses a short
+ * one at composition time: a reader that cannot authenticate its own cursors
+ * must not be constructible, because the alternative to supplying a key is not
+ * a weaker check but a reader that cannot tell a resumed page from a forged
+ * position.
+ */
+export type StructuredQueryCursorKey = Buffer;
+
+const MINIMUM_CURSOR_KEY_BYTES = 32;
+
+/**
+ * Refuse a key too short to authenticate anything, before a reader exists.
+ *
+ * A zero-length key HMACs perfectly well and is trivially reproducible by
+ * anyone, which is the exact failure the signature exists to prevent — so it is
+ * rejected at the composition boundary rather than discovered in production.
+ */
+export function requireCursorKey(key: StructuredQueryCursorKey): StructuredQueryCursorKey {
+  if (!Buffer.isBuffer(key) || key.length < MINIMUM_CURSOR_KEY_BYTES) {
+    throw new Error(
+      `a structured query cursor key needs at least ${MINIMUM_CURSOR_KEY_BYTES} bytes`
+    );
+  }
+  return key;
+}
+
+/**
+ * Encode one cursor, authenticated.
+ *
+ * The text is `base64url(canonical JSON)` + `.` + `base64url(HMAC-SHA256)`, so
+ * the position cannot be edited without the key: every field it carries,
+ * `aft` included, is covered by the MAC, and the reader verifies the MAC before
+ * it decodes anything.
  */
 export function encodeStructuredQueryCursor(
-  payload: StructuredQueryCursorPayload
+  payload: StructuredQueryCursorPayload,
+  key: StructuredQueryCursorKey
 ): string {
-  return Buffer.from(canonicalJson(payload), "utf8").toString("base64url");
+  const body = Buffer.from(canonicalJson(payload), "utf8").toString("base64url");
+  return `${body}.${cursorMac(body, key)}`;
+}
+
+function cursorMac(body: string, key: StructuredQueryCursorKey): string {
+  return createHmac("sha256", key).update(body, "utf8").digest("base64url");
 }
 
 /**
  * Decode one cursor, or refuse it whole.
  *
- * A value that is not base64url text, not canonical JSON, not a record, or not a
- * record with EXACTLY this cursor's keys, is `null`. There is no partial decode
- * and no "recovered" field, because a cursor whose half was understood is a
- * position this build never issued.
+ * A value that is not base64url text, not canonical JSON, not a record, not a
+ * record with EXACTLY this cursor's keys, or not signed by this deployment's
+ * key, is `null`. There is no partial decode and no "recovered" field, because a
+ * cursor whose half was understood is a position this build never issued.
  */
 export function decodeStructuredQueryCursor(
-  raw: string
+  raw: string,
+  key: StructuredQueryCursorKey
 ): StructuredQueryCursorPayload | null {
-  if (raw.length === 0 || !/^[A-Za-z0-9_-]+$/.test(raw)) return null;
+  if (raw.length === 0 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(raw)) return null;
+  const separator = raw.indexOf(".");
+  const body = raw.slice(0, separator);
+  const presented = raw.slice(separator + 1);
+  // Constant-time comparison: a MAC that can be probed byte by byte is not a
+  // signature, and this branch runs on untrusted text.
+  const expected = Buffer.from(cursorMac(body, key), "utf8");
+  const offered = Buffer.from(presented, "utf8");
+  if (expected.length !== offered.length) return null;
+  if (!timingSafeEqual(expected, offered)) return null;
   let parsed: unknown;
   try {
-    parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+    parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
   } catch {
     return null;
   }

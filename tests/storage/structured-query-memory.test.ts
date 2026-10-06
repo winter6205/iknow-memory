@@ -13,7 +13,7 @@
  * publication adapter, the real identity registry and the real immutable support
  * store. Nothing here stubs a membership or a tuple.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
@@ -29,6 +29,7 @@ import {
   STRUCTURED_QUERY_SUPPORT_ROLE,
   type StructuredQueryGrantPlan,
   type StructuredQueryRelationTuple,
+  type StructuredQueryReadPlan,
   type StructuredQueryStorage,
   type StructuredQuerySupportFact,
   type StructuredQuerySupportReader,
@@ -37,6 +38,14 @@ import {
 } from "../../src/core/storage/structured-query-reads.js";
 import { StructuredQueryError } from "../../src/core/structured/errors.js";
 import type { ValidatedStructuredQuery } from "../../src/core/structured/request.js";
+import {
+  buildStructuredResult,
+  STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER,
+  STRUCTURED_RESULT_MAX_BYTES,
+  structuredResultEnvelopeBytes,
+  type StructuredListRead,
+  type StructuredRelationRowRecord,
+} from "../../src/core/structured/result.js";
 import type { InMemoryStructuredIdentityStore } from "../../src/core/structured/identity-store.js";
 import {
   deriveRelationAssertionId,
@@ -62,6 +71,16 @@ const ANCHOR = "00000000-0000-4000-8000-00000000aaaa";
 const OTHER = "00000000-0000-4000-8000-00000000bbbb";
 
 let serial = 0;
+
+/**
+ * This lane's own cursor key.
+ *
+ * The tests drive cursors only through the reader, so they never need to sign
+ * one — the negative-control cases build UNSIGNED cursors on purpose, and a
+ * tampered cursor keeps the original signature so that the position check is
+ * what rejects it.
+ */
+const CURSOR_KEY = randomBytes(32);
 
 function unique(label: string): string {
   serial += 1;
@@ -91,6 +110,7 @@ function openLane(clock: () => Date = () => new Date(INSTANT)): Lane {
       tupleReaderOf(backend.structuredIdentityStore),
       supportReaderOf(backend),
       undefined,
+      CURSOR_KEY,
       clock
     ),
   };
@@ -108,7 +128,15 @@ function supportReaderOf(backend: MemoryBackend): StructuredQuerySupportReader {
           supportId: support.support_id,
           sourceRef: support.source_ref,
           sourceVersion: support.source_version,
-          location: { ...support.location },
+          // The store holds the wire's snake_case locator; this reader's port
+          // declares the domain names, so they are mapped rather than spread.
+          // Spreading them reads as a well-formed locator carrying no fields,
+          // which only fails once the row is projected onto the wire.
+          location: {
+            documentId: support.location.document_id,
+            version: support.location.version,
+            unit: support.location.unit,
+          },
           span: support.span === null ? null : { start: support.span.start, end: support.span.end },
           extractionRefs: await backend.listSupportExtractions(supportId),
         });
@@ -515,6 +543,154 @@ async function expectRefusal(
     return;
   }
   throw new Error(`expected refusal ${code}, but the read succeeded`);
+}
+
+function expectSyncRefusal(run: () => unknown, code: string): void {
+  try {
+    run();
+  } catch (error) {
+    expect(error).toBeInstanceOf(StructuredQueryError);
+    expect((error as StructuredQueryError).code).toBe(code);
+    return;
+  }
+  throw new Error(`expected refusal ${code}, but the call succeeded`);
+}
+
+/**
+ * The payload text of a cursor, with any signature discarded.
+ *
+ * Signing is what the reader checks, so a FORGED cursor is one whose signature
+ * does not cover the payload it now carries. These cases therefore rewrite the
+ * body and keep the old signature — the honest shape of an attacker's edit, and
+ * the case a cursor the server never minted arrives in.
+ */
+function cursorBody(raw: string): Record<string, unknown> {
+  return JSON.parse(
+    Buffer.from(raw.split(".")[0]!, "base64url").toString("utf8")
+  ) as Record<string, unknown>;
+}
+
+/**
+ * A cursor whose payload the caller rewrote, keeping the original signature.
+ *
+ * This is the honest shape of an attacker's edit: the body changes, the MAC
+ * still covers the body it was minted over. A reader that verifies before it
+ * decodes refuses it; one that only re-checks fields applies the position raw.
+ */
+function tamperCursor(raw: string, payload: Record<string, unknown>): string {
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const separator = raw.indexOf(".");
+  return separator < 0 ? body : `${body}.${raw.slice(separator + 1)}`;
+}
+
+/** A cursor carrying exactly the payload a caller chose, and nothing else. */
+function forgeCursor(payload: Record<string, unknown>): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+/** The emitted byte count of the envelope this plan projects to. */
+function envelopeBytes(
+  request: ValidatedStructuredQuery,
+  plan: Pick<
+    StructuredQueryReadPlan,
+    "queryDigest" | "scopeBinding" | "readRevision" | "maintenance" | "rows" | "nextCursor"
+  >,
+  now: Date
+): number {
+  const outcome: StructuredListRead = {
+    kind: "list",
+    context: {
+      queryDigest: plan.queryDigest,
+      scopeBinding: plan.scopeBinding,
+      readRevision: plan.readRevision,
+      evidenceRef: "",
+      maintenance: plan.maintenance,
+    },
+    rows: plan.rows.map((row) => ({
+      ...row,
+      evidenceRef: STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER,
+    })) as StructuredRelationRowRecord[],
+    nextCursor: plan.nextCursor,
+  };
+  return structuredResultEnvelopeBytes(request, outcome, now);
+}
+
+/** The envelope the producer ACTUALLY emits, through its own projection. */
+function emittedEnvelope(
+  request: ValidatedStructuredQuery,
+  plan: StructuredQueryReadPlan,
+  now: Date
+): string {
+  const issued = plan.rows.map(() => STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER);
+  return JSON.stringify(
+    buildStructuredResult(request, structuredQueryReadOutcome(plan, issued), now)
+  );
+}
+
+/** A one-relation read outcome carrying the window a case is about. */
+function relationRead(window: {
+  readonly from: string | null;
+  readonly until: string | null;
+}): StructuredListRead {
+  return {
+    kind: "list",
+    context: {
+      queryDigest: "digest-window-ordering",
+      scopeBinding: "scope-window-ordering",
+      readRevision: "7",
+      evidenceRef: "",
+      maintenance: {
+        maintenanceRevision: "m-1",
+        sourcesInScope: 1,
+        publishedSources: 1,
+        desiredIndex: { pending: 0, running: 0, ready: 1, failed: 0, stale: 0 },
+        conflictChecks: { pending: 0, running: 0, ready: 1, failed: 0, stale: 0 },
+        rulesetRevision: "ruleset-1",
+      },
+    },
+    rows: [
+      {
+        subject: "relation_assertion",
+        id: ANCHOR,
+        head: {
+          id: ANCHOR,
+          canonicalName: "Head",
+          type: "organization",
+          displaySupportId: OTHER,
+          displayDisagreement: false,
+        },
+        relationNorm: "owns",
+        tail: {
+          id: OTHER,
+          canonicalName: "Tail",
+          type: "organization",
+          displaySupportId: OTHER,
+          displayDisagreement: false,
+        },
+        validWindow: window,
+        evidenceRef: STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER,
+        supports: [
+          {
+            supportId: OTHER,
+            sourceRef: "s-a",
+            sourceVersion: "v1",
+            location: { documentId: "doc", version: "v1", unit: 1 },
+            extractionRef: "extraction-1",
+          },
+        ],
+      },
+    ],
+    nextCursor: null,
+  };
+}
+
+/** Eighteen ids, one page is twenty rows: the fixture must span pages. */
+function manyIds(count: number): string[] {
+  return Array.from(
+    { length: count },
+    (_unused, index) =>
+      `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -988,6 +1164,7 @@ describe("structured query memory twin", () => {
       tupleReaderOf(lane.identityStore),
       supportReaderOf(lane.backend),
       undefined,
+      CURSOR_KEY,
       laterClock
     );
     await expectRefusal(
@@ -1021,6 +1198,7 @@ describe("structured query memory twin", () => {
           { sourceRef, rulesetRevision: "ruleset-b", coverage: "coverage-b", retiredSupports: 0 },
         ]),
       },
+      CURSOR_KEY,
       lane.clock
     );
     await expectRefusal(
@@ -1132,6 +1310,324 @@ describe("structured query memory twin", () => {
       count: 2,
       coverage: "stored_structured_subjects",
     });
+  });
+
+  // -------------------------------------------------------------------------
+  // Envelope bound at row boundaries
+  // -------------------------------------------------------------------------
+
+  it("bounds a collectively oversized page to a resumable prefix at row boundaries", async () => {
+    const lane = openLane();
+    // Eight sources behind every one of twenty rows: the page is collectively far
+    // over the envelope, and only a row-boundary cut keeps the remainder
+    // reachable. A single oversized row would be `result_too_large` instead.
+    const ids = manyIds(20);
+    const sourceRefs = ["s-1", "s-2", "s-3", "s-4", "s-5", "s-6", "s-7", "s-8"];
+    const seeded = await seed(lane, {
+      sourceRefs,
+      facts: ids.flatMap((resultId) =>
+        sourceRefs.map((sourceRef) => ({
+          subject: "entity" as const,
+          resultId,
+          name: "Widget",
+          entityType: "organization",
+          sourceRef,
+        }))
+      ),
+    });
+
+    const first = await lane.storage.readStructuredQuery(seeded.context, list());
+    // The reduction ran, and it ran at a row boundary: the page is a strict
+    // prefix of the matched set, not the whole of it and not nothing.
+    expect(first.rows.length).toBeGreaterThan(0);
+    expect(first.rows.length).toBeLessThan(ids.length);
+    expect(first.rows.map((row) => row.id)).toEqual(ids.slice(0, first.rows.length));
+    expect(first.nextCursor).not.toBeNull();
+
+    // What the producer ACTUALLY emits is inside the bound.
+    const emitted = emittedEnvelope(list(), first, lane.clock());
+    expect(Buffer.byteLength(emitted, "utf8")).toBeLessThanOrEqual(STRUCTURED_RESULT_MAX_BYTES);
+
+    // Resuming from the cursor the page returned yields the remaining rows:
+    // no gap, no duplicate, and the union is the whole matched set.
+    const walked = [...first.rows];
+    const second = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ cursor: first.nextCursor! })
+    );
+    expect(second.rows.length).toBeGreaterThan(0);
+    walked.push(...second.rows);
+    expect(walked.map((row) => row.id)).toEqual(ids);
+    expect(new Set(walked.map((row) => row.id)).size).toBe(ids.length);
+
+    // The cut is the minimum one: one row more would NOT have fitted. This is
+    // the check an approximation fails — a page measured by the wrong shape
+    // reports more rows as fitting than actually do.
+    // The cut is the minimum one: one row more would NOT have fitted. Measured
+    // with the cursor a 14-row page would actually CARRY — a probe read that
+    // stops after one row mints exactly that cursor, which a page measured as
+    // `next_cursor: null` would under-count by the whole cursor.
+    const probe = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1, cursor: first.nextCursor! })
+    );
+    expect(probe.rows[0]!.id).toBe(ids[first.rows.length]);
+    const oneMore = {
+      ...first,
+      rows: [...first.rows, probe.rows[0]!],
+      nextCursor: probe.nextCursor,
+    };
+    expect(envelopeBytes(list(), oneMore, lane.clock())).toBeGreaterThan(
+      STRUCTURED_RESULT_MAX_BYTES
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Cursor authenticity
+  // -------------------------------------------------------------------------
+
+  it("refuses a hand-built cursor and a rewritten position, but continues a real one", async () => {
+    const lane = openLane();
+    const ids = manyIds(3);
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: ids.map((id, index) => ({
+        subject: "entity" as const,
+        resultId: id,
+        name: `E${index}`,
+        entityType: "organization",
+        sourceRef: "s-a",
+      })),
+    });
+    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const real = first.nextCursor!;
+    const payload = cursorBody(real);
+
+    // A hand-built cursor whose every field is correct. Nothing here is wrong
+    // except that this build never signed it.
+
+
+    // The same edit an attacker makes: decode, move the position onto a row in
+    // the middle of the set, re-encode. Every field the transaction can check
+    // still agrees; only the position was rewritten.
+
+
+    // A position that is not even an id. Unverified, this sorts AFTER every real
+    // row, so the read would resume past the whole set and answer a successful
+    // EMPTY page — indistinguishable from a genuinely empty result.
+    await expectRefusal(
+      () =>
+        lane.storage.readStructuredQuery(
+          seeded.context,
+          list({ limit: 1, cursor: tamperCursor(real, { ...payload, aft: "garbage" }) })
+        ),
+      "invalid_cursor"
+    );
+
+    // NEGATIVE CONTROL: the untouched cursor still continues, so the three
+    // refusals above cannot be passing because every cursor is refused.
+    const second = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1, cursor: real })
+    );
+    expect(second.rows.map((row) => row.id)).toEqual(ids.slice(1, 2));
+  });
+
+  it("carries the first page's expiry onto every later page's cursor", async () => {
+    const lane = openLane();
+    const ids = manyIds(3);
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: ids.map((id, index) => ({
+        subject: "entity" as const,
+        resultId: id,
+        name: `E${index}`,
+        entityType: "organization",
+        sourceRef: "s-a",
+      })),
+    });
+    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const second = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1, cursor: first.nextCursor! })
+    );
+    expect(second.rows.map((row) => row.id)).toEqual(ids.slice(1, 2));
+    // Carried forward, not re-opened: a renewed expiry would make the fixed
+    // ten-minute window a rolling one that no test reading page one would see.
+    expect(cursorBody(second.nextCursor!).exp).toBe(cursorBody(first.nextCursor!).exp);
+  });
+
+  // -------------------------------------------------------------------------
+  // Count over more than one page
+  // -------------------------------------------------------------------------
+
+  it("counts every distinct id walking all pages yields, not one page's rows", async () => {
+    const lane = openLane();
+    const ids = manyIds(25);
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a", "s-b"],
+      facts: ids.map((id, index) => ({
+        subject: "entity" as const,
+        resultId: id,
+        name: `E${index}`,
+        entityType: "organization",
+        sourceRef: index % 2 === 0 ? "s-a" : "s-b",
+      })),
+    });
+    const walked: string[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 5; page += 1) {
+      const read: StructuredQueryReadPlan = await lane.storage.readStructuredQuery(
+        seeded.context,
+        list(cursor === null ? {} : { cursor })
+      );
+      walked.push(...read.rows.map((row) => row.id));
+      cursor = read.nextCursor;
+      if (cursor === null) break;
+    }
+    // The union of every page is duplicate-free and IS the count.
+    expect(new Set(walked).size).toBe(walked.length);
+    expect(walked.length).toBeGreaterThan(20);
+    const counted = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ operation: "count" })
+    );
+    expect(counted.count).toBe(walked.length);
+    expect(counted.count).toBe(new Set(walked).size);
+  });
+
+  // -------------------------------------------------------------------------
+  // Reader lease
+  // -------------------------------------------------------------------------
+
+  it("refuses a read whose clock has passed the execution lease, and answers one inside it", async () => {
+    const lane = openLane();
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: [
+        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+      ],
+    });
+    const start = lane.clock().getTime();
+    // The reader stamps its start and its page from the SAME injected clock, so
+    // a clock that advances past the lease between the two readings is the whole
+    // condition. The scope authority keeps its own clock, so nothing else here
+    // expires: only the reader's lease can fire.
+    const late = new MemoryStructuredQueryStorage(
+      lane.backend.structuredScopeUnitOfWork,
+      tupleReaderOf(lane.identityStore),
+      supportReaderOf(lane.backend),
+      undefined,
+      CURSOR_KEY,
+      (() => {
+        let reading = 0;
+        return () => new Date(start + (reading++ === 0 ? 0 : 61_000));
+      })()
+    );
+    await expectRefusal(
+      () => late.readStructuredQuery(seeded.context, list()),
+      "query_timeout"
+    );
+    // NEGATIVE CONTROL: the same read on a clock that does not pass the lease.
+    const inside = await lane.storage.readStructuredQuery(seeded.context, list());
+    expect(inside.rows.map((row) => row.id)).toEqual([ANCHOR]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Authorization narrowing seam
+  // -------------------------------------------------------------------------
+
+  it("narrows a read to a requested subset and refuses a subset it does not own", async () => {
+    const lane = await openLane();
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a", "s-b"],
+      facts: [
+        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: "s-b" },
+      ],
+    });
+    const whole = await lane.storage.readStructuredQuery(seeded.context, list());
+    expect(whole.rows.map((row) => row.id)).toEqual([ANCHOR, OTHER]);
+
+    // Narrowing is allowed and is what the authorized subset means.
+    const narrowed = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list(),
+      [seeded.sourceRefs[1]!]
+    );
+    expect(narrowed.rows.map((row) => row.id)).toEqual([OTHER]);
+
+    // Widening is not, and the guard is reachable precisely because the
+    // requested set is a caller's second argument rather than the context's.
+    await expectRefusal(
+      () => lane.storage.readStructuredQuery(seeded.context, list(), ["never-authorized"]),
+      "authorization_denied"
+    );
+  });
+
+  it("refuses to compose a reader whose cursor key cannot authenticate", async () => {
+    const lane = openLane();
+    // A short key HMACs perfectly well and is reproducible by anyone, which is
+    // the failure the signature exists to prevent — so it is refused at
+    // composition rather than shipped as a cursor anyone can forge.
+    expect(
+      () =>
+        new MemoryStructuredQueryStorage(
+          lane.backend.structuredScopeUnitOfWork,
+          tupleReaderOf(lane.identityStore),
+          supportReaderOf(lane.backend),
+          undefined,
+          Buffer.alloc(8),
+          lane.clock
+        )
+    ).toThrow(/cursor key/);
+    // NEGATIVE CONTROL: this lane's own full-width key composes and reads.
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: [
+        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+      ],
+    });
+    const read = await lane.storage.readStructuredQuery(seeded.context, list());
+    expect(read.rows.map((row) => row.id)).toEqual([ANCHOR]);
+  });
+
+  // -------------------------------------------------------------------------
+  // Window ordering at the producer
+  // -------------------------------------------------------------------------
+
+  it("refuses a valid_window that does not order, and emits one that does", () => {
+    const request = list({ subject: "relation_assertion" });
+    const instant = new Date("2024-01-01T00:00:00Z");
+    // NEGATIVE CONTROL: an ordered window projects.
+    expect(
+      buildStructuredResult(
+        request,
+        relationRead({ from: "2020-01-01T00:00:00Z", until: "2021-01-01T00:00:00Z" }),
+        instant
+      ).schema
+    ).toBe("iknow.structured_result");
+    // A reversed window describes no instant, and the consumer refuses it as an
+    // opaque contract violation — the producer must name it in its own code.
+    expectSyncRefusal(
+      () =>
+        buildStructuredResult(
+          request,
+          relationRead({ from: "2021-01-01T00:00:00Z", until: "2020-01-01T00:00:00Z" }),
+          instant
+        ),
+      "structured_search_unavailable"
+    );
+    // A zero-length window is the same fact: `start >= end`.
+    expectSyncRefusal(
+      () =>
+        buildStructuredResult(
+          request,
+          relationRead({ from: "2020-01-01T00:00:00Z", until: "2020-01-01T00:00:00Z" }),
+          instant
+        ),
+      "structured_search_unavailable"
+    );
   });
 });
 

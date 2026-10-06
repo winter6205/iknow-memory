@@ -9,11 +9,16 @@
  * intents and the revision advance are one transaction, and every refusal
  * before that point leaves nothing behind for a separate connection to find.
  *
- * The fence against two decisions racing is the same one screening and
- * publication already use: the candidate row is locked `FOR UPDATE` before it is
- * read, so the second decision sees the first one's visibility rows rather than
- * the state both were written against. Nothing here keeps a private copy of
- * conflict state to compare against.
+ * The fence against two decisions racing is the conflict's own identity: the
+ * decision row is inserted under the unique `(scope_binding, candidate_id)`
+ * index and the loser of the race reads the winner's committed decision and
+ * refuses. That fence holds with every lock in this transaction removed, which
+ * no lock can do on its own — a lock is masked by whichever of the others is
+ * still held — and it holds without this code keeping a private copy of
+ * conflict state to compare against. The advisory, scope, source and candidate
+ * locks the shared unit of work takes stay as defence in depth: they keep the
+ * rest of the transaction serialized, but they are not what makes one conflict
+ * decide once.
  */
 import {
   conflictIsResolved,
@@ -152,6 +157,150 @@ function toRecord(row: DecisionRow): ScreeningDecisionRecord {
   };
 }
 
+/** The recorded decision as the outcome of an identical resubmission. */
+function idempotentOutcome(
+  row: DecisionRow,
+  revisions: { readonly read: number; readonly maintenance: number }
+): ScreeningDecisionOutcomeRecord {
+  // An identical resubmission is the same decision, not a second one. The
+  // effect was applied by the first submission; returning the recorded decision
+  // at the CURRENT revisions is what makes a retry safe, and re-applying
+  // nothing is what keeps it from advancing a revision twice.
+  return {
+    decision: toRecord(row),
+    effect: {
+      decisionId: row.decision_id,
+      candidateId: row.candidate_id,
+      outcome: row.outcome as ScreeningDecisionRecord["outcome"],
+      retireSupportIds: row.retire_support_ids,
+      retainSupportIds: row.retain_support_ids,
+      assertionIds: row.assertion_ids,
+      visibilityChanged: outcomeChangesVisibility(
+        row.outcome as ScreeningDecisionRecord["outcome"]
+      ),
+      projectionIntentsEnqueued: false,
+      readRevision: revisions.read,
+      maintenanceRevision: revisions.maintenance,
+    },
+    idempotent: true,
+  };
+}
+
+/**
+ * Resolve one submission against the decisions this conflict already holds.
+ *
+ * Returns `null` when this submission is the decision that resolves the
+ * conflict, and the recorded outcome when it is not — an identical
+ * resubmission reports the decision that already stands, and a submission that
+ * lost the claim on the conflict's identity refuses with the decision that won.
+ */
+async function claimConflictIdentity(
+  client: AuthorizedScopeWork["client"],
+  input: PgApplyDecisionInput,
+  insertValues: readonly unknown[]
+): Promise<ScreeningDecisionOutcomeRecord | null> {
+  const contentDigest = decisionContentDigest(input.request);
+  const prior = await client.query(
+    `SELECT ${DECISION_COLUMNS}
+       FROM structured_screening_decisions
+      WHERE decision_id = $1
+      FOR UPDATE`,
+    [input.request.decisionId]
+  );
+  const priorRow = prior.rows[0] as DecisionRow | undefined;
+  if (priorRow !== undefined && priorRow.content_digest !== contentDigest) {
+    // EXIT: the decision id is already recorded with different content. It
+    // throws `invalid_input` rather than overwriting the recorded decision,
+    // because an evidence row a later submission could rewrite would not be
+    // evidence of what was decided.
+    throw refusalError(
+      "invalid_input",
+      `decision ${input.request.decisionId} is already recorded with different content`
+    );
+  }
+  const resolvedBy = await client.query(
+    `SELECT decision_id FROM structured_screening_decisions
+      WHERE scope_binding = $1 AND candidate_id = $2
+        AND decision_id <> $3
+      ORDER BY decided_at, decision_id
+      FOR UPDATE`,
+    [
+      input.facts.scopeBinding,
+      input.request.candidateId,
+      input.request.decisionId,
+    ]
+  );
+  if (resolvedBy.rows.length > 0) {
+    // EXIT: a different decision already resolved this conflict. The decision
+    // refuses as `input_stale` rather than applying a second outcome over the
+    // first, because the state its author read — an unresolved conflict — no
+    // longer exists. This read is the cheap path for a decision that arrives
+    // after the winner committed; the claim below is the fence for one that
+    // arrives while it is still open.
+    throw refusalError(
+      "input_stale",
+      `conflict ${input.request.candidateId} was already resolved by decision ${String(
+        (resolvedBy.rows[0] as { decision_id?: string }).decision_id
+      )}`
+    );
+  }
+  if (priorRow !== undefined) {
+    return idempotentOutcome(
+      priorRow,
+      await readRevisions(client, input.facts.scopeBinding)
+    );
+  }
+  const claimed = await client.query(
+    `INSERT INTO structured_screening_decisions
+       (decision_id, scope_binding, candidate_id, check_id, outcome, reason,
+        actor_id, retire_support_ids, retain_support_ids, assertion_ids,
+        expected_input_revision, expected_relation_catalog_version,
+        content_digest, decided_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13,$14)
+     ON CONFLICT (scope_binding, candidate_id) DO NOTHING
+     RETURNING decision_id`,
+    insertValues
+  );
+  if (claimed.rows.length > 0) return null;
+  // EXIT: another decision claimed this conflict's identity while this
+  // transaction was open, which is what two decisions racing on one conflict
+  // look like from inside the loser. The claim is the guard rather than a lock:
+  // the insert waits for the transaction holding the identity to finish, so the
+  // row read here is the winner's committed decision rather than a guess at one
+  // that may still roll back.
+  const winner = await client.query(
+    `SELECT ${DECISION_COLUMNS}
+       FROM structured_screening_decisions
+      WHERE scope_binding = $1 AND candidate_id = $2`,
+    [input.facts.scopeBinding, input.request.candidateId]
+  );
+  const winnerRow = winner.rows[0] as DecisionRow | undefined;
+  if (winnerRow === undefined) {
+    // EXIT: the conflict identity was claimed and the decision holding it does
+    // not read back. The decision reports the state it cannot confirm rather
+    // than naming a winner it has not seen.
+    throw new StructuredScopeError(
+      "maintenance_status_unavailable",
+      "the decision that claimed this conflict is not readable"
+    );
+  }
+  if (winnerRow.decision_id === input.request.decisionId) {
+    // The same decision arriving twice at once is one decision; the first
+    // submission's effect stands and this one re-applies nothing.
+    return idempotentOutcome(
+      winnerRow,
+      await readRevisions(client, input.facts.scopeBinding)
+    );
+  }
+  // EXIT: the decision refuses as `input_stale` rather than applying a second
+  // outcome over the one that won, because the state its author read — an
+  // unresolved conflict — no longer exists.
+  throw refusalError(
+    "input_stale",
+    `conflict ${input.request.candidateId} was already resolved by decision ${winnerRow.decision_id}`
+  );
+}
+
 /** PostgreSQL guarded screening decisions, bound to the shared scope UOW. */
 export class PgScreeningDecisionStorage {
   constructor(private readonly scope: ScreeningDecisionAuthority) {}
@@ -159,10 +308,11 @@ export class PgScreeningDecisionStorage {
   /**
    * Apply one explicit decision, or refuse typed with nothing written.
    *
-   * The lock on the candidate row is taken before the conflict is read, so two
-   * decisions presented against the same expected revisions are serialized: the
-   * second one reads the first one's effect and refuses rather than resolving
-   * the same conflict twice.
+   * Two decisions presented against the same expected revisions resolve the
+   * same conflict once: the second one either loses the claim on the conflict's
+   * identity and reads the winner's committed decision, or arrives after it and
+   * reads the same decision through the ordinary path. Either way it refuses
+   * rather than resolving the conflict twice.
    */
   async applyDecision(
     input: PgApplyDecisionInput
@@ -219,103 +369,23 @@ export class PgScreeningDecisionStorage {
         }
         const decidedAt = now.toISOString();
         const contentDigest = decisionContentDigest(input.request);
-        const prior = await client.query(
-          `SELECT ${DECISION_COLUMNS}
-             FROM structured_screening_decisions
-            WHERE decision_id = $1
-            FOR UPDATE`,
-          [input.request.decisionId]
-        );
-        const priorRow = prior.rows[0] as DecisionRow | undefined;
-        if (priorRow !== undefined && priorRow.content_digest !== contentDigest) {
-          // EXIT: the decision id is already recorded with different content.
-          // It throws `invalid_input` rather than overwriting the recorded
-          // decision, because an evidence row a later submission could rewrite
-          // would not be evidence of what was decided.
-          throw refusalError(
-            "invalid_input",
-            `decision ${input.request.decisionId} is already recorded with different content`
-          );
-        }
-        const resolvedBy = await client.query(
-          `SELECT decision_id FROM structured_screening_decisions
-            WHERE scope_binding = $1 AND candidate_id = $2
-              AND decision_id <> $3
-            ORDER BY decided_at, decision_id
-            FOR UPDATE`,
-          [
-            input.facts.scopeBinding,
-            input.request.candidateId,
-            input.request.decisionId,
-          ]
-        );
-        if (resolvedBy.rows.length > 0) {
-          // EXIT: a different decision already resolved this conflict. The
-          // decision refuses as `input_stale` rather than applying a second
-          // outcome over the first, because the state its author read — an
-          // unresolved conflict — no longer exists. The candidate row is
-          // already locked, so two decisions presented together are serialized
-          // and the loser reads this and refuses.
-          throw refusalError(
-            "input_stale",
-            `conflict ${input.request.candidateId} was already resolved by decision ${String(
-              (resolvedBy.rows[0] as { decision_id?: string }).decision_id
-            )}`
-          );
-        }
-        if (priorRow !== undefined) {
-          // An identical resubmission is the same decision, not a second one.
-          // The effect was applied by the first submission; returning the
-          // recorded decision at the CURRENT revisions is what makes a retry
-          // safe, and re-applying nothing is what keeps it from advancing a
-          // revision twice.
-          const revisions = await readRevisions(
-            client,
-            input.facts.scopeBinding
-          );
-          return {
-            decision: toRecord(priorRow),
-            effect: {
-              decisionId: priorRow.decision_id,
-              candidateId: priorRow.candidate_id,
-              outcome: priorRow.outcome as ScreeningDecisionRecord["outcome"],
-              retireSupportIds: priorRow.retire_support_ids,
-              retainSupportIds: priorRow.retain_support_ids,
-              assertionIds: priorRow.assertion_ids,
-              visibilityChanged: outcomeChangesVisibility(
-                priorRow.outcome as ScreeningDecisionRecord["outcome"]
-              ),
-              projectionIntentsEnqueued: false,
-              readRevision: revisions.read,
-              maintenanceRevision: revisions.maintenance,
-            },
-            idempotent: true,
-          };
-        }
-        await client.query(
-          `INSERT INTO structured_screening_decisions
-             (decision_id, scope_binding, candidate_id, check_id, outcome, reason,
-              actor_id, retire_support_ids, retain_support_ids, assertion_ids,
-              expected_input_revision, expected_relation_catalog_version,
-              content_digest, decided_at)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11,$12,$13,$14)`,
-          [
-            input.request.decisionId,
-            input.facts.scopeBinding,
-            input.request.candidateId,
-            facts.checkId,
-            input.request.outcome,
-            input.request.reason,
-            input.request.context.actorId,
-            JSON.stringify([...input.request.retireSupportIds]),
-            JSON.stringify([...input.request.retainSupportIds]),
-            JSON.stringify([...input.request.assertionIds]),
-            input.request.expectedInputRevision,
-            input.request.expectedRelationCatalogVersion,
-            contentDigest,
-            decidedAt,
-          ]
-        );
+        const decided = await claimConflictIdentity(client, input, [
+          input.request.decisionId,
+          input.facts.scopeBinding,
+          input.request.candidateId,
+          facts.checkId,
+          input.request.outcome,
+          input.request.reason,
+          input.request.context.actorId,
+          JSON.stringify([...input.request.retireSupportIds]),
+          JSON.stringify([...input.request.retainSupportIds]),
+          JSON.stringify([...input.request.assertionIds]),
+          input.request.expectedInputRevision,
+          input.request.expectedRelationCatalogVersion,
+          contentDigest,
+          decidedAt,
+        ]);
+        if (decided !== null) return decided;
         const retired = new Set(input.request.retireSupportIds);
         const retained = new Set(input.request.retainSupportIds);
         const currentBySupport = new Map<string, boolean>();

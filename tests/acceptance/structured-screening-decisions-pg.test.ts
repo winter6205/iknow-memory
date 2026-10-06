@@ -181,6 +181,64 @@ async function withObserver<R>(
   }
 }
 
+/**
+ * The mutations this lane can be run under, read from the environment so the
+ * state under test is reached by running the lane rather than by editing it.
+ *
+ * `locks` removes every row and advisory lock the decision transaction takes —
+ * the mutation the ticket records as still letting two racing decisions both
+ * apply. `guard` removes that lock set AND the decision's conflict-identity
+ * guard, which is what shows the case below is deciding on the guard and not on
+ * its own timing. The case asserts the same correct outcome under all three, so
+ * a mutation fails the lane instead of changing what the lane claims.
+ */
+const DECISION_MUTATION = process.env.STRUCTURED_SCREENING_DECISION_MUTATION ?? "";
+const MUTATED_LOCKS = DECISION_MUTATION === "locks" || DECISION_MUTATION === "guard";
+const MUTATED_GUARD = DECISION_MUTATION === "guard";
+const CONFLICT_UNIQUE_INDEX = "structured_screening_decisions_conflict_uniq";
+
+const ADVISORY_XACT_LOCK = /pg_(?:try_)?advisory_xact_lock\s*\(/i;
+const ROW_LOCK = /\bFOR\s+UPDATE\b/i;
+const CONFLICT_IDENTITY_GUARD =
+  /\s*ON\s+CONFLICT\s*\(\s*scope_binding\s*,\s*candidate_id\s*\)\s*DO NOTHING\s*RETURNING\s*decision_id/i;
+
+type QueryFn = (
+  text: string,
+  values?: readonly unknown[]
+) => Promise<{ rows: unknown[] }>;
+
+/**
+ * The mutation reaches every client this lane's transactions lease.
+ *
+ * The advisory, scope and source locks are taken by the shared scope unit of
+ * work on its own client, which never reaches the decision callback, so
+ * rewriting only the callback's client would leave three of the four in place
+ * and the case would pass for the wrong reason. Every leased connection is an
+ * instance of the one class below, so that is where the statements are rewritten.
+ * The lock mutation removes only the locking clause: every read the decision
+ * makes still happens and only the serialization disappears.
+ */
+function neutralizingQueries(): () => void {
+  const prototype = pg.Client.prototype as unknown as { query: QueryFn };
+  const original = prototype.query;
+  prototype.query = function (
+    this: unknown,
+    text: string,
+    values?: readonly unknown[]
+  ): Promise<{ rows: unknown[] }> {
+    if (ADVISORY_XACT_LOCK.test(text)) {
+      return Promise.resolve({ rows: [{ acquired: true }] });
+    }
+    let rewritten = text;
+    if (MUTATED_LOCKS) rewritten = rewritten.replace(ROW_LOCK, "");
+    if (MUTATED_GUARD) rewritten = rewritten.replace(CONFLICT_IDENTITY_GUARD, "");
+    return original.call(this, rewritten, values);
+  };
+  return () => {
+    prototype.query = original;
+  };
+}
+
 async function seedConflict(label: string): Promise<{
   readonly context: AuthorizedScopeContext;
   readonly facts: ScreeningConflictFacts;
@@ -694,6 +752,99 @@ describe("screening decision transaction property", () => {
       seeded.facts.candidateId
     );
     expect(recorded).toHaveLength(1);
+  });
+
+  it("SD-18-PG-M one conflict identity decides once with every in-transaction lock removed", async () => {
+    const seeded = await seedConflict("guard-identity");
+    // Both transactions must read the conflict before either writes it, or the
+    // case passes because the second decision simply arrived late rather than
+    // because anything stopped it. The first arrival at the trigger holds until
+    // the second one has reached it, which is a fact about the run rather than a
+    // sleep long enough to be usually true. The wait is bounded so a run where
+    // the second decision is held up elsewhere still finishes.
+    await withObserver(async (observer) => {
+      await observer.query(`CREATE SEQUENCE "${driver.schema}".guard_overlap_seq`);
+      await observer.query(`
+        CREATE FUNCTION "${driver.schema}".guard_overlap_delay()
+        RETURNS trigger LANGUAGE plpgsql AS $f$
+        DECLARE
+          arrival integer;
+          waited integer := 0;
+        BEGIN
+          arrival := nextval('"${driver.schema}".guard_overlap_seq'::regclass);
+          IF arrival = 1 THEN
+            WHILE (SELECT last_value FROM "${driver.schema}".guard_overlap_seq) < 2
+              AND waited < 100 LOOP
+              PERFORM pg_sleep(0.01);
+              waited := waited + 1;
+            END LOOP;
+          END IF;
+          RETURN NEW;
+        END; $f$`);
+      await observer.query(`
+        CREATE TRIGGER guard_overlap_delay_trg BEFORE INSERT ON structured_screening_decisions
+        FOR EACH ROW EXECUTE FUNCTION "${driver.schema}".guard_overlap_delay()`);
+    });
+    if (MUTATED_GUARD) {
+      await withObserver((observer) =>
+        observer.query(`DROP INDEX IF EXISTS ${CONFLICT_UNIQUE_INDEX}`)
+      );
+    }
+    const mk = (outcome: "keep_both" | "retire_support") => ({
+      decisionId: unique(`t16-guard-${outcome}`),
+      context: seeded.context,
+      candidateId: seeded.facts.candidateId,
+      outcome,
+      reason: "two decisions presented with no lock left between them",
+      retireSupportIds: outcome === "keep_both" ? [] : [seeded.supports[0]!.supportId],
+      retainSupportIds: [] as readonly string[],
+      assertionIds: seeded.facts.assertionIds,
+      expectedInputRevision: seeded.facts.inputRevision,
+      expectedRelationCatalogVersion: seeded.facts.relationCatalogVersion,
+    });
+    const restore = neutralizingQueries();
+    try {
+      const results = await Promise.allSettled([
+        decisions.applyDecision({ request: mk("retire_support"), facts: seeded.facts }),
+        decisions.applyDecision({ request: mk("keep_both"), facts: seeded.facts }),
+      ]);
+      const applied = results.filter((r) => r.status === "fulfilled").length;
+      const codes = results
+        .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+        .map((r) => (r.reason as { code?: string }).code);
+      // Under `STRUCTURED_SCREENING_DECISION_MUTATION=locks` the advisory and row
+      // locks this transaction normally takes are gone, and one decision still
+      // resolves the conflict once. Nothing here holds a lock to do it with, so
+      // what holds is the conflict identity the decision row is keyed by.
+      expect(applied).toBe(1);
+      expect(codes).toEqual(["input_stale"]);
+      const recorded = await port.readDecisions(
+        seeded.scopeBinding,
+        seeded.facts.candidateId
+      );
+      expect(recorded).toHaveLength(1);
+      // The conflict identity is restored only once the case has passed. A
+      // mutated run that really did record two decisions for one conflict
+      // leaves a table this index refuses, and that refusal is this case's own
+      // failure rather than something the cleanup reports in its place.
+      if (MUTATED_GUARD) {
+        await withObserver((observer) =>
+          observer.query(
+            `CREATE UNIQUE INDEX IF NOT EXISTS ${CONFLICT_UNIQUE_INDEX}
+               ON structured_screening_decisions (scope_binding, candidate_id)`
+          )
+        );
+      }
+    } finally {
+      restore();
+      await withObserver(async (observer) => {
+        await observer.query(
+          `DROP TRIGGER IF EXISTS guard_overlap_delay_trg ON structured_screening_decisions`
+        );
+        await observer.query(`DROP FUNCTION IF EXISTS "${driver.schema}".guard_overlap_delay()`);
+        await observer.query(`DROP SEQUENCE IF EXISTS "${driver.schema}".guard_overlap_seq`);
+      });
+    }
   });
 
   it("leaves no decision, no visibility row and no intent when the outbox refuses", async () => {

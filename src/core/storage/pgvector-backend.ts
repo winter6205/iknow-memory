@@ -35,6 +35,7 @@ import type {
   IndexJobTerminalOutcome,
   NewSourceVersion,
   RetrievedChunk,
+  ScopeRevisionFence,
   ScopeRevisionRecord,
   SearchOptions,
   SourceDocRecord,
@@ -123,11 +124,17 @@ import {
   normalizeSourceVersion,
   type SourceVersionStamp,
 } from "./evidence-source.js";
-import { decideGrantRead, normalizeGrantRequest } from "./evidence-store.js";
+import {
+  assertScopeRevisionFenceCurrent,
+  decideGrantRead,
+  normalizeGrantRequest,
+  normalizeScopeRevisionFence,
+} from "./evidence-store.js";
 import {
   bindSourceLocatorRow,
   inEvidenceTransaction,
   issueGrantRows,
+  lockScopeRevisions,
   readGrantDependenciesByRef,
   readGrantFacts,
   readGrantPinnedExtractions,
@@ -2080,15 +2087,53 @@ export class PgvectorBackend
    * commit without the dependencies it claims to protect.
    */
   async issueGrant(request: GrantRequest): Promise<EvidenceGrantRecord> {
-    const plan = normalizeGrantRequest(request);
+    const [grant] = await this.issueGrants([request]);
+    // A one-element batch is a one-grant write, so this branch is unreachable
+    // rather than merely unlikely — and saying so beats indexing a possibly
+    // undefined element into a promise the caller awaits.
+    if (grant === undefined) {
+      throw new GraphragError(
+        "evidence store: issueGrants returned no grant for a one-request batch",
+        "STORAGE_ERROR"
+      );
+    }
+    return grant;
+  }
+
+  /**
+   * A whole page in one transaction.
+   *
+   * `inEvidenceTransaction` owns the BEGIN/COMMIT/ROLLBACK pairing, so a failure
+   * on the third of three requests rolls back the first two: the page's caller
+   * receives no references, and no reference is left behind it pinning
+   * dependencies it can never hand to anyone.
+   */
+  async issueGrants(
+    requests: readonly GrantRequest[],
+    expectedScopeRevisionFence?: ScopeRevisionFence
+  ): Promise<readonly EvidenceGrantRecord[]> {
+    const plans = requests.map((request) => ({
+      grant: normalizeGrantRequest(request),
+      evidenceRef: randomUUID(),
+      receiptId: randomUUID(),
+    }));
+    const fence = normalizeScopeRevisionFence(
+      expectedScopeRevisionFence,
+      plans.map((plan) => plan.grant)
+    );
     return inEvidenceTransaction(
       async () => (await this.ensureReady()).connect(),
-      (client) =>
-        issueGrantRows(client, {
-          grant: plan,
-          evidenceRef: randomUUID(),
-          receiptId: randomUUID(),
-        })
+      async (client) => {
+        if (fence !== null) {
+          const current = await lockScopeRevisions(client, fence.scope_binding);
+          assertScopeRevisionFenceCurrent(fence, current);
+        }
+        const issued: EvidenceGrantRecord[] = [];
+        for (const plan of plans) {
+          issued.push(await issueGrantRows(client, plan));
+        }
+        return issued;
+      }
     );
   }
 

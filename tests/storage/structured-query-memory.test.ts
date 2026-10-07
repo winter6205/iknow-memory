@@ -24,6 +24,7 @@ import {
 } from "../../src/core/maintenance/service.js";
 import type { PublicationFact } from "../../src/core/maintenance/publication-types.js";
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
+import { buildStructuredQueryReader } from "../../src/index.js";
 import {
   MemoryStructuredQueryStorage,
   STRUCTURED_QUERY_SUPPORT_ROLE,
@@ -52,9 +53,14 @@ import {
   normalizeRelationAssertion,
 } from "../../src/core/structured/identity.js";
 import type {
+  AuthorizedScopeRunOptions,
   AuthorizedScopeContext,
+  AuthorizedScopeUnitOfWork,
   MaintenanceStatusInput,
+  PreparedMemoryScopeWork,
+  ScopeTransactionOwner,
 } from "../../src/core/storage/structured-scope-types.js";
+import type { QueryScopeIdentity } from "../../src/core/storage/structured-query-scope.js";
 
 const DIMENSIONS = 8;
 const ACTOR = "query-memory-trusted-owner";
@@ -109,10 +115,63 @@ function openLane(clock: () => Date = () => new Date(INSTANT)): Lane {
       backend.structuredScopeUnitOfWork,
       tupleReaderOf(backend.structuredIdentityStore),
       supportReaderOf(backend),
+      (scopeBinding) => backend.getScopeRevisions(scopeBinding),
       undefined,
       CURSOR_KEY,
       clock
     ),
+  };
+}
+
+function advancePurgeDuringAcceptedRead(
+  lane: Lane,
+  scopeBinding: string
+): () => void {
+  const scope = lane.backend.structuredScopeUnitOfWork;
+  const runAuthorized = scope.withAuthorizedScope.bind(scope);
+  const originalDescriptor = Object.getOwnPropertyDescriptor(
+    scope,
+    "withAuthorizedScope"
+  );
+  Object.defineProperty(scope, "withAuthorizedScope", {
+    configurable: true,
+    value: <R>(
+      context: AuthorizedScopeContext,
+      callback: (work: PreparedMemoryScopeWork) => Promise<R>,
+      options?: AuthorizedScopeRunOptions
+    ) =>
+      runAuthorized(
+        context,
+        (work) => {
+          const readAcceptedInputs = work.readAcceptedInputs.bind(work);
+          const racingWork = new Proxy(work, {
+            get(target, property, receiver) {
+              if (property === "readAcceptedInputs") {
+                return async (sourceRefs: readonly string[]) => {
+                  const snapshot = await readAcceptedInputs(sourceRefs);
+                  await lane.backend.setScopeRevisions(scopeBinding, {
+                    purgeRevision: "purge-2",
+                  });
+                  return snapshot;
+                };
+              }
+              const member = Reflect.get(target, property, receiver);
+              return typeof member === "function"
+                ? member.bind(target)
+                : member;
+            },
+          });
+          return callback(racingWork);
+        },
+        options
+      ),
+  });
+  return () => {
+    if (originalDescriptor === undefined) {
+      Reflect.deleteProperty(scope, "withAuthorizedScope");
+    } else {
+      Object.defineProperty(scope, "withAuthorizedScope", originalDescriptor);
+    }
   };
 }
 
@@ -137,7 +196,10 @@ function supportReaderOf(backend: MemoryBackend): StructuredQuerySupportReader {
             version: support.location.version,
             unit: support.location.unit,
           },
-          span: support.span === null ? null : { start: support.span.start, end: support.span.end },
+          span:
+            support.span === null
+              ? null
+              : { start: support.span.start, end: support.span.end },
           extractionRefs: await backend.listSupportExtractions(supportId),
         });
       }
@@ -154,7 +216,8 @@ function tupleReaderOf(
     async readTuples(assertionIds) {
       const tuples = new Map<string, StructuredQueryRelationTuple>();
       for (const assertionId of assertionIds) {
-        const assertion = await identityStore.findRelationAssertion(assertionId);
+        const assertion =
+          await identityStore.findRelationAssertion(assertionId);
         if (assertion === null) continue;
         tuples.set(assertionId, {
           assertionId,
@@ -211,7 +274,8 @@ interface Seeded {
 
 function relationId(seeded: Seeded, index: number): string {
   const id = seeded.assertionIds[index];
-  if (id === undefined) throw new Error(`seeded corpus has no relation at ${index}`);
+  if (id === undefined)
+    throw new Error(`seeded corpus has no relation at ${index}`);
   return id;
 }
 
@@ -226,7 +290,8 @@ async function seed(lane: Lane, spec: SeedSpec): Promise<Seeded> {
   // A source may have only one authoritative publication scope, so every seed
   // scopes its own physical source refs; the declared names stay logical keys.
   const physical = new Map<string, string>();
-  for (const declared of spec.sourceRefs) physical.set(declared, unique(declared));
+  for (const declared of spec.sourceRefs)
+    physical.set(declared, unique(declared));
   const generations = new Map<string, number>();
   const extractionRefs = new Map<string, string>();
   for (const sourceRef of spec.sourceRefs) {
@@ -245,7 +310,8 @@ async function seed(lane: Lane, spec: SeedSpec): Promise<Seeded> {
       version: "frozen-v1",
       unit: index + 1,
     }));
-    for (const binding of locatorBindings) await backend.bindSourceLocator(binding);
+    for (const binding of locatorBindings)
+      await backend.bindSourceLocator(binding);
     const declared = await publication.declareDesired({
       scopeBinding,
       authorizedSourceRefs: spec.sourceRefs.map((ref) => physical.get(ref)!),
@@ -260,7 +326,9 @@ async function seed(lane: Lane, spec: SeedSpec): Promise<Seeded> {
   }
   const occurrencesFor = (sourceRef: string): number =>
     spec.facts.filter((fact) => fact.sourceRef === sourceRef).length +
-    (spec.relations ?? []).filter((relation) => relation.sourceRef === sourceRef).length;
+    (spec.relations ?? []).filter(
+      (relation) => relation.sourceRef === sourceRef
+    ).length;
   const unitCursor = new Map<string, number>();
   const nextUnit = (sourceRef: string): number => {
     const current = unitCursor.get(sourceRef) ?? 0;
@@ -280,8 +348,7 @@ async function seed(lane: Lane, spec: SeedSpec): Promise<Seeded> {
       identity,
       occurrence: {
         subject: identity.kind === "entity" ? "entity" : "assertion",
-        result_id:
-          identity.kind === "entity" ? identity.input.entityId : "",
+        result_id: identity.kind === "entity" ? identity.input.entityId : "",
         source_ref: physical.get(sourceRef)!,
         source_version: "v1",
         location: {
@@ -317,7 +384,9 @@ async function seed(lane: Lane, spec: SeedSpec): Promise<Seeded> {
     };
     // The assertion id IS its exact tuple, so a fixture cannot choose one: the
     // reader is handed the same derived UUID the publication lane stored.
-    const assertionId = deriveRelationAssertionId(normalizeRelationAssertion(input));
+    const assertionId = deriveRelationAssertionId(
+      normalizeRelationAssertion(input)
+    );
     assertionIds.push(assertionId);
     await lane.identityStore.registerRelationAssertion(input);
     const identity: PublicationFact["identity"] = {
@@ -403,7 +472,8 @@ async function declareSecondVersion(
     version: `frozen-${version}`,
     unit: index + 1,
   }));
-  for (const binding of locatorBindings) await backend.bindSourceLocator(binding);
+  for (const binding of locatorBindings)
+    await backend.bindSourceLocator(binding);
   const declared = await backend.structuredPublication.declareDesired({
     scopeBinding: seeded.scopeBinding,
     authorizedSourceRefs,
@@ -427,7 +497,12 @@ async function advanceMaintenanceProgress(
   lane: Lane,
   sourceRef: string,
   generation: number,
-  dependencies: readonly { sourceRef: string; generation: number; extractionRevision: number | null; relationBuckets: string[] }[]
+  dependencies: readonly {
+    sourceRef: string;
+    generation: number;
+    extractionRevision: number | null;
+    relationBuckets: string[];
+  }[]
 ): Promise<void> {
   const backend = lane.backend;
   await scheduleWork(
@@ -447,7 +522,9 @@ async function advanceMaintenanceProgress(
     clock: lane.clock,
   });
   if (claimed.guard === null) {
-    throw new Error("query memory fixture could not advance maintenance progress");
+    throw new Error(
+      "query memory fixture could not advance maintenance progress"
+    );
   }
   await settleWork(
     { store: backend.maintenanceWorkStore, clock: lane.clock },
@@ -470,7 +547,12 @@ async function publishOne(
 ): Promise<void> {
   const backend = lane.backend;
   const dependencies = [
-    { sourceRef, generation, extractionRevision: dependencyExtractionRevision, relationBuckets: [] },
+    {
+      sourceRef,
+      generation,
+      extractionRevision: dependencyExtractionRevision,
+      relationBuckets: [],
+    },
   ];
   const scheduled = await scheduleWork(
     { store: backend.maintenanceWorkStore, clock: lane.clock },
@@ -485,13 +567,16 @@ async function publishOne(
     }
   );
   if ("refused" in scheduled) {
-    throw new Error(`query memory fixture schedule refused: ${scheduled.refused}`);
+    throw new Error(
+      `query memory fixture schedule refused: ${scheduled.refused}`
+    );
   }
   const claimed = await claimNextWork({
     store: backend.maintenanceWorkStore,
     clock: lane.clock,
   });
-  if (claimed.guard === null) throw new Error("query memory fixture could not claim work");
+  if (claimed.guard === null)
+    throw new Error("query memory fixture could not claim work");
   if (claimed.guard.jobKey !== scheduled.record.jobKey) {
     throw new Error(
       `query memory fixture claimed ${claimed.guard.jobKey} instead of its own ${scheduled.record.jobKey}`
@@ -521,7 +606,9 @@ async function publishOne(
   }
 }
 
-function list(overrides: Partial<ValidatedStructuredQuery> = {}): ValidatedStructuredQuery {
+function list(
+  overrides: Partial<ValidatedStructuredQuery> = {}
+): ValidatedStructuredQuery {
   return {
     subject: "entity",
     operation: "list",
@@ -578,7 +665,9 @@ function cursorBody(raw: string): Record<string, unknown> {
  * decodes refuses it; one that only re-checks fields applies the position raw.
  */
 function tamperCursor(raw: string, payload: Record<string, unknown>): string {
-  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString(
+    "base64url"
+  );
   const separator = raw.indexOf(".");
   return separator < 0 ? body : `${body}.${raw.slice(separator + 1)}`;
 }
@@ -593,7 +682,12 @@ function envelopeBytes(
   request: ValidatedStructuredQuery,
   plan: Pick<
     StructuredQueryReadPlan,
-    "queryDigest" | "scopeBinding" | "readRevision" | "maintenance" | "rows" | "nextCursor"
+    | "queryDigest"
+    | "scopeBinding"
+    | "readRevision"
+    | "maintenance"
+    | "rows"
+    | "nextCursor"
   >,
   now: Date
 ): number {
@@ -621,9 +715,15 @@ function emittedEnvelope(
   plan: StructuredQueryReadPlan,
   now: Date
 ): string {
-  const issued = plan.rows.map(() => STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER);
+  const issued = plan.rows.map(
+    () => STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER
+  );
   return JSON.stringify(
-    buildStructuredResult(request, structuredQueryReadOutcome(plan, issued), now)
+    buildStructuredResult(
+      request,
+      structuredQueryReadOutcome(plan, issued),
+      now
+    )
   );
 }
 
@@ -644,7 +744,13 @@ function relationRead(window: {
         sourcesInScope: 1,
         publishedSources: 1,
         desiredIndex: { pending: 0, running: 0, ready: 1, failed: 0, stale: 0 },
-        conflictChecks: { pending: 0, running: 0, ready: 1, failed: 0, stale: 0 },
+        conflictChecks: {
+          pending: 0,
+          running: 0,
+          ready: 1,
+          failed: 0,
+          stale: 0,
+        },
         rulesetRevision: "ruleset-1",
       },
     },
@@ -698,13 +804,122 @@ function manyIds(count: number): string[] {
 // ---------------------------------------------------------------------------
 
 describe("structured query memory twin", () => {
+  it("captures an independent authorization and purge revision fence in the read plan", async () => {
+    const lane = openLane();
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: [
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+      ],
+    });
+    const plan = await lane.storage.readStructuredQuery(seeded.context, list());
+    const expected = {
+      scope_binding: seeded.scopeBinding,
+      authorization_revision: AUTHORIZATION_REVISION,
+      purge_revision: "purge-1",
+    };
+    const fence = plan.issuanceFence;
+
+    expect(fence).toEqual(expected);
+    expect(Object.isFrozen(fence)).toBe(true);
+
+    await lane.backend.setScopeRevisions(seeded.scopeBinding, {
+      authorizationRevision: unique("authorization-advanced"),
+    });
+    expect(fence).toEqual(expected);
+  });
+
+  it("captures the memory fence before inputs and refuses a purge advance during the read", async () => {
+    const lane = openLane();
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: [
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+      ],
+    });
+    const scope = lane.backend.structuredScopeUnitOfWork;
+    const restoreScope = advancePurgeDuringAcceptedRead(
+      lane,
+      seeded.scopeBinding
+    );
+
+    try {
+      const storage = new MemoryStructuredQueryStorage(
+        scope,
+        tupleReaderOf(lane.identityStore),
+        supportReaderOf(lane.backend),
+        (scopeBinding) => lane.backend.getScopeRevisions(scopeBinding),
+        undefined,
+        CURSOR_KEY,
+        lane.clock
+      );
+      const authority = {
+        createAuthorizedContext: scope.createAuthorizedContext.bind(scope),
+        withAuthorizedScope: scope.withAuthorizedScope.bind(scope),
+        runTransaction: async () => {
+          throw new Error(
+            "memory Query does not open a PostgreSQL transaction"
+          );
+        },
+      } as unknown as AuthorizedScopeUnitOfWork & ScopeTransactionOwner;
+      const identity: QueryScopeIdentity = {
+        actorId: ACTOR,
+        ownerScopeBinding: seeded.scopeBinding,
+        readerBinding: seeded.scopeBinding,
+        sourceRefs: seeded.sourceRefs.join(","),
+        authorizationRevision: AUTHORIZATION_REVISION,
+        deadlineAt: new Date(lane.clock().getTime() + 60_000).toISOString(),
+      };
+      const reader = buildStructuredQueryReader(
+        authority,
+        lane.backend,
+        storage,
+        identity
+      );
+
+      await expectRefusal(
+        () => reader.readStructuredQuery(list()),
+        "structured_search_unavailable"
+      );
+      expect(
+        lane.backend.getScopeRevisions(seeded.scopeBinding)?.purge_revision
+      ).toBe("purge-2");
+    } finally {
+      restoreScope();
+    }
+  });
+
   it("returns one row per authorized subject when two sources support it", async () => {
     const lane = openLane();
     const seeded = await seed(lane, {
       sourceRefs: ["s-a", "s-b"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Widget", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: ANCHOR, name: "Widget", entityType: "organization", sourceRef: "s-b" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Widget",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Widget",
+          entityType: "organization",
+          sourceRef: "s-b",
+        },
       ],
     });
     const plan = await lane.storage.readStructuredQuery(seeded.context, list());
@@ -717,8 +932,20 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     const plan = await lane.storage.readStructuredQuery(seeded.context, list());
@@ -742,7 +969,10 @@ describe("structured query memory twin", () => {
         sourceRef: "s-a",
       })),
     });
-    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 2 }));
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 2 })
+    );
     expect(first.rows.map((row) => row.id)).toEqual(ids.slice(0, 2));
     expect(first.nextCursor).not.toBeNull();
     const second = await lane.storage.readStructuredQuery(
@@ -758,8 +988,20 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "place", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "place",
+          sourceRef: "s-a",
+        },
       ],
     });
     const byName = await lane.storage.readStructuredQuery(
@@ -769,7 +1011,11 @@ describe("structured query memory twin", () => {
     expect(byName.rows.map((row) => row.id)).toEqual([ANCHOR]);
     const byTypeIn = await lane.storage.readStructuredQuery(
       seeded.context,
-      list({ filters: [{ field: "type", op: "in", values: ["organization", "place"] }] })
+      list({
+        filters: [
+          { field: "type", op: "in", values: ["organization", "place"] },
+        ],
+      })
     );
     expect(byTypeIn.rows).toHaveLength(2);
     const anded = await lane.storage.readStructuredQuery(
@@ -790,13 +1036,45 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Other", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: far, name: "Far", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: far,
+          name: "Far",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
       relations: [
-        { head: ANCHOR, relationNorm: "owns", tail: OTHER, sourceRef: "s-a", validFrom: null, validUntil: null },
-        { head: OTHER, relationNorm: "owns", tail: far, sourceRef: "s-a", validFrom: null, validUntil: null },
+        {
+          head: ANCHOR,
+          relationNorm: "owns",
+          tail: OTHER,
+          sourceRef: "s-a",
+          validFrom: null,
+          validUntil: null,
+        },
+        {
+          head: OTHER,
+          relationNorm: "owns",
+          tail: far,
+          sourceRef: "s-a",
+          validFrom: null,
+          validUntil: null,
+        },
       ],
     });
     const outgoing = await lane.storage.readStructuredQuery(
@@ -822,8 +1100,20 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Other", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
       relations: [
         {
@@ -861,8 +1151,20 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Other", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
       relations: [
         {
@@ -896,29 +1198,68 @@ describe("structured query memory twin", () => {
     const forward = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Zeta", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Zeta",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     const backward = await seed(openLane(), {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: ANCHOR, name: "Zeta", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Zeta",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
-    const displayOf = (plan: { rows: readonly { id: string; canonicalName: string; type: string; displaySupportId: string; displayDisagreement: boolean }[] }) => ({
+    const displayOf = (plan: {
+      rows: readonly {
+        id: string;
+        canonicalName: string;
+        type: string;
+        displaySupportId: string;
+        displayDisagreement: boolean;
+      }[];
+    }) => ({
       id: plan.rows[0]!.id,
       canonicalName: plan.rows[0]!.canonicalName,
       type: plan.rows[0]!.type,
       displayDisagreement: plan.rows[0]!.displayDisagreement,
       // The chosen support must be one of the row's own current supports, and it
       // must be the support whose display value is the pair that won.
-      supportIsCurrent:
-        plan.rows[0]!.supports.some((support) => support.supportId === plan.rows[0]!.displaySupportId),
+      supportIsCurrent: plan.rows[0]!.supports.some(
+        (support) => support.supportId === plan.rows[0]!.displaySupportId
+      ),
     });
-    const firstPlan = await lane.storage.readStructuredQuery(forward.context, list());
-    const secondPlan = await backward.lane.storage.readStructuredQuery(backward.context, list());
+    const firstPlan = await lane.storage.readStructuredQuery(
+      forward.context,
+      list()
+    );
+    const secondPlan = await backward.lane.storage.readStructuredQuery(
+      backward.context,
+      list()
+    );
     // Both orders show the byte-order-smallest pair, and both declare the
     // disagreement the two distinct values represent.
     expect(firstPlan.rows[0]!.canonicalName).toBe("Alpha");
@@ -929,7 +1270,9 @@ describe("structured query memory twin", () => {
     const byName = async (seeded: Seeded) => {
       const plan = await seeded.lane.storage.readStructuredQuery(
         seeded.context,
-        list({ filters: [{ field: "canonical_name", op: "eq", value: "Zeta" }] })
+        list({
+          filters: [{ field: "canonical_name", op: "eq", value: "Zeta" }],
+        })
       );
       return plan.rows.length;
     };
@@ -942,14 +1285,32 @@ describe("structured query memory twin", () => {
     const narrow = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     const wide = await seed(openLane(), {
       sourceRefs: ["s-a", "s-b"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "place", sourceRef: "s-b" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "place",
+          sourceRef: "s-b",
+        },
       ],
     });
     const narrowPlan = await narrow.lane.storage.readStructuredQuery(
@@ -969,7 +1330,13 @@ describe("structured query memory twin", () => {
     const empty = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     const noMatch = await lane.storage.readStructuredQuery(
@@ -1013,11 +1380,26 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
-    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     // Publishing a second desired version is a DATA change: the row set a cursor
     // was walking is no longer the set this revision holds.
     const generation = await declareSecondVersion(
@@ -1034,7 +1416,10 @@ describe("structured query memory twin", () => {
       generation,
       [
         {
-          identity: { kind: "entity", input: { entityId: ANCHOR, type: "organization" } },
+          identity: {
+            kind: "entity",
+            input: { entityId: ANCHOR, type: "organization" },
+          },
           occurrence: {
             subject: "entity",
             result_id: ANCHOR,
@@ -1071,11 +1456,26 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
-    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     await expectRefusal(
       () =>
         lane.storage.readStructuredQuery(
@@ -1106,18 +1506,26 @@ describe("structured query memory twin", () => {
         sourceRef: "s-a",
       })),
     });
-    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     // Scheduling and settling a conflict check moves the durable-work ledger the
     // status counts, and touches no corpus row. That is PROGRESS: the read
     // revision stands, so a live cursor stays live.
-    await advanceMaintenanceProgress(lane, seeded.sourceRefs[0]!, seeded.generations.get("s-a")!, [
-      {
-        sourceRef: seeded.sourceRefs[0]!,
-        generation: seeded.generations.get("s-a")!,
-        extractionRevision: 1,
-        relationBuckets: [],
-      },
-    ]);
+    await advanceMaintenanceProgress(
+      lane,
+      seeded.sourceRefs[0]!,
+      seeded.generations.get("s-a")!,
+      [
+        {
+          sourceRef: seeded.sourceRefs[0]!,
+          generation: seeded.generations.get("s-a")!,
+          extractionRevision: 1,
+          relationBuckets: [],
+        },
+      ]
+    );
     const second = await lane.storage.readStructuredQuery(
       seeded.context,
       list({ limit: 1, cursor: first.nextCursor! })
@@ -1137,32 +1545,52 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     await expectRefusal(
       () =>
-        lane.storage.readStructuredQuery(seeded.context, list({ cursor: "not-a-cursor!!" })),
+        lane.storage.readStructuredQuery(
+          seeded.context,
+          list({ cursor: "not-a-cursor!!" })
+        ),
       "invalid_cursor"
     );
-    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     // The SAME authority over the same scope, read on a clock eleven minutes
     // later. Only the instant differs, so the refusal observed is the expiry and
     // not a foreign context or a moved revision.
     const laterClock = () => new Date(INSTANT.getTime() + 11 * 60_000);
-    const laterContext = lane.backend.structuredScopeUnitOfWork.createAuthorizedContext({
-      actorId: ACTOR,
-      ownerScopeBinding: seeded.scopeBinding,
-      readerBinding: seeded.scopeBinding,
-      authorizedSourceRefs: seeded.sourceRefs,
-      authorizationRevision: AUTHORIZATION_REVISION,
-      deadlineAt: new Date(laterClock().getTime() + 60_000).toISOString(),
-    });
+    const laterContext =
+      lane.backend.structuredScopeUnitOfWork.createAuthorizedContext({
+        actorId: ACTOR,
+        ownerScopeBinding: seeded.scopeBinding,
+        readerBinding: seeded.scopeBinding,
+        authorizedSourceRefs: seeded.sourceRefs,
+        authorizationRevision: AUTHORIZATION_REVISION,
+        deadlineAt: new Date(laterClock().getTime() + 60_000).toISOString(),
+      });
     const laterReader = new MemoryStructuredQueryStorage(
       lane.backend.structuredScopeUnitOfWork,
       tupleReaderOf(lane.identityStore),
       supportReaderOf(lane.backend),
+      (scopeBinding) => lane.backend.getScopeRevisions(scopeBinding),
       undefined,
       CURSOR_KEY,
       laterClock
@@ -1182,7 +1610,13 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     // Two persisted check records in one scope that disagree on the ruleset are
@@ -1192,11 +1626,23 @@ describe("structured query memory twin", () => {
       lane.backend.structuredScopeUnitOfWork,
       tupleReaderOf(lane.identityStore),
       supportReaderOf(lane.backend),
+      (scopeBinding) => lane.backend.getScopeRevisions(scopeBinding),
       {
-        readScreeningStatus: (_scopeBinding, sourceRefs) => sourceRefs.flatMap((sourceRef) => [
-          { sourceRef, rulesetRevision: "ruleset-a", coverage: "coverage-a", retiredSupports: 0 },
-          { sourceRef, rulesetRevision: "ruleset-b", coverage: "coverage-b", retiredSupports: 0 },
-        ]),
+        readScreeningStatus: (_scopeBinding, sourceRefs) =>
+          sourceRefs.flatMap((sourceRef) => [
+            {
+              sourceRef,
+              rulesetRevision: "ruleset-a",
+              coverage: "coverage-a",
+              retiredSupports: 0,
+            },
+            {
+              sourceRef,
+              rulesetRevision: "ruleset-b",
+              coverage: "coverage-b",
+              retiredSupports: 0,
+            },
+          ]),
       },
       CURSOR_KEY,
       lane.clock
@@ -1232,7 +1678,13 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     // Both the reader's own guard and the unit-of-work guard refuse an unminted
@@ -1249,7 +1701,8 @@ describe("structured query memory twin", () => {
         return (...args: unknown[]) => {
           scopesOpened += 1;
           return Reflect.apply(
-            (target as { withAuthorizedScope: (...a: unknown[]) => unknown }).withAuthorizedScope,
+            (target as { withAuthorizedScope: (...a: unknown[]) => unknown })
+              .withAuthorizedScope,
             target,
             args
           );
@@ -1260,6 +1713,7 @@ describe("structured query memory twin", () => {
       countingScope,
       tupleReaderOf(lane.backend.structuredIdentityStore),
       supportReaderOf(lane.backend),
+      (scopeBinding) => lane.backend.getScopeRevisions(scopeBinding),
       undefined,
       CURSOR_KEY,
       lane.clock
@@ -1277,8 +1731,20 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Other", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
       relations: [
         {
@@ -1297,7 +1763,9 @@ describe("structured query memory twin", () => {
     );
     const roles = new Set(plan.grants[0]!.supports.map((ref) => ref.role));
     expect(roles.has(STRUCTURED_QUERY_SUPPORT_ROLE.OCCURRENCE)).toBe(true);
-    expect(roles.has(STRUCTURED_QUERY_SUPPORT_ROLE.ENDPOINT_DISPLAY)).toBe(true);
+    expect(roles.has(STRUCTURED_QUERY_SUPPORT_ROLE.ENDPOINT_DISPLAY)).toBe(
+      true
+    );
   });
 
   it("refuses to project a row with no issued evidence reference", async () => {
@@ -1305,7 +1773,13 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     const plan = await lane.storage.readStructuredQuery(seeded.context, list());
@@ -1320,11 +1794,26 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
-    const listPlan = await lane.storage.readStructuredQuery(seeded.context, list());
+    const listPlan = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list()
+    );
     expect(listPlan.grants).toHaveLength(2);
     const countPlan = await lane.storage.readStructuredQuery(
       seeded.context,
@@ -1366,17 +1855,24 @@ describe("structured query memory twin", () => {
       ),
     });
 
-    const first = await lane.storage.readStructuredQuery(seeded.context, list());
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list()
+    );
     // The reduction ran, and it ran at a row boundary: the page is a strict
     // prefix of the matched set, not the whole of it and not nothing.
     expect(first.rows.length).toBeGreaterThan(0);
     expect(first.rows.length).toBeLessThan(ids.length);
-    expect(first.rows.map((row) => row.id)).toEqual(ids.slice(0, first.rows.length));
+    expect(first.rows.map((row) => row.id)).toEqual(
+      ids.slice(0, first.rows.length)
+    );
     expect(first.nextCursor).not.toBeNull();
 
     // What the producer ACTUALLY emits is inside the bound.
     const emitted = emittedEnvelope(list(), first, lane.clock());
-    expect(Buffer.byteLength(emitted, "utf8")).toBeLessThanOrEqual(STRUCTURED_RESULT_MAX_BYTES);
+    expect(Buffer.byteLength(emitted, "utf8")).toBeLessThanOrEqual(
+      STRUCTURED_RESULT_MAX_BYTES
+    );
 
     // Resuming from the cursor the page returned yields the remaining rows:
     // no gap, no duplicate, and the union is the whole matched set.
@@ -1429,18 +1925,19 @@ describe("structured query memory twin", () => {
         sourceRef: "s-a",
       })),
     });
-    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     const real = first.nextCursor!;
     const payload = cursorBody(real);
 
     // A hand-built cursor whose every field is correct. Nothing here is wrong
     // except that this build never signed it.
 
-
     // The same edit an attacker makes: decode, move the position onto a row in
     // the middle of the set, re-encode. Every field the transaction can check
     // still agrees; only the position was rewritten.
-
 
     // A position that is not even an id. Unverified, this sorts AFTER every real
     // row, so the read would resume past the whole set and answer a successful
@@ -1449,7 +1946,10 @@ describe("structured query memory twin", () => {
       () =>
         lane.storage.readStructuredQuery(
           seeded.context,
-          list({ limit: 1, cursor: tamperCursor(real, { ...payload, aft: "garbage" }) })
+          list({
+            limit: 1,
+            cursor: tamperCursor(real, { ...payload, aft: "garbage" }),
+          })
         ),
       "invalid_cursor"
     );
@@ -1476,7 +1976,10 @@ describe("structured query memory twin", () => {
         sourceRef: "s-a",
       })),
     });
-    const first = await lane.storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     const second = await lane.storage.readStructuredQuery(
       seeded.context,
       list({ limit: 1, cursor: first.nextCursor! })
@@ -1484,7 +1987,9 @@ describe("structured query memory twin", () => {
     expect(second.rows.map((row) => row.id)).toEqual(ids.slice(1, 2));
     // Carried forward, not re-opened: a renewed expiry would make the fixed
     // ten-minute window a rolling one that no test reading page one would see.
-    expect(cursorBody(second.nextCursor!).exp).toBe(cursorBody(first.nextCursor!).exp);
+    expect(cursorBody(second.nextCursor!).exp).toBe(
+      cursorBody(first.nextCursor!).exp
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -1507,10 +2012,11 @@ describe("structured query memory twin", () => {
     const walked: string[] = [];
     let cursor: string | null = null;
     for (let page = 0; page < 5; page += 1) {
-      const read: StructuredQueryReadPlan = await lane.storage.readStructuredQuery(
-        seeded.context,
-        list(cursor === null ? {} : { cursor })
-      );
+      const read: StructuredQueryReadPlan =
+        await lane.storage.readStructuredQuery(
+          seeded.context,
+          list(cursor === null ? {} : { cursor })
+        );
       walked.push(...read.rows.map((row) => row.id));
       cursor = read.nextCursor;
       if (cursor === null) break;
@@ -1535,7 +2041,13 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     const start = lane.clock().getTime();
@@ -1547,6 +2059,7 @@ describe("structured query memory twin", () => {
       lane.backend.structuredScopeUnitOfWork,
       tupleReaderOf(lane.identityStore),
       supportReaderOf(lane.backend),
+      (scopeBinding) => lane.backend.getScopeRevisions(scopeBinding),
       undefined,
       CURSOR_KEY,
       (() => {
@@ -1559,7 +2072,10 @@ describe("structured query memory twin", () => {
       "query_timeout"
     );
     // NEGATIVE CONTROL: the same read on a clock that does not pass the lease.
-    const inside = await lane.storage.readStructuredQuery(seeded.context, list());
+    const inside = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list()
+    );
     expect(inside.rows.map((row) => row.id)).toEqual([ANCHOR]);
   });
 
@@ -1572,11 +2088,26 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a", "s-b"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
-        { subject: "entity", resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: "s-b" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+        {
+          subject: "entity",
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef: "s-b",
+        },
       ],
     });
-    const whole = await lane.storage.readStructuredQuery(seeded.context, list());
+    const whole = await lane.storage.readStructuredQuery(
+      seeded.context,
+      list()
+    );
     expect(whole.rows.map((row) => row.id)).toEqual([ANCHOR, OTHER]);
 
     // Narrowing is allowed and is what the authorized subset means.
@@ -1590,7 +2121,10 @@ describe("structured query memory twin", () => {
     // Widening is not, and the guard is reachable precisely because the
     // requested set is a caller's second argument rather than the context's.
     await expectRefusal(
-      () => lane.storage.readStructuredQuery(seeded.context, list(), ["never-authorized"]),
+      () =>
+        lane.storage.readStructuredQuery(seeded.context, list(), [
+          "never-authorized",
+        ]),
       "authorization_denied"
     );
   });
@@ -1606,6 +2140,7 @@ describe("structured query memory twin", () => {
           lane.backend.structuredScopeUnitOfWork,
           tupleReaderOf(lane.identityStore),
           supportReaderOf(lane.backend),
+          (scopeBinding) => lane.backend.getScopeRevisions(scopeBinding),
           undefined,
           Buffer.alloc(8),
           lane.clock
@@ -1615,7 +2150,13 @@ describe("structured query memory twin", () => {
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
-        { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
       ],
     });
     const read = await lane.storage.readStructuredQuery(seeded.context, list());
@@ -1633,7 +2174,10 @@ describe("structured query memory twin", () => {
     expect(
       buildStructuredResult(
         request,
-        relationRead({ from: "2020-01-01T00:00:00Z", until: "2021-01-01T00:00:00Z" }),
+        relationRead({
+          from: "2020-01-01T00:00:00Z",
+          until: "2021-01-01T00:00:00Z",
+        }),
         instant
       ).schema
     ).toBe("iknow.structured_result");
@@ -1643,7 +2187,10 @@ describe("structured query memory twin", () => {
       () =>
         buildStructuredResult(
           request,
-          relationRead({ from: "2021-01-01T00:00:00Z", until: "2020-01-01T00:00:00Z" }),
+          relationRead({
+            from: "2021-01-01T00:00:00Z",
+            until: "2020-01-01T00:00:00Z",
+          }),
           instant
         ),
       "structured_search_unavailable"
@@ -1653,7 +2200,10 @@ describe("structured query memory twin", () => {
       () =>
         buildStructuredResult(
           request,
-          relationRead({ from: "2020-01-01T00:00:00Z", until: "2020-01-01T00:00:00Z" }),
+          relationRead({
+            from: "2020-01-01T00:00:00Z",
+            until: "2020-01-01T00:00:00Z",
+          }),
           instant
         ),
       "structured_search_unavailable"

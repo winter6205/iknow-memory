@@ -8,12 +8,27 @@
 import { describe, expect, it } from "vitest";
 
 import { decideServingGuard } from "../../src/core/structured/serving-guard.js";
-import type { SourceLifecycleFacts } from "../../src/core/structured/serving-guard.js";
+import type {
+  SourceLifecycleFact,
+  SourceLifecycleFacts,
+} from "../../src/core/structured/serving-guard.js";
 
-const facts = (entries: Record<string, string | null>): SourceLifecycleFacts => {
-  const map = new Map<string, { sourceRef: string; retiredAt: string | null; payloadCollectedAt: string | null }>();
+const facts = (
+  entries: Record<string, string | null>,
+  active: Record<string, boolean> = {}
+): SourceLifecycleFacts => {
+  const map = new Map<string, SourceLifecycleFact>();
   for (const [sourceRef, payloadCollectedAt] of Object.entries(entries)) {
-    map.set(sourceRef, { sourceRef, retiredAt: null, payloadCollectedAt });
+    map.set(sourceRef, {
+      sourceRef,
+      retiredAt: null,
+      payloadCollectedAt,
+      // Withdrawal is a SEPARATE fact from collection, so it is seeded
+      // separately: `active` defaults to true because a source with no
+      // `structured_publication_sources` row at all is ingested, not withdrawn,
+      // and must keep serving.
+      active: active[sourceRef] ?? true,
+    });
   }
   return map;
 };
@@ -35,7 +50,7 @@ describe("MP12 — a source is served while any version is live", () => {
 
   it("keeps a retired source visible, because retirement is not collection", () => {
     const retiredOnly: SourceLifecycleFacts = new Map([
-      ["a", { sourceRef: "a", retiredAt: "2026-01-01T00:00:00.000Z", payloadCollectedAt: null }],
+      ["a", { sourceRef: "a", retiredAt: "2026-01-01T00:00:00.000Z", payloadCollectedAt: null, active: true }],
     ]);
     expect(decideServingGuard(["a"], retiredOnly)).toEqual({ served: true, dropped: [] });
   });
@@ -44,6 +59,37 @@ describe("MP12 — a source is served while any version is live", () => {
     const verdict = decideServingGuard(["b", "b", "a"], purged);
     if (!verdict.served) throw new Error("expected a verdict");
     expect(verdict.dropped).toEqual(["b"]);
+  });
+});
+
+describe("MP12 — a withdrawn source is not served", () => {
+  it("drops a source whose publication row says it is withdrawn", () => {
+    const withdrawn = facts({ a: null, b: null }, { b: false });
+    const verdict = decideServingGuard(["a", "b"], withdrawn);
+    expect(verdict.served).toBe(true);
+    if (!verdict.served) return;
+    expect(verdict.dropped).toEqual(["b"]);
+  });
+
+  it("drops a withdrawn source even though its payload was never collected", () => {
+    // The half of M19 the payload rule cannot reach: withdrawal is recorded on
+    // `structured_publication_sources.active = false` and never touches
+    // `source_versions`, so an un-collected withdrawn source looks perfectly
+    // live to a payload-only predicate.
+    const verdict = decideServingGuard(["withdrawn"], facts({ withdrawn: null }, { withdrawn: false }));
+    expect(verdict.served).toBe(true);
+    if (!verdict.served) return;
+    expect(verdict.dropped).toEqual(["withdrawn"]);
+  });
+
+  it("keeps serving a source with no publication row, because ingested is not withdrawn", () => {
+    // `NOT EXISTS (withdrawn)` polarity, asserted where it matters: `active`
+    // defaults to true, so only the withdrawn set is blocked. A source that was
+    // ingested but never published keeps serving.
+    expect(decideServingGuard(["ingested"], facts({ ingested: null }))).toEqual({
+      served: true,
+      dropped: [],
+    });
   });
 });
 

@@ -4,7 +4,10 @@
  * The point of the twin is that the two lanes answer the SAME question the same
  * way, so every case here is one the SQL aggregate could plausibly get wrong —
  * a source with one live and one collected version is the one, because a naive
- * `bool_and` over the wrong column would drop it.
+ * `bool_and` over the wrong column would drop it. Withdrawal is the second:
+ * `max(sv.retired_at)` and "the first non-null `retiredAt`" are different
+ * aggregations, and the memory twin can only be a faithful copy if the
+ * aggregation is part of the asserted contract rather than an accident.
  */
 import { describe, expect, it } from "vitest";
 
@@ -47,5 +50,41 @@ describe("MP12 memory lane", () => {
   it("serves an empty candidate set without reading anything", () => {
     const guard = new MemoryServingGuard([{ sourceRef: "a" }]);
     expect(guard.guard([])).toEqual({ served: true, dropped: [] });
+  });
+});
+
+describe("MP12 memory lane — withdrawal", () => {
+  it("drops a withdrawn source whose payload was never collected", () => {
+    const guard = new MemoryServingGuard([{ sourceRef: "a", active: false }]);
+    const verdict = guard.guard(["a"]);
+    if (!verdict.served) throw new Error("expected a verdict");
+    expect(verdict.dropped).toEqual(["a"]);
+  });
+
+  it("keeps serving a source with no publication row, because ingested is not withdrawn", () => {
+    const guard = new MemoryServingGuard([{ sourceRef: "a" }]);
+    expect(guard.guard(["a"])).toEqual({ served: true, dropped: [] });
+  });
+});
+
+describe("MP12 memory lane — the facts mirror the SQL aggregate", () => {
+  it("reports the LATEST retirement, so seeding order cannot change the answer", () => {
+    // `max(sv.retired_at)`, not "the first non-null one". Order-independence is
+    // the property: a first-non-null read answers a different question and
+    // diverges from the SQL lane the moment the seed order changes.
+    const earliest = new MemoryServingGuard([
+      { sourceRef: "a", retiredAt: "2026-01-01T00:00:00.000Z" },
+      { sourceRef: "a", retiredAt: "2026-03-01T00:00:00.000Z" },
+      { sourceRef: "a", retiredAt: "2026-02-01T00:00:00.000Z" },
+    ]);
+    const shuffled = new MemoryServingGuard([
+      { sourceRef: "a", retiredAt: "2026-02-01T00:00:00.000Z" },
+      { sourceRef: "a", retiredAt: "2026-03-01T00:00:00.000Z" },
+      { sourceRef: "a", retiredAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+    expect(earliest.factsFor(["a"])?.get("a")?.retiredAt).toBe(
+      "2026-03-01T00:00:00.000Z"
+    );
+    expect(shuffled.factsFor(["a"])).toEqual(earliest.factsFor(["a"]));
   });
 });

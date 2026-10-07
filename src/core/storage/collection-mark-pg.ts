@@ -262,16 +262,11 @@ export class PgCollectionMarkStore {
       );
       if (outcome.refused) return outcome;
 
-      await work.client.query(
-        `UPDATE structured_collection_marks
-            SET state = 'cancelled', cancelled_at = $3::timestamptz, cancelled_reason = $4
-          WHERE payload_class = $1 AND payload_ref = $2`,
-        [
-          input.identity.payloadClass,
-          input.identity.payloadRef,
-          outcome.plan.cancelledAt,
-          outcome.plan.reason,
-        ]
+      await cancelMarkRow(
+        work.client,
+        input.identity,
+        outcome.plan.cancelledAt,
+        outcome.plan.reason
       );
 
       if (outcome.plan.resumedObligations && input.sourceVersionId !== null) {
@@ -314,16 +309,11 @@ export class PgCollectionMarkStore {
           detail: `scope revision moved from ${input.observedLifecycleRevision} to ${observed}`,
         };
       }
-      await work.client.query(
-        `UPDATE structured_collection_marks
-            SET state = 'cancelled', cancelled_at = $3::timestamptz, cancelled_reason = $4
-          WHERE payload_class = $1 AND payload_ref = $2 AND state = 'marked'`,
-        [
-          input.payloadClass,
-          input.payloadRef,
-          planned.cancellation.cancelledAt,
-          planned.cancellation.reason,
-        ]
+      await cancelMarkRow(
+        work.client,
+        input,
+        planned.cancellation.cancelledAt,
+        planned.cancellation.reason
       );
       work.bumpRevisions({ read: false, maintenance: true });
       return planned;
@@ -357,6 +347,27 @@ export class PgCollectionMarkStore {
       return { found: true, mark, recheck: recheck.recheck };
     });
   }
+}
+
+/**
+ * Record a mark's cancellation and why.
+ *
+ * One statement for both callers — a reactivation and a stale recheck — because the
+ * two differ only in the reason they pass, and a cancellation whose reason is chosen
+ * at a call site is a cancellation whose reason can drift from the vocabulary.
+ */
+async function cancelMarkRow(
+  client: EvidenceClient,
+  identity: CollectionMarkIdentity,
+  cancelledAt: string,
+  reason: string
+): Promise<void> {
+  await client.query(
+    `UPDATE structured_collection_marks
+        SET state = 'cancelled', cancelled_at = $3::timestamptz, cancelled_reason = $4
+      WHERE payload_class = $1 AND payload_ref = $2 AND state = 'marked'`,
+    [identity.payloadClass, identity.payloadRef, cancelledAt, reason]
+  );
 }
 
 /**

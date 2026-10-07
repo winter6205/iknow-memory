@@ -20,6 +20,7 @@
  * forbids; `expectedLifecycleRevision` is the one revision the caller owns, because
  * a lost update is only visible against what the caller believed.
  */
+import { MaintenanceStoreError } from "../maintenance/store-error.js";
 import {
   planCollectionMark,
   planCollectionReactivation,
@@ -28,6 +29,7 @@ import {
 } from "../maintenance/collection-mark.js";
 import type {
   CollectionMark,
+  CollectionMarkCancelReason,
   CollectionMarkCancellationOutcome,
   CollectionMarkIdentity,
   CollectionMarkOutcome,
@@ -106,6 +108,11 @@ export interface CollectionMarkReadInput {
  */
 export type CollectionMarkReadOutcome =
   | { readonly found: false }
+  | {
+      readonly refused: true;
+      readonly code: MaintenanceWorkFailureCode;
+      readonly detail: string;
+    }
   | ({ readonly found: true; readonly mark: CollectionMark } &
       (
         | { readonly recheck: CollectionMarkRecheck }
@@ -148,6 +155,8 @@ export class PgCollectionMarkStore {
     input: CollectionMarkCandidateInput
   ): Promise<CollectionMarkOutcome> {
     return this.authority.withAuthorizedScope(input.context, async (work) => {
+      const owned = requireOwnedScope(input.context, input.scopeBinding);
+      if (owned !== null) return owned;
       const now = await databaseNow(work.client);
       const lifecycleRevision = await commitRevision(work.client, input.scopeBinding);
       const outcome = planCollectionMark(
@@ -170,13 +179,17 @@ export class PgCollectionMarkStore {
           work.client,
           input.sourceVersionId
         );
-        if (!facts.exists) {
-          return refusal(
-            "unsupported_source_binding",
-            `source version ${String(input.sourceVersionId)} is not held by the store, so no mark can stop its obligations`
-          );
-        }
+        const unbound = refuseIfUnstammable(facts, input.sourceVersionId);
+        if (unbound !== null) return unbound;
       }
+
+      // A payload that already carries a mark row is refused, not overwritten and
+      // not left to collide on the primary key. Which of those two it is used to do
+      // is the caller's decision, and both lanes must give the same answer: a bare
+      // INSERT raised an untyped unique_violation here while the memory lane
+      // silently replaced the row.
+      const clash = await refuseIfAlreadyMarked(work.client, outcome.plan.mark);
+      if (clash !== null) return clash;
 
       await work.client.query(
         `INSERT INTO structured_collection_marks
@@ -220,6 +233,8 @@ export class PgCollectionMarkStore {
     input: CollectionReactivateCandidateInput
   ): Promise<CollectionReactivateOutcome> {
     return this.authority.withAuthorizedScope(input.context, async (work) => {
+      const owned = requireOwnedScope(input.context, input.scopeBinding);
+      if (owned !== null) return owned;
       const now = await databaseNow(work.client);
       const observedLifecycleRevision = await observedRevision(
         work.client,
@@ -237,16 +252,9 @@ export class PgCollectionMarkStore {
         );
       }
 
-      const facts: SourceVersionFacts =
-        input.sourceVersionId === null
-          ? { exists: true, payloadCollected: false, obligationsStopped: false }
-          : await readSourceVersionFacts(work.client, input.sourceVersionId);
-      if (!facts.exists) {
-        return refusal(
-          "unsupported_source_binding",
-          `source version ${String(input.sourceVersionId)} is not held by the store, so its mark cannot be reactivated`
-        );
-      }
+      const facts = await readMarkSourceFacts(work.client, input.sourceVersionId);
+      const unbound = refuseIfUnstammable(facts, input.sourceVersionId);
+      if (unbound !== null) return unbound;
 
       const outcome = planCollectionReactivation(
         {
@@ -262,12 +270,14 @@ export class PgCollectionMarkStore {
       );
       if (outcome.refused) return outcome;
 
-      await cancelMarkRow(
+      const withdrew = await cancelMarkRow(
         work.client,
         input.identity,
         outcome.plan.cancelledAt,
         outcome.plan.reason
       );
+      const empty = refuseIfNotWithdrawn(withdrew, input.identity.payloadRef);
+      if (empty !== null) return empty;
 
       if (outcome.plan.resumedObligations && input.sourceVersionId !== null) {
         // The one effect with no STAMP_SQL entry: that map is closed over SET stamps
@@ -298,6 +308,8 @@ export class PgCollectionMarkStore {
     input: CollectionStaleCancellationInput
   ): Promise<CollectionMarkCancellationOutcome> {
     return this.authority.withAuthorizedScope(input.context, async (work) => {
+      const owned = requireOwnedScope(input.context, input.scopeBinding);
+      if (owned !== null) return owned;
       const now = await databaseNow(work.client);
       const planned = planStaleMarkCancellation(input, now);
       if (planned.refused) return planned;
@@ -309,12 +321,14 @@ export class PgCollectionMarkStore {
           detail: `scope revision moved from ${input.observedLifecycleRevision} to ${observed}`,
         };
       }
-      await cancelMarkRow(
+      const withdrew = await cancelMarkRow(
         work.client,
         input,
         planned.cancellation.cancelledAt,
         planned.cancellation.reason
       );
+      const empty = refuseIfNotWithdrawn(withdrew, input.payloadRef);
+      if (empty !== null) return empty;
       work.bumpRevisions({ read: false, maintenance: true });
       return planned;
     });
@@ -329,6 +343,8 @@ export class PgCollectionMarkStore {
     input: CollectionMarkReadInput
   ): Promise<CollectionMarkReadOutcome> {
     return this.authority.withAuthorizedScope(input.context, async (work) => {
+      const owned = requireOwnedScope(input.context, input.scopeBinding);
+      if (owned !== null) return owned;
       const now = await databaseNow(work.client);
       const row = await readMarkRow(
         work.client,
@@ -350,7 +366,99 @@ export class PgCollectionMarkStore {
 }
 
 /**
- * Record a mark's cancellation and why.
+ * The source-version facts a mark decision reads, with the object-scoped shape
+ * folded in.
+ *
+ * A mark on one of the two object-scoped classes has no source version at all, and
+ * that is not the same fact as one whose source version is missing from the store —
+ * the first is a valid mark, the second is a binding the store cannot honour.
+ */
+async function readMarkSourceFacts(
+  client: EvidenceClient,
+  sourceVersionId: string | null
+): Promise<SourceVersionFacts> {
+  if (sourceVersionId === null) {
+    return { exists: true, payloadCollected: false, obligationsStopped: false };
+  }
+  return readSourceVersionFacts(client, sourceVersionId);
+}
+
+/** Refuse a source version the store does not hold, so no stamp can land on it. */
+function refuseIfUnstammable(
+  facts: SourceVersionFacts,
+  sourceVersionId: string | null
+): { readonly refused: true; readonly code: "unsupported_source_binding"; readonly detail: string } | null {
+  if (facts.exists) return null;
+  return {
+    refused: true,
+    code: "unsupported_source_binding",
+    detail: `source version ${String(sourceVersionId)} is not held by the store, so no mark can stop its obligations`,
+  };
+}
+
+/**
+ * Refuse a payload that already carries a mark row.
+ *
+ * Whether a payload that was marked and then cancelled may be marked again is a
+ * retention policy question MP15 has not answered yet, so the safe answer stands:
+ * it may not, and the caller is told so rather than finding out from a primary-key
+ * collision. PostgreSQL and the memory lane both refuse, deliberately.
+ */
+async function refuseIfAlreadyMarked(
+  client: EvidenceClient,
+  identity: CollectionMarkIdentity
+): Promise<{ readonly refused: true; readonly code: "input_stale"; readonly detail: string } | null> {
+  const existing = await readMarkRow(client, identity, /* forUpdate */ true);
+  if (existing === null) return null;
+  return {
+    refused: true,
+    code: "input_stale",
+    detail: `payload ${identity.payloadRef} already carries a ${existing.state} mark, so marking it again must cancel or delete that one first`,
+  };
+}
+
+/** Refuse a cancellation that withdrew no live mark, naming the payload. */
+function refuseIfNotWithdrawn(
+  withdrew: boolean,
+  payloadRef: string
+): { readonly refused: true; readonly code: "input_stale"; readonly detail: string } | null {
+  if (withdrew) return null;
+  return {
+    refused: true,
+    code: "input_stale",
+    detail: `payload ${payloadRef} has no live mark to cancel`,
+  };
+}
+
+/**
+ * Refuse a mark whose scope is not the one this transaction was authorized for.
+ *
+ * Not belt-and-braces. `withAuthorizedScope` locks and advances
+ * `context.ownerScopeBinding`, so a caller passing a different `scopeBinding` would
+ * have this store read and write the revision of a scope the transaction never
+ * routed to — recording a `expected_lifecycle_revision` that corresponds to nothing
+ * that committed, and stamping a source version the transaction was never
+ * authorized to touch. The memory lane already refuses this; the two must agree.
+ */
+function requireOwnedScope(
+  context: AuthorizedScopeContext,
+  scopeBinding: string
+): { readonly refused: true; readonly code: "access_denied"; readonly detail: string } | null {
+  if (scopeBinding === context.ownerScopeBinding) return null;
+  return {
+    refused: true,
+    code: "access_denied",
+    detail: `the mark scope ${scopeBinding} is not the context's owner scope ${context.ownerScopeBinding}`,
+  };
+}
+
+/**
+ * Record a mark's cancellation and why, reporting whether it withdrew anything.
+ *
+ * The boolean is load-bearing: a cancellation aimed at a payload that was never
+ * marked, or at one already cancelled, updates nothing — and a caller told "cancelled"
+ * for a write that matched no row would believe a stale mark had been withdrawn when
+ * it is still sitting in the table for the next scan to find.
  *
  * One statement for both callers — a reactivation and a stale recheck — because the
  * two differ only in the reason they pass, and a cancellation whose reason is chosen
@@ -360,14 +468,18 @@ async function cancelMarkRow(
   client: EvidenceClient,
   identity: CollectionMarkIdentity,
   cancelledAt: string,
-  reason: string
-): Promise<void> {
-  await client.query(
+  reason: CollectionMarkCancelReason
+): Promise<boolean> {
+  // RETURNING rather than rowCount: the client surface here reports rows only, and
+  // the returned row IS the proof that a live mark was withdrawn.
+  const { rows } = await client.query(
     `UPDATE structured_collection_marks
         SET state = 'cancelled', cancelled_at = $3::timestamptz, cancelled_reason = $4
-      WHERE payload_class = $1 AND payload_ref = $2 AND state = 'marked'`,
+      WHERE payload_class = $1 AND payload_ref = $2 AND state = 'marked'
+      RETURNING payload_ref`,
     [identity.payloadClass, identity.payloadRef, cancelledAt, reason]
   );
+  return rows.length > 0;
 }
 
 /**
@@ -399,12 +511,21 @@ async function observedRevision(
       FOR UPDATE`,
     [scopeBinding]
   );
-  if (rows.length !== 1) {
-    throw new Error(
-      `scope ${scopeBinding} is not registered, so no collection mark can name a revision in it`
+  if (rows.length === 0) {
+    throw new MaintenanceStoreError(
+      `scope ${scopeBinding} is not registered, so no collection mark can name a revision in it`,
+      "unsupported_source_binding"
     );
   }
-  return String(rows[0]?.revision ?? "0");
+  if (rows.length > 1) {
+    throw new MaintenanceStoreError(
+      `scope ${scopeBinding} resolved to ${rows.length} rows under a primary key`,
+      "backend_unavailable"
+    );
+  }
+  // No `?? 0` fallback: an absent row is not the same fact as revision zero, and a
+  // default here would hand the mark a revision no scope ever held.
+  return String(rows[0].revision);
 }
 
 /**
@@ -412,9 +533,26 @@ async function observedRevision(
  * instant it is recorded and the instant it is rechecked come from the same clock
  * that wrote the row, not from a process whose clock may differ from the server's.
  */
+/**
+ * The database's own clock.
+ *
+ * The mark's deadline and instant are both decided from this, never from the
+ * process clock, so a skewed application host cannot move a grace window. It
+ * refuses rather than defaulting: an absent row would otherwise become
+ * `new Date("undefined")`, an Invalid Date, and the planner would reject it as a
+ * bad input — a fault in this store's read reported as the caller's mistake.
+ */
 async function databaseNow(client: EvidenceClient): Promise<Date> {
   const { rows } = await client.query(`SELECT clock_timestamp()::text AS now`);
-  return new Date(String(rows[0]?.now));
+  const raw = rows[0]?.now;
+  const instant = new Date(String(raw));
+  if (raw === null || raw === undefined || Number.isNaN(instant.getTime())) {
+    throw new MaintenanceStoreError(
+      "the database returned no usable clock_timestamp, so a mark cannot be dated",
+      "backend_unavailable"
+    );
+  }
+  return instant;
 }
 
 async function readSourceVersionFacts(
@@ -431,7 +569,15 @@ async function readSourceVersionFacts(
       WHERE source_version_id = $1`,
     [sourceVersionId]
   );
-  if (rows.length !== 1) return { exists: false, payloadCollected: false, obligationsStopped: false };
+  if (rows.length === 0) {
+    return { exists: false, payloadCollected: false, obligationsStopped: false };
+  }
+  if (rows.length > 1) {
+    throw new MaintenanceStoreError(
+      `source version ${String(sourceVersionId)} resolved to ${rows.length} rows under a primary key`,
+      "backend_unavailable"
+    );
+  }
   const row = rows[0] as
     | { payload_collected: boolean; obligations_stopped: boolean }
     | undefined;
@@ -457,8 +603,9 @@ async function readMarkRow(
   );
   if (rows.length === 0) return null;
   if (rows.length > 1) {
-    throw new Error(
-      `collection mark ${identity.payloadRef} resolved to ${rows.length} rows under a primary key`
+    throw new MaintenanceStoreError(
+      `collection mark ${identity.payloadRef} resolved to ${rows.length} rows under a primary key`,
+      "backend_unavailable"
     );
   }
   return rows[0] as MarkRow;

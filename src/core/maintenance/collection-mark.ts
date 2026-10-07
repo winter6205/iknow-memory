@@ -83,6 +83,11 @@ export function planCollectionMark(
     );
   }
 
+  const nowMs = now.getTime();
+  if (Number.isNaN(nowMs)) {
+    return refusal("invalid_input", "now must be a valid Date");
+  }
+
   const mark: CollectionMark = {
     payloadClass: request.payloadClass,
     payloadRef: request.payloadRef,
@@ -238,11 +243,8 @@ export function planStaleMarkCancellation(
 /**
  * What makes a mark unusable before any store is touched.
  *
- * A source-bound class must carry the source version it stops obligations on: a
- * source-bound mark whose `sourceVersionId` is null would set an effect on nothing
- * while still reporting itself marked. The two object-scoped classes must NOT carry
- * one, because they have no source version and a lane that wrote it would be
- * stamping a row that does not exist.
+ * The identity and source-binding rules live in {@link findInvalidMarkIdentity} and
+ * are shared with the reactivation; what is left here is what only marking needs.
  */
 function findInvalidMarkRequest(request: CollectionMarkRequest): string | null {
   const identity = findInvalidMarkIdentity(request);
@@ -256,7 +258,7 @@ function findInvalidMarkRequest(request: CollectionMarkRequest): string | null {
   return null;
 }
 
-/** The reactivation twin of {@link findInvalidMarkRequest}. */
+/** The reactivation's own rules, over the same shared identity check. */
 function findInvalidReactivationRequest(
   request: CollectionReactivationRequest
 ): string | null {

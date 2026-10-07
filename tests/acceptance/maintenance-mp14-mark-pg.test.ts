@@ -120,11 +120,9 @@ describeAcceptance("M15-M18 acceptance — collection marks on the real boundary
     await pgHarness.resetSchema(admin);
     backend = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
     await backend.initialize();
-    // One deviation from the MP13 lane, and it is a wiring gap rather than a
-    // choice: the mark DDL is applied directly because `upSchemaBootstrap` does not
-    // yet call `upSchemaCollectionMark`. Until that one call is added, the product
-    // cannot build this table, and this lane is what proves the table's shape and
-    // the store's transaction before the wiring lands.
+    // The mark DDL is applied directly rather than through the bootstrap: the lane
+    // needs the table before anything composes a backend, and driving the module
+    // keeps the case independent of the product's own startup order.
     await upSchemaCollectionMark(admin);
     pool = new pg.Pool({ connectionString: SCHEMA_URL, max: 4 });
     const composed = backend as PgvectorBackend & {
@@ -640,6 +638,58 @@ describeAcceptance("M15-M18 acceptance — collection marks on the real boundary
     expect(persisted?.mark.cancelledReason).toBe("lifecycle_revision_changed");
     expect(persisted?.mark.cancelledAt).not.toBeNull();
     expect(read?.mark.cancelledReason).toBeNull();
+  });
+
+  it("refuses a second mark, an empty cancellation, and a scope the context does not own", async () => {
+    const retiredLongAgo = daysBeforeNow(200);
+    const source = await seedSourceVersion("s1", retiredLongAgo);
+    await seedScope(["s1"]);
+    const eligibility = await decide(candidate("s1", retiredLongAgo), new Date());
+    const identity = { payloadClass: "retired_unreferenced" as const, payloadRef: "s1" };
+    const markOnce = (): Promise<unknown> =>
+      marks.markCollectionCandidate({
+        context: context(["s1"]),
+        identity,
+        scopeBinding: SCOPE,
+        sourceVersionId: source,
+        eligibility,
+      });
+
+    const first = await markOnce();
+    if (typeof first === "object" && first !== null && "refused" in first && first.refused === true) {
+      throw new Error(`first mark refused ${String((first as { code: string }).code)}`);
+    }
+
+    // A payload that already carries a mark is refused, not overwritten and not
+    // left to collide on the primary key — the same answer the memory lane gives.
+    const second = (await markOnce()) as { refused: boolean; code?: string };
+    expect(second.refused).toBe(true);
+    expect(second.code).toBe("input_stale");
+
+    // A scope the context does not own is refused outright. withAuthorizedScope
+    // locks and advances the OWNER scope, so honouring a different one would record
+    // a revision belonging to no transaction and stamp a source version this
+    // transaction was never authorized to touch.
+    const foreignScope = (await marks.markCollectionCandidate({
+      context: context(["s1"]),
+      identity: { payloadClass: "retired_unreferenced", payloadRef: "s2" },
+      scopeBinding: "a-different-scope",
+      sourceVersionId: source,
+      eligibility,
+    })) as { refused: boolean; code?: string };
+    expect(foreignScope.refused).toBe(true);
+    expect(foreignScope.code).toBe("access_denied");
+
+    // A cancellation that withdraws no live mark must say so, rather than
+    // reporting a withdrawal that never happened.
+    const nothing = (await marks.cancelStaleCollectionMark({
+      context: context(["s1"]),
+      scopeBinding: SCOPE,
+      payloadClass: "retired_unreferenced",
+      payloadRef: "s2",
+      observedLifecycleRevision: "0",
+    })) as { refused: boolean };
+    expect(nothing.refused).toBe(true);
   });
 });
 

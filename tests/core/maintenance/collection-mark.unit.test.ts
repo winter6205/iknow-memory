@@ -432,3 +432,41 @@ describe("MP14 — a stale recheck leaves a recorded cancellation", () => {
     expect(reactivate.plan.reason).toBe("reactivated");
   });
 });
+
+describe("MP14 — an invalid injected instant is a refusal, not a throw", () => {
+  it("refuses a mark rather than throwing on an invalid now", () => {
+    const outcome = planCollectionMark(markRequest(), new Date(Number.NaN));
+    expect(outcome.refused).toBe(true);
+    if (!outcome.refused) return;
+    expect(outcome.code).toBe("invalid_input");
+    expect(outcome.detail).toContain("valid Date");
+  });
+
+  it("answers the same way for all three planners, so the contract is uniform", () => {
+    const bad = new Date(Number.NaN);
+    const mark = planCollectionMark(markRequest(), bad);
+    const undo = planCollectionReactivation(reactivation(), bad);
+    const stale = planStaleMarkCancellation(
+      { payloadClass: "retired_unreferenced", payloadRef: "s1" },
+      bad
+    );
+    for (const outcome of [mark, undo, stale]) {
+      expect(outcome.refused).toBe(true);
+    }
+  });
+
+  it("never touches the wall clock while refusing", () => {
+    const real = Date.now;
+    let calls = 0;
+    Date.now = () => {
+      calls += 1;
+      return real();
+    };
+    try {
+      planCollectionMark(markRequest(), new Date(Number.NaN));
+    } finally {
+      Date.now = real;
+    }
+    expect(calls).toBe(0);
+  });
+});

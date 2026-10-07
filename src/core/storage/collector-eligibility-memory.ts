@@ -41,8 +41,15 @@ export interface MemoryGrant {
 
 export interface MemoryPublicationSource {
   readonly sourceRef: string;
+  readonly scopeBinding: string;
   readonly publishedSourceVersion?: string | null;
   readonly desiredSourceVersion?: string | null;
+}
+
+/** A staged extraction attempt: one row in `structured_publication_stages`. */
+export interface MemoryPublicationStage {
+  readonly sourceRef: string;
+  readonly scopeBinding: string;
 }
 
 export interface MemoryJob {
@@ -63,8 +70,7 @@ export interface InMemoryCollectionSeed {
   }[];
   readonly grants?: readonly MemoryGrant[];
   readonly publicationSources?: readonly MemoryPublicationSource[];
-  /** Source refs with a staged (not yet published) extraction attempt. */
-  readonly stagedSourceRefs?: readonly string[];
+  readonly stagedPublications?: readonly MemoryPublicationStage[];
   readonly jobs?: readonly MemoryJob[];
 }
 
@@ -78,7 +84,7 @@ export class InMemoryCollectionEligibilityReader implements CollectionEligibilit
       grantSupports: seed.grantSupports ?? [],
       grants: seed.grants ?? [],
       publicationSources: seed.publicationSources ?? [],
-      stagedSourceRefs: seed.stagedSourceRefs ?? [],
+      stagedPublications: seed.stagedPublications ?? [],
       jobs: seed.jobs ?? [],
     };
   }
@@ -97,6 +103,7 @@ export class InMemoryCollectionEligibilityReader implements CollectionEligibilit
     return {
       bindingResolved: target !== null,
       payloadCollected: target?.payloadCollectedAt != null,
+      targetRetired: target?.retiredAt != null,
       currentDependencies: this.dependenciesOf(payloadRef, target),
       validLeases: [
         ...this.jobLeasesOf(payloadRef),
@@ -149,6 +156,13 @@ export class InMemoryCollectionEligibilityReader implements CollectionEligibilit
     return this.seed.grants.filter((grant) => held.has(grant.evidenceRef));
   }
 
+  /**
+ * `holder` is the row the dependency lives on — the scope binding or the job key,
+ * not the source ref — because a recheck has to name that row to cancel it. The
+ * seed therefore carries the same columns the SQL joins on, and the result is
+ * sorted by (kind, holder) because the SQL's `ORDER BY` makes the twin's order
+ * observable to a parity assertion.
+ */
   private dependenciesOf(
     payloadRef: string,
     target: MemorySourceVersion | null
@@ -173,21 +187,30 @@ export class InMemoryCollectionEligibilityReader implements CollectionEligibilit
           publication.desiredSourceVersion === target?.sourceVersion)
     );
     if (published !== undefined) {
-      found.push({ kind: "published_or_desired_scope", holder: payloadRef });
+      found.push({
+        kind: "published_or_desired_scope",
+        holder: published.scopeBinding,
+      });
     }
-    if (this.seed.stagedSourceRefs.includes(payloadRef)) {
-      found.push({ kind: "staged_publication", holder: payloadRef });
+    const staged = this.seed.stagedPublications.find(
+      (stage) => stage.sourceRef === payloadRef
+    );
+    if (staged !== undefined) {
+      found.push({ kind: "staged_publication", holder: staged.scopeBinding });
     }
-    if (
-      this.seed.jobs.some(
-        (job) =>
-          job.sourceRef === payloadRef &&
-          (job.status === "pending" || job.status === "running")
-      )
-    ) {
-      found.push({ kind: "live_maintenance_job", holder: payloadRef });
+    const liveJob = this.seed.jobs.find(
+      (job) =>
+        job.sourceRef === payloadRef &&
+        (job.status === "pending" || job.status === "running")
+    );
+    if (liveJob !== undefined) {
+      found.push({ kind: "live_maintenance_job", holder: liveJob.jobKey });
     }
-    return found;
+    return found.sort((a, b) =>
+      a.kind === b.kind
+        ? a.holder.localeCompare(b.holder)
+        : a.kind.localeCompare(b.kind)
+    );
   }
 
   private jobLeasesOf(payloadRef: string): readonly CollectionLease[] {

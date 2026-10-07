@@ -36,8 +36,10 @@ import type {
   MaintenanceWorkRequest,
 } from "../../src/core/maintenance/types.js";
 import { PgCollectionEligibilityReader } from "../../src/core/storage/collector-eligibility-pg.js";
+import { InMemoryCollectionEligibilityReader } from "../../src/core/storage/collector-eligibility-memory.js";
 import { PgMaintenanceWorkStore } from "../../src/core/storage/maintenance-work-pg.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
+import { upSchemaBootstrap } from "../../src/core/storage/schema-bootstrap.js";
 import {
   createPgIntegrationHarness,
   probePostgres,
@@ -48,6 +50,8 @@ const EXPECTED_COMMAND =
   "MAINTENANCE_ACCEPTANCE=1 npx vitest run tests/acceptance/maintenance-mp13-collection-pg.test.ts";
 const ACCEPTANCE_ENV = "MAINTENANCE_ACCEPTANCE";
 const DIM = 8;
+const SCOPE = "scope-a";
+const SOURCE_VERSION_ID = "11111111-1111-4111-8111-111111111111";
 
 const REQUIRED = process.env[ACCEPTANCE_ENV] === "1";
 const CONNECTION_STRING = resolvePgConnectionString(
@@ -233,6 +237,35 @@ describeAcceptance("M14 acceptance — collector eligibility on the real boundar
     return evidenceRef;
   }
 
+  /** A scope row that still desires this source version: a current dependency. */
+  async function seedDesiredScope(): Promise<void> {
+    await admin.query(
+      `INSERT INTO structured_publication_scopes (scope_binding) VALUES ($1)
+       ON CONFLICT DO NOTHING`,
+      [SCOPE]
+    );
+    await admin.query(
+      `INSERT INTO structured_publication_sources
+         (scope_binding, source_ref, active, generation, desired_source_version,
+          desired_extraction_revision, desired_config_revision)
+       VALUES ($1, 's1', true, 1, 'v1', 1, 'extractor-1')
+       ON CONFLICT DO NOTHING`,
+      [SCOPE]
+    );
+  }
+
+  /** A staged extraction attempt on that scope. */
+  async function seedStage(): Promise<void> {
+    await admin.query(
+      `INSERT INTO structured_publication_stages
+         (scope_binding, source_ref, generation, job_key, attempt_number,
+          fencing_token, extraction_ref, accepted_facts, staged_at)
+       VALUES ($1, 's1', 1, 'job-stage-1', 1, 'token-1', 'extraction-1',
+               '[]'::jsonb, $2)`,
+      [SCOPE, iso(DAY0)]
+    );
+  }
+
   /** A running ledger job holding a real lease over the payload. */
   async function seedRunningLease(now: Date): Promise<MaintenanceWorkDeps> {
     const deps: MaintenanceWorkDeps = {
@@ -323,6 +356,71 @@ describeAcceptance("M14 acceptance — collector eligibility on the real boundar
     await store.close();
   });
 
+  it("migrates the work-kind CHECK on a store bootstrapped before MP13", async () => {
+    // The deployed shape: the table exists, and its inline CHECK is still the
+    // three-kind list, so nothing about CREATE TABLE IF NOT EXISTS can reach it.
+    await admin.query(
+      `ALTER TABLE maintenance_jobs
+        DROP CONSTRAINT maintenance_jobs_work_kind_closed_check`
+    );
+    await admin.query(
+      `ALTER TABLE maintenance_jobs
+        ADD CONSTRAINT maintenance_jobs_work_kind_check
+        CHECK (work_kind IN ('extract_publish','conflict_check','projection_rebuild'))`
+    );
+
+    // The state the migration exists to fix, asserted rather than assumed.
+    await expect(
+      admin.query(
+        `INSERT INTO maintenance_jobs
+           (job_key, work_kind, source_ref, source_version, source_generation,
+            input_revision, config_revision, created_at, updated_at)
+         VALUES ('legacy-probe', 'collect_payload', 's1', 'v1', 1, 'rev-1',
+                 'collector-1', $1, $1)`,
+        [iso(DAY0)]
+      )
+    ).rejects.toThrow(/maintenance_jobs_work_kind_check/);
+
+    // The readiness probe must answer not-ready for the widened CHECK, or this
+    // replay would be short-circuited away.
+    await upSchemaBootstrap(admin, DIM, 2000);
+
+    const store = new PgMaintenanceWorkStore(poolOf(SCHEMA_URL));
+    const scheduled = await scheduleWork(
+      { store, clock: () => DAY0 },
+      { actorId: "m14-operator" },
+      collectRequest("s1", "v1")
+    );
+
+    if ("refused" in scheduled) throw new Error(scheduled.detail);
+    expect(scheduled.record.workKind).toBe("collect_payload");
+    await store.close();
+  });
+
+  it("leaves the rebuilt CHECK alone on a second bootstrap", async () => {
+    const definitions = async (): Promise<string[]> => {
+      const { rows } = await admin.query<{ conname: string; definition: string }>(
+        `SELECT k.conname, pg_get_constraintdef(k.oid) AS definition
+           FROM pg_constraint k
+           JOIN pg_class t ON t.oid = k.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND t.relname = 'maintenance_jobs'
+            AND k.contype = 'c'
+          ORDER BY k.conname`
+      );
+      return rows.map((row) => `${row.conname}:${row.definition}`);
+    };
+
+    await upSchemaBootstrap(admin, DIM, 2000);
+    const first = await definitions();
+
+    await upSchemaBootstrap(admin, DIM, 2000);
+    expect(await definitions()).toEqual(first);
+    // Exactly one work-kind constraint, so the rebuild cannot stack copies.
+    expect(first.filter((name) => name.includes("work_kind"))).toHaveLength(1);
+  });
+
   it("refuses a source-bound candidate whose source version is not in the store", async () => {
     const pool = poolOf(SCHEMA_URL);
     const { readCollectionEligibility } = await import(
@@ -359,6 +457,33 @@ describeAcceptance("M14 acceptance — collector eligibility on the real boundar
 
     expect(eligibility.earliestCandidateAt).toBe(iso(atDay(90)));
     expect(eligibility.physicalPurgeNotBefore).toBe(iso(atDay(97)));
+  });
+
+  it("refuses a retired_unreferenced candidate for a source that is not retired", async () => {
+    await seedSource({ retired: false });
+    const pool = poolOf(SCHEMA_URL);
+    const { readCollectionEligibility } = await import(
+      "../../src/core/maintenance/collector-eligibility.js"
+    );
+
+    const outcome = await readCollectionEligibility(
+      { reader: new PgCollectionEligibilityReader(pool), clock: () => atDay(400) },
+      candidate("retired_unreferenced")
+    );
+    await pool.end();
+
+    // Day 400, no dependency, no grant, no lease — and still not collectible,
+    // because current knowledge is never collected for being old.
+    expect(outcome.refused).toBe(true);
+    if (!outcome.refused) return;
+    expect(outcome.code).toBe("invalid_input");
+  });
+
+  it("still collects an attempt stage sitting on that same unretired source", async () => {
+    await seedSource({ retired: false });
+    const eligibility = await decide(candidate("attempt_stage"), atDay(7));
+
+    expect(eligibility.eligible).toBe(true);
   });
 
   it("blocks on a current compiled object that still depends on the retired source", async () => {
@@ -484,6 +609,61 @@ describeAcceptance("M14 acceptance — collector eligibility on the real boundar
     expect(atCap.earliestCandidateAt).toBe(iso(atDay(365)));
     expect(atCap.eligible).toBe(true);
     expect(atCap.physicalPurgeNotBefore).toBe(iso(atDay(372)));
+  });
+
+  it("lifts the day-365 cap while a current dependency keeps the reference alive", async () => {
+    const supportId = await seedSource({ retired: true });
+    await seedGrant(supportId, "row", atDay(400));
+    await seedDesiredScope();
+
+    const eligibility = await decide(candidate("retired_evidence_protected"), atDay(365));
+
+    // The cap is conditioned on the absence of a current dependency (spec 292),
+    // so the deadline MP14 would persist is the reference's own expiry.
+    expect(eligibility.earliestCandidateAt).toBe(iso(atDay(400)));
+    expect(eligibility.blockingReasons).toContain("current_dependency");
+    expect(eligibility.eligible).toBe(false);
+  });
+
+  it("reports the same dependencies as the in-memory twin, holder included", async () => {
+    await seedSource({ retired: true });
+    await seedDesiredScope();
+    await seedStage();
+    await seedRunningLease(atDay(90));
+    const job = await admin.query<{ job_key: string }>(
+      "SELECT job_key FROM maintenance_jobs LIMIT 1"
+    );
+    const jobKey = job.rows[0]?.job_key as string;
+
+    const payload = candidate("retired_unreferenced");
+    const fromPg = await readFacts(payload, atDay(90));
+    const fromMemory = await new InMemoryCollectionEligibilityReader({
+      sourceVersions: [
+        {
+          sourceRef: "s1",
+          sourceVersion: "v1",
+          sourceVersionId: SOURCE_VERSION_ID,
+          retiredAt: iso(DAY0),
+          payloadCollectedAt: null,
+        },
+      ],
+      publicationSources: [
+        { sourceRef: "s1", scopeBinding: SCOPE, desiredSourceVersion: "v1" },
+      ],
+      stagedPublications: [{ sourceRef: "s1", scopeBinding: SCOPE }],
+      jobs: [
+        { jobKey, sourceRef: "s1", status: "running", leaseExpiresAt: iso(atDay(95)) },
+      ],
+    }).readCollectionFacts(payload, atDay(90));
+
+    // `holder` is the row a recheck has to name, so a lane that answered a
+    // different one would send MP14's cancellation to the wrong row.
+    expect(fromMemory.currentDependencies).toEqual(fromPg.currentDependencies);
+    expect(fromPg.currentDependencies).toEqual([
+      { kind: "live_maintenance_job", holder: jobKey },
+      { kind: "published_or_desired_scope", holder: SCOPE },
+      { kind: "staged_publication", holder: SCOPE },
+    ]);
   });
 
   it("releases a payload at the boundary a nonrenewing expired row reference reaches", async () => {

@@ -53,6 +53,7 @@ const candidate = (
 const cleanFacts: CollectionReadFacts = {
   bindingResolved: true,
   payloadCollected: false,
+  targetRetired: true,
   currentDependencies: [],
   validLeases: [],
   rowReferences: [],
@@ -318,6 +319,59 @@ describe("collector eligibility — the 365-day cap", () => {
     );
 
     expect(eligibility.physicalPurgeNotBefore).toBe(atDay(372).toISOString());
+  });
+
+  it("lifts the cap for a reference a current dependency holds alive", () => {
+    const eligibility = decide(
+      protectedPayload,
+      {
+        rowReferences: [{ evidenceRef: "g1", expiresAt: atDay(400).toISOString() }],
+        currentDependencies: [{ kind: "current_source_version", holder: "v2" }],
+      },
+      atDay(365)
+    );
+
+    // The cap is conditioned on the absence of a current dependency (spec 292), so
+    // the reported deadline is the reference's own expiry. MP14 persists this
+    // deadline, which is why the branch is asserted rather than left implicit.
+    expect(eligibility.earliestCandidateAt).toBe(atDay(400).toISOString());
+    expect(eligibility.blockingReasons).toContain("current_dependency");
+  });
+});
+
+describe("collector eligibility — retirement is a store fact, not a claim", () => {
+  it("refuses a retired_* class for a source version that is not retired", () => {
+    const outcome = decideCollectionEligibility(
+      candidate("retired_unreferenced"),
+      { ...cleanFacts, targetRetired: false },
+      atDay(90)
+    );
+
+    expect(outcome.refused).toBe(true);
+    if (!outcome.refused) return;
+    expect(outcome.code).toBe("invalid_input");
+  });
+
+  it("refuses the same class at day 400, where being old would otherwise suffice", () => {
+    const outcome = decideCollectionEligibility(
+      candidate("retired_evidence_protected"),
+      { ...cleanFacts, targetRetired: false },
+      atDay(400)
+    );
+
+    expect(outcome.refused).toBe(true);
+  });
+
+  it("still collects the two classes that legitimately sit on a current version", () => {
+    // Attempt stages and derived generations hang off a source version that is
+    // still current (spec 289-290): their anchors are a terminal state and a stable
+    // replacement, not a retirement.
+    expect(
+      decide(candidate("attempt_stage"), { targetRetired: false }, atDay(7)).eligible
+    ).toBe(true);
+    expect(
+      decide(candidate("derived_generation"), { targetRetired: false }, atDay(7)).eligible
+    ).toBe(true);
   });
 });
 

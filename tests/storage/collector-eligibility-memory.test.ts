@@ -108,8 +108,8 @@ describe("in-memory collector read — which facts it finds", () => {
       atDay(90)
     );
 
-    expect(facts.currentDependencies.map((dep) => dep.kind)).toEqual([
-      "current_source_version",
+    expect(facts.currentDependencies).toEqual([
+      { kind: "current_source_version", holder: "v2" },
     ]);
   });
 
@@ -118,22 +118,22 @@ describe("in-memory collector read — which facts it finds", () => {
       {
         ...retiredSource,
         publicationSources: [
-          { sourceRef: "s1", desiredSourceVersion: "v1" },
+          { sourceRef: "s1", scopeBinding: "scope-a", desiredSourceVersion: "v1" },
         ],
       },
       atDay(90)
     );
 
-    expect(facts.currentDependencies.map((dep) => dep.kind)).toEqual([
-      "published_or_desired_scope",
+    expect(facts.currentDependencies).toEqual([
+      { kind: "published_or_desired_scope", holder: "scope-a" },
     ]);
   });
 
-  it("finds a staged attempt and a live job as dependencies", async () => {
+  it("finds a staged attempt and a live job as dependencies, each naming its row", async () => {
     const facts = await factsOf(
       {
         ...retiredSource,
-        stagedSourceRefs: ["s1"],
+        stagedPublications: [{ sourceRef: "s1", scopeBinding: "scope-b" }],
         jobs: [
           { jobKey: "job-1", sourceRef: "s1", status: "pending", leaseExpiresAt: null },
         ],
@@ -141,9 +141,11 @@ describe("in-memory collector read — which facts it finds", () => {
       atDay(90)
     );
 
-    expect(facts.currentDependencies.map((dep) => dep.kind).sort()).toEqual([
-      "live_maintenance_job",
-      "staged_publication",
+    // Sorted by (kind, holder) the way the SQL's ORDER BY returns them, so a
+    // parity assertion can compare the two twins directly.
+    expect(facts.currentDependencies).toEqual([
+      { kind: "live_maintenance_job", holder: "job-1" },
+      { kind: "staged_publication", holder: "scope-b" },
     ]);
   });
 
@@ -308,5 +310,46 @@ describe("in-memory collector read — the day boundaries", () => {
 
   it("counts a day as one elapsed 24-hour period", () => {
     expect(atDay(1).getTime() - atDay(0).getTime()).toBe(COLLECTION_DAY_MS);
+  });
+});
+
+describe("in-memory collector read — retirement is read, not claimed", () => {
+  const currentSource: InMemoryCollectionSeed = {
+    ...retiredSource,
+    sourceVersions: [
+      {
+        sourceRef: "s1",
+        sourceVersion: "v1",
+        sourceVersionId: SOURCE_VERSION_ID,
+        retiredAt: null,
+        payloadCollectedAt: null,
+      },
+    ],
+  };
+
+  it("refuses a retired_unreferenced candidate for a source that is not retired", async () => {
+    const facts = await factsOf(currentSource, atDay(90));
+    expect(facts.targetRetired).toBe(false);
+
+    // Old enough, unreferenced, and no dependency — and still not collectible,
+    // because current knowledge is not deleted for being old.
+    const outcome = decideCollectionEligibility(
+      candidate("retired_unreferenced"),
+      facts,
+      atDay(90)
+    );
+    expect(outcome.refused).toBe(true);
+    if (!outcome.refused) return;
+    expect(outcome.code).toBe("invalid_input");
+  });
+
+  it("still collects an attempt stage on that same unretired source", async () => {
+    const eligibility = await decide(
+      currentSource,
+      candidate("attempt_stage"),
+      atDay(7)
+    );
+
+    expect(eligibility.eligible).toBe(true);
   });
 });

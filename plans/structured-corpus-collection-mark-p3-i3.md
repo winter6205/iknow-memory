@@ -63,13 +63,14 @@ depends on, which is what "reuse the scope UOW's lock order" asks for:
 `PgScopeTransactionRunner.runTransaction` was rejected as the host: it takes **no**
 structured locks, so ordering would be left to the caller.
 
-**One asymmetry must be resolved.** The three lifecycle mutators run through
-`wrapPgRead` on a **pool** (`pgvector-backend.ts:2229-2232`), so they cannot join
-this transaction and "atomically mark … and stop new obligations" would be two
-transactions. MP14 adds a client-scoped stamp execution that reuses the existing
-closed `STAMP_SQL` map (`evidence-pg.ts:69-73`) — the column name still cannot
-arrive from a caller, so the injection-safety property is preserved rather than
-reimplemented.
+**One asymmetry had to be resolved.** The three lifecycle mutators as *store
+methods* run through `wrapPgRead` on a **pool** (`pgvector-backend.ts:2229-2232`),
+so calling them from inside a transaction would not join it — and "atomically mark
+… and stop new obligations" would be two transactions. The seam already existed:
+`stampSourceVersionRow(client, stamp, …)` (`evidence-pg.ts:838`) is client-scoped and
+exports the same closed `STAMP_SQL` map. MP14 calls it rather than adding a second
+stamp executor, so the column name still cannot arrive from a caller and the
+injection-safety property is preserved by construction instead of reimplemented.
 
 ## What MP14 does not own
 

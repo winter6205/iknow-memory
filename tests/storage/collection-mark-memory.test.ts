@@ -712,3 +712,89 @@ describe("MP14 memory lane — cancelling a stale mark", () => {
     expect(outcome.code).toBe("access_denied");
   });
 });
+
+/**
+ * The repairs the review forced, pinned in the memory lane.
+ *
+ * Each of these is a case where a caller could previously be told something true
+ * about the world while the store had done nothing: a mark that replaced an earlier
+ * one, or a cancellation that withdrew no mark at all. The memory lane and the
+ * PostgreSQL lane now answer identically on both, which is the whole point of the
+ * twin.
+ */
+describe("MP14 memory lane — a second mark and an empty cancellation", () => {
+  it("refuses to mark a payload that already carries a mark", async () => {
+    const target = await lane("remark");
+    await marked(target);
+    const second = await target.marks.markCollectionCandidate({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      sourceVersionId: SOURCE_VERSION_ID,
+      eligibility: eligibilityFor("retired_unreferenced"),
+    });
+    expect(second.refused).toBe(true);
+    if (!second.refused) return;
+    expect(second.code).toBe("input_stale");
+  });
+
+  it("refuses to cancel a mark that was never made", async () => {
+    const target = await lane("cancel-nothing");
+    const revision = String(await target.maintenanceRevision());
+    const outcome = await target.marks.cancelStaleCollectionMark({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      observedLifecycleRevision: revision,
+    });
+    expect(outcome.refused).toBe(true);
+    if (!outcome.refused) return;
+    expect(outcome.code).toBe("input_stale");
+    expect(await target.marks.readCollectionMark(target.identity)).toBeNull();
+  });
+
+  it("refuses a second cancellation of the same mark", async () => {
+    const target = await lane("cancel-twice");
+    await marked(target);
+    const first = String(await target.maintenanceRevision());
+    const cancelled = await target.marks.cancelStaleCollectionMark({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      observedLifecycleRevision: first,
+    });
+    expect(cancelled.refused).toBe(false);
+
+    const second = String(await target.maintenanceRevision());
+    const again = await target.marks.cancelStaleCollectionMark({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      observedLifecycleRevision: second,
+    });
+    expect(again.refused).toBe(true);
+    if (!again.refused) return;
+    expect(again.code).toBe("input_stale");
+  });
+
+  it("refuses a reactivation naming a scope the context does not own", async () => {
+    const target = await lane("react-ownership");
+    await marked(target);
+    const revision = String(await target.maintenanceRevision());
+    const outcome = await target.marks.reactivateCollectionCandidate({
+      context: target.context,
+      scopeBinding: "a-different-scope",
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      sourceVersionId: SOURCE_VERSION_ID,
+      expectedLifecycleRevision: revision,
+    });
+    expect(outcome.refused).toBe(true);
+    if (!outcome.refused) return;
+    expect(outcome.code).toBe("access_denied");
+  });
+});

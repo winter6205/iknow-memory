@@ -172,6 +172,17 @@ export class InMemoryCollectionMarkStorage {
       if (target !== null && !target.ok) return target.refusal;
 
       const key = markKey(mark.payloadClass, mark.payloadRef);
+      // Refuse an existing mark rather than replacing it, so this lane answers the
+      // same as PostgreSQL — which refuses it too. Whether a payload that was marked
+      // and then cancelled may be marked again is a retention policy question, and
+      // until MP15 states one, the safe answer is that it may not.
+      if (this.marks.has(key)) {
+        return {
+          refused: true,
+          code: "input_stale",
+          detail: `payload ${mark.payloadRef} already carries a mark, so marking it again must cancel or delete that one first`,
+        };
+      }
       work.prepare(() => {
         this.marks.set(key, mark);
       });
@@ -230,14 +241,12 @@ export class InMemoryCollectionMarkStorage {
       const key = markKey(plan.identity.payloadClass, plan.identity.payloadRef);
       work.prepare(() => {
         const live = this.marks.get(key);
-        if (live !== undefined && live.state === "marked") {
-          this.marks.set(key, {
-            ...live,
-            state: "cancelled",
-            cancelledAt: plan.cancelledAt,
-            cancelledReason: plan.reason,
-          });
-        }
+        this.marks.set(key, {
+          ...(live as CollectionMark),
+          state: "cancelled",
+          cancelledAt: plan.cancelledAt,
+          cancelledReason: plan.reason,
+        });
       });
       if (plan.resumedObligations && row !== null) {
         work.prepare(() => {
@@ -284,16 +293,24 @@ export class InMemoryCollectionMarkStorage {
         };
       }
       const key = markKey(request.payloadClass, request.payloadRef);
+      // A cancellation that would withdraw nothing must say so, rather than
+      // reporting a withdrawal that never happened and leaving a caller believing
+      // a stale mark is gone.
+      const live = this.marks.get(key);
+      if (live === undefined || live.state !== "marked") {
+        return {
+          refused: true,
+          code: "input_stale",
+          detail: `payload ${request.payloadRef} has no live mark to cancel`,
+        };
+      }
       work.prepare(() => {
-        const live = this.marks.get(key);
-        if (live !== undefined && live.state === "marked") {
-          this.marks.set(key, {
-            ...live,
-            state: "cancelled",
-            cancelledAt: outcome.cancellation.cancelledAt,
-            cancelledReason: outcome.cancellation.reason,
-          });
-        }
+        this.marks.set(key, {
+          ...live,
+          state: "cancelled",
+          cancelledAt: outcome.cancellation.cancelledAt,
+          cancelledReason: outcome.cancellation.reason,
+        });
       });
       work.bumpRevisions({ read: false, maintenance: true });
       return outcome;

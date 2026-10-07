@@ -3,13 +3,15 @@
  *
  * The guard has two implementations that fail independently, so this file has
  * two tiers. The `guardCandidateSources` cases prove the lifecycle read and the
- * pure decision against real rows. The `buildVectorSearchQuery` cases prove
- * `SERVING_GUARD_CLAUSE` — the one artifact that changes what production returns
- * — by executing the emitted SQL against real `chunks`, `source_versions` and
- * `structured_publication_sources` rows. A join can be syntactically fine and
- * semantically wrong, and it can be right in isolation yet unreachable in the
- * query that carries it, which is why the clause is run the way the vector query
- * actually runs it.
+ * pure decision against real rows. The `buildVectorSearchQuery` and
+ * `buildEntityChunksQuery` cases prove `SERVING_GUARD_CLAUSE` — the one artifact
+ * that changes what production returns — by executing the emitted SQL against
+ * real `chunks`, `source_versions` and `structured_publication_sources` rows. A
+ * join can be syntactically fine and semantically wrong, and it can be right in
+ * isolation yet unreachable in the query that carries it, which is why the clause
+ * is run the way each query actually runs it: once on the vector tier, once on
+ * the graph tier, whose step-3 hop is the only place graph recall emits chunk
+ * text (chunks never enter the graph, ADR-0001).
  *
  * Opt-in: `MAINTENANCE_ACCEPTANCE=1 npx vitest run tests/acceptance/maintenance-mp12-guards-pg.test.ts`.
  * Under the marker an unreachable database throws and exits non-zero; without it
@@ -26,7 +28,10 @@ import {
 } from "../integration/pg-test-harness.js";
 import { createEvidenceTables } from "../../src/core/storage/schema-evidence.js";
 import { upSchemaPublication } from "../../src/core/storage/schema-publication.js";
-import { buildVectorSearchQuery } from "../../src/core/storage/pgvector-backend.js";
+import {
+  buildEntityChunksQuery,
+  buildVectorSearchQuery,
+} from "../../src/core/storage/pgvector-backend.js";
 import { EMBEDDING_SLOT_BASE } from "../../src/core/storage/embedding-generation.js";
 import {
   guardCandidateSources,
@@ -114,6 +119,25 @@ beforeAll(async () => {
     metadata jsonb NOT NULL,
     created_at timestamptz NOT NULL
   )`);
+  // The graph tier hops `triples` → `chunks` on `source_chunk_id`, so the guard
+  // cases need a real edge to a real chunk. Created here rather than through
+  // `upSchemaBootstrap` because the lane owns its own `chunks` DDL above and
+  // bootstrap would collide with it; the columns are the ones
+  // `ENTITY_CHUNKS_SQL` actually reads.
+  await client.query(`CREATE TABLE entities (
+    id uuid PRIMARY KEY,
+    canonical_name text NOT NULL
+  )`);
+  await client.query(`CREATE TABLE triples (
+    id uuid PRIMARY KEY,
+    head_id uuid NOT NULL,
+    tail_id uuid NOT NULL,
+    relation_raw text NOT NULL,
+    relation_norm text NOT NULL,
+    confidence real NOT NULL,
+    source_chunk_id uuid NULL,
+    valid_window tstzrange NOT NULL
+  )`);
 }, 180_000);
 
 /** Register a source so it has a publication row to be withdrawn on. */
@@ -155,6 +179,47 @@ async function servedSourceRefs(): Promise<string[]> {
     { validAt: VALID_AT, limit: 50 },
     EMBEDDING_SLOT_BASE
   );
+  const result = await client.query(sql, params);
+  return result.rows.map((row: { source_ref: string }) => row.source_ref);
+}
+
+/**
+ * A real chunk behind a real `triples` edge, reachable from `entityId`.
+ *
+ * The head/tail pair is the point: `ENTITY_CHUNKS_SQL` expands each triple into
+ * two ranked rows, so a guard that only checked one side of the hop would pass
+ * a test whose seed was reachable from the other.
+ */
+async function seedGraphChunk(
+  entityId: string,
+  sourceRef: string
+): Promise<string> {
+  const otherEntityId = randomUUID();
+  await client.query(`INSERT INTO entities (id, canonical_name) VALUES ($1, $2)`, [
+    otherEntityId,
+    `neighbour of ${entityId}`,
+  ]);
+  const chunkId = randomUUID();
+  await client.query(
+    `INSERT INTO chunks
+       (id, content, embedding, valid_from, valid_until, source_ref, metadata, created_at)
+     VALUES ($1, $2, $3::vector, '2026-01-01T00:00:00.000Z', NULL, $4, '{}'::jsonb, now())`,
+    [chunkId, `graph chunk for ${sourceRef}`, `[${QUERY_EMBEDDING.join(",")}]`, sourceRef]
+  );
+  // head = entityId, so the ranked row carries the entity the arm asked for.
+  await client.query(
+    `INSERT INTO triples
+       (id, head_id, tail_id, relation_raw, relation_norm, confidence,
+        source_chunk_id, valid_window)
+     VALUES ($1, $2, $3, 'raw', 'norm', 0.9, $4, tstzrange('-infinity', 'infinity', '[]'))`,
+    [randomUUID(), entityId, otherEntityId, chunkId]
+  );
+  return chunkId;
+}
+
+/** The `source_ref`s the production graph-arm hop actually returns. */
+async function servedGraphSourceRefs(entityIds: readonly string[]): Promise<string[]> {
+  const { sql, params } = buildEntityChunksQuery(entityIds, VALID_AT, 50);
   const result = await client.query(sql, params);
   return result.rows.map((row: { source_ref: string }) => row.source_ref);
 }
@@ -385,6 +450,99 @@ describeAcceptance("M13/M19 acceptance — serving guards on the real boundary",
     expect(verdict.served).toBe(false);
     if (verdict.served) return;
     expect(verdict.code).toBe("maintenance_status_unavailable");
+  });
+});
+
+describeAcceptance("M13/M19 acceptance — graph tier guard on the real boundary", () => {
+  it("returns a live chunk, and refuses the purged and withdrawn ones, through the real graph query", async () => {
+    // The graph tier's version of the vector case above. Step 3 of the Neo4j
+    // arm is the ONLY place graph recall emits chunk text — chunks never enter
+    // the graph (ADR-0001) — so until this case existed the graph tier served
+    // withdrawn and sole-purged content with no test anywhere saying it should
+    // not, while every neighbouring suite passed.
+    await seed([
+      {
+        sourceRef: "graph-live",
+        active: true,
+        versions: [{ sourceVersion: "v1", retiredAt: null, payloadCollectedAt: null }],
+      },
+      {
+        sourceRef: "graph-purged",
+        active: true,
+        versions: [
+          { sourceVersion: "v1", retiredAt: "2026-01-01T00:00:00.000Z", payloadCollectedAt: "2026-02-01T00:00:00.000Z" },
+          { sourceVersion: "v2", retiredAt: null, payloadCollectedAt: "2026-02-02T00:00:00.000Z" },
+        ],
+      },
+      {
+        sourceRef: "graph-withdrawn",
+        active: false,
+        versions: [{ sourceVersion: "v1", retiredAt: null, payloadCollectedAt: null }],
+      },
+    ]);
+    const liveEntity = randomUUID();
+    const purgedEntity = randomUUID();
+    const withdrawnEntity = randomUUID();
+    await seedGraphChunk(liveEntity, "graph-live");
+    await seedGraphChunk(purgedEntity, "graph-purged");
+    await seedGraphChunk(withdrawnEntity, "graph-withdrawn");
+
+    const served = await servedGraphSourceRefs([
+      liveEntity,
+      purgedEntity,
+      withdrawnEntity,
+    ]);
+    expect(served).toContain("graph-live");
+    expect(served).not.toContain("graph-purged");
+    expect(served).not.toContain("graph-withdrawn");
+  });
+
+  it("keeps a graph chunk alive while ONE of its source's versions is still live", async () => {
+    // The per-SOURCE aggregate, proven on the graph tier too: a source whose
+    // older version is purged stays servable, because `bool_or` /
+    // `count(*) > 0` over versions satisfies the payload half on any one row.
+    await seed([
+      {
+        sourceRef: "graph-partial",
+        active: true,
+        versions: [
+          { sourceVersion: "v1", retiredAt: "2026-01-01T00:00:00.000Z", payloadCollectedAt: "2026-02-01T00:00:00.000Z" },
+          { sourceVersion: "v2", retiredAt: null, payloadCollectedAt: null },
+        ],
+      },
+    ]);
+    const entityId = randomUUID();
+    await seedGraphChunk(entityId, "graph-partial");
+
+    expect(await servedGraphSourceRefs([entityId])).toContain("graph-partial");
+  });
+
+  it("keeps an ingested-but-unpublished graph source serving, because it is not withdrawn", async () => {
+    // The `NOT EXISTS (withdrawn)` polarity on the graph tier. Guarding this
+    // query with the opposite phrasing would fail-close every source ingested
+    // before it was ever published, and only a real publication-table read can
+    // catch that — no mock would.
+    await seed([
+      {
+        sourceRef: "graph-ingested",
+        versions: [{ sourceVersion: "v1", retiredAt: null, payloadCollectedAt: null }],
+      },
+    ]);
+    const entityId = randomUUID();
+    await seedGraphChunk(entityId, "graph-ingested");
+
+    expect(await servedGraphSourceRefs([entityId])).toContain("graph-ingested");
+  });
+
+  it("refuses a graph chunk whose source has no version row at all, the fail-closed direction", async () => {
+    // The other half of the polarity: withdrawal is blocked by NOT EXISTS, but a
+    // source the store cannot account for must still fail closed on the graph
+    // tier exactly as it does on the vector tier.
+    await publish("graph-unknown", true);
+    const entityId = randomUUID();
+    await seedGraphChunk(entityId, "graph-unknown");
+
+    expect(await servedGraphSourceRefs([entityId])).not.toContain("graph-unknown");
   });
 });
 

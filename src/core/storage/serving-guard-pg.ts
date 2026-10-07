@@ -1,14 +1,16 @@
 /**
  * The PostgreSQL half of MP12's serving guard.
  *
- * Two shapes for the same rule, deliberately: a predicate the vector query
- * joins on, so a stale row is never materialised, and a read of the lifecycle
+ * Two shapes for the same rule, deliberately: a predicate the chunk queries
+ * join on — the vector search and the graph arm's hop back from ranked entities
+ * to chunks — so a stale row is never materialised, and a read of the lifecycle
  * facts for a candidate set, so a caller holding already-fetched hits can apply
  * the identical rule in memory. Both are derived from the same two facts — an
  * un-collected version, and a source that has not been withdrawn — so the lanes
  * cannot answer different questions.
  */
 import { decideServingGuard } from "../structured/serving-guard.js";
+import { GraphragError } from "../errors.js";
 import type {
   SourceLifecycleFact,
   SourceLifecycleFacts,
@@ -21,7 +23,37 @@ export interface ServingGuardClient {
 }
 
 /**
- * The predicate `buildVectorSearchQuery` appends. Two halves, both required:
+ * The predicate a chunk query appends, bound to the query's LOCAL name for the
+ * `chunks` table.
+ *
+ * The alias is a parameter because the two tiers that consume chunks name that
+ * table differently — `buildVectorSearchQuery` reads `FROM chunks` (no alias),
+ * `ENTITY_CHUNKS_SQL` reads `JOIN chunks c` — and the guard has to be able to
+ * match the SAME column in both. Parametrizing the alias rather than writing a
+ * second copy of the clause is what keeps the two tiers from drifting in
+ * polarity: a one-sided edit to a duplicated string would be invisible to every
+ * test, because each copy would still be internally consistent.
+ *
+ * It is validated, not trusted, because it reaches SQL as a bare identifier.
+ * Only call-site literals may pass, mirroring `assertEmbeddingSlotIdentifier`.
+ */
+export function servingGuardClause(alias: string): string {
+  assertChunkAlias(alias);
+  return `
+      AND (SELECT count(*)
+             FROM source_versions sv
+            WHERE sv.source_ref = ${alias}.source_ref
+              AND sv.payload_collected_at IS NULL) > 0
+      AND NOT EXISTS (
+        SELECT 1
+          FROM structured_publication_sources ps
+         WHERE ps.source_ref = ${alias}.source_ref
+           AND ps.active = false
+      )`;
+}
+
+/**
+ * The clause's two halves, both required:
  *
  * - **Payload**: a source is servable while any of its versions still has an
  *   un-collected payload, so one live version outweighs its collected siblings.
@@ -46,18 +78,27 @@ export interface ServingGuardClient {
  * `WHERE` subquery is not pulled up, so it stays a filter on the index scan.
  * `count(*) > 0` over the same predicate is the same boolean as `EXISTS`,
  * including for a source with no version row (count 0 → not served).
+ *
+ * The shape is settled ONCE here and every call site inherits it. A tier that
+ * "simplified" the aggregate to `EXISTS` for readability would be locally
+ * readable and globally wrong, which is why there is no per-call-site variant.
  */
-export const SERVING_GUARD_CLAUSE = `
-      AND (SELECT count(*)
-             FROM source_versions sv
-            WHERE sv.source_ref = chunks.source_ref
-              AND sv.payload_collected_at IS NULL) > 0
-      AND NOT EXISTS (
-        SELECT 1
-          FROM structured_publication_sources ps
-         WHERE ps.source_ref = chunks.source_ref
-           AND ps.active = false
-      )`;
+export const SERVING_GUARD_CLAUSE = servingGuardClause("chunks");
+
+/**
+ * A bare SQL identifier: letters, digits and underscores, not starting with a
+ * digit. Narrow on purpose — an alias that needed quoting would already be a
+ * sign the call site is doing something this function cannot vouch for.
+ */
+function assertChunkAlias(alias: string): void {
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) return;
+  throw new GraphragError(
+    `serving-guard-pg: unsafe chunks alias "${alias}"`,
+    "STORAGE_ERROR"
+  );
+  // EXIT: the alias is a call-site literal, never operator input; anything
+  // else reaching this point is a programming error, not a runtime condition.
+}
 
 /**
  * Read the lifecycle facts for a candidate set, in one round trip.

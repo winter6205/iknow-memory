@@ -113,7 +113,7 @@ import {
   slotWriteWidths,
 } from "../embed-slots.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
-import { SERVING_GUARD_CLAUSE } from "./serving-guard-pg.js";
+import { SERVING_GUARD_CLAUSE, servingGuardClause } from "./serving-guard-pg.js";
 import { randomUUID } from "node:crypto";
 import {
   assertFilled,
@@ -291,6 +291,13 @@ const ONE_HOP_CHUNKS_SQL =
  *
  * `array_position` orders by the caller's ranking so the `LIMIT` keeps the
  * chunks of the most relevant entities rather than an arbitrary slice.
+ *
+ * MP12: the same serving guard the vector tier carries is appended here, bound
+ * to this query's local `c` alias. Step 3 of the Neo4j arm is the only place
+ * the graph tier emits chunk text (chunks never enter the graph, ADR-0001), so
+ * this predicate is the whole graph tier's exposure — a withdrawn or
+ * sole-purged source must not be materialised here either, for the same
+ * reason it must not be materialised by the vector read.
  */
 const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_ref,
           c.valid_from, c.valid_until
@@ -300,9 +307,33 @@ const ENTITY_CHUNKS_SQL = `SELECT ranked.entity_id, c.id, c.content, c.source_re
     WHERE ranked.entity_id = ANY($1::uuid[])
       AND t.valid_window @> $2::timestamptz
       AND c.valid_from <= $2::timestamptz
-      AND (c.valid_until IS NULL OR c.valid_until > $2::timestamptz)
+      AND (c.valid_until IS NULL OR c.valid_until > $2::timestamptz)${servingGuardClause("c")}
     ORDER BY array_position($1::uuid[], ranked.entity_id), c.id
     LIMIT $3`;
+
+/**
+ * The graph arm's step-3 query and its bound parameters.
+ *
+ * Exists for the same reason `buildVectorSearchQuery` does: the acceptance lane
+ * must execute the SQL production executes. A test that re-typed the query would
+ * pass while the served one drifted, and a test that could not reach this const
+ * had no way to prove the guard at all.
+ *
+ * `$1` is the ranked entity-id array (the caller's PPR order — `array_position`
+ * reads it), `$2` is `validAt`, `$3` is the limit. Reuses the vector query's
+ * `{ sql, params }` shape because the shape is the contract; the field names are
+ * not a claim that this is a vector search.
+ */
+export function buildEntityChunksQuery(
+  entityIds: readonly string[],
+  validAt: string,
+  limit: number
+): VectorSearchQuery {
+  return {
+    sql: ENTITY_CHUNKS_SQL,
+    params: [[...entityIds], validAt, limit],
+  };
+}
 
 /**
  * The ONE `level <= N` predicate every `community_summaries` read applies
@@ -2365,11 +2396,8 @@ export class PgvectorBackend
       if (entityIds.length === 0) return [];
       try {
         const pool = await this.ensureReady();
-        const result = await pool.query(ENTITY_CHUNKS_SQL, [
-          [...entityIds],
-          validAt,
-          limit,
-        ]);
+        const { sql, params } = buildEntityChunksQuery(entityIds, validAt, limit);
+        const result = await pool.query(sql, params);
         return result.rows.map((r) => {
           const row = r as {
             entity_id: string;

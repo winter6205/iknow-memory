@@ -37,6 +37,8 @@ import { upSchemaCollectionMark } from "./schema-collection-mark.js";
 import { upSchemaMaintenanceWork } from "./schema-maintenance-work.js";
 import { upSchemaPublication } from "./schema-publication.js";
 import { upSchemaStructuredPurge } from "./schema-structured-purge.js";
+import { upSchemaStructuredCompletion } from "./schema-structured-completion.js";
+import { upSchemaCollectionDelete } from "./schema-collection-delete.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 export type { SchemaBootstrapClient } from "./schema-sql.js";
 
@@ -841,6 +843,17 @@ export async function upSchemaBootstrap(
     // source the publication tables own, and the purge transaction refuses a
     // source it cannot lock there.
     await upSchemaStructuredPurge(client);
+    // After upSchemaStructuredPurge: the completion record's owner set is derived
+    // from `evidence_grants.consumer_id`, and its purge transaction runs after the
+    // tombstone's. Neither is an FK, but both are facts about what the purge
+    // already wrote, so the ordering documents the sequence rather than enforcing
+    // a dependency.
+    await upSchemaStructuredCompletion(client);
+    // After upSchemaStructuredPurge: MP15's progress row records WHICH delete
+    // phase committed last, and its terminal phase writes the completion record's
+    // `collected` state — so this capability is only reachable once the purge
+    // tombstone and the outcome record it reconciles both exist.
+    await upSchemaCollectionDelete(client);
     // ALTER chunks back-pointers must come after `source_documents` exists
     // (FK target) and after `chunks` itself exists (caller's responsibility —
     // `PgvectorBackend.ensureTable` creates it before invoking us).

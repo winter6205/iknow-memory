@@ -22,11 +22,13 @@
  * **"Every event it covers was in fact returned" is checked against the stream,
  * not remembered.** A checkpoint is minted only by the drain, over the last `seq`
  * of a page it actually handed over, so the fact that an event was delivered is
- * established by the event still being here under the gapless per-consumer `seq`
- * (ADR 0097 §2.2). The check is therefore a COUNT over the covered range compared
- * with the range's length: a hole in the middle — retention removed a row the
- * consumer never saw the gap for — fails, and so does a checkpoint whose covered
- * position is past the backend's own allocation watermark.
+ * established by where that consumer's retained window begins: if the earliest
+ * row still held sits at or below the stored position, then every event above it
+ * that survives was on the page, and the ones that do not survive were collected
+ * under the retention clause rather than skipped. A window that begins ABOVE the
+ * stored position has lost its own beginning, which no later acknowledgement can
+ * repair — so it is refused. See `planAckAdvance` for why a row count cannot
+ * stand in for that test.
  *
  * **Monotonicity is enforced twice, deliberately.** `planAckAdvance` decides it and
  * the guarded `UPDATE` re-states it as `acked_seq < $`, so a plan that were ever
@@ -60,12 +62,12 @@ import {
   type EvidenceRefusal,
 } from "./evidence-read.js";
 import {
+  readFirstRetainedSeq,
   readInvalidationCursor,
   type EvidenceInvalidationCursor,
 } from "./invalidation-outbox.js";
 import { recordOwnerScrub } from "./structured-purge-completion.js";
 import { assertCurrentAuthorization } from "./structured-status-reads.js";
-import { scopedSafeNumber } from "./structured-scope-reads.js";
 import {
   scopeAuthorityOf,
   type AuthorizedScopeContext,
@@ -79,40 +81,15 @@ import {
  *
  * A closed set, because a caller branches on it: fin must be able to tell "you
  * presented a position that was never yours" from "you presented a position this
- * stream already passed", and both from a genuine transport failure.
+ * stream already passed", and both from a genuine transport failure. The tokens
+ * live in `EVIDENCE_REFUSAL_REASON` rather than beside this module, because a
+ * reason a caller switches on and cannot name is not a closed set — it is a cast.
  */
-export const ACK_REFUSAL_REASON = {
-  /**
-   * The token did not authenticate under this deployment's key, or it was minted
-   * for another consumer.
-   *
-   * One token rather than two, because the spec treats them identically — a
-   * malformed or cross-consumer checkpoint REFUSES (evidence spec `:257-259`) —
-   * and a caller has exactly one recovery for each: present its own last
-   * acknowledged position. Which of the two it was is visible to an operator in
-   * the key configuration and in `consumer_id`, and neither is something fin can
-   * act on differently.
-   */
-  NOT_MINTED_HERE: "ack_checkpoint_not_minted_here",
-  /** The presented position is above anything this store ever handed out. */
-  NEVER_ISSUED: "ack_checkpoint_never_issued",
-  /**
-   * The presented position is BELOW the one already acknowledged.
-   *
-   * Refused rather than clamped: clamping would answer "here is what you
-   * acknowledged" to a caller who asked to go backwards, and the stored position
-   * would be the only place the disagreement was visible.
-   */
-  WOULD_MOVE_BACKWARDS: "ack_would_move_backwards",
-  /**
-   * The range the checkpoint covers has a hole in it, so at least one event in it
-   * was never handed to this consumer.
-   */
-  NOT_CONTIGUOUS: "ack_range_not_contiguous",
-} as const;
-
 export type AckRefusalReason =
-  (typeof ACK_REFUSAL_REASON)[keyof typeof ACK_REFUSAL_REASON];
+  | typeof EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NOT_MINTED_HERE
+  | typeof EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NEVER_ISSUED
+  | typeof EVIDENCE_REFUSAL_REASON.ACK_WOULD_MOVE_BACKWARDS
+  | typeof EVIDENCE_REFUSAL_REASON.ACK_RANGE_NOT_CONTIGUOUS;
 
 /** The stored facts one acknowledgement is decided from. */
 export interface AckPlanInput {
@@ -121,13 +98,11 @@ export interface AckPlanInput {
   /** This consumer's stored cursor, or `null` before anything was allocated. */
   readonly cursor: EvidenceInvalidationCursor | null;
   /**
-   * How many retained stream rows lie in `(ackedSeq, coveredSeq]`.
+   * The lowest `seq` this consumer still retains, or `null` when it retains none.
    *
-   * The delivery fact, read from the outbox rather than remembered: under ADR
-   * 0097 §2.2 a delivered range is gapless, so a short count means a row is gone
-   * that this consumer was never told about.
+   * The delivery fact, read from the outbox rather than remembered.
    */
-  readonly coveredRows: number;
+  readonly firstRetainedSeq: number | null;
 }
 
 /**
@@ -155,8 +130,25 @@ export type AckPlan =
  *  2. **Backwards.** Strictly below the stored position. Checked before the
  *     idempotent arm so that "equal" is the only position that is not a refusal.
  *  3. **Already acknowledged.** Equal. The recovery path of ADR 0097 §2.4.
- *  4. **Contiguity.** The covered range must be exactly as long as the rows
- *     actually retained inside it.
+ *  4. **Contiguity.** The range must still contain its own beginning.
+ *
+ * **Why contiguity is the floor and not a row count.** Comparing the number of
+ * retained rows against the length of the range looks equivalent while nothing
+ * deletes rows, and stops being equivalent the moment the retention sweep does its
+ * job: `grantIsFinished` collects an event the consumer may never have seen, and
+ * one deletion inside an un-acked range makes the equality false for every later
+ * acknowledgement of that consumer — the offline-owner case, the one the retention
+ * clause exists for. What the count cannot distinguish is a position lost to a
+ * collection from one lost to anything else, and after a sweep there is no row left
+ * that could. The floor does distinguish them, by asking only whether the range
+ * still begins where the consumer left off: when it does, every surviving event in
+ * the range was on the page this checkpoint was minted over, and every position
+ * that is not there was judged collectable by the sweep that removed it, so
+ * advancing loses no event. When the floor sits above the stored position, the
+ * beginning of the range is gone and the backend cannot say by what, so the
+ * acknowledgement is refused rather than assumed — which is the same verdict
+ * `planInvalidationDrain` reaches for the same rows, and the loss is permanent
+ * either way.
  *
  * A consumer with no cursor row is treated as position 0 with a watermark of 0:
  * there is nothing stored to contradict, and a checkpoint covering position 0 is
@@ -168,7 +160,7 @@ export function planAckAdvance(input: AckPlanInput): AckPlan {
   if (input.coveredSeq > lastAllocatedSeq) {
     return {
       state: "refused",
-      reason: ACK_REFUSAL_REASON.NEVER_ISSUED,
+      reason: EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NEVER_ISSUED,
       detail:
         `checkpoint covers ${input.coveredSeq}, above the highest position this ` +
         `stream ever handed out (${lastAllocatedSeq})`,
@@ -177,7 +169,7 @@ export function planAckAdvance(input: AckPlanInput): AckPlan {
   if (input.coveredSeq < ackedSeq) {
     return {
       state: "refused",
-      reason: ACK_REFUSAL_REASON.WOULD_MOVE_BACKWARDS,
+      reason: EVIDENCE_REFUSAL_REASON.ACK_WOULD_MOVE_BACKWARDS,
       detail:
         `checkpoint covers ${input.coveredSeq}, below the acknowledged ` +
         `${ackedSeq}; an acknowledgement moves forward only`,
@@ -186,34 +178,18 @@ export function planAckAdvance(input: AckPlanInput): AckPlan {
   if (input.coveredSeq === ackedSeq) {
     return { state: "already_acknowledged", coveredSeq: input.coveredSeq };
   }
-  const expectedRows = input.coveredSeq - ackedSeq;
-  if (input.coveredRows !== expectedRows) {
+  if (input.firstRetainedSeq !== null && input.firstRetainedSeq > ackedSeq + 1) {
     return {
       state: "refused",
-      reason: ACK_REFUSAL_REASON.NOT_CONTIGUOUS,
+      reason: EVIDENCE_REFUSAL_REASON.ACK_RANGE_NOT_CONTIGUOUS,
       detail:
-        `the covered range ${ackedSeq + 1}..${input.coveredSeq} retains ` +
-        `${input.coveredRows} of ${expectedRows} events, so at least one of them ` +
-        "was never handed to this consumer",
+        `the covered range ${ackedSeq + 1}..${input.coveredSeq} no longer begins ` +
+        `where this consumer left off — its earliest retained event is ` +
+        `${input.firstRetainedSeq} — so the batch cannot be shown to have been ` +
+        "one contiguous handover",
     };
   }
   return { state: "advance", coveredSeq: input.coveredSeq };
-}
-
-/** How many stream rows the covered range actually retains. */
-async function readCoveredRows(
-  client: ScopeTransactionClient,
-  consumerId: string,
-  fromSeq: number,
-  toSeq: number
-): Promise<number> {
-  const { rows } = await client.query(
-    `SELECT count(*)::bigint AS covered
-       FROM evidence_invalidation_outbox
-      WHERE consumer_id = $1 AND seq > $2 AND seq <= $3`,
-    [consumerId, fromSeq, toSeq]
-  );
-  return scopedSafeNumber(rows[0]?.covered, "acknowledged range row count");
 }
 
 /**
@@ -355,7 +331,7 @@ async function writeAcknowledgement(
   const decoded = decodeInvalidationCheckpoint(checkpoint, consumerId, key);
   if (decoded === null) {
     return refused(
-      ACK_REFUSAL_REASON.NOT_MINTED_HERE,
+      EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NOT_MINTED_HERE,
       "the presented checkpoint did not authenticate for this consumer, " +
         "so it was either forged, damaged, or minted for another stream"
     );
@@ -365,10 +341,8 @@ async function writeAcknowledgement(
   const plan = planAckAdvance({
     coveredSeq: decoded.s,
     cursor,
-    coveredRows:
-      decoded.s > ackedSeq
-        ? await readCoveredRows(client, consumerId, ackedSeq, decoded.s)
-        : 0,
+    firstRetainedSeq:
+      decoded.s > ackedSeq ? await readFirstRetainedSeq(client, consumerId) : null,
   });
   if (plan.state === "refused") {
     return refused(plan.reason, plan.detail);
@@ -424,7 +398,7 @@ function refused(reason: AckRefusalReason, message: string): AckOutcome {
   return {
     refused: {
       code: "malformed_evidence_contract",
-      reason: reason as EvidenceRefusal["reason"],
+      reason,
       message,
     },
   };

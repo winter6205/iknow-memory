@@ -187,6 +187,33 @@ export async function readInvalidationCursor(
   return first === undefined ? null : toInvalidationCursor(first);
 }
 
+/**
+ * The lowest `seq` this consumer still retains, or `null` when it retains none.
+ *
+ * Read, not remembered, and read from the stream itself: retention deletes rows
+ * under its own authority, so a stored floor would be a value the sweep has to
+ * keep in step with a statement that already decides the same thing.
+ *
+ * Shared by the drain and the acknowledgement because both ask the same question
+ * about the same rows — where this consumer's window begins — and two copies of
+ * it would be two boundaries allowed to disagree about what a consumer was
+ * handed.
+ */
+export async function readFirstRetainedSeq(
+  client: InvalidationOutboxClient,
+  consumerId: string
+): Promise<number | null> {
+  const { rows } = await client.query(
+    `SELECT min(seq) AS first_seq
+       FROM evidence_invalidation_outbox
+      WHERE consumer_id = $1`,
+    [consumerId]
+  );
+  const first = rows[0] as { first_seq?: unknown } | undefined;
+  if (first === undefined || first.first_seq === null) return null;
+  return scopedSafeNumber(first.first_seq, "invalidation first retained seq");
+}
+
 /** One event's two retention facts, as the sweep reads them. */
 export interface RetainedInvalidationEvent {
   readonly eventId: string;

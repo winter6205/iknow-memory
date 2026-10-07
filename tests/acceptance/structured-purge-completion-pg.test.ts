@@ -96,6 +96,26 @@ const SHORT_SCOPE = "p3-completion-short-scope";
 const SHORT_SOURCE = "p3-completion-short-source";
 const SHORT_OWNER_ACKED = "fin-short-acked";
 const SHORT_OWNER_PENDING = "fin-short-pending";
+/**
+ * Its own scope, for the case where MP15's collection has already deleted every
+ * grant row: the owners the purge froze must survive the deletion of the grants
+ * that named them, which cannot share a scope with any case that keeps grants.
+ */
+const SWEPT_GRANTS_SCOPE = "p3-completion-swept-grants-scope";
+const SWEPT_GRANTS_SOURCE = "p3-completion-swept-grants-source";
+const SWEPT_GRANT_OWNER_A = "fin-swept-owner-a";
+const SWEPT_GRANT_OWNER_B = "fin-swept-owner-b";
+/**
+ * Its own scope and consumer, for the retention/acknowledgement interaction: a
+ * sweep inside an un-acked range must not wedge the consumer, and a genuinely
+ * gapped one must still be refused.
+ */
+const MIDSWEEP_SCOPE = "p3-completion-midsweep-scope";
+const MIDSWEEP_SOURCE = "p3-completion-midsweep-source";
+const MIDSWEEP_CONSUMER = "fin-midsweep-owner";
+const GAPPED_SCOPE = "p3-completion-gapped-scope";
+const GAPPED_SOURCE = "p3-completion-gapped-source";
+const GAPPED_CONSUMER = "fin-gapped-owner";
 const AUTH_REV = "auth-rev-1";
 const NOW_ISO = "2026-10-08T00:00:00.000Z";
 const FUTURE_ISO = "2027-10-08T00:00:00.000Z";
@@ -345,6 +365,56 @@ function asClient(client: pg.Client): { query(text: string, values?: unknown[]):
   };
 }
 
+/**
+ * Seed one event on a consumer's stream, through the store's OWN allocator,
+ * naming a real grant reference.
+ *
+ * The cursor's watermark is therefore one the store produced, which is the value
+ * the acknowledgement path compares against; and the reference is the GRANT's
+ * own, because the retention sweep resolves an event's deadline by joining on
+ * it — an event naming a reference no grant carries has no deadline at all, which
+ * is a different case and would pass for the wrong reason.
+ */
+async function seedEvent(
+  consumerId: string,
+  evidenceRef: string
+): Promise<string> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const eventId = randomUUID();
+    const seq = await allocateInvalidationSeq(asClient(client), consumerId);
+    await client.query(
+      `INSERT INTO evidence_invalidation_outbox
+         (consumer_id, seq, event_id, evidence_ref, reason, occurred_at)
+       VALUES ($1, $2, $3, $4, 'purged', now())`,
+      [consumerId, seq, eventId, evidenceRef]
+    );
+    await client.query("COMMIT");
+    return eventId;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Run one full retention-sweep pass over the whole outbox, through the store's
+ * own read, plan and delete.
+ *
+ * A hand-written `DELETE` here would bypass the retention decision the cases are
+ * about — that the sweep, not the test, judged these rows collectable.
+ */
+async function sweepOutbox(): Promise<readonly string[]> {
+  const plan = planInvalidationRetention(
+    await readRetainedInvalidations(asClient(admin)),
+    NOW_ISO
+  );
+  return collectRetainedInvalidations(asClient(admin), plan);
+}
+
 beforeAll(async () => {
   admin = await connectedClient();
   await harness.resetSchema(admin);
@@ -537,13 +607,16 @@ describeLane("no premature completion", () => {
   });
 });
 
-describeLane("a missing owner row is not a completion", () => {
-  it("refuses to complete with the only owner row deleted, and an ack cannot recreate it", async () => {
-    // The sharpest form of "absent is not acked": every other conjunct is
-    // satisfied — one owner, scrubbed, collected — so the missing row is the ONLY
-    // thing left to block the write. On the main scope this case could not be
-    // told apart from a record that was already completed, which is why it owns a
-    // scope of its own.
+describeLane("a revision with no owner row is refused, not completed", () => {
+  it("refuses reconcile when the revision's owner set is empty, and completes once an owner row exists", async () => {
+    // The refactored contract, stated on real rows: the reconciler judges the
+    // owner rows the purge FROZE (`structured_purge_ack_states`), never a set
+    // re-derived from `evidence_grants`. A revision with zero owner rows has had
+    // no scrub judged — the completion guard is written negatively, so an empty
+    // set would satisfy it and complete the revision on `collected` alone — so
+    // the reconciler refuses rather than answers. The earlier version of this
+    // case expected a verdict here, which is exactly the vacuous completion the
+    // repair removes.
     const versionId = await ensureScope(ORPHAN_SCOPE, ORPHAN_SOURCE);
     await seedGrant({
       scope: ORPHAN_SCOPE,
@@ -575,18 +648,15 @@ describeLane("a missing owner row is not a completion", () => {
     );
     expect(await readAckRow(ORPHAN_SCOPE, ORPHAN_REVISION, ORPHAN_CONSUMER)).toBeNull();
 
-    const blocked = await reconciler.reconcile({
-      scopeBinding: ORPHAN_SCOPE,
-      purgeRevision: ORPHAN_REVISION,
-    });
-    expect(blocked.evaluatedOwners).toEqual([ORPHAN_CONSUMER]);
-    expect(blocked.completed).toBe(false);
+    await expect(
+      reconciler.reconcile({ scopeBinding: ORPHAN_SCOPE, purgeRevision: ORPHAN_REVISION })
+    ).rejects.toThrowError(/records no owner/);
     expect(
       (await readOutcomeRow(ORPHAN_SCOPE, ORPHAN_REVISION))?.completed_at
     ).toBeNull();
 
-    // The owner really does acknowledge — and the owner row is still absent,
-    // because ADR 0099 §2.1 makes `scheduled` the PURGE transaction's write. An
+    // The owner really does acknowledge — and the refusal stands, because ADR
+    // 0099 §2.1 makes `scheduled` the PURGE transaction's write. An
     // acknowledgement advances a position; it does not invent an owner.
     await ack(
       ORPHAN_SCOPE,
@@ -595,14 +665,12 @@ describeLane("a missing owner row is not a completion", () => {
       await drainAndTakeCheckpoint(ORPHAN_SCOPE, ORPHAN_SOURCE, ORPHAN_CONSUMER)
     );
     expect(await readAckRow(ORPHAN_SCOPE, ORPHAN_REVISION, ORPHAN_CONSUMER)).toBeNull();
-    const stillBlocked = await reconciler.reconcile({
-      scopeBinding: ORPHAN_SCOPE,
-      purgeRevision: ORPHAN_REVISION,
-    });
-    expect(stillBlocked.completed).toBe(false);
+    await expect(
+      reconciler.reconcile({ scopeBinding: ORPHAN_SCOPE, purgeRevision: ORPHAN_REVISION })
+    ).rejects.toThrowError(/records no owner/);
 
-    // With the row present and scrubbed, the same guard completes — so the
-    // refusal above was the missing row and nothing else.
+    // With the row present and scrubbed, the same revision completes — so the
+    // refusal above was the empty owner set and nothing else.
     await admin.query(
       `INSERT INTO structured_purge_ack_states
          (scope_binding, purge_revision, consumer_id, ack_state, covered_seq,
@@ -621,6 +689,7 @@ describeLane("a missing owner row is not a completion", () => {
     });
     expect(completed.applied).toBe(true);
     expect(completed.completed).toBe(true);
+    expect(completed.evaluatedOwners).toEqual([ORPHAN_CONSUMER]);
   });
 });
 
@@ -710,6 +779,218 @@ describeLane("one owner acked and one not is never a completion", () => {
   });
 });
 
+describeLane("deleting the scope's grants does not erase a frozen owner", () => {
+  it("completes with every owner scrubbed after MP15's collection removed every grant row", async () => {
+    // ADR 0099 §2.3: an owner whose grant has gone is still `NULL` — never
+    // "assumed scrubbed" — and §2.4b's guard judges owner ROWS, not a set
+    // re-derived from `evidence_grants`. This is the hole the old derivation
+    // opened: MP15's collection deletes from `evidence_grants`, so re-deriving
+    // after collection would yield `[]`, and the old vacuous join would complete
+    // the revision with zero owners scrubbed. On its own scope, because the
+    // grant deletion is the state every other case must not inherit.
+    const revision = "purge-rev-swept-grants";
+    const versionId = await ensureScope(SWEPT_GRANTS_SCOPE, SWEPT_GRANTS_SOURCE);
+    await seedGrant({
+      scope: SWEPT_GRANTS_SCOPE,
+      source: SWEPT_GRANTS_SOURCE,
+      versionId,
+      evidenceRef: "ref-swept-a",
+      consumerId: SWEPT_GRANT_OWNER_A,
+    });
+    await seedGrant({
+      scope: SWEPT_GRANTS_SCOPE,
+      source: SWEPT_GRANTS_SOURCE,
+      versionId,
+      evidenceRef: "ref-swept-b",
+      consumerId: SWEPT_GRANT_OWNER_B,
+    });
+    await purge.purge({
+      scopeBinding: SWEPT_GRANTS_SCOPE,
+      sourceRef: SWEPT_GRANTS_SOURCE,
+      purgeRevision: revision,
+    });
+
+    // The local delete transaction's own shape: the payload removal and the
+    // `collected` write in one commit, with the grant rows deleted inside it.
+    const collected = await connectedClient();
+    try {
+      await collected.query("BEGIN");
+      await collected.query(`DELETE FROM evidence_grants WHERE scope_binding = $1`, [
+        SWEPT_GRANTS_SCOPE,
+      ]);
+      await recordPayloadCollection(asClient(collected), {
+        scopeBinding: SWEPT_GRANTS_SCOPE,
+        purgeRevision: revision,
+      });
+      await collected.query("COMMIT");
+    } catch (error) {
+      await collected.query("ROLLBACK");
+      throw error;
+    } finally {
+      await collected.end();
+    }
+    const { rows: grantCount } = await admin.query(
+      `SELECT count(*)::bigint AS n FROM evidence_grants WHERE scope_binding = $1`,
+      [SWEPT_GRANTS_SCOPE]
+    );
+    expect(Number(grantCount[0]!.n)).toBe(0);
+    expect((await readOutcomeRow(SWEPT_GRANTS_SCOPE, revision))?.collection_state).toBe(
+      "collected"
+    );
+
+    // The frozen owner rows survived the deletion that emptied the derivation
+    // table — and both owners still owe a scrub.
+    await ack(
+      SWEPT_GRANTS_SCOPE,
+      SWEPT_GRANTS_SOURCE,
+      SWEPT_GRANT_OWNER_A,
+      await drainAndTakeCheckpoint(SWEPT_GRANTS_SCOPE, SWEPT_GRANTS_SOURCE, SWEPT_GRANT_OWNER_A)
+    );
+    await ack(
+      SWEPT_GRANTS_SCOPE,
+      SWEPT_GRANTS_SOURCE,
+      SWEPT_GRANT_OWNER_B,
+      await drainAndTakeCheckpoint(SWEPT_GRANTS_SCOPE, SWEPT_GRANTS_SOURCE, SWEPT_GRANT_OWNER_B)
+    );
+    expect(
+      (await readAckRow(SWEPT_GRANTS_SCOPE, revision, SWEPT_GRANT_OWNER_A))?.ack_state
+    ).toBe("scrubbed");
+    expect(
+      (await readAckRow(SWEPT_GRANTS_SCOPE, revision, SWEPT_GRANT_OWNER_B))?.ack_state
+    ).toBe("scrubbed");
+
+    const verdict = await reconciler.reconcile({
+      scopeBinding: SWEPT_GRANTS_SCOPE,
+      purgeRevision: revision,
+    });
+    expect(verdict.applied).toBe(true);
+    expect(verdict.completed).toBe(true);
+    expect(verdict.evaluatedOwners).toEqual([SWEPT_GRANT_OWNER_A, SWEPT_GRANT_OWNER_B]);
+  });
+});
+
+describeLane("a mid-range retention sweep does not wedge the acknowledgement", () => {
+  it("advances an ack whose un-acked range was swept from its middle", async () => {
+    // The offline-owner case the retention clause exists for: the consumer acked
+    // a prefix, then its grant expired for one later event and the sweep collected
+    // it FROM THE MIDDLE of the un-acked range. The earliest retained event still
+    // opens the range at ackedSeq+1, so the loss was the sweep's own judgement and
+    // nothing un-judged was skipped. A row-count contiguity test refused this
+    // acknowledgement forever (the covered range could never again match its
+    // length); the floor test advances.
+    const versionId = await ensureScope(MIDSWEEP_SCOPE, MIDSWEEP_SOURCE);
+    await seedGrant({
+      scope: MIDSWEEP_SCOPE,
+      source: MIDSWEEP_SOURCE,
+      versionId,
+      evidenceRef: "ref-midsweep-kept",
+      consumerId: MIDSWEEP_CONSUMER,
+      expiresAt: FUTURE_ISO,
+    });
+    await seedGrant({
+      scope: MIDSWEEP_SCOPE,
+      source: MIDSWEEP_SOURCE,
+      versionId,
+      evidenceRef: "ref-midsweep-swept",
+      consumerId: MIDSWEEP_CONSUMER,
+      expiresAt: PAST_ISO,
+    });
+    // seq 1..2 are the acknowledged prefix.
+    await seedEvent(MIDSWEEP_CONSUMER, "ref-midsweep-kept");
+    await seedEvent(MIDSWEEP_CONSUMER, "ref-midsweep-kept");
+    await ack(
+      MIDSWEEP_SCOPE,
+      MIDSWEEP_SOURCE,
+      MIDSWEEP_CONSUMER,
+      await drainAndTakeCheckpoint(MIDSWEEP_SCOPE, MIDSWEEP_SOURCE, MIDSWEEP_CONSUMER)
+    );
+    // seq 3..5 are the pending range; seq 4 names the expired grant and is the
+    // row the sweep collects from its middle.
+    await seedEvent(MIDSWEEP_CONSUMER, "ref-midsweep-kept");
+    const sweptEventId = await seedEvent(MIDSWEEP_CONSUMER, "ref-midsweep-swept");
+    await seedEvent(MIDSWEEP_CONSUMER, "ref-midsweep-kept");
+    // The sweep also collects the acknowledged prefix (it has served its
+    // purpose), but the retained window's floor STAYS at or below the position
+    // the ack will be judged from — the range keeps its own beginning at 3.
+    const collected = await sweepOutbox();
+    expect(collected).toContain(sweptEventId);
+
+    // The drain resumes from the stored position 2, finds the window still opens
+    // at 3 (the swept row was at 4), and hands over a batch covering 5.
+    const checkpoint = await drainAndTakeCheckpoint(
+      MIDSWEEP_SCOPE,
+      MIDSWEEP_SOURCE,
+      MIDSWEEP_CONSUMER
+    );
+    await ack(MIDSWEEP_SCOPE, MIDSWEEP_SOURCE, MIDSWEEP_CONSUMER, checkpoint);
+    const { rows } = await admin.query(
+      `SELECT acked_seq FROM evidence_invalidation_cursors WHERE consumer_id = $1`,
+      [MIDSWEEP_CONSUMER]
+    );
+    expect(Number(rows[0]!.acked_seq)).toBe(5);
+  });
+
+  it("still refuses an ack whose range has lost its beginning", async () => {
+    // The counter-case: the sweep removed the EARLIEST un-acked row, so the
+    // covered range no longer opens at ackedSeq+1 and no later acknowledgement can
+    // show it was one contiguous handover. Advancing here would be the silent
+    // event loss the refusal exists to prevent.
+    const versionId = await ensureScope(GAPPED_SCOPE, GAPPED_SOURCE);
+    await seedGrant({
+      scope: GAPPED_SCOPE,
+      source: GAPPED_SOURCE,
+      versionId,
+      evidenceRef: "ref-gapped-kept",
+      consumerId: GAPPED_CONSUMER,
+      expiresAt: FUTURE_ISO,
+    });
+    await seedGrant({
+      scope: GAPPED_SCOPE,
+      source: GAPPED_SOURCE,
+      versionId,
+      evidenceRef: "ref-gapped-swept",
+      consumerId: GAPPED_CONSUMER,
+      expiresAt: PAST_ISO,
+    });
+    await seedEvent(GAPPED_CONSUMER, "ref-gapped-kept");
+    await seedEvent(GAPPED_CONSUMER, "ref-gapped-kept");
+    await ack(
+      GAPPED_SCOPE,
+      GAPPED_SOURCE,
+      GAPPED_CONSUMER,
+      await drainAndTakeCheckpoint(GAPPED_SCOPE, GAPPED_SOURCE, GAPPED_CONSUMER)
+    );
+    // seq 3 is the earliest un-acked row and names the expired grant, so it is
+    // the row the sweep collects — the one that opened the range. The full
+    // sweep pass also lifts the acknowledged prefix; what is left opens ABOVE
+    // the position the next ack is judged from.
+    const sweptEventId = await seedEvent(GAPPED_CONSUMER, "ref-gapped-swept");
+    await seedEvent(GAPPED_CONSUMER, "ref-gapped-kept");
+    await seedEvent(GAPPED_CONSUMER, "ref-gapped-kept");
+    const collected = await sweepOutbox();
+    expect(collected).toContain(sweptEventId);
+
+    const checkpoint = await drainAndTakeCheckpoint(
+      GAPPED_SCOPE,
+      GAPPED_SOURCE,
+      GAPPED_CONSUMER
+    );
+    await expect(
+      acknowledger.acknowledgeInvalidations(
+        contextFor(GAPPED_SCOPE, GAPPED_SOURCE),
+        GAPPED_CONSUMER,
+        { action: "ack" as never, checkpoint }
+      )
+    ).rejects.toThrowError(/no longer begins/);
+    // The refusal left the stored position exactly where the prefix put it.
+    const { rows } = await admin.query(
+      `SELECT acked_seq FROM evidence_invalidation_cursors WHERE consumer_id = $1`,
+      [GAPPED_CONSUMER]
+    );
+    expect(Number(rows[0]!.acked_seq)).toBe(2);
+  });
+});
+
 describeLane("acknowledgement monotonicity, against real rows", () => {
   it("refuses an acknowledgement below the stored position and leaves it alone", async () => {
     // The second, statement-level fence: the stored position moves only when the
@@ -763,41 +1044,6 @@ describeLane("acknowledgement monotonicity, against real rows", () => {
 });
 
 describeLane("§1.6 retention of unacknowledged events", () => {
-  /**
-   * Seed one event on its own consumer, through the store's OWN allocator, naming
-   * a real grant reference.
-   *
-   * The cursor's watermark is therefore one the store produced, which is the value
-   * the acknowledgement path compares against; and the reference is the GRANT's
-   * own, because the retention sweep resolves an event's deadline by joining on
-   * it — an event naming a reference no grant carries has no deadline at all, which
-   * is a different case and would pass for the wrong reason.
-   */
-  async function seedEvent(
-    consumerId: string,
-    evidenceRef: string
-  ): Promise<string> {
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const eventId = randomUUID();
-      const seq = await allocateInvalidationSeq(asClient(client), consumerId);
-      await client.query(
-        `INSERT INTO evidence_invalidation_outbox
-           (consumer_id, seq, event_id, evidence_ref, reason, occurred_at)
-         VALUES ($1, $2, $3, $4, 'purged', now())`,
-        [consumerId, seq, eventId, evidenceRef]
-      );
-      await client.query("COMMIT");
-      return eventId;
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
   /** The sweep's view of one event, straight from the real join. */
   async function retentionRow(eventId: string): Promise<RetainedInvalidationEvent | null> {
     const events = await readRetainedInvalidations(asClient(admin));

@@ -272,6 +272,31 @@ export const EVIDENCE_REFUSAL_REASON = {
    * so a caller that routed either here needs to be told which one it got wrong.
    */
   ACK_NOT_A_GRANT_READ: "ack_not_a_grant_read",
+  /**
+   * The `ack` checkpoint did not authenticate for this consumer.
+   *
+   * One token for "forged, damaged, or minted for another stream", because the
+   * spec treats all three identically — a malformed or cross-consumer checkpoint
+   * REFUSES (evidence spec `:257-259`) — and a caller has exactly one recovery
+   * for each: present its own last acknowledged position. Which of the three it
+   * was is visible to an operator in the key configuration and in `consumer_id`.
+   */
+  ACK_CHECKPOINT_NOT_MINTED_HERE: "ack_checkpoint_not_minted_here",
+  /** The acknowledged position is above anything this store ever handed out. */
+  ACK_CHECKPOINT_NEVER_ISSUED: "ack_checkpoint_never_issued",
+  /**
+   * The acknowledged position is BELOW the one already recorded.
+   *
+   * Refused rather than clamped: clamping would answer "here is what you
+   * acknowledged" to a caller who asked to go backwards, and the stored position
+   * would be the only place the disagreement was visible.
+   */
+  ACK_WOULD_MOVE_BACKWARDS: "ack_would_move_backwards",
+  /**
+   * The covered range no longer begins where the consumer left off, so it cannot
+   * be shown to have been one contiguous handover.
+   */
+  ACK_RANGE_NOT_CONTIGUOUS: "ack_range_not_contiguous",
 } as const;
 
 export type EvidenceRefusalReason =

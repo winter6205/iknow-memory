@@ -13,6 +13,7 @@ import { COLLECTION_DAY_MS, decideCollectionEligibility } from "../../../src/cor
 import {
   planCollectionMark,
   planCollectionReactivation,
+  planStaleMarkCancellation,
   recheckCollectionMark,
 } from "../../../src/core/maintenance/collection-mark.js";
 import type {
@@ -388,5 +389,46 @@ describe("MP14 — purity", () => {
       Date.now = real;
     }
     expect(calls).toBe(0);
+  });
+});
+
+describe("MP14 — a stale recheck leaves a recorded cancellation", () => {
+  it("records the stale reason, distinct from a reactivation's", () => {
+    const outcome = planStaleMarkCancellation(
+      { payloadClass: "retired_unreferenced", payloadRef: "s1" },
+      atDay(97)
+    );
+    if (outcome.refused) throw new Error(`${outcome.code}: ${outcome.detail}`);
+    expect(outcome.cancellation.reason).toBe("lifecycle_revision_changed");
+  });
+
+  it("is not the reactivation reason, so MP15 can tell a stale mark from an undo", () => {
+    const undo = planCollectionReactivation(reactivation(), atDay(91));
+    if (undo.refused) throw new Error(`${undo.code}: ${undo.detail}`);
+    const stale = planStaleMarkCancellation(
+      { payloadClass: "retired_unreferenced", payloadRef: "s1" },
+      atDay(97)
+    );
+    if (stale.refused) throw new Error(`${stale.code}: ${stale.detail}`);
+    expect(undo.plan.reason).toBe("reactivated");
+    expect(stale.cancellation.reason).not.toBe(undo.plan.reason);
+  });
+
+  it("refuses an empty payload ref rather than cancelling nothing", () => {
+    const outcome = planStaleMarkCancellation(
+      { payloadClass: "retired_unreferenced", payloadRef: "" },
+      atDay(97)
+    );
+    expect(outcome.refused).toBe(true);
+  });
+
+  it("stamps a live mark as uncancelled and a reactivated one as cancelled with its reason", () => {
+    const fresh = plan(markRequest()).mark;
+    expect(fresh.cancelledAt).toBeNull();
+    expect(fresh.cancelledReason).toBeNull();
+    const reactivate = planCollectionReactivation(reactivation(), atDay(91));
+    if (reactivate.refused) throw new Error(`${reactivate.code}: ${reactivate.detail}`);
+    expect(reactivate.plan.cancelledAt).toBe(atDay(91).toISOString());
+    expect(reactivate.plan.reason).toBe("reactivated");
   });
 });

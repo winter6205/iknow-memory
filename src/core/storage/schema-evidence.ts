@@ -72,6 +72,19 @@ async function createSourceVersions(
   await client.query(`
     CREATE UNIQUE INDEX IF NOT EXISTS source_versions_source_ref_source_version_idx
       ON source_versions (source_ref, source_version)`);
+  // MP15 (spec:312, "exact live reference accounting"): the two columns that
+  // name the ORIGINAL content are both NOT NULL and both unindexed, so counting
+  // the other logical sources that name the same content was a seq scan over
+  // the corpus's largest table — inside a transaction holding source rows. Each
+  // index exists for exactly one counted query, named here:
+  //   SELECT count(*) FROM source_versions WHERE content_digest  = $1
+  //   SELECT count(*) FROM source_versions WHERE origin_object_ref = $1
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS source_versions_content_digest_idx
+      ON source_versions (content_digest)`);
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS source_versions_origin_object_ref_idx
+      ON source_versions (origin_object_ref)`);
 }
 
 async function createSourceVersionLocators(
@@ -296,4 +309,10 @@ async function createEvidenceGrantExtractions(
       REFERENCES support_extractions(support_id, extraction_ref)
         ON DELETE RESTRICT
     )`);
+  // MP15's `dependent_supports` phase deletes these pins for one payload's
+  // supports, and the PK leads with `evidence_ref`, so it cannot serve that
+  // predicate. The collector asks the same question from the support side.
+  await client.query(`
+    CREATE INDEX IF NOT EXISTS evidence_grant_extractions_support_id_idx
+      ON evidence_grant_extractions (support_id)`);
 }

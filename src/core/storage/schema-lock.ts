@@ -135,6 +135,16 @@ const BOOTSTRAP_TABLES = [
   // would short-circuit before replaying their CREATE statements.
   "structured_read_leases",
   "structured_purge_tombstones",
+  // The all-owner completion record: one row per purge revision and one per owner,
+  // both brand-new tables under the same rule as index_jobs, so the probe names
+  // them or a deployed store would short-circuit before replaying their CREATE
+  // statements and the purge transaction would fail on a table that is not there.
+  "structured_purge_outcomes",
+  "structured_purge_ack_states",
+  // MP15's per-phase deletion progress. Brand-new under the same rule: a store
+  // that short-circuits past its CREATE has no row to resume from, and a retry
+  // would re-run every phase instead of skipping the ones that committed.
+  "structured_collection_deletions",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -191,6 +201,17 @@ const BOOTSTRAP_INDEXES = [
   "evidence_invalidation_outbox_evidence_ref_idx",
   // The purge's active-read scan: (scope, source) narrowed by a live bound.
   "structured_read_leases_active_idx",
+  // The reconciler's all-owner guard joins owner rows by (scope, revision) against
+  // a derived owner list.
+  "structured_purge_ack_states_scope_revision_idx",
+  // MP15: the shared-object live-reference counts filter on `content_digest` and
+  // on `origin_object_ref`, and neither column carries any index today, so both
+  // counts are seq scans over the corpus's largest table.
+  "source_versions_content_digest_idx",
+  "source_versions_origin_object_ref_idx",
+  // MP15: the `dependent_supports` phase deletes the grant's extraction pins by
+  // support, and that table's PK leads with `evidence_ref`.
+  "evidence_grant_extractions_support_id_idx",
 ] as const;
 
 /**

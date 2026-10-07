@@ -1899,6 +1899,9 @@ function seamIdentity(seeded: Seeded): QueryScopeIdentity {
     // reader's own sixty-second execution lease is separate and is the case
     // clock, which is what the existing lease case drives.
     [QUERY_SCOPE_ENV_VARS.deadlineAt]: "2099-01-01T00:00:00.000Z",
+    // A grant cannot be issued without one; the cases below refuse for their own
+    // named reasons, so the consumer has to be present and valid.
+    [QUERY_SCOPE_ENV_VARS.consumerId]: "structured-query-pg-consumer",
   });
 }
 
@@ -2366,16 +2369,20 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
     // arms on every grant, and `normalizeGrantRequest` refuses a row grant that
     // still names a count — which is the arm-exclusivity the seam's
     // `grantRequestOf` enforces and this case has to honour too.
-    const requests = plan.grants.map(({ count: _count, ...grant }, index) =>
-      index === 1
+    const requests = plan.grants.map(({ count: _count, ...grant }, index) => ({
+      // The plan carries no consumer: which stream a grant belongs to is a
+      // property of the connection it was served to, and this case issues the
+      // plan directly rather than through the seam that would supply it.
+      consumerId: "structured-query-pg-consumer",
+      ...(index === 1
         ? {
             ...grant,
             supports: [
               { support_id: ABSENT_SUPPORT, role: grant.supports[0]!.role },
             ],
           }
-        : grant
-    );
+        : grant),
+    }));
 
     const issued = await backend.issueGrants(requests).then(
       () => null,

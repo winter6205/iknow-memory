@@ -38,6 +38,18 @@ export const QUERY_SCOPE_ENV_VARS = {
   sourceRefs: "IKNOW_QUERY_SOURCE_REFS",
   authorizationRevision: "IKNOW_QUERY_AUTH_REVISION",
   deadlineAt: "IKNOW_QUERY_DEADLINE_AT",
+  /**
+   * Deliberately the EVIDENCE-side name, not a seventh `IKNOW_QUERY_*` one.
+   *
+   * The consumer is a property of the transport's deployment, not of one
+   * channel: the same host variable names the stream for both the Evidence
+   * channel and the Query issuer that mints its grants, so one host setting
+   * gives one consumer id rather than two that could disagree. A second name
+   * would make "which stream do these grants belong to" a per-channel
+   * question, which is precisely what ADR 0097 §2.1's stored-not-sent
+   * `consumer_id` exists to prevent.
+   */
+  consumerId: "IKNOW_EVIDENCE_CONSUMER_ID",
 } as const;
 
 /** The read environment the host reads a binding from; `process.env`'s shape. */
@@ -69,16 +81,33 @@ export interface QueryScopeIdentity {
   readonly sourceRefs?: string;
   readonly authorizationRevision?: string;
   readonly deadlineAt?: string;
+  /**
+   * Which per-consumer invalidation stream this connection's grants belong to.
+   *
+   * NOT a scope member, unlike the six above: it never enters
+   * `resolveQueryScope` and never reaches the authorized context, because which
+   * stream to publish an invalidation on says nothing about what this
+   * connection may read. It rides on the same host-injected object because the
+   * host sets both from the same channel and the grant needs it, so this is
+   * where an unbound host's absence is representable. Absent is a per-call
+   * refusal by the issuer, not a default consumer.
+   */
+  readonly consumerId?: string;
 }
 
 /**
- * The six members, as a key map.
+ * The members the host may bind, as a key map.
  *
  * Typed `Record<keyof QueryScopeIdentity, true>` for the reason
  * `EVIDENCE_STORE_METHODS` is typed in `backend.ts`: a member added to the
  * identity without an entry here is a compile error, which is the only thing that
  * can notice. The reverse map then derives the environment names from the same
  * key, so a member and the variable the host reads it from cannot drift apart.
+ *
+ * `consumerId` is listed because the host sets it here, but it is deliberately
+ * NOT one of the six `resolveQueryScope` requires: a missing consumer is an
+ * unissuable grant, not an unprovisioned scope, and collapsing the two would
+ * report a binding problem as a reading problem.
  */
 const QUERY_SCOPE_MEMBERS: Record<keyof QueryScopeIdentity, true> = {
   actorId: true,
@@ -87,14 +116,15 @@ const QUERY_SCOPE_MEMBERS: Record<keyof QueryScopeIdentity, true> = {
   sourceRefs: true,
   authorizationRevision: true,
   deadlineAt: true,
+  consumerId: true,
 };
 
 /** The environment variable each member is read from, derived not restated. */
 const MEMBER_ENV_VARS: Readonly<Record<keyof QueryScopeIdentity, string>> =
   Object.fromEntries(
-    (
-      Object.keys(QUERY_SCOPE_MEMBERS) as (keyof QueryScopeIdentity)[]
-    ).map((member) => [member, QUERY_SCOPE_ENV_VARS[member]])
+    (Object.keys(QUERY_SCOPE_MEMBERS) as (keyof QueryScopeIdentity)[]).map(
+      (member) => [member, QUERY_SCOPE_ENV_VARS[member]]
+    )
   ) as Record<keyof QueryScopeIdentity, string>;
 
 /**
@@ -119,13 +149,13 @@ export function queryScopeIdentityFromEnv(
     sourceRefs: read("sourceRefs"),
     authorizationRevision: read("authorizationRevision"),
     deadlineAt: read("deadlineAt"),
+    consumerId: read("consumerId"),
   };
 }
 
 /** A fully resolved Query scope, or the reason it is not resolvable. */
 export type ResolvedQueryScope =
-  | { readonly context: AuthorizedScopeContext }
-  | { readonly refusal: string };
+  { readonly context: AuthorizedScopeContext } | { readonly refusal: string };
 
 /** One member as this resolver needs it: present and non-blank, or absent. */
 function requireMember(
@@ -160,7 +190,10 @@ export function resolveQueryScope(
   const ownerScopeBinding = requireMember(identity, "ownerScopeBinding");
   const readerBinding = requireMember(identity, "readerBinding");
   const sourceRefs = requireMember(identity, "sourceRefs");
-  const authorizationRevision = requireMember(identity, "authorizationRevision");
+  const authorizationRevision = requireMember(
+    identity,
+    "authorizationRevision"
+  );
   const deadlineAt = requireMember(identity, "deadlineAt");
 
   const missing: string[] = [

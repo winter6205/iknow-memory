@@ -307,6 +307,7 @@ function recordingGrants(
             value: plan.value,
             result_count: plan.count,
             authorization_receipt_id: plan.kind === "count" ? uuid(900) : null,
+            consumer_id: plan.consumer_id,
           };
         });
       },
@@ -394,10 +395,11 @@ function grantRecord(
     value: request.value,
     result_count: request.kind === "count" ? request.count : null,
     authorization_receipt_id: request.kind === "count" ? uuid(900) : null,
+    consumer_id: request.consumerId,
   };
 }
 
-/** The six members of ONE connection's injected identity. */
+/** The members of ONE connection's injected identity. */
 function connectionIdentity(
   actorId: string,
   sourceRefs: string = SOURCE_REF
@@ -409,6 +411,10 @@ function connectionIdentity(
     sourceRefs,
     authorizationRevision: AUTHORIZATION_REVISION,
     deadlineAt: "2099-01-01T00:00:00.000Z",
+    // Not a scope member, but a grant cannot be issued without one, so every
+    // identity here carries it. The case that must REFUSE an absent one states
+    // it explicitly rather than relying on this default.
+    consumerId: `consumer-${actorId}`,
   };
 }
 
@@ -883,5 +889,63 @@ describe("the Query seam — issuance is all-or-nothing and typed", () => {
     });
     // And the detail is still available to whoever reads the error itself.
     expect(error.message).toContain("stopped accepting obligations");
+  });
+
+  it("refuses a page whose connection carries no consumer, naming the variable", async () => {
+    // A grant with no stream could never be invalidated, so its revocation would
+    // be silent — the exact failure the per-consumer outbox exists to make loud.
+    // The refusal is the SPEC's own unavailable code and names the one variable
+    // the host has to inject, and NO grant is written.
+    const { authority } = recordingAuthority();
+    const { reader, seen } = recordingReader(listPlan([entityRow(1)]));
+    const { grants, issued, fences } = recordingGrants();
+    const identity = connectionIdentity("session-a");
+    const unbound: QueryScopeIdentity = { ...identity, consumerId: undefined };
+
+    const error = await capturedStructuredError(() =>
+      buildStructuredQueryReader(
+        authority,
+        grants,
+        reader,
+        unbound
+      ).readStructuredQuery(LIST)
+    );
+    expect(error.code).toBe("structured_search_unavailable");
+    expect(error.message).toContain("IKNOW_EVIDENCE_CONSUMER_ID");
+    expect(issued).toHaveLength(0);
+    expect(fences).toHaveLength(0);
+    // And the corpus was never read for it. A connection that cannot issue a
+    // grant has nothing the read could produce, so the refusal is raised beside
+    // the scope gate rather than after a full page read whose result is thrown
+    // away — the cost of an unprovisioned host should not scale with the corpus.
+    expect(seen).toHaveLength(0);
+  });
+
+  it("gives the issued grant the consumer this connection was bound to", async () => {
+    // Two connections, two consumers: which stream a grant's invalidation goes
+    // to is a property of who was served, so it must not be a constant.
+    const rows = [entityRow(1)];
+    const a = recordingAuthority();
+    const b = recordingAuthority();
+    const readerA = recordingReader(listPlan(rows));
+    const readerB = recordingReader(listPlan(rows));
+    const grantsA = recordingGrants();
+    const grantsB = recordingGrants();
+
+    await buildStructuredQueryReader(
+      a.authority,
+      grantsA.grants,
+      readerA.reader,
+      connectionIdentity("session-a")
+    ).readStructuredQuery(LIST);
+    await buildStructuredQueryReader(
+      b.authority,
+      grantsB.grants,
+      readerB.reader,
+      connectionIdentity("session-b")
+    ).readStructuredQuery(LIST);
+
+    expect(grantsA.issued[0]?.consumerId).toBe("consumer-session-a");
+    expect(grantsB.issued[0]?.consumerId).toBe("consumer-session-b");
   });
 });

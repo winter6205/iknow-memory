@@ -42,6 +42,16 @@
  * the authorization fence above. The transaction bracket is the scope's, so a
  * selector decision and the grant facts it is decided against are one statement
  * set under one fence.
+ *
+ * **`invalidations` is answered by a sibling module, and this one still refuses
+ * it.** The drain reads a per-consumer stream rather than a grant, so it needs
+ * the checkpoint key and a cursor position this reader does not hold;
+ * `evidence-invalidation-read.ts` owns both. What stays HERE is the envelope, the
+ * request parse and the refusal, because the contract is one: a request that
+ * names the action reaches this parser whether or not this function is the seam
+ * that answers it, and an action routed here must be a typed refusal rather than
+ * a crash or a grant read keyed on nothing. `ack` is still out of scope at both
+ * seams — see the fence below.
  */
 import {
   EVIDENCE_DENIAL_REASON,
@@ -51,6 +61,7 @@ import {
   type EvidenceGrantRead,
   type EvidenceSupportRef,
 } from "../types.js";
+import type { InvalidationReason } from "./invalidation-outbox.js";
 import {
   CONTRACT_VIOLATION,
   decideSupportContinuation,
@@ -93,10 +104,20 @@ export const EVIDENCE_PRIVATE_METHOD = "corpus_evidence";
  */
 export type EvidenceScope = StructuredScopeUnitOfWork<AuthorizedScopeWork>;
 
-/** The two actions T13 answers. `invalidations` and `ack` are out of scope here. */
+/** The three actions this contract accepts. `ack` is still out of scope here. */
 export const EVIDENCE_ACTION = {
   READ: "read",
   SUPPORTS: "supports",
+  /**
+   * Added by register §1.3, which lifted the `invalidations` half of this fence.
+   *
+   * `ack` remains out of scope and is NOT a member: it is a WRITE that
+   * re-verifies the batch it advances through, in its own write transaction, and
+   * the purge-outcome table that makes that re-verification decidable does not
+   * exist yet (register §1.5, ADR 0097 §4.5). Naming it here before it can be
+   * honoured would let a caller receive an action the store cannot serve.
+   */
+  INVALIDATIONS: "invalidations",
 } as const;
 
 export type EvidenceAction = (typeof EVIDENCE_ACTION)[keyof typeof EVIDENCE_ACTION];
@@ -116,7 +137,42 @@ export interface EvidenceSupportsRequest {
   readonly support_id?: string | null;
 }
 
-export type EvidenceRequest = EvidenceReadRequest | EvidenceSupportsRequest;
+/**
+ * The drain request, carrying no reference of its own.
+ *
+ * The absence of `evidence_ref` is the contract, not an omission: a drain
+ * answers for the CONSUMER's whole stream, and a request that named a reference
+ * would be asking this action to filter — which is the grant read's job and
+ * would turn a scrub queue into a selective disclosure.
+ */
+export interface EvidenceInvalidationsRequest {
+  readonly action: typeof EVIDENCE_ACTION.INVALIDATIONS;
+  /** The consumer's last accepted checkpoint; absent or null on a first drain. */
+  readonly checkpoint?: string | null;
+  /**
+   * Events to return, `1..20`.
+   *
+   * Optional on the WIRE and required here, because the parser resolves an
+   * absent key to the spec's documented default: a reader handed a resolved
+   * request can never reach the store without a page size, and a page size that
+   * could be missing is a page size two callers would default differently.
+   */
+  readonly limit: number;
+}
+
+/**
+ * The actions answered from a single retained grant.
+ *
+ * Narrower than `EvidenceRequest` on purpose: it is what makes
+ * `readPrivateEvidence` structurally unable to be handed a drain, so the wrong
+ * routing is a compile error rather than a refusal somebody has to remember to
+ * write.
+ */
+export type EvidenceGrantRequest =
+  | EvidenceReadRequest
+  | EvidenceSupportsRequest;
+
+export type EvidenceRequest = EvidenceGrantRequest | EvidenceInvalidationsRequest;
 
 /** Refusal reasons this ticket adds on top of the store's denial reasons. */
 export const EVIDENCE_REFUSAL_REASON = {
@@ -144,6 +200,35 @@ export const EVIDENCE_REFUSAL_REASON = {
   ENVELOPE_TOO_LARGE: "envelope_too_large",
   /** The transport injected no binding, or one this build cannot resolve. */
   TRUSTED_BINDING_UNRESOLVED: "trusted_binding_unresolved",
+  /**
+   * A recognised field carrying a version this build does not implement.
+   *
+   * Not folded onto `UNKNOWN_FIELD`, which reports that a key is not part of the
+   * contract: `schema_version` IS on the contract, and telling a caller this
+   * field does not exist would send an operator looking for a malformed payload
+   * when the real fact is a version skew. Register §1b.5 makes the split the
+   * same one fin's parser makes.
+   */
+  UNSUPPORTED_CONTRACT_VERSION: "unsupported_contract_version",
+  /**
+   * A `limit` outside the `1..20` the spec fixes for `invalidations`.
+   *
+   * Also not `UNKNOWN_FIELD`, for the same reason: the key is on the contract
+   * and its value is not on it. Serving the nearest legal value instead would
+   * make a consumer's own over-limit check unreachable, since the backend would
+   * never emit the batch it exists to detect.
+   */
+  INVALIDATION_LIMIT_OUT_OF_RANGE: "invalidation_limit_out_of_range",
+  /**
+   * The `invalidations` action reached the grant read.
+   *
+   * Live rather than historical: `parseEvidenceRequest` accepts the action
+   * because the contract does, and the drain itself is answered by
+   * `evidence-invalidation-read.ts`, which holds the checkpoint key and opens its
+   * own read-only unit of work. Naming the mis-route keeps a caller that composes
+   * the wrong seam on the typed path instead of the exception path.
+   */
+  INVALIDATIONS_NOT_A_GRANT_READ: "invalidations_not_a_grant_read",
 } as const;
 
 export type EvidenceRefusalReason =
@@ -165,14 +250,16 @@ export type EvidenceRefusalReason =
  * the refusal on the Evidence channel's own result token and records the
  * conflict as blocker B4 rather than silently opening the set.
  *
- * B4 is the envelope shape only. Of the eight tokens the spec names, seven are
- * already in one of the two sets above and reach the wire today; exactly one —
- * `unsupported_evidence_contract`, which ADR 0097 §2.1 requires for a
- * `schema_version` other than 1 — is in neither. It is an omission, not a
- * design question: it belongs in `EVIDENCE_FAILURE` as a declared member, beside
- * `MALFORMED_CONTRACT`, because a contract fact is what that set carries. An
- * earlier version of this comment said "six of the eight ... are in neither closed
- * set", which is wrong by five; the count above is enumerated, not estimated.
+ * B4 is the envelope shape only. Of the eight tokens the spec names, seven were
+ * already in one of the two sets above before this module and reached the wire
+ * today; the eighth, `unsupported_evidence_contract`, is the one that had no
+ * home. Register §1b.5a settled it — it is a contract fact, so it joins
+ * `EVIDENCE_FAILURE` as a declared member beside `MALFORMED_CONTRACT` — and
+ * §1.3's `invalidations` action is the case that reaches it. All eight are
+ * enumerated in `EVIDENCE_FAILURE`; there is no token left unplaced. An earlier
+ * version of this comment said "six of the eight ... are in neither closed set",
+ * which was wrong by five and was this register's own unverified restatement
+ * rather than an observation.
  */
 export class EvidenceRefusalError extends Error {
   constructor(
@@ -277,10 +364,50 @@ export interface EvidenceSupportsResult {
   readonly selected: boolean;
 }
 
+/**
+ * One invalidation event: ADR 0097 §2.1's five closed fields.
+ *
+ * Content-free by construction. `evidence_ref` is an opaque handle and
+ * `occurred_at` is a time, so neither names a subject, an operation, a filename
+ * or a value; `reason` is a two-member enum with no expiry member, so an event
+ * can never be read as an age-based collection signal (ADR 0097 §2.6). There is
+ * no optional field set and no free text: an extra key is a contract violation,
+ * which is how the content prohibition is enforced on the consumer's side.
+ */
+export interface EvidenceInvalidationEvent {
+  readonly event_id: string;
+  readonly seq: number;
+  readonly evidence_ref: string;
+  readonly reason: InvalidationReason;
+  readonly occurred_at: string;
+}
+
+/**
+ * The success arm for `invalidations`: one page of a consumer's stream.
+ *
+ * `gap` is the BACKEND'S verdict (ADR 0097 §2.7), never something a consumer
+ * infers from an empty array — a consumer that inferred it would have to treat
+ * "nothing pending" and "this stream moved past something I never saw" as the
+ * same batch, which is the window the spec's revalidate branch exists to close.
+ * `checkpoint` echoes the cursor that was presented and is the consumer's
+ * contiguity attestation; `next_checkpoint` is a NEW token and is the only value
+ * §1.5's acknowledgement may advance through.
+ */
+export interface EvidenceInvalidationsResult {
+  readonly schema: typeof EVIDENCE_RESULT_SCHEMA;
+  readonly schema_version: typeof EVIDENCE_ENVELOPE_VERSION;
+  readonly action: typeof EVIDENCE_ACTION.INVALIDATIONS;
+  readonly checkpoint: string | null;
+  readonly events: readonly EvidenceInvalidationEvent[];
+  readonly next_checkpoint: string;
+  readonly gap: boolean;
+}
+
 export type EvidenceEnvelope =
   | EvidenceErrorEnvelope
   | EvidenceReadResult
-  | EvidenceSupportsResult;
+  | EvidenceSupportsResult
+  | EvidenceInvalidationsResult;
 
 /** The exact request keys each action accepts. */
 const REQUEST_FIELDS: Readonly<Record<EvidenceAction, readonly string[]>> = {
@@ -292,6 +419,17 @@ const REQUEST_FIELDS: Readonly<Record<EvidenceAction, readonly string[]>> = {
     "evidence_ref",
     "cursor",
     "support_id",
+  ],
+  // No `evidence_ref` here, and that omission is the point: this action answers
+  // for the whole consumer stream, so a request naming a reference would be
+  // asking it to filter. `consumer_id` is absent for the same reason the other
+  // actions omit every identity — the transport supplies it, never the request.
+  [EVIDENCE_ACTION.INVALIDATIONS]: [
+    "schema",
+    "schema_version",
+    "action",
+    "checkpoint",
+    "limit",
   ],
 };
 
@@ -323,13 +461,8 @@ export function parseEvidenceRequest(input: unknown): EvidenceRequest {
       `schema must be ${EVIDENCE_REQUEST_SCHEMA}`
     );
   }
-  if (body["schema_version"] !== EVIDENCE_ENVELOPE_VERSION) {
-    throw new EvidenceRefusalError(
-      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
-      `schema_version must be ${EVIDENCE_ENVELOPE_VERSION}`
-    );
-  }
+  const rawVersion = body["schema_version"];
+  assertRequestedVersion(rawVersion);
   const action = body["action"];
   if (typeof action !== "string" || !ACTIONS.includes(action)) {
     throw new EvidenceRefusalError(
@@ -349,14 +482,10 @@ export function parseEvidenceRequest(input: unknown): EvidenceRequest {
         "channel is refused, never read."
     );
   }
-  const evidenceRef = body["evidence_ref"];
-  if (typeof evidenceRef !== "string" || evidenceRef.trim() === "") {
-    throw new EvidenceRefusalError(
-      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
-      "evidence_ref must be a non-empty string"
-    );
+  if (action === EVIDENCE_ACTION.INVALIDATIONS) {
+    return invalidationsRequest(body);
   }
+  const evidenceRef = requireEvidenceRef(body["evidence_ref"]);
   return action === EVIDENCE_ACTION.SUPPORTS
     ? {
         action: EVIDENCE_ACTION.SUPPORTS,
@@ -365,6 +494,105 @@ export function parseEvidenceRequest(input: unknown): EvidenceRequest {
         support_id: optionalSelector(body["support_id"], "support_id"),
       }
     : { action: EVIDENCE_ACTION.READ, evidence_ref: evidenceRef };
+}
+
+/**
+ * The spec's documented `limit` window for `invalidations` (`spec:226`).
+ *
+ * Declared here rather than in the reader because this is the contract, and the
+ * parser is what enforces it: a bound that only the caller knew about would be a
+ * bound every other caller could quietly exceed.
+ */
+export const MIN_INVALIDATION_LIMIT = 1;
+export const MAX_INVALIDATION_LIMIT = 20;
+export const DEFAULT_INVALIDATION_LIMIT = 20;
+
+/**
+ * The envelope version, refused under the class that names the fault.
+ *
+ * WHY two classes, which are not the same fault. A value with no integer form is
+ * a malformed payload — the field is required and must be a number. A finite
+ * integer this build does not implement is a contract this build does not speak,
+ * and ADR 0097 §2.7 names `unsupported_evidence_contract` for exactly that.
+ * Reading it as version 1 is the third option and is never taken: a v2 caller
+ * told it is being served v1 acts on an answer to a question it did not ask, and
+ * ADR 0097 §2.3 already requires version skew to be a refusal rather than a
+ * fallback. Register §1b.5 is the decision this implements.
+ */
+function assertRequestedVersion(rawVersion: unknown): void {
+  if (typeof rawVersion !== "number" || !Number.isInteger(rawVersion)) {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+      "schema_version must be an integer"
+    );
+  }
+  if (rawVersion !== EVIDENCE_ENVELOPE_VERSION) {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.UNSUPPORTED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.UNSUPPORTED_CONTRACT_VERSION,
+      `schema_version ${rawVersion} is not implemented; this build speaks ` +
+        `${EVIDENCE_REQUEST_SCHEMA} version ${EVIDENCE_ENVELOPE_VERSION}. ` +
+        "An unrecognized version is refused, never read as the nearest older one."
+    );
+  }
+}
+
+/** The drain's two fields, resolved. Absent `limit` means the spec's default. */
+function invalidationsRequest(
+  body: Record<string, unknown>
+): EvidenceInvalidationsRequest {
+  return {
+    action: EVIDENCE_ACTION.INVALIDATIONS,
+    // Absent, null and empty all reach the reader as "no position yet": which
+    // spelling means none is the checkpoint's own rule, and re-deciding it here
+    // would be a second rule that could disagree with the codec's.
+    checkpoint: optionalSelector(body["checkpoint"], "checkpoint") ?? null,
+    limit: invalidationLimit(body["limit"]),
+  };
+}
+
+/** The two grant actions' shared field, refused before anything is read. */
+function requireEvidenceRef(value: unknown): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+      "evidence_ref must be a non-empty string"
+    );
+  }
+  return value;
+}
+
+/**
+ * The drain's page size, or the spec's documented default.
+ *
+ * An out-of-range value is REFUSED rather than clamped, and that is the whole
+ * point of the check: a consumer's own guard refuses a batch past the documented
+ * `limit`, and a backend that silently served 20 to a caller who asked for 100
+ * would make that guard unreachable — the batch over the contract would never
+ * reach the consumer whose job is to notice it. `Number.isInteger` before the
+ * range test, so a float or a numeric string cannot pass the bounds it happens
+ * to satisfy.
+ */
+function invalidationLimit(value: unknown): number {
+  if (value === undefined) return DEFAULT_INVALIDATION_LIMIT;
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.INVALIDATION_LIMIT_OUT_OF_RANGE,
+      `limit must be an integer, got ${JSON.stringify(value)}`
+    );
+  }
+  if (value < MIN_INVALIDATION_LIMIT || value > MAX_INVALIDATION_LIMIT) {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.INVALIDATION_LIMIT_OUT_OF_RANGE,
+      `limit must be between ${MIN_INVALIDATION_LIMIT} and ` +
+        `${MAX_INVALIDATION_LIMIT}, got ${value}`
+    );
+  }
+  return value;
 }
 
 /**
@@ -487,6 +715,18 @@ export async function readPrivateEvidence(
       EVIDENCE_FAILURE.ACCESS_DENIED,
       EVIDENCE_REFUSAL_REASON.CONTEXT_NOT_MINTED,
       "the authorized scope context was not minted by this composition"
+    );
+  }
+  // Checked before the unit of work opens, because the answer would be the same
+  // refusal either way and there is no grant, no client and no lock to take for
+  // an action this seam does not answer. `PgEvidenceInvalidationStorage` is.
+  if (request.action === EVIDENCE_ACTION.INVALIDATIONS) {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.INVALIDATIONS_NOT_A_GRANT_READ,
+      "invalidations is answered by the invalidation reader, which holds the " +
+        "checkpoint key; it names no evidence_ref, so this read would be " +
+        "reading a grant nobody named."
     );
   }
   const outcome = await scope.withAuthorizedScope(

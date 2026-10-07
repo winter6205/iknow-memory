@@ -163,8 +163,16 @@ export type EvidenceRefusalReason =
  * `StructuredErrorCode`, a closed set that contains none of the evidence tokens,
  * so putting them there would require widening it. This build therefore carries
  * the refusal on the Evidence channel's own result token and records the
- * conflict as blocker B4 (six of the eight evidence failure codes are in neither
- * closed set) rather than silently opening the set.
+ * conflict as blocker B4 rather than silently opening the set.
+ *
+ * B4 is the envelope shape only. Of the eight tokens the spec names, seven are
+ * already in one of the two sets above and reach the wire today; exactly one —
+ * `unsupported_evidence_contract`, which ADR 0097 §2.1 requires for a
+ * `schema_version` other than 1 — is in neither. It is an omission, not a
+ * design question: it belongs in `EVIDENCE_FAILURE` as a declared member, beside
+ * `MALFORMED_CONTRACT`, because a contract fact is what that set carries. An
+ * earlier version of this comment said "six of the eight ... are in neither closed
+ * set", which is wrong by five; the count above is enumerated, not estimated.
  */
 export class EvidenceRefusalError extends Error {
   constructor(

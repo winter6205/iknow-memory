@@ -66,7 +66,10 @@ import {
   type StructuredSupportRecord,
 } from "../../src/core/structured/result.js";
 import { STRUCTURED_QUERY_FILTER_KEY } from "../../src/core/retrieval/wire-filters.js";
-import { createRetrieveHandler } from "../../src/tools/retrieve.js";
+import {
+  createRetrieveHandler,
+  createRetrieveInputSchema,
+} from "../../src/tools/retrieve.js";
 
 const TEST_DIM = 1536;
 /** A fixed clock reading, so the emitted stamp and expiry are assertable. */
@@ -748,6 +751,25 @@ describe("createRetrieveHandler — the structured seam", () => {
 });
 
 /**
+ * The published top-level keys `retrieve` advertises, frozen in both directions
+ * — an addition and a removal must both go red. Strictness for a CALLER-supplied
+ * unknown key is proven elsewhere (request-conformance refuses one), but that
+ * proof stays green when the schema GAINS a member, because no caller is sending
+ * it yet; that blind spot is exactly what T39's B2 review blocked an earlier
+ * attempt on, and it left the whole repo byte-identical to baseline while the
+ * model-facing surface grew.
+ */
+const RETRIEVE_INPUT_KEYS = [
+  "filters",
+  "limit",
+  "preset",
+  "query",
+  "valid_at",
+  "wait_for_drain",
+  "wait_for_drain_timeout_ms",
+] as const;
+
+/**
  * The frozen host-facing surface. A mode switch hidden inside
  * `filters.structured_query` cannot be advertised by `tools/list`, which is
  * exactly why this feature is safe: the tool set is unchanged and the switch is
@@ -775,7 +797,42 @@ describe("the frozen tool surface", () => {
       await close();
     }
   });
+
+  it("advertises the same seven retrieve input keys, sorted and exact", () => {
+    const published = Object.keys(createRetrieveInputSchema().shape).sort();
+    expect(published, keySetDrift(published)).toEqual([...RETRIEVE_INPUT_KEYS]);
+  });
+
+  it("publishes those same seven retrieve input keys on the wire", async () => {
+    // A schema-only host reads the JSON Schema `tools/list` serves, not the Zod
+    // source, so the source-level freeze above is pinned a second time on the
+    // form that actually ships. The two can only agree if the registration
+    // path publishes the schema a caller is parsed against.
+    const { client, close } = await connectInProcess();
+    try {
+      const { tools } = await client.listTools();
+      const published = Object.keys(
+        (
+          tools.find((tool) => tool.name === "retrieve")?.inputSchema as {
+            properties?: Record<string, unknown>;
+          }
+        ).properties ?? {}
+      ).sort();
+      expect(published, keySetDrift(published)).toEqual([...RETRIEVE_INPUT_KEYS]);
+    } finally {
+      await close();
+    }
+  });
 });
+
+/** Name the keys by which direction the set moved, so a reader sees the change. */
+function keySetDrift(published: string[]): string {
+  const missing = RETRIEVE_INPUT_KEYS.filter((key) => !published.includes(key));
+  const unexpected = published.filter((key) =>
+    !(RETRIEVE_INPUT_KEYS as readonly string[]).includes(key)
+  );
+  return `missing: [${missing.join(", ")}]; unexpected: [${unexpected.join(", ")}]`;
+}
 
 /** Await the handler and return the code it refused with. */
 async function refusalCodeOf(

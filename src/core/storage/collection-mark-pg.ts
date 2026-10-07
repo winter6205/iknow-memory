@@ -105,6 +105,10 @@ export interface CollectionMarkReadInput {
  * a refusal instead. `recheck` is present exactly when the mark is in the `marked`
  * state — a cancelled mark has no live recheck, which is the decision's own answer
  * rather than this store's.
+ *
+ * `refused` is the one arm that is not about the mark at all: it is the scope
+ * ownership fence, reported here because a read of another scope's mark is a caller
+ * error rather than an answer about the payload.
  */
 export type CollectionMarkReadOutcome =
   | { readonly found: false }
@@ -179,7 +183,10 @@ export class PgCollectionMarkStore {
           work.client,
           input.sourceVersionId
         );
-        const unbound = refuseIfUnstammable(facts, input.sourceVersionId);
+        const unbound = refuseIfUnstammable(
+          facts,
+          `source version ${String(input.sourceVersionId)} is not held by the store, so no mark can stop its obligations`
+        );
         if (unbound !== null) return unbound;
       }
 
@@ -253,7 +260,10 @@ export class PgCollectionMarkStore {
       }
 
       const facts = await readMarkSourceFacts(work.client, input.sourceVersionId);
-      const unbound = refuseIfUnstammable(facts, input.sourceVersionId);
+      const unbound = refuseIfUnstammable(
+        facts,
+        `source version ${String(input.sourceVersionId)} is not held by the store, so its mark cannot be reactivated`
+      );
       if (unbound !== null) return unbound;
 
       const outcome = planCollectionReactivation(
@@ -270,11 +280,16 @@ export class PgCollectionMarkStore {
       );
       if (outcome.refused) return outcome;
 
+      // NOT requireLive: a reactivation of an already-cancelled mark is legitimate —
+      // spec:304's precondition is then already satisfied — and the point of the
+      // call is to put the payload back in service. Refusing here would leave
+      // obligations_stopped_at set, and decideGrantRead denies on exactly that
+      // (`evidence-store.ts:449-454`), so the payload could never be served again.
       const withdrew = await cancelMarkRow(
         work.client,
         input.identity,
-        outcome.plan.cancelledAt,
-        outcome.plan.reason
+        { cancelledAt: outcome.plan.cancelledAt, reason: outcome.plan.reason },
+        /* requireLive */ false
       );
       const empty = refuseIfNotWithdrawn(withdrew, input.identity.payloadRef);
       if (empty !== null) return empty;
@@ -311,7 +326,10 @@ export class PgCollectionMarkStore {
       const owned = requireOwnedScope(input.context, input.scopeBinding);
       if (owned !== null) return owned;
       const now = await databaseNow(work.client);
-      const planned = planStaleMarkCancellation(input, now);
+      const planned = planStaleMarkCancellation(
+        { payloadClass: input.payloadClass, payloadRef: input.payloadRef },
+        now
+      );
       if (planned.refused) return planned;
       const observed = await observedRevision(work.client, input.scopeBinding);
       if (observed !== input.observedLifecycleRevision) {
@@ -324,8 +342,8 @@ export class PgCollectionMarkStore {
       const withdrew = await cancelMarkRow(
         work.client,
         input,
-        planned.cancellation.cancelledAt,
-        planned.cancellation.reason
+        { cancelledAt: planned.cancellation.cancelledAt, reason: planned.cancellation.reason },
+        /* requireLive */ true
       );
       const empty = refuseIfNotWithdrawn(withdrew, input.payloadRef);
       if (empty !== null) return empty;
@@ -377,43 +395,45 @@ async function readMarkSourceFacts(
   client: EvidenceClient,
   sourceVersionId: string | null
 ): Promise<SourceVersionFacts> {
-  if (sourceVersionId === null) {
-    return { exists: true, payloadCollected: false, obligationsStopped: false };
-  }
   return readSourceVersionFacts(client, sourceVersionId);
 }
 
-/** Refuse a source version the store does not hold, so no stamp can land on it. */
+/**
+ * Refuse a source version the store does not hold.
+ *
+ * The caller supplies the consequence, because the two callers mean opposite things
+ * by it: a mark is about to STOP a payload's obligations, a reactivation is about to
+ * RESUME them, and a message written for one reads as a non-sequitur in the other.
+ */
 function refuseIfUnstammable(
   facts: SourceVersionFacts,
-  sourceVersionId: string | null
+  detail: string
 ): { readonly refused: true; readonly code: "unsupported_source_binding"; readonly detail: string } | null {
   if (facts.exists) return null;
-  return {
-    refused: true,
-    code: "unsupported_source_binding",
-    detail: `source version ${String(sourceVersionId)} is not held by the store, so no mark can stop its obligations`,
-  };
+  return { refused: true, code: "unsupported_source_binding", detail };
 }
 
 /**
  * Refuse a payload that already carries a mark row.
  *
- * Whether a payload that was marked and then cancelled may be marked again is a
- * retention policy question MP15 has not answered yet, so the safe answer stands:
- * it may not, and the caller is told so rather than finding out from a primary-key
- * collision. PostgreSQL and the memory lane both refuse, deliberately.
+ * Only a LIVE mark refuses. A payload that was marked and then cancelled is exactly
+ * the case spec:307 sends down this path — cancel, re-evaluate, and if it is still
+ * eligible mark it again — so refusing a cancelled row would make the re-evaluation
+ * branch unreachable and strand the payload: never markable, never collected. The
+ * earlier mark's cancellation is overwritten rather than kept; MP15 deletes this row
+ * with the payload, and if the history of a first cancellation is ever needed it
+ * belongs in MP15/MP16's tombstone, not in a row keyed by the payload.
  */
 async function refuseIfAlreadyMarked(
   client: EvidenceClient,
   identity: CollectionMarkIdentity
 ): Promise<{ readonly refused: true; readonly code: "input_stale"; readonly detail: string } | null> {
   const existing = await readMarkRow(client, identity, /* forUpdate */ true);
-  if (existing === null) return null;
+  if (existing === null || existing.state !== "marked") return null;
   return {
     refused: true,
     code: "input_stale",
-    detail: `payload ${identity.payloadRef} already carries a ${existing.state} mark, so marking it again must cancel or delete that one first`,
+    detail: `payload ${identity.payloadRef} already carries a live mark, so marking it again must cancel or delete that one first`,
   };
 }
 
@@ -467,17 +487,23 @@ function requireOwnedScope(
 async function cancelMarkRow(
   client: EvidenceClient,
   identity: CollectionMarkIdentity,
-  cancelledAt: string,
-  reason: CollectionMarkCancelReason
+  cancellation: { readonly cancelledAt: string; readonly reason: CollectionMarkCancelReason },
+  requireLive: boolean
 ): Promise<boolean> {
   // RETURNING rather than rowCount: the client surface here reports rows only, and
   // the returned row IS the proof that a live mark was withdrawn.
   const { rows } = await client.query(
     `UPDATE structured_collection_marks
         SET state = 'cancelled', cancelled_at = $3::timestamptz, cancelled_reason = $4
-      WHERE payload_class = $1 AND payload_ref = $2 AND state = 'marked'
+      WHERE payload_class = $1 AND payload_ref = $2
+        ${requireLive ? "AND state = 'marked'" : ""}
       RETURNING payload_ref`,
-    [identity.payloadClass, identity.payloadRef, cancelledAt, reason]
+    [
+      identity.payloadClass,
+      identity.payloadRef,
+      cancellation.cancelledAt,
+      cancellation.reason,
+    ]
   );
   return rows.length > 0;
 }
@@ -529,11 +555,6 @@ async function observedRevision(
 }
 
 /**
- * The database's own clock. A mark's deadline is a retention promise, so both the
- * instant it is recorded and the instant it is rechecked come from the same clock
- * that wrote the row, not from a process whose clock may differ from the server's.
- */
-/**
  * The database's own clock.
  *
  * The mark's deadline and instant are both decided from this, never from the
@@ -560,6 +581,9 @@ async function readSourceVersionFacts(
   sourceVersionId: string | null
 ): Promise<SourceVersionFacts> {
   if (sourceVersionId === null) {
+    // Unreachable from the mark path — `stopsObligations` is true only for the
+    // source-bound classes, and the identity check refuses those without one. Kept
+    // because the reactivation reaches it directly.
     return { exists: true, payloadCollected: false, obligationsStopped: false };
   }
   const { rows } = await client.query(

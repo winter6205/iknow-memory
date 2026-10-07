@@ -140,8 +140,8 @@ Both sabotage runs, observed:
 
 | Removed | Mutex | Race tests |
 |---|---|---|
-| `MemoryStructuredScopeTail.exclusive` body | gone | 9/9 still green — invariant unaffected |
-| the routing-token re-read in the commit slice | intact | 2 tests red |
+| `MemoryStructuredScopeTail.exclusive` body | gone | all green — invariant unaffected |
+| the routing-token re-read in the commit slice | intact | tests red |
 
 So the tests do have teeth; the lever that proves it is the token check, not the
 tail. A reviewer who sabotages the mutex will see a green suite and wrongly
@@ -154,4 +154,12 @@ rather than by luck. That wrapper is test-side; the store is untouched.
 The invariant under test is "one authoritative state wins" — asserted as the two
 winners directly, `markStands && reactivationStands`, so a failure names the exact
 state it prevents.
+
+**Re-measured after the review repairs**, because the repairs changed what defends
+the invariant: with the token check removed, one race test still goes red. The
+second stopped depending on the token, because refusing a reactivation of a payload
+that was never marked is now an independent barrier in its own right. That is
+defence in depth rather than a weakened test — the two-winner state needs both
+barriers gone at once — but it does mean a future reader must not treat "the token
+lever" as the sole thing these tests check.
 

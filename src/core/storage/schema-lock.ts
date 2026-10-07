@@ -119,6 +119,12 @@ const BOOTSTRAP_TABLES = [
   // short-circuit before replaying their CREATE statements.
   "evidence_invalidation_outbox",
   "evidence_invalidation_cursors",
+  // The explicit-purge capability's two tables: the active-read lease a purge
+  // waits on, and the tombstone that makes a purge retry idempotent. Brand-new
+  // tables, same rule as index_jobs, so the probe names them or a deployed store
+  // would short-circuit before replaying their CREATE statements.
+  "structured_read_leases",
+  "structured_purge_tombstones",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -173,6 +179,8 @@ const BOOTSTRAP_INDEXES = [
   "structured_publication_extraction_bindings_pkey",
   // The retention scan and the purge path key on the reference, not the consumer.
   "evidence_invalidation_outbox_evidence_ref_idx",
+  // The purge's active-read scan: (scope, source) narrowed by a live bound.
+  "structured_read_leases_active_idx",
 ] as const;
 
 /**

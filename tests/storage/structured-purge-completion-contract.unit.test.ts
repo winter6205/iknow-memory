@@ -17,10 +17,7 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { EVIDENCE_FAILURE } from "../../src/core/types.js";
-import {
-  ACK_REFUSAL_REASON,
-  planAckAdvance,
-} from "../../src/core/storage/evidence-invalidation-ack.js";
+import { planAckAdvance } from "../../src/core/storage/evidence-invalidation-ack.js";
 import {
   EVIDENCE_ACTION,
   EVIDENCE_REFUSAL_REASON,
@@ -59,10 +56,10 @@ function retained(
 }
 
 describe("deciding an acknowledgement", () => {
-  it("advances over a range that is exactly as long as it is populated", () => {
+  it("advances over a range whose earliest retained event still opens it", () => {
     // Three events, one cursor row that has acknowledged none of them: the ack
-    // covers seq 3 and the stream holds 1..3, so every event in the range was
-    // handed to this consumer.
+    // covers seq 3 and the stream still opens at 1, so every event in the range
+    // was handed to this consumer.
     expect(
       planAckAdvance({
         coveredSeq: 3,
@@ -73,9 +70,49 @@ describe("deciding an acknowledgement", () => {
           acked_at: NOW,
           last_allocated_seq: 3,
         },
-        coveredRows: 3,
+        firstRetainedSeq: 1,
       })
     ).toEqual({ state: "advance", coveredSeq: 3 });
+  });
+
+  it("advances over a range whose first rows were collected by the retention sweep", () => {
+    // The offline-owner case the retention clause exists for: a sweep collected
+    // the earliest un-acked rows (grant expired, ADR 0099 §2.3), so the window
+    // now opens at 4. Under the old coveredRows comparison this acknowledgement
+    // was refused forever; the floor test sees the range still holds its own
+    // beginning (the row at ackedSeq+1) and advances. Nothing un-judged is lost —
+    // the positions below the floor were the sweep's own verdict, not a skip.
+    expect(
+      planAckAdvance({
+        coveredSeq: 6,
+        cursor: {
+          consumer_id: CONSUMER,
+          acked_checkpoint: "",
+          acked_seq: 3,
+          acked_at: NOW,
+          last_allocated_seq: 6,
+        },
+        firstRetainedSeq: 4,
+      })
+    ).toEqual({ state: "advance", coveredSeq: 6 });
+  });
+
+  it("advances on an empty stream, where a sweep has left no floor at all", () => {
+    // Every event of the range collected by retention, so the window is gone
+    // entirely. `null` is the same "lost to the sweep, not skipped" fact.
+    expect(
+      planAckAdvance({
+        coveredSeq: 6,
+        cursor: {
+          consumer_id: CONSUMER,
+          acked_checkpoint: "",
+          acked_seq: 3,
+          acked_at: NOW,
+          last_allocated_seq: 6,
+        },
+        firstRetainedSeq: null,
+      })
+    ).toEqual({ state: "advance", coveredSeq: 6 });
   });
 
   it("refuses a position past anything this stream handed out", () => {
@@ -91,11 +128,11 @@ describe("deciding an acknowledgement", () => {
         acked_at: NOW,
         last_allocated_seq: 10,
       },
-      coveredRows: 11,
+      firstRetainedSeq: 1,
     });
     expect(plan.state).toBe("refused");
     expect(plan.state === "refused" && plan.reason).toBe(
-      ACK_REFUSAL_REASON.NEVER_ISSUED
+      EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NEVER_ISSUED
     );
   });
 
@@ -109,13 +146,14 @@ describe("deciding an acknowledgement", () => {
         acked_at: NOW,
         last_allocated_seq: 10,
       },
-      // A full count on purpose: the range IS contiguous, so only the direction
-      // can be the fault, and this proves the two refusals do not overlap.
-      coveredRows: 3,
+      // An intact floor on purpose: the range IS contiguous, so only the
+      // direction can be the fault, and this proves the two refusals do not
+      // overlap.
+      firstRetainedSeq: 8,
     });
     expect(plan.state).toBe("refused");
     expect(plan.state === "refused" && plan.reason).toBe(
-      ACK_REFUSAL_REASON.WOULD_MOVE_BACKWARDS
+      EVIDENCE_REFUSAL_REASON.ACK_WOULD_MOVE_BACKWARDS
     );
   });
 
@@ -133,7 +171,7 @@ describe("deciding an acknowledgement", () => {
           acked_at: NOW,
           last_allocated_seq: 10,
         },
-        coveredRows: 0,
+        firstRetainedSeq: 8,
       })
     ).toEqual({ state: "already_acknowledged", coveredSeq: 7 });
   });
@@ -145,14 +183,15 @@ describe("deciding an acknowledgement", () => {
       planAckAdvance({
         coveredSeq: 0,
         cursor: null,
-        coveredRows: 0,
+        firstRetainedSeq: null,
       })
     ).toEqual({ state: "already_acknowledged", coveredSeq: 0 });
   });
 
-  it("refuses a covered range with a hole in it", () => {
-    // Retention removed a row this consumer was never told about, so the range
-    // cannot be one contiguous batch and must not be acknowledged as if it were.
+  it("refuses a range that has lost its own beginning", () => {
+    // The earliest retained event sits ABOVE ackedSeq+1, so the row the range
+    // must open with is gone and the backend cannot say by what — no later
+    // acknowledgement can repair that, so it is refused rather than assumed.
     const plan = planAckAdvance({
       coveredSeq: 3,
       cursor: {
@@ -162,11 +201,11 @@ describe("deciding an acknowledgement", () => {
         acked_at: NOW,
         last_allocated_seq: 3,
       },
-      coveredRows: 2,
+      firstRetainedSeq: 2,
     });
     expect(plan.state).toBe("refused");
     expect(plan.state === "refused" && plan.reason).toBe(
-      ACK_REFUSAL_REASON.NOT_CONTIGUOUS
+      EVIDENCE_REFUSAL_REASON.ACK_RANGE_NOT_CONTIGUOUS
     );
   });
 });
@@ -429,6 +468,28 @@ describe("the four-state vocabularies", () => {
   it("keeps the mis-route refusal tokens distinct", () => {
     expect(EVIDENCE_REFUSAL_REASON.ACK_NOT_A_GRANT_READ).not.toBe(
       EVIDENCE_REFUSAL_REASON.INVALIDATIONS_NOT_A_GRANT_READ
+    );
+  });
+
+  it("names the four ack refusals in the shared vocabulary, typed into it", () => {
+    // The tokens live in `EVIDENCE_REFUSAL_REASON` and `AckRefusalReason` is a
+    // union of them, so the compiler checks every refusal instead of a cast
+    // silencing it: a downstream `switch` on `EvidenceRefusal["reason"]` can no
+    // longer fall through on an ack token. The file-level shape guard below
+    // (`no writer for completed_at outside the reconciler module`) doubles as the
+    // check that no parallel `ACK_REFUSAL_REASON` const has reappeared beside
+    // this module's import surface — the union must point at the one vocabulary.
+    expect(EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NOT_MINTED_HERE).toBe(
+      "ack_checkpoint_not_minted_here"
+    );
+    expect(EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NEVER_ISSUED).toBe(
+      "ack_checkpoint_never_issued"
+    );
+    expect(EVIDENCE_REFUSAL_REASON.ACK_WOULD_MOVE_BACKWARDS).toBe(
+      "ack_would_move_backwards"
+    );
+    expect(EVIDENCE_REFUSAL_REASON.ACK_RANGE_NOT_CONTIGUOUS).toBe(
+      "ack_range_not_contiguous"
     );
   });
 });

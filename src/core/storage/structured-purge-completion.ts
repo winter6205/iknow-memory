@@ -26,9 +26,17 @@
  * also why ADR 0099 §2.4b can say that re-running the reconciler is the only way
  * forward from a partial state.
  *
- * **The configured-owner set is derived, not configured.** See
- * `readConfiguredOwners` for why `evidence_grants.consumer_id` is the whole
- * derivation and why no new configuration surface appears for it.
+ * **Two owner sets, and the reconciler reads only one of them.** The purge
+ * DERIVES its owner set from `evidence_grants` (`readConfiguredOwners`) and
+ * freezes one row per owner; the reconciler then judges against the rows that
+ * derivation left behind (`readRevisionOwners`). Re-deriving at reconcile time
+ * would make a live, mutable table the authority over a decision the purge
+ * already made: MP15's collection deletes from `evidence_grants`, so the last
+ * grant leaving a scope would empty the set and let the all-owner join pass with
+ * no owner judged at all — a revision `completed` with nothing scrubbed. ADR 0099
+ * §2.4b's conjuncts are both about owner ROWS for a revision, and §2.3 says an
+ * owner whose grant expires stays `NULL` rather than being assumed scrubbed; a
+ * grant expiring must never be able to erase an owner from the decision.
  *
  * **Two of the four states are written as client-level functions, not as methods.**
  * `schedulePurgeCompletion` is called from MP16's existing purge transaction and
@@ -94,12 +102,12 @@ export interface PurgeCompletionVerdict extends PurgeCompletionRow {
    * different facts and a caller that wants to distinguish them reads the row.
    */
   readonly applied: boolean;
-  /** The owner ids the guard evaluated, in sorted order. */
+  /** The owner ids the purge froze for this revision, in sorted order. */
   readonly evaluatedOwners: readonly string[];
 }
 
 /**
- * Read this scope's configured owners.
+ * Read this scope's owner set at PURGE time, to freeze one row per owner.
  *
  * **Why `evidence_grants.consumer_id` and not a configuration list.** ADR 0099
  * requires completion for "every configured owner of that revision", and the
@@ -121,12 +129,12 @@ export interface PurgeCompletionVerdict extends PurgeCompletionRow {
  * `unpublishedRefs` in MP16's outcome a fact about an owner and not a contradiction
  * of it.
  *
- * **Re-read at every call rather than frozen once.** The purge transaction freezes
- * one owner row per owner; this reads the live set, so a consumer that gains a
- * grant in the scope afterwards is an owner of every open revision with no owner
- * row — and a missing owner row is not a completion. That is the conservative
- * direction on purpose; `plans/structured-corpus-mp17-completion-p3-i6.md` §6
- * records what it costs.
+ * **The purge's input, and nothing after it.** The set this returns is frozen into
+ * `structured_purge_ack_states` rows in the same commit as the tombstone, and the
+ * reconciler reads those rows instead (see `readRevisionOwners`). This table is
+ * live and MP15's collection deletes from it, so a value re-read here after the
+ * purge would be a different set than the one the purge froze — and the empty one
+ * is reachable, not hypothetical.
  */
 export async function readConfiguredOwners(
   client: PurgeCompletionClient,
@@ -142,6 +150,32 @@ export async function readConfiguredOwners(
     .map((row) => String(row.consumer_id ?? ""))
     .filter(isBoundedConsumerId)
     .sort();
+}
+
+/**
+ * Read the owner set of ONE revision: the owners the purge froze for it.
+ *
+ * This is the set ADR 0099 §2.4b's conjuncts are written over, and the difference
+ * from `readConfiguredOwners` is the difference between a decision and a lookup.
+ * The guard asks "did every owner of this revision scrub?", and the rows in this
+ * table are the answer the purge committed to; `evidence_grants` is a live table
+ * the same decision has no authority over. A consumer that gains a grant in the
+ * scope after the purge is not an owner of that revision — it holds no row, and
+ * ADR 0099 §2.4b judges rows — while an owner whose grant has since expired or
+ * been collected is still one, which is §2.3's "still `NULL`, not assumed
+ * scrubbed" surviving the grant that created it.
+ */
+export async function readRevisionOwners(
+  client: PurgeCompletionClient,
+  key: PurgeCompletionKey
+): Promise<readonly string[]> {
+  const { rows } = await client.query(
+    `SELECT consumer_id
+       FROM structured_purge_ack_states
+      WHERE scope_binding = $1 AND purge_revision = $2`,
+    [key.scopeBinding, key.purgeRevision]
+  );
+  return rows.map((row) => String(row.consumer_id)).sort();
 }
 
 /**
@@ -347,20 +381,21 @@ export async function recordOwnerScrub(
  * The guarded completion UPDATE — the ONLY statement in this repository that
  * sets `completed_at`.
  *
- * Each conjunct is one of ADR 0099 §2.4b's three clauses, plus the two absences
- * that make the join honest:
+ * Each conjunct is one of ADR 0099 §2.4b's three clauses:
  *
  *  - `completed_at IS NULL` — re-running the reconciler changes nothing, so a
  *    second pass cannot restamp the instant.
  *  - `collection_state = 'collected'` — the local delete transaction's own fact.
- *  - `NOT EXISTS (configured owner without a scrubbed row)` — the all-owner join,
- *    written as the NEGATIVE so that a scope with no configured owner completes
- *    vacuously, which is correct: with no owners there are no copied live
- *    snapshot payloads left unacknowledged.
- *  - `ack_state = 'scrubbed'` inside the inner join, never a bare row presence: a
- *    MISSING owner row and an owner row still `scheduled` are the same failure
- *    here, which is the property ADR 0099 §2.4b asks for and the one a bare
- *    `EXISTS` would lose.
+ *  - `NOT EXISTS` an owner row of THIS revision whose `ack_state IS DISTINCT FROM
+ *    'scrubbed'` — the other two clauses of §2.4b at once: no owner row still
+ *    `NULL` or `'scheduled'`, and every owner that exists scrubbed. Written
+ *    against the revision's own rows rather than a configured set re-derived at
+ *    query time, so the join cannot be emptied from under itself.
+ *
+ * The set being judged here is never empty, and that is a precondition rather
+ * than a hope: `reconcile` refuses a revision with no owner row before this
+ * statement runs, because an empty set would make the `NOT EXISTS` vacuously true
+ * and complete a revision on `collected` alone.
  *
  * A zero-row result is not a completion and is not an error either; the
  * reconciler reports it as `completed: false` with the record it actually holds.
@@ -374,15 +409,10 @@ const COMPLETE_PURGE_SQL = `
      AND o.collection_state = 'collected'
      AND NOT EXISTS (
        SELECT 1
-         FROM unnest($3::text[]) AS configured(consumer_id)
-        WHERE NOT EXISTS (
-          SELECT 1
-            FROM structured_purge_ack_states a
-           WHERE a.scope_binding = o.scope_binding
-             AND a.purge_revision = o.purge_revision
-             AND a.consumer_id = configured.consumer_id
-             AND a.ack_state = 'scrubbed'
-        )
+         FROM structured_purge_ack_states a
+        WHERE a.scope_binding = o.scope_binding
+          AND a.purge_revision = o.purge_revision
+          AND a.ack_state IS DISTINCT FROM 'scrubbed'
      )
   RETURNING o.completed_at`;
 
@@ -391,12 +421,13 @@ const COMPLETE_PURGE_SQL = `
  *
  * PG-only and structurally so: it REQUIRES a `ScopeTransactionOwner`, which the
  * memory lane does not supply, so it cannot be composed over a backend whose
- * completion record is a `Map`. The reconciler reads the owner set, attempts the
- * one guarded write and reads the record back inside ONE transaction, because a
- * verdict assembled from two snapshots could describe a state that never held.
+ * completion record is a `Map`. The reconciler reads the record and its owner
+ * rows, attempts the one guarded write and reads the record back inside ONE
+ * transaction, because a verdict assembled from two snapshots could describe a
+ * state that never held.
  *
  * It takes no consumer identity, because it makes no claim on behalf of one: it
- * joins whatever the store says about each owner. `PgStructuredPurgeStore` is the
+ * joins whatever the purge froze for each owner. `PgStructuredPurgeStore` is the
  * construction precedent — same transaction vocabulary, no second one here.
  */
 export class PgPurgeCompletionReconciler {
@@ -407,12 +438,6 @@ export class PgPurgeCompletionReconciler {
     const purgeRevision = requireKeyToken(key?.purgeRevision, "purgeRevision");
     return this.scope.runTransaction(
       async (client) => {
-        const owners = await readConfiguredOwners(client, scopeBinding);
-        const written = await client.query(COMPLETE_PURGE_SQL, [
-          scopeBinding,
-          purgeRevision,
-          owners,
-        ]);
         const row = await readPurgeCompletion(client, {
           scopeBinding,
           purgeRevision,
@@ -427,8 +452,38 @@ export class PgPurgeCompletionReconciler {
             `no purge completion record exists for ${purgeRevision}`
           );
         }
+        const owners = await readRevisionOwners(client, {
+          scopeBinding,
+          purgeRevision,
+        });
+        if (owners.length === 0) {
+          // EXIT: a revision whose owner set is empty has had no scrub judged,
+          // because there is no owner row to judge one against — and the guard
+          // below is written negatively, so an empty set would satisfy it. The
+          // refusal is named rather than returned as a verdict because no re-run
+          // resolves it: only the purge writes these rows, and it wrote none for
+          // this revision. A caller polling for completion would otherwise wait on
+          // a revision that can never reach it.
+          throw new StructuredScopeError(
+            "maintenance_status_unavailable",
+            `purge ${purgeRevision} records no owner for ${scopeBinding}, so no ` +
+              "owner can be shown to have scrubbed it"
+          );
+        }
+        const written = await client.query(COMPLETE_PURGE_SQL, [
+          scopeBinding,
+          purgeRevision,
+        ]);
+        // Read back rather than assembled from `written`: the verdict is the
+        // record the transaction committed, not this pass's expectation of it. The
+        // row was read above in this same transaction and the UPDATE only matched
+        // it, so it cannot have gone.
+        const settled = (await readPurgeCompletion(client, {
+          scopeBinding,
+          purgeRevision,
+        }))!;
         return {
-          ...row,
+          ...settled,
           applied: written.rows.length === 1,
           evaluatedOwners: owners,
         };

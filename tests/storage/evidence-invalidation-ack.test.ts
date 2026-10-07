@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 
 import { EVIDENCE_FAILURE } from "../../src/core/types.js";
-import { ACK_REFUSAL_REASON, PgEvidenceInvalidationAckStore } from "../../src/core/storage/evidence-invalidation-ack.js";
+import { PgEvidenceInvalidationAckStore } from "../../src/core/storage/evidence-invalidation-ack.js";
 import {
   mintInvalidationCheckpoint,
   type InvalidationCheckpointKey,
@@ -55,12 +55,14 @@ interface Recorded {
  * everything, including the transaction bracket.
  *
  * The answers are keyed on the statement, not on a call order, so a reordering
- * cannot make a case pass for the wrong reason.
+ * cannot make a case pass for the wrong reason. `firstSeq` answers the
+ * `readFirstRetainedSeq` query — the delivery fact the new contiguity test reads
+ * from the stream rather than the row count the old one counted.
  */
 function fakeClient(input: {
   authorizationRevision?: string | null;
   cursor?: EvidenceInvalidationCursor | null;
-  retainedSeqs?: readonly number[];
+  firstSeq?: number | null;
   advancedTo?: number;
 }): {
   client: ScopeTransactionClient;
@@ -86,8 +88,13 @@ function fakeClient(input: {
       if (text.includes("FROM evidence_invalidation_cursors")) {
         return { rows: input.cursor === null ? [] : [cursorRow(input.cursor)] };
       }
-      if (text.includes("count(*)::bigint AS covered")) {
-        return { rows: [{ covered: String(input.retainedSeqs?.length ?? 0) }] };
+      if (text.includes("min(seq) AS first_seq")) {
+        return {
+          rows:
+            input.firstSeq === null || input.firstSeq === undefined
+              ? [{ first_seq: null }]
+              : [{ first_seq: String(input.firstSeq) }],
+        };
       }
       if (text.includes("UPDATE evidence_invalidation_cursors")) {
         return {
@@ -216,7 +223,7 @@ interface AckAttempt {
 async function attempt(input: {
   authorizationRevision?: string | null;
   cursor?: EvidenceInvalidationCursor | null;
-  retainedSeqs?: readonly number[];
+  firstSeq?: number | null;
   advancedTo?: number;
   checkpoint: string;
   consumerId?: string;
@@ -224,7 +231,7 @@ async function attempt(input: {
   const { client } = fakeClient({
     authorizationRevision: input.authorizationRevision,
     cursor: input.cursor === undefined ? cursor() : input.cursor,
-    retainedSeqs: input.retainedSeqs,
+    firstSeq: input.firstSeq,
     advancedTo: input.advancedTo,
   });
   const { authority, statements } = fakeAuthority(client);
@@ -267,7 +274,7 @@ describe("the ack transaction's shape", () => {
     // is asserted rather than assumed.
     const { statements } = await acknowledge({
       checkpoint: mintInvalidationCheckpoint(1, CONSUMER, KEY),
-      retainedSeqs: [1],
+      firstSeq: 1,
       advancedTo: 1,
     });
     expect(statements[0]!.text).toBe("BEGIN");
@@ -281,7 +288,7 @@ describe("the ack transaction's shape", () => {
     // is the assertion.
     const { statements } = await acknowledge({
       checkpoint: mintInvalidationCheckpoint(1, CONSUMER, KEY),
-      retainedSeqs: [1],
+      firstSeq: 1,
       advancedTo: 1,
     });
     const authorization = matching(statements, "authorization_revision")[0]!;
@@ -295,7 +302,7 @@ describe("the ack transaction's shape", () => {
       acknowledge({
         authorizationRevision: "rev-2",
         checkpoint: mintInvalidationCheckpoint(1, CONSUMER, KEY),
-        retainedSeqs: [1],
+        firstSeq: 1,
         advancedTo: 1,
       })
     ).rejects.toThrowError(/authorization changed/);
@@ -341,7 +348,7 @@ describe("§1.5's re-verification, as guards on the statements", () => {
     // statement can carry that second fence.
     const { statements } = await acknowledge({
       checkpoint: mintInvalidationCheckpoint(3, CONSUMER, KEY),
-      retainedSeqs: [1, 2, 3],
+      firstSeq: 1,
       advancedTo: 3,
     });
     const update = matching(statements, "UPDATE evidence_invalidation_cursors")[0]!;
@@ -351,7 +358,7 @@ describe("§1.5's re-verification, as guards on the statements", () => {
   it("states the owner-row fence as a scheduled row and a covered position", async () => {
     const { statements } = await acknowledge({
       checkpoint: mintInvalidationCheckpoint(3, CONSUMER, KEY),
-      retainedSeqs: [1, 2, 3],
+      firstSeq: 1,
       advancedTo: 3,
     });
     const update = matching(statements, "UPDATE structured_purge_ack_states")[0]!;
@@ -377,7 +384,7 @@ describe("§1.5's re-verification, as guards on the statements", () => {
       const outcome = await attempt({ checkpoint });
       expect(outcome.error).toBeInstanceOf(EvidenceRefusalError);
       expect((outcome.error as EvidenceRefusalError).reason).toBe(
-        ACK_REFUSAL_REASON.NOT_MINTED_HERE
+        EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NOT_MINTED_HERE
       );
     }
   });
@@ -392,33 +399,70 @@ describe("§1.5's re-verification, as guards on the statements", () => {
     const { statements, reason } = await refusedAttempt({
       checkpoint: mintInvalidationCheckpoint(4, CONSUMER, KEY),
       cursor: cursor({ acked_seq: 7, last_allocated_seq: 10 }),
-      retainedSeqs: [5, 6, 7, 8, 9, 10],
+      firstSeq: 8,
       advancedTo: 7,
     });
-    expect(reason).toBe(ACK_REFUSAL_REASON.WOULD_MOVE_BACKWARDS);
+    expect(reason).toBe(EVIDENCE_REFUSAL_REASON.ACK_WOULD_MOVE_BACKWARDS);
     expect(matching(statements, "UPDATE evidence_invalidation_cursors")).toHaveLength(0);
     expect(matching(statements, "UPDATE structured_purge_ack_states")).toHaveLength(0);
   });
 
-  it("refuses a range the stream no longer holds in full", async () => {
-    const { reason } = await refusedAttempt({
-      // A hole means an event this consumer was never handed sits inside the
-      // acknowledged range.
+  it("refuses a range that has lost its own beginning, without writing anything", async () => {
+    const { statements, reason } = await refusedAttempt({
+      // The earliest retained event sits at 2, above ackedSeq+1: the row the
+      // covered range must open with is gone and nothing left in the stream can
+      // say whether it was swept or skipped.
       checkpoint: mintInvalidationCheckpoint(3, CONSUMER, KEY),
-      retainedSeqs: [1, 3],
+      firstSeq: 2,
       advancedTo: 3,
     });
-    expect(reason).toBe(ACK_REFUSAL_REASON.NOT_CONTIGUOUS);
+    expect(reason).toBe(EVIDENCE_REFUSAL_REASON.ACK_RANGE_NOT_CONTIGUOUS);
+    expect(matching(statements, "UPDATE evidence_invalidation_cursors")).toHaveLength(0);
+    expect(matching(statements, "UPDATE structured_purge_ack_states")).toHaveLength(0);
+  });
+
+  it("advances after a mid-range sweep, because the floor still opens the range", async () => {
+    // The retention clause's own case: a sweep collected rows 4 and 5 above the
+    // stored position 3, so the window now opens at 6. Under a row-count
+    // comparison this acknowledgement would have been refused forever; the floor
+    // still sits at ackedSeq+1, so the batch the checkpoint covers was one
+    // contiguous handover and the advance is written.
+    const { statements, result } = await acknowledge({
+      checkpoint: mintInvalidationCheckpoint(6, CONSUMER, KEY),
+      cursor: cursor({ acked_seq: 3, last_allocated_seq: 6 }),
+      firstSeq: 4,
+      advancedTo: 6,
+    });
+    expect(result.checkpoint).toBe(mintInvalidationCheckpoint(6, CONSUMER, KEY));
+    const update = matching(statements, "UPDATE evidence_invalidation_cursors")[0]!;
+    expect(update.values[2]).toBe(6);
+  });
+
+  it("reads the delivery fact from the stream, not from a remembered count", async () => {
+    // The contiguity question is answered by the `min(seq)` read issued against
+    // the outbox inside this transaction, so the statement — not a stored or
+    // derived number — is the assertion.
+    const { statements } = await acknowledge({
+      checkpoint: mintInvalidationCheckpoint(3, CONSUMER, KEY),
+      firstSeq: 1,
+      advancedTo: 3,
+    });
+    const floorRead = matching(statements, "min(seq) AS first_seq")[0]!;
+    expect(matching(statements, "FROM evidence_invalidation_cursors").length).toBe(1);
+    expect(statements.indexOf(floorRead)).toBeGreaterThan(
+      statements.indexOf(matching(statements, "FROM evidence_invalidation_cursors")[0]!)
+    );
+    expect(floorRead.values[0]).toBe(CONSUMER);
   });
 
   it("refuses a position past the stream's own watermark", async () => {
     const { reason } = await refusedAttempt({
       checkpoint: mintInvalidationCheckpoint(11, CONSUMER, KEY),
       cursor: cursor({ last_allocated_seq: 10 }),
-      retainedSeqs: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+      firstSeq: 1,
       advancedTo: 11,
     });
-    expect(reason).toBe(ACK_REFUSAL_REASON.NEVER_ISSUED);
+    expect(reason).toBe(EVIDENCE_REFUSAL_REASON.ACK_CHECKPOINT_NEVER_ISSUED);
   });
 
   it("types every refusal as a contract fact, never a transport one", async () => {
@@ -438,7 +482,7 @@ describe("the ack success arm", () => {
     const { result } = await acknowledge({
       checkpoint: mintInvalidationCheckpoint(3, CONSUMER, KEY),
       cursor: cursor({ acked_seq: 3, acked_checkpoint: stored, last_allocated_seq: 3 }),
-      retainedSeqs: [],
+      firstSeq: null,
     });
     expect(result).toEqual({
       schema: "iknow.evidence_result",
@@ -456,7 +500,7 @@ describe("the ack success arm", () => {
     const { statements } = await acknowledge({
       checkpoint: mintInvalidationCheckpoint(0, CONSUMER, KEY),
       cursor: cursor({ last_allocated_seq: 0 }),
-      retainedSeqs: [],
+      firstSeq: null,
     });
     expect(matching(statements, "UPDATE structured_purge_ack_states")).toHaveLength(1);
     expect(
@@ -469,7 +513,7 @@ describe("the ack success arm", () => {
     const { result } = await acknowledge({
       checkpoint: presented,
       cursor: cursor({ last_allocated_seq: 0 }),
-      retainedSeqs: [],
+      firstSeq: null,
     });
     // The cursor row exists only because a seq was allocated, so its stored
     // checkpoint is empty. The presented token is server-minted for this consumer

@@ -113,6 +113,7 @@ import {
   slotWriteWidths,
 } from "../embed-slots.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
+import { SERVING_GUARD_CLAUSE } from "./serving-guard-pg.js";
 import { randomUUID } from "node:crypto";
 import {
   assertFilled,
@@ -570,11 +571,16 @@ export function buildVectorSearchQuery(
   params.push(opts.limit);
 
   return {
+    // MP12 (spec 320-323): the guard is a real join to source lifecycle, not a
+    // post-filter. It has to be here rather than after the fetch because a
+    // withdrawn or sole-purged row must never be MATERIALISED — a post-filter
+    // would still have read it, and "we read it and then hid it" is not the
+    // same promise as "we never served it".
     sql: `
       SELECT id, content, source_ref, valid_from, valid_until,
              ${activeSlot} <=> $1::vector AS distance
       FROM chunks
-      WHERE ${where.join(" AND ")}
+      WHERE ${where.join(" AND ")}${SERVING_GUARD_CLAUSE}
       ORDER BY ${activeSlot} <=> $1::vector ASC
       LIMIT $${params.length}
     `,

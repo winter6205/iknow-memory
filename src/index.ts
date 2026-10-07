@@ -58,19 +58,17 @@ import type { BusinessLedgerConfig } from "./core/business-query/sql-query-types
 import { readSourceTool } from "./tools/read_source.js";
 import {
   PgStructuredQueryStorage,
-  type StructuredQueryReadPlan,
-  type StructuredQueryRowPlan,
+  refuseCount,
+  structuredQueryReadOutcome,
+  type StructuredQueryGrantPlan,
+  type StructuredQueryStorage,
 } from "./core/storage/structured-query-reads.js";
 import {
+  queryScopeIdentityFromEnv,
   resolveQueryScope,
-  type QueryScopeEnv,
+  type QueryScopeIdentity,
 } from "./core/storage/structured-query-scope.js";
-import type {
-  StructuredEntityRowRecord,
-  StructuredRelationRowRecord,
-  StructuredQueryReader,
-  StructuredReadContext,
-} from "./core/structured/result.js";
+import type { StructuredQueryReader } from "./core/structured/result.js";
 import type {
   AuthorizedScopeUnitOfWork,
   ScopeTransactionOwner,
@@ -101,6 +99,8 @@ import {
 import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
 import { createAnthropicChunkReranker } from "./core/rerank/anthropic-reranker.js";
 import type {
+  EvidenceStore,
+  GrantRequest,
   IndexJobStore,
   StorageBackend,
   StorageReadPort,
@@ -108,6 +108,7 @@ import type {
 import type { SearchOptions } from "./core/types.js";
 import {
   supportsCommunityIndexState,
+  supportsEvidenceStore,
   supportsIndexJobStore,
   type LexicalStorageBackend,
 } from "./core/storage/backend.js";
@@ -213,93 +214,194 @@ interface ServerDeps {
    * capability trigger — rather than minting unsigned tokens.
    */
   queryCursorKey?: string;
+  /**
+   * The Query identity the HOST bound to this connection, or absent when the
+   * host bound none.
+   *
+   * This is B1's per-connection injection point, so it is an argument rather than
+   * something the reader reads out of the environment: a host serving two
+   * connections from one process composes two sets of deps with two bindings and
+   * the two never share an identity. The production composition reads it from the
+   * session's own environment through `queryScopeIdentityFromEnv`, which is the
+   * channel a stdio host uses when it spawns one child per session with an
+   * explicit `env=` — a channel, not a fallback, because an absent or blank
+   * variable becomes an absent member and an absent member refuses. Reading it
+   * ONCE, here, is what makes it per-CONNECTION: a host that spawns one child
+   * per session has made this process the connection, and nothing a second
+   * connection would share is read again. A host serving two connections from
+   * one process instead composes two sets of deps, with two bindings, and gets
+   * two identities.
+   *
+   * Absent is an unprovisioned capability with no reader, exactly as an absent
+   * cursor key is; present but incomplete is a reader that refuses per call
+   * naming the members it lacks.
+   */
+  queryIdentity?: QueryScopeIdentity;
 }
+
+/**
+ * The one evidence capability this seam mints with: a finite, nonrenewable
+ * reference whose obligations commit together with it — and, for a page, with
+ * each other.
+ *
+ * Narrowed to the batch method because that is all a Query reader needs: a read
+ * returns a whole page of grants, and issuing them one at a time would commit a
+ * prefix of a page the caller may never receive. The store that provides it is
+ * recognized by `supportsEvidenceStore`, which checks the whole `EvidenceStore`,
+ * so a backend missing any method of that capability is not treated as partially
+ * grantable.
+ */
+type StructuredGrantStore = Pick<EvidenceStore, "issueGrants">;
 
 /**
  * Bind a storage-level Query reader to the tool's per-request reader.
  *
- * The storage reader needs an authorized context on every call, while the tool
- * passes only the validated request — so the context is resolved ONCE here, at
- * composition, and re-used for every request this process serves. That is the
- * per-session decision P1-D1 recorded: the read revision a cursor binds is read
- * inside each request's transaction, so the per-request half of the authority is
- * still per-request even though the scope is not.
+ * `identity` is the binding the HOST injected for the connection this reader
+ * serves, and it is an argument rather than something read out of a process-wide
+ * environment. That is B1's rule — per-connection, no process-level fallback, no
+ * default scope — and it is why this function takes the identity instead of
+ * reaching for one: a value read from `process.env` is one identity for every
+ * connection in the process, so the guarantee would rest on the transport
+ * happening to give each connection a process of its own rather than on the
+ * code. A host serving two connections from one process calls this twice, with
+ * two bindings, and gets two identities with nothing global mutated between them.
  *
- * An unprovisioned scope yields `undefined`, which reaches the tool as an absent
- * reader and is reported as `structured_search_unavailable` — the SPEC's
- * capability trigger. It never yields a context with a guessed owner or an empty
- * source set, which would report an authorized empty corpus for a deployment
- * that meant to expose one.
+ * The binding is therefore per CONNECTION, not per call. Re-resolving it per call
+ * is not what makes two sessions differ, and nothing here claims it is: it mints
+ * a fresh context each time so the reader's own entry gate stays meaningful —
+ * `scopeAuthorityOf` admits the context because THIS composition minted it — while
+ * the identity behind it is fixed for the connection.
+ *
+ * An incomplete binding refuses per call with `structured_search_unavailable`,
+ * the SPEC's capability trigger and the same code an absent reader produces, so
+ * a deployment whose host injected no identity reads as unprovisioned rather than
+ * as an authorized empty corpus. The refusal names the members that are absent.
+ * There is no fallback: all six are mandatory, and a guessed owner or an empty
+ * source set would report a corpus nobody authorized.
+ *
+ * Exported so the seam's own properties — that two bindings produce two
+ * identities, and that a row's reference is one the evidence store actually
+ * minted for THAT row — are assertable against the real issuance path rather
+ * than against a stand-in for it (tests/index-query-seam.test.ts,
+ * tests/acceptance/structured-query-pg.test.ts).
  */
-function buildStructuredQueryReader(
+export function buildStructuredQueryReader(
   authority: AuthorizedScopeUnitOfWork & ScopeTransactionOwner,
-  cursorKey: string,
-  env: QueryScopeEnv
-): StructuredQueryReader | undefined {
-  const resolved = resolveQueryScope(authority, env);
-  if ("refusal" in resolved) {
-    return undefined;
-  }
-  const storage = new PgStructuredQueryStorage(
-    authority,
-    Buffer.from(cursorKey, "utf8")
-  );
+  grants: StructuredGrantStore,
+  reader: StructuredQueryStorage,
+  identity: QueryScopeIdentity
+): StructuredQueryReader {
   return {
     readStructuredQuery: async (request) => {
-      const plan = await storage.readStructuredQuery(resolved.context, request);
-      return plan.kind === "list"
-        ? {
-            kind: "list",
-            context: readContextOf(plan),
-            rows: plan.rows.map(readRowOf),
-            nextCursor: plan.nextCursor,
-          }
-        : {
-            kind: "count",
-            context: readContextOf(plan),
-            count: plan.count ?? 0,
-          };
+      const resolved = resolveQueryScope(authority, identity);
+      if ("refusal" in resolved) {
+        throw new StructuredQueryError(
+          resolved.refusal,
+          "structured_search_unavailable"
+        );
+      }
+      const plan = await reader.readStructuredQuery(resolved.context, request);
+      const issued = await issuePage(grants, plan.grants);
+      // The storage layer owns this projection because it owns the issuer-side
+      // refusal: a row or a receipt whose reference was never issued is refused
+      // THERE, on the mismatch between the rows the plan returned and the
+      // references the store minted. The count, by contrast, is already settled
+      // one line up — `grantRequestOf` refuses an unmeasured count before any
+      // grant is written, so the projection's own `count_unavailable` is the
+      // backstop for a caller that reaches it another way, not the guard this
+      // path depends on.
+      return structuredQueryReadOutcome(plan, issued);
     },
   };
 }
 
-/** Project the storage plan's context onto the producer's own shape. */
-function readContextOf(plan: StructuredQueryReadPlan): StructuredReadContext {
-  return {
-    queryDigest: plan.queryDigest,
-    scopeBinding: plan.scopeBinding,
-    readRevision: plan.readRevision,
-    evidenceRef: "",
-    maintenance: plan.maintenance,
-  };
+/**
+ * Mint one reference per grant the plan carries, as a single write.
+ *
+ * The page is issued THROUGH the evidence store's own batch rather than a loop
+ * over `issueGrant`, and that is the whole point: `issueGrant` is one reference
+ * in one transaction, which is correct for one reference and strands the ones
+ * already committed when a later request in the same page fails. A reference
+ * pins its dependencies for 365 days, so a half-issued page leaves obligations
+ * nobody can cite and nobody can unwind — and the caller, who received a refusal,
+ * never learns the reference existed. The batch answers the plan's no-partial-
+ * success clause at the only level it can be answered: inside the write.
+ *
+ * The read itself is `READ ONLY` and a grant is a WRITE, so this follows the read
+ * rather than sharing its transaction. P1-I6 asked for the opposite — to call
+ * `issueGrantRows` "within P1-I1's transaction, so the grant is atomically
+ * consistent with the snapshot it describes" — and that requirement is NOT met
+ * here, so it is recorded rather than restated as the design.
+ *
+ * What the gap is, exactly: `read_revision` is carried from the read, while
+ * `authorization_revision` and `purge_revision` are read from the scope at WRITE
+ * time (evidence-pg.ts `readScopeRevisions`, then the grant insert). A scope
+ * whose authorization advances inside that window therefore produces a grant that
+ * names the NEWER admission revision over the OLDER snapshot. The read proved
+ * its context was authorized at read time and the replay proves the grant's
+ * revision is still current, so the pair cannot be verified end to end: nothing
+ * checks that the revision written down admitted the snapshot read. The window
+ * is the gap between the read's commit and the batch's commit.
+ *
+ * Closing it means making the read's transaction writable and issuing inside it,
+ * which is a change to P1-I1's `READ ONLY REPEATABLE READ` guarantee rather than a
+ * wiring fix, so it is left as a known limitation of this seam.
+ */
+async function issuePage(
+  grants: StructuredGrantStore,
+  grantPlans: readonly StructuredQueryGrantPlan[]
+): Promise<readonly string[]> {
+  const requests = grantPlans.map(grantRequestOf);
+  try {
+    const issued = await grants.issueGrants(requests);
+    return issued.map((grant) => grant.evidence_ref);
+  } catch (error) {
+    // The store refuses in ITS vocabulary — `GraphragError` with a failure token
+    // the evidence lane defines — so an untranslated failure would fall through
+    // the adapter's structured branch and leave as the legacy `{error, message}`
+    // shape, contradicting tools/retrieve.ts's promise that every structured
+    // refusal is a typed envelope. `structured_search_unavailable` is the same
+    // code an unprovisioned identity and an unissued reference report, which is
+    // honest: the capability could not produce a citable answer, and no code in
+    // the closed set claims more than that.
+    //
+    // The original message is KEPT as the error's message rather than replaced,
+    // because that is the log: `structuredErrorEnvelope` builds the host payload
+    // from the code alone, so the detail reaches `logger.error` and never the
+    // wire, while the envelope still carries only `code` + `retryable`.
+    if (error instanceof StructuredQueryError) throw error;
+    throw new StructuredQueryError(
+      error instanceof Error ? error.message : String(error),
+      "structured_search_unavailable"
+    );
+  }
 }
 
 /**
- * Project one planned row onto the producer's row record.
+ * One grant plan as the grant store's own request.
  *
- * The row's citable reference is the grant reference, and P1-I6's issuer is not
- * wired on this path. So a row arrives here WITHOUT one, and the honest reading
- * is that the result cannot be cited: a reference invented here would look
- * citable to a reader and be a lie to anyone who tried to resolve it. The
- * producer's own `readEvidenceRef` therefore refuses the empty reference, which
- * is the SPEC's typed outcome rather than a partial success.
- *
- * Wiring `issueGrantRows` here is the remaining P1-I6 unit; it needs a write
- * transaction, so it cannot be folded into the read path this seam already owns.
+ * The plan carries both arms on every grant — a row grant's null count and a
+ * count grant's empty support set — while `normalizeGrantRequest` refuses a row
+ * grant carrying a count and a count grant naming supports, because each would
+ * retain something its kind may not keep. The arm this grant is NOT is
+ * therefore dropped here rather than forwarded as a null.
  */
-function readRowOf(
-  row: StructuredQueryRowPlan
-): StructuredEntityRowRecord | StructuredRelationRowRecord {
-  // The row's citable reference is its grant's, and `plan.grants[i]` carries no
-  // reference yet: P1-I6's issuer has not run, so the field is absent BY TYPE
-  // rather than merely empty. The empty string here is therefore not a
-  // placeholder value — it is what makes the producer's `readEvidenceRef` refuse
-  // the row with a typed code instead of printing a reference no one granted.
-  // Wiring `issueGrantRows` is the remaining P1-I6 unit; it needs a write
-  // transaction, so it cannot fold into the read path this seam already owns.
-  return { ...row, evidenceRef: "" } as
-    | StructuredEntityRowRecord
-    | StructuredRelationRowRecord;
+function grantRequestOf(plan: StructuredQueryGrantPlan): GrantRequest {
+  const shared = {
+    subject: plan.subject,
+    operation: plan.operation,
+    queryDigest: plan.queryDigest,
+    scopeBinding: plan.scopeBinding,
+    readRevision: plan.readRevision,
+    queriedAt: plan.queriedAt,
+    context: plan.context,
+    value: plan.value,
+  };
+  if (plan.kind === "row") {
+    return { ...shared, kind: "row", supports: plan.supports };
+  }
+  if (plan.count === null) refuseCount();
+  return { ...shared, kind: "count", count: plan.count };
 }
 
 /**
@@ -363,6 +465,7 @@ export function buildRetrieveDeps(
     | "reranker"
     | "businessLedger"
     | "queryCursorKey"
+    | "queryIdentity"
   >,
   debug: boolean
 ): RetrieveDeps {
@@ -389,25 +492,58 @@ export function buildRetrieveDeps(
     ...(deps.businessLedger !== undefined
       ? { businessQuery: new BusinessQueryExecutor(deps.businessLedger) }
       : {}),
-    // The structured reader rides the scope seam the backends already expose,
-    // so it inherits the same authorized-context mint rather than a second one.
-    // The seam is read structurally, the way the evidence dispatcher reads its
-    // own, because `StorageBackend` is chunks-only and the seam is an optional
-    // extension. Key and seam are required together: a key with no seam has
-    // nothing to read, and a seam with no key cannot sign a cursor.
-    ...(() => {
-      const authority = supportsStructuredQueryScope(deps.storage);
-      if (authority === undefined || deps.queryCursorKey === undefined) {
-        return {};
-      }
-      const reader = buildStructuredQueryReader(
-        authority,
-        deps.queryCursorKey,
-        process.env
-      );
-      return reader === undefined ? {} : { structuredReader: reader };
-    })(),
+    // The structured reader rides the scope seam the backends already expose, so
+    // it inherits the same authorized-context mint rather than a second one.
+    ...buildStructuredReaderSlot(deps),
     debug,
+  };
+}
+
+/**
+ * The structured reader this backend and host can serve, or nothing.
+ *
+ * Four capabilities are required together and none alone is usable: a scope seam
+ * to mint with, a cursor key to sign a cursor, an evidence store to mint the
+ * references a row is cited by, and the identity the host bound to THIS
+ * connection. A seam with no key cannot sign a cursor; a seam with no evidence
+ * store could only answer with the empty references that make every non-empty
+ * page refuse; and all three with no identity would answer as the process's own
+ * authority, which is the one answer B1 forbids.
+ *
+ * Its own function so the gate is assertable and `buildRetrieveDeps` stays a
+ * wiring map: which capabilities this server HAS is decided here, and nothing
+ * here decides WHO is asking.
+ */
+function buildStructuredReaderSlot(
+  deps: Pick<
+    ServerDeps,
+    "storage" | "queryCursorKey" | "queryIdentity"
+  >
+): { readonly structuredReader?: StructuredQueryReader } {
+  const authority = supportsStructuredQueryScope(deps.storage);
+  // Read structurally, the way the evidence dispatcher reads its own, because
+  // `StorageBackend` is chunks-only and both seams are optional extensions.
+  const grants = supportsEvidenceStore(deps.storage)
+    ? deps.storage
+    : undefined;
+  if (
+    authority === undefined ||
+    grants === undefined ||
+    deps.queryCursorKey === undefined ||
+    deps.queryIdentity === undefined
+  ) {
+    return {};
+  }
+  return {
+    structuredReader: buildStructuredQueryReader(
+      authority,
+      grants,
+      new PgStructuredQueryStorage(
+        authority,
+        Buffer.from(deps.queryCursorKey, "utf8")
+      ),
+      deps.queryIdentity
+    ),
   };
 }
 
@@ -612,6 +748,12 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     ...(process.env.IKNOW_QUERY_CURSOR_KEY !== undefined
       ? { queryCursorKey: process.env.IKNOW_QUERY_CURSOR_KEY }
       : {}),
+    // The host's half of B1's binding, and the last step on this path that
+    // touches a process global. What the reader then receives is this object, not
+    // the environment — see `ServerDeps.queryIdentity` for why that matters and
+    // for why reading it here rather than per call is what makes it per
+    // connection.
+    queryIdentity: queryScopeIdentityFromEnv(process.env),
   };
 }
 

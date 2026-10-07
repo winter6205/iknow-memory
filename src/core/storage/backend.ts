@@ -235,7 +235,8 @@ export function supportsCommunityReportLexical(
  * coverage requirement is the type system talking: a method added to the
  * capability without an entry here fails `tsc`, which is the only thing that
  * can notice — a runtime `every` over a shorter list would simply stop
- * checking. It is also a conjunction that cannot grow a thirteenth clause.
+ * checking. It is also a conjunction that cannot be satisfied by a subset of
+ * the store.
  */
 const EVIDENCE_STORE_METHODS: Record<keyof EvidenceStore, true> = {
   registerSourceVersion: true,
@@ -244,6 +245,7 @@ const EVIDENCE_STORE_METHODS: Record<keyof EvidenceStore, true> = {
   getSupport: true,
   listSupportExtractions: true,
   issueGrant: true,
+  issueGrants: true,
   readGrant: true,
   listGrantSupports: true,
   listGrantPinnedExtractions: true,

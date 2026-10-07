@@ -13,14 +13,21 @@
 import type { Clock } from "../clock.js";
 
 /**
- * The three maintenance work kinds. They keep independent state, so a job key
- * never spans two of them: the same source scheduled for a re-extraction and
- * for a conflict check is two jobs.
+ * The maintenance work kinds. They keep independent state, so a job key never
+ * spans two of them: the same source scheduled for a re-extraction and for a
+ * conflict check is two jobs.
+ *
+ * `collect_payload` is MP13's kind. It is a separate kind rather than another
+ * status on an existing one because the ledger's fences are the ones a collector
+ * attempt needs — a lease, a fencing token, an attempt bound — and because a
+ * collection job must not join an extraction job whose key happens to share a
+ * source ref.
  */
 export const MAINTENANCE_WORK_KINDS = [
   "extract_publish",
   "conflict_check",
   "projection_rebuild",
+  "collect_payload",
 ] as const;
 
 export type MaintenanceWorkKind = (typeof MAINTENANCE_WORK_KINDS)[number];
@@ -48,14 +55,18 @@ export function isRetryableStatus(status: MaintenanceWorkStatus): boolean {
 
 /**
  * Typed work failures. A failure is always a value that names its class — never
- * an empty success, and never a message the caller has to parse. The subset the
- * spec fixes for maintenance (Physical collection) is present; `ruleset_unavailable`
- * is the config-class code, and `unsupported_source_binding` arrives with the
- * source-lifecycle slice (MP5).
+ * an empty success, and never a message the caller has to parse. This is the
+ * specification's full set of nine (fin specs/structured-corpus-maintenance.md
+ * line 333); `unsupported_source_binding` is the source-binding refusal the
+ * collector returns for a candidate whose source version the store does not hold,
+ * and it now passes through the stores unchanged instead of being renamed to
+ * `backend_unavailable`, which would have told a caller to retry a binding that
+ * will never resolve.
  */
 export const MAINTENANCE_WORK_FAILURE_CODES = [
   "invalid_input",
   "access_denied",
+  "unsupported_source_binding",
   "input_stale",
   "lease_lost",
   "ruleset_unavailable",

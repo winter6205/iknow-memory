@@ -50,8 +50,15 @@
  * request parse and the refusal, because the contract is one: a request that
  * names the action reaches this parser whether or not this function is the seam
  * that answers it, and an action routed here must be a typed refusal rather than
- * a crash or a grant read keyed on nothing. `ack` is still out of scope at both
- * seams — see the fence below.
+ * a crash or a grant read keyed on nothing.
+ *
+ * **`ack` is the same arrangement, one seam further out.** It is answered by
+ * `evidence-invalidation-ack.ts`, which is a WRITE in its own transaction because
+ * register §1.5 makes it re-verify what it advances through; the envelope, the
+ * request parse and the mis-route refusal are still here, for the same reason.
+ * The fence below is therefore closed: the spec's action union at
+ * `specs/structured-corpus-evidence.md:220-227` is fully named and every member
+ * has a seam that can honour it.
  */
 import {
   EVIDENCE_DENIAL_REASON,
@@ -104,20 +111,25 @@ export const EVIDENCE_PRIVATE_METHOD = "corpus_evidence";
  */
 export type EvidenceScope = StructuredScopeUnitOfWork<AuthorizedScopeWork>;
 
-/** The three actions this contract accepts. `ack` is still out of scope here. */
+/** The four actions this contract accepts. */
 export const EVIDENCE_ACTION = {
   READ: "read",
   SUPPORTS: "supports",
   /**
    * Added by register §1.3, which lifted the `invalidations` half of this fence.
-   *
-   * `ack` remains out of scope and is NOT a member: it is a WRITE that
-   * re-verifies the batch it advances through, in its own write transaction, and
-   * the purge-outcome table that makes that re-verification decidable does not
-   * exist yet (register §1.5, ADR 0097 §4.5). Naming it here before it can be
-   * honoured would let a caller receive an action the store cannot serve.
    */
   INVALIDATIONS: "invalidations",
+  /**
+   * The `ack` half, added by register §1.5 — the last member of the spec's action
+   * union (`specs/structured-corpus-evidence.md:227`).
+   *
+   * It is a WRITE, which is why its store lives in
+   * `evidence-invalidation-ack.ts` rather than here or beside the drain read: it
+   * re-verifies the batch it advances through, in its own transaction, and the
+   * purge-owner rows that make that re-verification decidable land with ADR 0099's
+   * `scrubbed` state in the same commit.
+   */
+  ACK: "ack",
 } as const;
 
 export type EvidenceAction = (typeof EVIDENCE_ACTION)[keyof typeof EVIDENCE_ACTION];
@@ -161,18 +173,40 @@ export interface EvidenceInvalidationsRequest {
 }
 
 /**
+ * The acknowledgement request: one position, named by nothing else.
+ *
+ * `checkpoint` is REQUIRED and non-null here, unlike `invalidations`'s nullable
+ * one, and the asymmetry is the contract rather than an inconsistency: a drain may
+ * legitimately start from nowhere, while an acknowledgement that carries no
+ * position is a request with nothing to acknowledge — resolving it to `null` here
+ * would let a caller reach the store asking for an action with no argument.
+ *
+ * The absence of `evidence_ref` and of any identity is the same rule the drain
+ * follows: this action answers for the CONSUMER's stream, so it names no reference
+ * and the transport supplies the consumer.
+ */
+export interface EvidenceAckRequest {
+  readonly action: typeof EVIDENCE_ACTION.ACK;
+  /** The server-minted position the consumer is acknowledging. */
+  readonly checkpoint: string;
+}
+
+/**
  * The actions answered from a single retained grant.
  *
  * Narrower than `EvidenceRequest` on purpose: it is what makes
- * `readPrivateEvidence` structurally unable to be handed a drain, so the wrong
- * routing is a compile error rather than a refusal somebody has to remember to
- * write.
+ * `readPrivateEvidence` structurally unable to be handed a drain or an
+ * acknowledgement, so the wrong routing is a compile error rather than a refusal
+ * somebody has to remember to write.
  */
 export type EvidenceGrantRequest =
   | EvidenceReadRequest
   | EvidenceSupportsRequest;
 
-export type EvidenceRequest = EvidenceGrantRequest | EvidenceInvalidationsRequest;
+export type EvidenceRequest =
+  | EvidenceGrantRequest
+  | EvidenceInvalidationsRequest
+  | EvidenceAckRequest;
 
 /** Refusal reasons this ticket adds on top of the store's denial reasons. */
 export const EVIDENCE_REFUSAL_REASON = {
@@ -229,6 +263,15 @@ export const EVIDENCE_REFUSAL_REASON = {
    * the wrong seam on the typed path instead of the exception path.
    */
   INVALIDATIONS_NOT_A_GRANT_READ: "invalidations_not_a_grant_read",
+  /**
+   * The `ack` action reached the grant read.
+   *
+   * The same mis-route as `invalidations`, and a separate token because the two are
+   * composed against different seams: the acknowledgement is a WRITE in its own
+   * transaction (`evidence-invalidation-ack.ts`) while the drain is a read-only one,
+   * so a caller that routed either here needs to be told which one it got wrong.
+   */
+  ACK_NOT_A_GRANT_READ: "ack_not_a_grant_read",
 } as const;
 
 export type EvidenceRefusalReason =
@@ -403,11 +446,34 @@ export interface EvidenceInvalidationsResult {
   readonly gap: boolean;
 }
 
+/**
+ * The success arm for `ack`: the position the backend now holds as acknowledged.
+ *
+ * One field of contract beyond the envelope, and it is the spec's own wording —
+ * `checkpoint`, meaning the ACKNOWLEDGED one (`specs/structured-corpus-evidence.md:227`).
+ * It exists so fin's recovery path can read the backend's answer rather than
+ * assume its own acknowledgement landed: after a crash between the scrub commit
+ * and fin's own record, the resume point is the server's value, not fin's memory
+ * of what it sent.
+ *
+ * The action is echoed because it is an ACTION of the one `iknow.evidence_result`
+ * envelope (ADR 0097's amendment), so a caller reading the response cannot tell
+ * which action produced it without this field — and must never have to infer it
+ * from the shape.
+ */
+export interface EvidenceAckResult {
+  readonly schema: typeof EVIDENCE_RESULT_SCHEMA;
+  readonly schema_version: typeof EVIDENCE_ENVELOPE_VERSION;
+  readonly action: typeof EVIDENCE_ACTION.ACK;
+  readonly checkpoint: string;
+}
+
 export type EvidenceEnvelope =
   | EvidenceErrorEnvelope
   | EvidenceReadResult
   | EvidenceSupportsResult
-  | EvidenceInvalidationsResult;
+  | EvidenceInvalidationsResult
+  | EvidenceAckResult;
 
 /** The exact request keys each action accepts. */
 const REQUEST_FIELDS: Readonly<Record<EvidenceAction, readonly string[]>> = {
@@ -431,6 +497,12 @@ const REQUEST_FIELDS: Readonly<Record<EvidenceAction, readonly string[]>> = {
     "checkpoint",
     "limit",
   ],
+  // Exactly the keys `invalidations` uses minus `limit`: one position, nothing to
+  // page. `consumer_id` is absent for the same reason the other actions omit every
+  // identity — the transport supplies it, never the request — so an acknowledgement
+  // that named its own stream is an unlisted key and therefore a refusal rather
+  // than a value somebody could assert.
+  [EVIDENCE_ACTION.ACK]: ["schema", "schema_version", "action", "checkpoint"],
 };
 
 const ACTIONS: readonly string[] = Object.values(EVIDENCE_ACTION);
@@ -482,19 +554,34 @@ export function parseEvidenceRequest(input: unknown): EvidenceRequest {
         "channel is refused, never read."
     );
   }
-  if (action === EVIDENCE_ACTION.INVALIDATIONS) {
-    return invalidationsRequest(body);
-  }
-  const evidenceRef = requireEvidenceRef(body["evidence_ref"]);
-  return action === EVIDENCE_ACTION.SUPPORTS
-    ? {
-        action: EVIDENCE_ACTION.SUPPORTS,
-        evidence_ref: evidenceRef,
-        cursor: optionalSelector(body["cursor"], "cursor"),
-        support_id: optionalSelector(body["support_id"], "support_id"),
-      }
-    : { action: EVIDENCE_ACTION.READ, evidence_ref: evidenceRef };
+  // One lookup per action instead of a branch per action. `REQUEST_PARSERS` is a
+  // `Record<EvidenceAction, …>`, so adding a fifth action to the union without
+  // giving it a parser is a COMPILE error — which is the guarantee a chain of
+  // `if (action === …)` comparisons cannot give, and the reason the four-arm
+  // version of this was measured as a regression the moment `ack` arrived.
+  return REQUEST_PARSERS[action as EvidenceAction](body);
 }
+
+/** The four per-action parsers, exhaustive by construction over the action union. */
+const REQUEST_PARSERS: Readonly<
+  Record<EvidenceAction, (body: Record<string, unknown>) => EvidenceRequest>
+> = {
+  [EVIDENCE_ACTION.READ]: (body) => ({
+    action: EVIDENCE_ACTION.READ,
+    evidence_ref: requireEvidenceRef(body["evidence_ref"]),
+  }),
+  [EVIDENCE_ACTION.SUPPORTS]: (body) => ({
+    action: EVIDENCE_ACTION.SUPPORTS,
+    evidence_ref: requireEvidenceRef(body["evidence_ref"]),
+    cursor: optionalSelector(body["cursor"], "cursor"),
+    support_id: optionalSelector(body["support_id"], "support_id"),
+  }),
+  [EVIDENCE_ACTION.INVALIDATIONS]: invalidationsRequest,
+  [EVIDENCE_ACTION.ACK]: (body) => ({
+    action: EVIDENCE_ACTION.ACK,
+    checkpoint: requireCheckpoint(body),
+  }),
+};
 
 /**
  * The spec's documented `limit` window for `invalidations` (`spec:226`).
@@ -550,6 +637,34 @@ function invalidationsRequest(
     checkpoint: optionalSelector(body["checkpoint"], "checkpoint") ?? null,
     limit: invalidationLimit(body["limit"]),
   };
+}
+
+/**
+ * The acknowledgement's one required field.
+ *
+ * The absence of `optionalSelector` here is the whole difference between the two
+ * checkpoint fields: `invalidations` treats "no position" as a legitimate first
+ * drain, while `ack` has nothing to acknowledge without one. `undefined`, `null`,
+ * a blank string and a non-string are therefore all refusals — an empty string in
+ * particular, because a caller that reached the store with one would be asking to
+ * acknowledge a position that cannot exist.
+ *
+ * Refused as `UNKNOWN_FIELD` rather than under its own token because the request
+ * itself is not on the contract in that case, which is precisely what the existing
+ * token says; the version skew and out-of-range tokens exist only where a key IS
+ * on the contract and its VALUE is not.
+ */
+function requireCheckpoint(body: Record<string, unknown>): string {
+  const value = body["checkpoint"];
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.UNKNOWN_FIELD,
+      "the ack action requires a non-empty checkpoint; there is no position to " +
+        "acknowledge without one"
+    );
+  }
+  return value;
 }
 
 /** The two grant actions' shared field, refused before anything is read. */
@@ -693,6 +808,46 @@ function callerRefusal(
   return null;
 }
 
+/**
+ * Refuse the two actions this seam does not answer, before the unit of work opens.
+ *
+ * The answer would be the same refusal either way and there is no grant, no client
+ * and no lock to take for an action answered elsewhere —
+ * `PgEvidenceInvalidationStorage` and `PgEvidenceInvalidationAckStore` are.
+ *
+ * Separate arms rather than one message, because the two mis-routes have different
+ * right answers: the acknowledgement is a WRITE, and handing it to a grant read
+ * would open a READ-ONLY unit of work around a caller who believed it was
+ * recording an advance.
+ *
+ * An assertion rather than a bare guard, so the narrowing it performs is visible
+ * to the caller: after it returns, `request` is a grant request, and every
+ * `request.evidence_ref` below is a field the type has promised exists rather than
+ * an `any` the caller has to trust.
+ */
+function assertNotAStreamAction(
+  request: EvidenceRequest
+): asserts request is EvidenceGrantRequest {
+  if (request.action === EVIDENCE_ACTION.INVALIDATIONS) {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.INVALIDATIONS_NOT_A_GRANT_READ,
+      "invalidations is answered by the invalidation reader, which holds the " +
+        "checkpoint key; it names no evidence_ref, so this read would be " +
+        "reading a grant nobody named."
+    );
+  }
+  if (request.action === EVIDENCE_ACTION.ACK) {
+    throw new EvidenceRefusalError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      EVIDENCE_REFUSAL_REASON.ACK_NOT_A_GRANT_READ,
+      "ack is answered by the invalidation acknowledgement store, which writes " +
+        "in its own transaction; this read names no evidence_ref and grants no " +
+        "consumer position."
+    );
+  }
+}
+
 /** What the scope's callback hands back: one rendered envelope, or one refusal. */
 type ScopeOutcome =
   | { readonly granted: EvidenceReadResult | EvidenceSupportsResult }
@@ -717,18 +872,7 @@ export async function readPrivateEvidence(
       "the authorized scope context was not minted by this composition"
     );
   }
-  // Checked before the unit of work opens, because the answer would be the same
-  // refusal either way and there is no grant, no client and no lock to take for
-  // an action this seam does not answer. `PgEvidenceInvalidationStorage` is.
-  if (request.action === EVIDENCE_ACTION.INVALIDATIONS) {
-    throw new EvidenceRefusalError(
-      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
-      EVIDENCE_REFUSAL_REASON.INVALIDATIONS_NOT_A_GRANT_READ,
-      "invalidations is answered by the invalidation reader, which holds the " +
-        "checkpoint key; it names no evidence_ref, so this read would be " +
-        "reading a grant nobody named."
-    );
-  }
+  assertNotAStreamAction(request);
   const outcome = await scope.withAuthorizedScope(
     context,
     async (work: AuthorizedScopeWork): Promise<ScopeOutcome> => {

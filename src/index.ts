@@ -98,14 +98,16 @@ import {
 } from "./core/graph/neo4j-ppr.js";
 import { createHttpChunkReranker } from "./core/rerank/http-reranker.js";
 import { createAnthropicChunkReranker } from "./core/rerank/anthropic-reranker.js";
-import type {
-  EvidenceStore,
-  GrantRequest,
-  IndexJobStore,
-  StorageBackend,
-  StorageReadPort,
+import {
+  EVIDENCE_FAILURE,
+  type EvidenceStore,
+  type GrantRequest,
+  type IndexJobStore,
+  type ScopeRevisionFence,
+  type SearchOptions,
+  type StorageBackend,
+  type StorageReadPort,
 } from "./core/types.js";
-import type { SearchOptions } from "./core/types.js";
 import {
   supportsCommunityIndexState,
   supportsEvidenceStore,
@@ -301,7 +303,12 @@ export function buildStructuredQueryReader(
         );
       }
       const plan = await reader.readStructuredQuery(resolved.context, request);
-      const issued = await issuePage(grants, plan.grants);
+      const issued = await issuePage(
+        grants,
+        plan.grants,
+        plan.issuanceFence,
+        plan.scopeBinding
+      );
       // The storage layer owns this projection because it owns the issuer-side
       // refusal: a row or a receipt whose reference was never issued is refused
       // THERE, on the mismatch between the rows the plan returned and the
@@ -328,42 +335,50 @@ export function buildStructuredQueryReader(
  * success clause at the only level it can be answered: inside the write.
  *
  * The read itself is `READ ONLY` and a grant is a WRITE, so this follows the read
- * rather than sharing its transaction. P1-I6 asked for the opposite — to call
- * `issueGrantRows` "within P1-I1's transaction, so the grant is atomically
- * consistent with the snapshot it describes" — and that requirement is NOT met
- * here, so it is recorded rather than restated as the design.
+ * rather than sharing its transaction. Before any grant is written, the evidence
+ * store locks the scope revision row and checks the read plan's authorization and
+ * purge fence. If either moved after the read, the whole batch is refused, so a
+ * successful grant cannot describe a snapshot admitted by a later authorization
+ * or purge revision.
  *
- * What the gap is, exactly: `read_revision` is carried from the read, while
- * `authorization_revision` and `purge_revision` are read from the scope at WRITE
- * time (evidence-pg.ts `readScopeRevisions`, then the grant insert). A scope
- * whose authorization advances inside that window therefore produces a grant that
- * names the NEWER admission revision over the OLDER snapshot. The read proved
- * its context was authorized at read time and the replay proves the grant's
- * revision is still current, so the pair cannot be verified end to end: nothing
- * checks that the revision written down admitted the snapshot read. The window
- * is the gap between the read's commit and the batch's commit.
- *
- * Closing it means making the read's transaction writable and issuing inside it,
- * which is a change to P1-I1's `READ ONLY REPEATABLE READ` guarantee rather than a
- * wiring fix, so it is left as a known limitation of this seam.
+ * P1-I6's literal same-transaction requirement remains open: the fence check and
+ * grant write share one evidence transaction, but the read snapshot was produced
+ * by the preceding `READ ONLY REPEATABLE READ` transaction. Sharing one writable
+ * transaction would require changing that P1-I1 guarantee.
  */
 async function issuePage(
   grants: StructuredGrantStore,
-  grantPlans: readonly StructuredQueryGrantPlan[]
+  grantPlans: readonly StructuredQueryGrantPlan[],
+  expectedScopeRevisionFence: ScopeRevisionFence,
+  expectedScopeBinding: string
 ): Promise<readonly string[]> {
+  if (
+    expectedScopeRevisionFence === null ||
+    typeof expectedScopeRevisionFence !== "object" ||
+    expectedScopeRevisionFence.scope_binding !== expectedScopeBinding
+  ) {
+    // EXIT: a missing or mismatched Query fence must not downgrade to the
+    // optional legacy Evidence call contract.
+    throw new StructuredQueryError(
+      "structured query issuance fence is unavailable for its scope",
+      "structured_search_unavailable"
+    );
+  }
   const requests = grantPlans.map(grantRequestOf);
   try {
-    const issued = await grants.issueGrants(requests);
+    const issued = await grants.issueGrants(
+      requests,
+      expectedScopeRevisionFence
+    );
     return issued.map((grant) => grant.evidence_ref);
   } catch (error) {
     // The store refuses in ITS vocabulary — `GraphragError` with a failure token
     // the evidence lane defines — so an untranslated failure would fall through
     // the adapter's structured branch and leave as the legacy `{error, message}`
     // shape, contradicting tools/retrieve.ts's promise that every structured
-    // refusal is a typed envelope. `structured_search_unavailable` is the same
-    // code an unprovisioned identity and an unissued reference report, which is
-    // honest: the capability could not produce a citable answer, and no code in
-    // the closed set claims more than that.
+    // refusal is a typed envelope. A stale authorization fence is reported as
+    // `authorization_denied`; stale purge state and malformed or missing fences
+    // use the existing `structured_search_unavailable` refusal.
     //
     // The original message is KEPT as the error's message rather than replaced,
     // because that is the log: `structuredErrorEnvelope` builds the host payload
@@ -372,7 +387,9 @@ async function issuePage(
     if (error instanceof StructuredQueryError) throw error;
     throw new StructuredQueryError(
       error instanceof Error ? error.message : String(error),
-      "structured_search_unavailable"
+      failureTokenOf(error) === EVIDENCE_FAILURE.ACCESS_DENIED
+        ? "authorization_denied"
+        : "structured_search_unavailable"
     );
   }
 }
@@ -515,17 +532,12 @@ export function buildRetrieveDeps(
  * here decides WHO is asking.
  */
 function buildStructuredReaderSlot(
-  deps: Pick<
-    ServerDeps,
-    "storage" | "queryCursorKey" | "queryIdentity"
-  >
+  deps: Pick<ServerDeps, "storage" | "queryCursorKey" | "queryIdentity">
 ): { readonly structuredReader?: StructuredQueryReader } {
   const authority = supportsStructuredQueryScope(deps.storage);
   // Read structurally, the way the evidence dispatcher reads its own, because
   // `StorageBackend` is chunks-only and both seams are optional extensions.
-  const grants = supportsEvidenceStore(deps.storage)
-    ? deps.storage
-    : undefined;
+  const grants = supportsEvidenceStore(deps.storage) ? deps.storage : undefined;
   if (
     authority === undefined ||
     grants === undefined ||
@@ -989,10 +1001,7 @@ function registerOne(
         // degraded into prose or an empty success would be
         // indistinguishable from a no-match.
         if (err instanceof StructuredQueryError) {
-          return textResult(
-            JSON.stringify(structuredErrorEnvelope(err)),
-            true
-          );
+          return textResult(JSON.stringify(structuredErrorEnvelope(err)), true);
         }
         // A failure that declares a stable token publishes it as the JSON
         // body's `error` field, matching the read_source error results, so a

@@ -23,6 +23,7 @@ import {
   type EvidenceSupportRole,
   type GrantDependencyFact,
   type GrantRequest,
+  type ScopeRevisionFence,
   type ScopeRevisionRecord,
   type SupportRecord,
 } from "../types.js";
@@ -115,9 +116,7 @@ function failureForReason(reason: EvidenceDenialReason): EvidenceFailureToken {
 }
 
 /** The denial half of a read; a grant is never a granted empty value. */
-function deniedForReason(
-  reason: EvidenceDenialReason
-): EvidenceGrantRead {
+function deniedForReason(reason: EvidenceDenialReason): EvidenceGrantRead {
   return { state: "denied", failure: failureForReason(reason), reason };
 }
 
@@ -164,7 +163,9 @@ function normalizeRowSupports(value: unknown): readonly EvidenceSupportRef[] {
       );
     }
     const supportId = assertUuid(entry["support_id"], "support_id");
-    const role = normalizeRole(entry["role"] ?? EVIDENCE_SUPPORT_ROLE.OCCURRENCE);
+    const role = normalizeRole(
+      entry["role"] ?? EVIDENCE_SUPPORT_ROLE.OCCURRENCE
+    );
     // A repeated id is one dependency however many times it was named.
     if (seen.has(supportId)) continue;
     seen.add(supportId);
@@ -194,7 +195,9 @@ function normalizeCount(value: unknown): number {
 }
 
 /** Validate the fields both grant kinds carry, and the bounded envelope. */
-function normalizeGrantBase(input: GrantRequest): Omit<NormalizedGrant, "kind" | "supports" | "count" | "expires_at"> {
+function normalizeGrantBase(
+  input: GrantRequest
+): Omit<NormalizedGrant, "kind" | "supports" | "count" | "expires_at"> {
   if (!isPlainRecord(input)) {
     throw evidenceError(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
@@ -240,7 +243,9 @@ function normalizeGrantBase(input: GrantRequest): Omit<NormalizedGrant, "kind" |
  * carrying a count would carry a value no row reader could interpret.
  */
 export function normalizeGrantRequest(input: GrantRequest): NormalizedGrant {
-  const kind = isPlainRecord(input) ? (input as { kind?: unknown }).kind : undefined;
+  const kind = isPlainRecord(input)
+    ? (input as { kind?: unknown }).kind
+    : undefined;
   if (typeof kind !== "string" || !GRANT_KINDS.includes(kind)) {
     throw evidenceError(
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
@@ -260,7 +265,9 @@ export function normalizeGrantRequest(input: GrantRequest): NormalizedGrant {
       ...base,
       kind: EVIDENCE_GRANT_KIND.ROW,
       expires_at,
-      supports: normalizeRowSupports((input as { supports?: unknown }).supports),
+      supports: normalizeRowSupports(
+        (input as { supports?: unknown }).supports
+      ),
       count: null,
     };
   }
@@ -277,6 +284,63 @@ export function normalizeGrantRequest(input: GrantRequest): NormalizedGrant {
     supports: [],
     count: normalizeCount((input as { count?: unknown }).count),
   };
+}
+
+/** Validate and detach the read-side fence before a grant batch can write. */
+export function normalizeScopeRevisionFence(
+  input: ScopeRevisionFence | undefined,
+  grants: readonly NormalizedGrant[]
+): ScopeRevisionFence | null {
+  if (input === undefined) return null;
+  if (!isPlainRecord(input)) {
+    throw evidenceError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      "expected scope revision fence must be a record"
+    );
+  }
+  const fence: ScopeRevisionFence = Object.freeze({
+    scope_binding: assertFilled(input.scope_binding, "expected scope_binding"),
+    authorization_revision: assertFilled(
+      input.authorization_revision,
+      "expected authorization_revision"
+    ),
+    purge_revision: assertFilled(
+      input.purge_revision,
+      "expected purge_revision"
+    ),
+  });
+  if (grants.some((grant) => grant.scope_binding !== fence.scope_binding)) {
+    throw evidenceError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      "expected scope revision fence must match every grant in the batch"
+    );
+  }
+  return fence;
+}
+
+/** Refuse a batch when authorization or purge moved after its read snapshot. */
+export function assertScopeRevisionFenceCurrent(
+  expected: ScopeRevisionFence,
+  current: ScopeRevisionRecord | null
+): void {
+  if (current === null || current.scope_binding !== expected.scope_binding) {
+    throw evidenceError(
+      EVIDENCE_FAILURE.UNAVAILABLE,
+      `grant: admission scope "${expected.scope_binding}" has no current revisions`
+    );
+  }
+  if (current.authorization_revision !== expected.authorization_revision) {
+    throw evidenceError(
+      EVIDENCE_FAILURE.ACCESS_DENIED,
+      `grant: authorization revision changed for scope "${expected.scope_binding}"`
+    );
+  }
+  if (current.purge_revision !== expected.purge_revision) {
+    throw evidenceError(
+      EVIDENCE_FAILURE.UNAVAILABLE,
+      `grant: purge revision changed for scope "${expected.scope_binding}"`
+    );
+  }
 }
 
 /** The two arms a read returns, so a caller cannot invent a third. */

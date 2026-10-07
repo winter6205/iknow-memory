@@ -182,8 +182,12 @@ export function runEvidenceStoreContract(
       const first = await store.registerSourceVersion(input);
       const second = await store.registerSourceVersion(input);
       expect(first.created).toBe(true);
-      expect(second.created, "an identical repeat is the same version").toBe(false);
-      expect(second.record.source_version_id).toBe(first.record.source_version_id);
+      expect(second.created, "an identical repeat is the same version").toBe(
+        false
+      );
+      expect(second.record.source_version_id).toBe(
+        first.record.source_version_id
+      );
       expect(first.record.retired_at).toBeNull();
     });
 
@@ -248,7 +252,11 @@ export function runEvidenceStoreContract(
       const err = await refusal(
         store.recordSupport(
           occurrenceFor(seed, caseId, {
-            location: { document_id: "other-doc", version: "frozen-v1", unit: 1 },
+            location: {
+              document_id: "other-doc",
+              version: "frozen-v1",
+              unit: 1,
+            },
           })
         )
       );
@@ -263,12 +271,15 @@ export function runEvidenceStoreContract(
       const seed = await seedSourceVersion(store, caseId);
       const first = await store.recordSupport(occurrenceFor(seed, caseId));
       const second = await store.recordSupport(
-        occurrenceFor(seed, caseId, { extraction_ref: `${caseId}-extraction-2` })
+        occurrenceFor(seed, caseId, {
+          extraction_ref: `${caseId}-extraction-2`,
+        })
       );
       expect(first.created).toBe(true);
-      expect(second.created, "the same occurrence is not a second support").toBe(
-        false
-      );
+      expect(
+        second.created,
+        "the same occurrence is not a second support"
+      ).toBe(false);
       expect(second.support.support_id).toBe(first.support.support_id);
       expect(
         await store.listSupportExtractions(first.support.support_id)
@@ -382,7 +393,9 @@ export function runEvidenceStoreContract(
         { created_at: "not-a-date" },
         { source_version_id: "not-a-uuid" },
       ]) {
-        const err = await refusal(store.registerSourceVersion({ ...blank, ...patch }));
+        const err = await refusal(
+          store.registerSourceVersion({ ...blank, ...patch })
+        );
         expect(failureTokenOf(err), JSON.stringify(patch)).toBe(
           EVIDENCE_FAILURE.MALFORMED_CONTRACT
         );
@@ -404,9 +417,13 @@ export function runEvidenceStoreContract(
 
     it("refuses a support id that resolves to nothing", async () => {
       const store = await open();
-      expect(await store.getSupport("00000000-0000-4000-8000-000000000000")).toBeNull();
       expect(
-        await store.listSupportExtractions("00000000-0000-4000-8000-000000000000")
+        await store.getSupport("00000000-0000-4000-8000-000000000000")
+      ).toBeNull();
+      expect(
+        await store.listSupportExtractions(
+          "00000000-0000-4000-8000-000000000000"
+        )
       ).toEqual([]);
     });
 
@@ -451,9 +468,8 @@ export function runEvidenceStoreContract(
       const caseId = uniqueCase();
       await admit(store, caseId);
       const seed = await seedSourceVersion(store, caseId);
-      const support = (
-        await store.recordSupport(occurrenceFor(seed, caseId))
-      ).support;
+      const support = (await store.recordSupport(occurrenceFor(seed, caseId)))
+        .support;
       const endpoint = (
         await store.recordSupport(
           occurrenceFor(seed, caseId, {
@@ -464,7 +480,10 @@ export function runEvidenceStoreContract(
       ).support;
       const grant = await store.issueGrant(
         rowGrant(caseId, [
-          { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+          {
+            support_id: support.support_id,
+            role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+          },
           {
             support_id: endpoint.support_id,
             role: EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY,
@@ -485,12 +504,18 @@ export function runEvidenceStoreContract(
       expect(
         replay.supports.map((entry: SupportRecord) => entry.support_id).sort()
       ).toEqual([support.support_id, endpoint.support_id].sort());
-      expect(replay.authorization, "a row grant re-checks access per dependency").toBeNull();
+      expect(
+        replay.authorization,
+        "a row grant re-checks access per dependency"
+      ).toBeNull();
 
       const dependencies = await store.listGrantSupports(grant.evidence_ref);
-      expect(
-        dependencies.map((entry) => entry.role).sort()
-      ).toEqual([EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY, EVIDENCE_SUPPORT_ROLE.OCCURRENCE].sort());
+      expect(dependencies.map((entry) => entry.role).sort()).toEqual(
+        [
+          EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY,
+          EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        ].sort()
+      );
       // Ordered by support UUID, which is a store-assigned id: the contract
       // is the order, not which random id sorts first.
       expect(
@@ -537,7 +562,9 @@ export function runEvidenceStoreContract(
       for (const grant of [zero, later]) {
         expect(grant.kind).toBe(EVIDENCE_GRANT_KIND.COUNT);
         expect(await store.listGrantSupports(grant.evidence_ref)).toEqual([]);
-        expect(await store.listGrantPinnedExtractions(grant.evidence_ref)).toEqual([]);
+        expect(
+          await store.listGrantPinnedExtractions(grant.evidence_ref)
+        ).toEqual([]);
         const replay = await store.readGrant(grant.evidence_ref, LATER);
         expect(replay.state).toBe("granted");
         if (replay.state !== "granted") return;
@@ -546,9 +573,14 @@ export function runEvidenceStoreContract(
         expect(replay.grant.value).toEqual(grant.value);
       }
       // The stored value is the receipt as supplied — no ids array added to it.
-      expect(Object.keys(zero.value as object).sort()).toEqual(["count", "operation"]);
+      expect(Object.keys(zero.value as object).sort()).toEqual([
+        "count",
+        "operation",
+      ]);
       // One receipt serves every reference admitted under this scope/revision.
-      expect(zero.authorization_receipt_id).toBe(later.authorization_receipt_id);
+      expect(zero.authorization_receipt_id).toBe(
+        later.authorization_receipt_id
+      );
       // A support existed when the count was taken and still pins nothing.
       expect(await store.getSupport(support.support_id)).not.toBeNull();
       expect(zero.authorization_receipt_id).not.toBeNull();
@@ -583,9 +615,14 @@ export function runEvidenceStoreContract(
       expect(reread.state).toBe("granted");
       if (reread.state !== "granted") return;
       expect(Date.parse(reread.grant.expires_at)).toBe(expiry);
-      expect((await store.readGrant(grant.evidence_ref, new Date(expiry).toISOString())).state).toBe(
-        "denied"
-      );
+      expect(
+        (
+          await store.readGrant(
+            grant.evidence_ref,
+            new Date(expiry).toISOString()
+          )
+        ).state
+      ).toBe("denied");
     });
 
     it("invalidates count replay on a permission change and on a purge", async () => {
@@ -593,7 +630,9 @@ export function runEvidenceStoreContract(
       const caseId = uniqueCase();
       await admit(store, caseId);
       const grant = await store.issueGrant(countGrant(caseId, 3));
-      expect((await store.readGrant(grant.evidence_ref, LATER)).state).toBe("granted");
+      expect((await store.readGrant(grant.evidence_ref, LATER)).state).toBe(
+        "granted"
+      );
 
       await store.setScopeRevisions(`${caseId}-scope`, {
         authorizationRevision: "auth-2",
@@ -606,7 +645,9 @@ export function runEvidenceStoreContract(
       });
 
       const afterPurge = await store.issueGrant(countGrant(caseId, 3));
-      await store.setScopeRevisions(`${caseId}-scope`, { purgeRevision: "purge-2" });
+      await store.setScopeRevisions(`${caseId}-scope`, {
+        purgeRevision: "purge-2",
+      });
       const purged = await store.readGrant(afterPurge.evidence_ref, LATER);
       expect(purged).toEqual({
         state: "denied",
@@ -625,11 +666,17 @@ export function runEvidenceStoreContract(
       const count = await store.issueGrant(countGrant(caseId, 1));
       const row = await store.issueGrant(
         rowGrant(caseId, [
-          { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+          {
+            support_id: support.support_id,
+            role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+          },
         ])
       );
 
-      await store.markSourceVersionRetired(seed.version.source_version_id, LATER);
+      await store.markSourceVersionRetired(
+        seed.version.source_version_id,
+        LATER
+      );
       await store.collectSourceVersionPayload(
         seed.version.source_version_id,
         LATER
@@ -651,7 +698,10 @@ export function runEvidenceStoreContract(
       const support = (await store.recordSupport(occurrenceFor(seed, caseId)))
         .support;
       const deps = [
-        { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+        {
+          support_id: support.support_id,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
       ];
       const before = await store.issueGrant(rowGrant(caseId, deps));
 
@@ -662,7 +712,10 @@ export function runEvidenceStoreContract(
       const err = await refusal(store.issueGrant(rowGrant(caseId, deps)));
       expect(failureTokenOf(err)).toBe(EVIDENCE_FAILURE.UNAVAILABLE);
 
-      const replay = await store.readGrant(before.evidence_ref, "2026-05-02T00:00:00.000Z");
+      const replay = await store.readGrant(
+        before.evidence_ref,
+        "2026-05-02T00:00:00.000Z"
+      );
       expect(replay).toEqual({
         state: "denied",
         failure: EVIDENCE_FAILURE.UNAVAILABLE,
@@ -670,9 +723,10 @@ export function runEvidenceStoreContract(
       });
       // A count grant holds no source dependency, so it is untouched.
       const count = await store.issueGrant(countGrant(caseId, 0));
-      expect((await store.readGrant(count.evidence_ref, "2026-05-02T00:00:00.000Z")).state).toBe(
-        "granted"
-      );
+      expect(
+        (await store.readGrant(count.evidence_ref, "2026-05-02T00:00:00.000Z"))
+          .state
+      ).toBe("granted");
     });
 
     it("refuses a whole batch when one member cannot be issued, and leaves the scope issuing", async () => {
@@ -697,7 +751,10 @@ export function runEvidenceStoreContract(
       const support = (await store.recordSupport(occurrenceFor(seed, caseId)))
         .support;
       const good = [
-        { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+        {
+          support_id: support.support_id,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
       ];
       const ABSENT = "00000000-0000-4000-8000-00000000dead";
 
@@ -736,7 +793,10 @@ export function runEvidenceStoreContract(
       const support = (await store.recordSupport(occurrenceFor(seed, caseId)))
         .support;
       const deps = [
-        { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+        {
+          support_id: support.support_id,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
       ];
       const requests = [
         rowGrant(caseId, deps, { queryDigest: `${caseId}-q0` }),
@@ -760,6 +820,58 @@ export function runEvidenceStoreContract(
           "granted"
         );
       }
+    });
+
+    it("checks the expected scope revisions before issuing, including an empty batch", async () => {
+      const store = await open();
+      const caseId = uniqueCase();
+      await admit(store, caseId);
+      const expected = {
+        scope_binding: `${caseId}-scope`,
+        authorization_revision: "auth-1",
+        purge_revision: "purge-1",
+      };
+
+      await store.setScopeRevisions(expected.scope_binding, {
+        authorizationRevision: "auth-2",
+      });
+      const authChanged = await refusal(
+        store.issueGrants([countGrant(caseId, 0)], expected)
+      );
+      expect(failureTokenOf(authChanged)).toBe(EVIDENCE_FAILURE.ACCESS_DENIED);
+
+      const emptyBatch = await refusal(store.issueGrants([], expected));
+      expect(failureTokenOf(emptyBatch)).toBe(EVIDENCE_FAILURE.ACCESS_DENIED);
+
+      const purgeCase = uniqueCase();
+      await admit(store, purgeCase);
+      const purgeFence = {
+        scope_binding: `${purgeCase}-scope`,
+        authorization_revision: "auth-1",
+        purge_revision: "purge-1",
+      };
+      await store.setScopeRevisions(purgeFence.scope_binding, {
+        purgeRevision: "purge-2",
+      });
+      const purgeChanged = await refusal(
+        store.issueGrants([countGrant(purgeCase, 0)], purgeFence)
+      );
+      expect(failureTokenOf(purgeChanged)).toBe(EVIDENCE_FAILURE.UNAVAILABLE);
+    });
+
+    it("rejects an expected revision fence for another scope", async () => {
+      const store = await open();
+      const caseId = uniqueCase();
+      await admit(store, caseId);
+      const expected = {
+        scope_binding: "another-scope",
+        authorization_revision: "auth-1",
+        purge_revision: "purge-1",
+      };
+      const err = await refusal(
+        store.issueGrants([countGrant(caseId, 0)], expected)
+      );
+      expect(failureTokenOf(err)).toBe(EVIDENCE_FAILURE.MALFORMED_CONTRACT);
     });
 
     it("refuses an unknown reference, an unknown scope and a malformed instant", async () => {
@@ -790,7 +902,10 @@ export function runEvidenceStoreContract(
       const support = (await store.recordSupport(occurrenceFor(seed, caseId)))
         .support;
       const deps = [
-        { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+        {
+          support_id: support.support_id,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
       ];
 
       const malformed: Array<[string, unknown]> = [
@@ -806,16 +921,31 @@ export function runEvidenceStoreContract(
         ["row with no supports", rowGrant(caseId, [])],
         ["row with a count", { ...rowGrant(caseId, deps), count: 1 }],
         ["count with supports", { ...countGrant(caseId, 1), supports: deps }],
-        ["bad role", rowGrant(caseId, [{ support_id: support.support_id, role: "pin" }])],
-        ["empty support id", rowGrant(caseId, [{ support_id: "", role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE }])],
-        ["support id is not a uuid", rowGrant(caseId, [{ support_id: "nope", role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE }])],
+        [
+          "bad role",
+          rowGrant(caseId, [{ support_id: support.support_id, role: "pin" }]),
+        ],
+        [
+          "empty support id",
+          rowGrant(caseId, [
+            { support_id: "", role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+          ]),
+        ],
+        [
+          "support id is not a uuid",
+          rowGrant(caseId, [
+            { support_id: "nope", role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+          ]),
+        ],
         ["negative count", countGrant(caseId, -1)],
         ["fractional count", countGrant(caseId, 1.5)],
         ["not-a-number count", countGrant(caseId, Number.NaN)],
         ["overflowing count", countGrant(caseId, Number.MAX_SAFE_INTEGER + 2)],
         [
           "oversized value",
-          rowGrant(caseId, deps, { value: { blob: "x".repeat(MAX_EVIDENCE_BYTES + 1) } }),
+          rowGrant(caseId, deps, {
+            value: { blob: "x".repeat(MAX_EVIDENCE_BYTES + 1) },
+          }),
         ],
       ];
       for (const [name, request] of malformed) {

@@ -32,10 +32,11 @@
  *
  * This reader does NOT issue its own evidence grants. A grant is a WRITE and this
  * transaction is `READ ONLY`, so the read returns a `StructuredQueryReadPlan`
- * carrying everything a grant needs; the caller issues it through the injected
- * `StructuredQueryGrantIssuer` and projects the outcome with
- * `buildStructuredResult`. That keeps P1-I6's grant wiring a constructor
- * injection instead of a rewrite.
+ * carrying the authorization and purge revision fence observed by this snapshot.
+ * The caller passes that fence into the injected `StructuredQueryGrantIssuer`,
+ * which locks and rechecks it before writing. This closes the stale-read grant
+ * window; the grant write still runs in its own transaction, so P1-I6's literal
+ * same-transaction requirement remains open.
  */
 import {
   buildMaintenanceStatus,
@@ -59,6 +60,8 @@ import {
   type StructuredSupportRecord,
   structuredResultEnvelopeBytes,
 } from "../structured/result.js";
+import type { ScopeRevisionFence, ScopeRevisionRecord } from "../types.js";
+import { readScopeRevisions } from "./evidence-pg.js";
 import { stableSourceRefs } from "./structured-scope-locks-pg.js";
 import {
   buildPgMaintenanceStatus,
@@ -165,7 +168,8 @@ export type StructuredQuerySupportRole =
  *
  * The reader returns these rather than calling `issueGrantRows`, because issuing
  * a grant is a write and this read is `READ ONLY`. The shape is deliberately
- * field-for-field the grant request, so P1-I6 is a constructor injection.
+ * field-for-field the grant request. The read plan also carries the revision
+ * fence that the batch issuer must still match before it persists these grants.
  */
 export interface StructuredQueryGrantPlan {
   readonly kind: "row" | "count";
@@ -231,8 +235,7 @@ export interface StructuredQueryRelationRowPlan {
  * projection needs and nothing that would have to be written back afterwards.
  */
 export type StructuredQueryRowPlan =
-  | StructuredQueryEntityRowPlan
-  | StructuredQueryRelationRowPlan;
+  StructuredQueryEntityRowPlan | StructuredQueryRelationRowPlan;
 
 /** What the reader proved, before any evidence reference was issued. */
 export interface StructuredQueryReadPlan {
@@ -244,6 +247,8 @@ export interface StructuredQueryReadPlan {
   readonly readerBinding: string;
   readonly authorizationRevision: string;
   readonly readRevision: string;
+  /** Detached snapshot fence rechecked before any evidence grant is written. */
+  readonly issuanceFence: ScopeRevisionFence;
   readonly queriedAt: string;
   readonly maintenance: StructuredMaintenanceRecord;
   readonly rows: readonly StructuredQueryRowPlan[];
@@ -393,31 +398,48 @@ function authorizedSubset(
 }
 
 /**
- * Re-read the scope's authorization inside the read transaction.
+ * Validate the observed scope revisions and detach them as an issuance fence.
  *
  * A context minted before a revocation still names a scope this reader would
  * happily read; only the persisted revision says whether it is still authorized.
  */
-async function assertCurrentAuthorization(
-  client: ScopeTransactionClient,
+function assertCurrentAuthorization(
+  revisions: Readonly<ScopeRevisionRecord> | null,
   context: AuthorizedScopeContext
-): Promise<void> {
-  const { rows } = await client.query(
-    `SELECT authorization_revision
-       FROM evidence_scope_revisions WHERE scope_binding = $1`,
-    [context.ownerScopeBinding]
-  );
-  const row = rows[0] as Record<string, unknown> | undefined;
-  const granted = row?.authorization_revision;
-  if (granted === context.authorizationRevision) return;
-  // EXIT: the scope carries no authorization row, or its authorization moved
-  // after this context was minted. An old cursor must not restore revoked access.
-  throw new StructuredQueryError(
-    granted === undefined || granted === null
-      ? "the trusted scope carries no authorization revision"
-      : "the trusted scope's authorization changed after this context was minted",
-    "authorization_denied"
-  );
+): ScopeRevisionFence {
+  if (
+    revisions === null ||
+    revisions.scope_binding !== context.ownerScopeBinding
+  ) {
+    // EXIT: a missing or mismatched persisted scope cannot prove this context's
+    // authorization, so refuse the read before returning any page or count.
+    throw new StructuredQueryError(
+      "the trusted scope carries no authorization revision",
+      "authorization_denied"
+    );
+  }
+  if (revisions.authorization_revision !== context.authorizationRevision) {
+    // EXIT: an old cursor or context must not restore access after revocation.
+    throw new StructuredQueryError(
+      "the trusted scope's authorization changed after this context was minted",
+      "authorization_denied"
+    );
+  }
+  if (
+    typeof revisions.purge_revision !== "string" ||
+    revisions.purge_revision.length === 0
+  ) {
+    // EXIT: without a known purge revision, this page cannot be fenced at write time.
+    throw new StructuredQueryError(
+      "the trusted scope's purge revision is unavailable",
+      "structured_search_unavailable"
+    );
+  }
+  return Object.freeze({
+    scope_binding: revisions.scope_binding,
+    authorization_revision: revisions.authorization_revision,
+    purge_revision: revisions.purge_revision,
+  });
 }
 
 /**
@@ -427,13 +449,14 @@ async function assertCurrentAuthorization(
  * `structured_search_unavailable`: the request was valid, so retrying it unchanged
  * cannot help beyond the code's own retryability.
  */
-const SCOPE_CODE_MAP: Readonly<Partial<Record<StructuredScopeFailureCode, StructuredErrorCode>>> =
-  {
-    access_denied: "authorization_denied",
-    maintenance_status_unavailable: "maintenance_status_unavailable",
-    execution_timeout: "query_timeout",
-    lease_lost: "query_timeout",
-  };
+const SCOPE_CODE_MAP: Readonly<
+  Partial<Record<StructuredScopeFailureCode, StructuredErrorCode>>
+> = {
+  access_denied: "authorization_denied",
+  maintenance_status_unavailable: "maintenance_status_unavailable",
+  execution_timeout: "query_timeout",
+  lease_lost: "query_timeout",
+};
 
 function structuredRefusal(error: StructuredScopeError): StructuredQueryError {
   return new StructuredQueryError(
@@ -574,7 +597,9 @@ interface SubjectDisplay {
 /** How one subject was stored, so an entity row can find an endpoint's display. */
 type StorageSubject = "entity" | "assertion";
 
-function storageSubjectOf(subject: "entity" | "relation_assertion"): StorageSubject {
+function storageSubjectOf(
+  subject: "entity" | "relation_assertion"
+): StorageSubject {
   return subject === "entity" ? "entity" : "assertion";
 }
 
@@ -601,7 +626,8 @@ function groupSubjects(
       groups.set(membership.resultId, group);
     }
     group.sourceRefs.add(membership.sourceRef);
-    for (const supportId of membership.supportIds) group.supportIds.add(supportId);
+    for (const supportId of membership.supportIds)
+      group.supportIds.add(supportId);
   }
   return groups;
 }
@@ -621,9 +647,15 @@ function displayIndex(
   snapshot: AcceptedInputSnapshot,
   groups: ReadonlyMap<string, SubjectGroup>
 ): Map<string, SubjectDisplay> {
-  const extractions = new Map<string, AcceptedInputSnapshot["extractions"][number]>();
+  const extractions = new Map<
+    string,
+    AcceptedInputSnapshot["extractions"][number]
+  >();
   for (const extraction of snapshot.extractions) {
-    extractions.set(`${extraction.sourceRef}\u0000${extraction.extractionRef}`, extraction);
+    extractions.set(
+      `${extraction.sourceRef}\u0000${extraction.extractionRef}`,
+      extraction
+    );
   }
   const chosen = new Map<string, MutableDisplay>();
   for (const membership of snapshot.memberships) {
@@ -631,7 +663,9 @@ function displayIndex(
     if (group === undefined) continue;
     const supports = new Set(membership.supportIds);
     for (const extractionRef of membership.extractionRefs) {
-      const extraction = extractions.get(`${membership.sourceRef}\u0000${extractionRef}`);
+      const extraction = extractions.get(
+        `${membership.sourceRef}\u0000${extractionRef}`
+      );
       if (extraction === undefined) continue;
       for (const value of extraction.attributedValues) {
         if (supports.has(value.supportId)) {
@@ -662,7 +696,11 @@ interface MutableDisplay {
 function recordDisplayCandidate(
   chosen: Map<string, MutableDisplay>,
   resultId: string,
-  value: { readonly supportId: string; readonly canonicalName: string; readonly entityType: string }
+  value: {
+    readonly supportId: string;
+    readonly canonicalName: string;
+    readonly entityType: string;
+  }
 ): void {
   let entry = chosen.get(resultId);
   if (entry === undefined) {
@@ -708,10 +746,12 @@ function matchesOwnFields(
         if (!exactTest(filter, group.resultId)) return false;
         break;
       case "canonical_name":
-        if (display === null || !exactTest(filter, display.canonicalName)) return false;
+        if (display === null || !exactTest(filter, display.canonicalName))
+          return false;
         break;
       case "type":
-        if (display === null || !exactTest(filter, display.entityType)) return false;
+        if (display === null || !exactTest(filter, display.entityType))
+          return false;
         break;
       case "source_ref":
         if (
@@ -779,7 +819,9 @@ function exactTest(
   filter: ValidatedStructuredQuery["filters"][number],
   value: string
 ): boolean {
-  return filter.op === "eq" ? filter.value === value : filter.values.includes(value);
+  return filter.op === "eq"
+    ? filter.value === value
+    : filter.values.includes(value);
 }
 
 /** Ascending UUID byte order. */
@@ -824,6 +866,7 @@ interface AssemblyInput {
   readonly snapshot: AcceptedInputSnapshot;
   readonly maintenance: MaintenanceStatus;
   readonly readRevision: string;
+  readonly issuanceFence: ScopeRevisionFence;
   readonly tuples: StructuredQueryTupleReader;
   readonly supports: StructuredQuerySupportReader;
   readonly now: Date;
@@ -862,12 +905,16 @@ async function assembleRead(
     readerBinding: context.readerBinding,
     authorizationRevision: context.authorizationRevision,
     readRevision,
+    issuanceFence: Object.freeze({ ...input.issuanceFence }),
     queriedAt,
     maintenance,
   };
   const subject = request.subject;
   const groups = groupSubjects(snapshot.memberships, storageSubjectOf(subject));
-  const displays = displayIndex(snapshot, displayGroups(snapshot, subject, groups));
+  const displays = displayIndex(
+    snapshot,
+    displayGroups(snapshot, subject, groups)
+  );
   const matched =
     subject === "entity"
       ? matchEntities(request, groups, displays)
@@ -888,7 +935,9 @@ async function assembleRead(
   }
   const limit = request.limit ?? STRUCTURED_LIST_DEFAULT_LIMIT;
   const start =
-    continuation.after === null ? 0 : lowerBound(matched, continuation.after) + 1;
+    continuation.after === null
+      ? 0
+      : lowerBound(matched, continuation.after) + 1;
   const selected = matched.slice(start, start + limit);
   const { rows } = await buildRows(selected, displays, input);
   const bounded = boundPageToEnvelope(rows, {
@@ -940,7 +989,10 @@ function assertRevisionBinding(
   readRevision: string
 ): void {
   if (request.operation === "count") {
-    if (request.readRevision !== undefined && request.readRevision !== readRevision) {
+    if (
+      request.readRevision !== undefined &&
+      request.readRevision !== readRevision
+    ) {
       // EXIT: the count asked for a revision this transaction did not read.
       // Answering with the current count would report a receipt for a revision
       // the caller never asked about.
@@ -965,7 +1017,9 @@ function matchEntities(
   displays: ReadonlyMap<string, SubjectDisplay>
 ): SubjectGroup[] {
   return [...groups.values()]
-    .filter((group) => matchesOwnFields(request, group, displays.get(group.resultId) ?? null))
+    .filter((group) =>
+      matchesOwnFields(request, group, displays.get(group.resultId) ?? null)
+    )
     .sort((left, right) => compareUuidBytes(left.resultId, right.resultId));
 }
 
@@ -983,10 +1037,14 @@ async function matchRelations(
   tuples: StructuredQueryTupleReader
 ): Promise<SubjectGroup[]> {
   const candidates = [...groups.values()]
-    .filter((group) => matchesOwnFields(request, group, displays.get(group.resultId) ?? null))
+    .filter((group) =>
+      matchesOwnFields(request, group, displays.get(group.resultId) ?? null)
+    )
     .sort((left, right) => compareUuidBytes(left.resultId, right.resultId));
   if (candidates.length === 0) return [];
-  const resolved = await tuples.readTuples(candidates.map((group) => group.resultId));
+  const resolved = await tuples.readTuples(
+    candidates.map((group) => group.resultId)
+  );
   const matched: SubjectGroup[] = [];
   for (const group of candidates) {
     const tuple = resolved.get(group.resultId);
@@ -1024,7 +1082,9 @@ function displayGroups(
   return combined;
 }
 
-function maintenanceRecord(status: MaintenanceStatus): StructuredMaintenanceRecord {
+function maintenanceRecord(
+  status: MaintenanceStatus
+): StructuredMaintenanceRecord {
   return {
     maintenanceRevision: status.maintenanceRevision,
     sourcesInScope: status.sourcesInScope,
@@ -1042,7 +1102,11 @@ function maintenanceRecord(status: MaintenanceStatus): StructuredMaintenanceReco
  * rather than returning a page that is complete but late.
  */
 function assertReaderLease(input: AssemblyInput): void {
-  if (input.now.getTime() - input.startedAtMs <= STRUCTURED_QUERY_READER_LEASE_MS) return;
+  if (
+    input.now.getTime() - input.startedAtMs <=
+    STRUCTURED_QUERY_READER_LEASE_MS
+  )
+    return;
   throw new StructuredQueryError(
     `structured read exceeded its ${STRUCTURED_QUERY_READER_LEASE_MS} ms execution lease`,
     "query_timeout"
@@ -1099,7 +1163,9 @@ async function buildRows(
       }),
     };
   }
-  const resolved = await input.tuples.readTuples(page.map((group) => group.resultId));
+  const resolved = await input.tuples.readTuples(
+    page.map((group) => group.resultId)
+  );
   const rows: StructuredQueryRelationRowPlan[] = [];
   for (const group of page) {
     const tuple = resolved.get(group.resultId);
@@ -1221,9 +1287,12 @@ function boundPageToEnvelope(
     const lastEmitted = page[page.length - 1]!;
     // More to walk means the caller needs a way back to the rest: either the
     // matched set outran this page, or the envelope dropped rows out of it.
-    const moreRemain = input.matched > input.start + keep || keep < input.selected;
+    const moreRemain =
+      input.matched > input.start + keep || keep < input.selected;
     const nextCursor = moreRemain ? input.mint(lastEmitted.id) : null;
-    if (projectedBytes(page, nextCursor, input) <= STRUCTURED_RESULT_MAX_BYTES) {
+    if (
+      projectedBytes(page, nextCursor, input) <= STRUCTURED_RESULT_MAX_BYTES
+    ) {
       return { rows: page, nextCursor };
     }
   }
@@ -1282,7 +1351,9 @@ interface GrantContext {
   readonly queriedAt: string;
 }
 
-function grantContext(context: GrantContext): Readonly<Record<string, unknown>> {
+function grantContext(
+  context: GrantContext
+): Readonly<Record<string, unknown>> {
   return {
     query_digest: context.queryDigest,
     scope_binding: context.scopeBinding,
@@ -1513,7 +1584,14 @@ export class PgStructuredQueryStorage implements StructuredQueryStorage {
     try {
       return await this.scope.runTransaction(
         async (client) => {
-          await assertCurrentAuthorization(client, context);
+          const scopeRevisions = await readScopeRevisions(
+            client,
+            context.ownerScopeBinding
+          );
+          const issuanceFence = assertCurrentAuthorization(
+            scopeRevisions,
+            context
+          );
           const revisions = await readPgStatusRevisions(
             client,
             context.ownerScopeBinding
@@ -1524,13 +1602,18 @@ export class PgStructuredQueryStorage implements StructuredQueryStorage {
             refs,
             revisions.readRevision
           );
-          const maintenance = await buildPgMaintenanceStatus(client, context, refs);
+          const maintenance = await buildPgMaintenanceStatus(
+            client,
+            context,
+            refs
+          );
           return assembleRead({
             request,
             context,
             snapshot,
             maintenance,
             readRevision: String(revisions.readRevision),
+            issuanceFence,
             tuples: new PgStructuredQueryTupleReader(client),
             supports: new PgStructuredQuerySupportReader(client),
             now: this.now(),
@@ -1607,10 +1690,19 @@ export class MemoryStructuredQueryStorage implements StructuredQueryStorage {
     private readonly scope: MemoryStructuredQueryAuthority,
     private readonly tuples: StructuredQueryTupleReader,
     private readonly supports: StructuredQuerySupportReader,
+    private readonly scopeRevisions: (
+      scopeBinding: string
+    ) => Readonly<ScopeRevisionRecord> | null,
     private readonly screening: MemoryStructuredQueryScreeningPort = NO_SCREENING_EVIDENCE,
     cursorKey: StructuredQueryCursorKey,
     private readonly now: () => Date = () => new Date()
   ) {
+    if (typeof scopeRevisions !== "function") {
+      throw new StructuredQueryError(
+        "structured scope revisions are unavailable",
+        "structured_search_unavailable"
+      );
+    }
     this.cursorKey = requireCursorKey(cursorKey);
   }
 
@@ -1629,6 +1721,10 @@ export class MemoryStructuredQueryStorage implements StructuredQueryStorage {
       return await this.scope.withAuthorizedScope(
         context,
         async (work) => {
+          const issuanceFence = assertCurrentAuthorization(
+            this.scopeRevisions(context.ownerScopeBinding),
+            context
+          );
           const [accepted, maintenanceInputs] = await Promise.all([
             work.readAcceptedInputs(refs),
             work.readMaintenanceInputs(refs),
@@ -1652,6 +1748,7 @@ export class MemoryStructuredQueryStorage implements StructuredQueryStorage {
             snapshot: accepted,
             maintenance,
             readRevision: String(accepted.readRevision),
+            issuanceFence,
             tuples: this.tuples,
             supports: this.supports,
             now: this.now(),
@@ -1677,8 +1774,14 @@ function assertSameActiveScope(
   maintenanceSources: readonly { readonly sourceRef: string }[],
   acceptedSources: readonly { readonly sourceRef: string }[]
 ): void {
-  const fromMaintenance = maintenanceSources.map((source) => source.sourceRef).sort().join(",");
-  const fromAccepted = acceptedSources.map((source) => source.sourceRef).sort().join(",");
+  const fromMaintenance = maintenanceSources
+    .map((source) => source.sourceRef)
+    .sort()
+    .join(",");
+  const fromAccepted = acceptedSources
+    .map((source) => source.sourceRef)
+    .sort()
+    .join(",");
   if (fromMaintenance === fromAccepted) return;
   throw new StructuredQueryError(
     "structured maintenance status is unavailable: the authorized views disagree about the active source set",

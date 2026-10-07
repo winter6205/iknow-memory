@@ -27,6 +27,7 @@ import type {
   PrecisionSearchOptions,
   RetrievedChunk,
   SearchOptions,
+  ScopeRevisionFence,
   ScopeRevisionRecord,
   SourceDocRecord,
   SourceLocatorBinding,
@@ -102,8 +103,10 @@ import {
   type SourceVersionStamp,
 } from "./evidence-source.js";
 import {
+  assertScopeRevisionFenceCurrent,
   decideGrantRead,
   normalizeGrantRequest,
+  normalizeScopeRevisionFence,
   type GrantReadFacts,
   type NormalizedGrant,
 } from "./evidence-store.js";
@@ -1380,10 +1383,21 @@ export class MemoryBackend
    * by rolling back.
    */
   async issueGrants(
-    requests: readonly GrantRequest[]
+    requests: readonly GrantRequest[],
+    expectedScopeRevisionFence?: ScopeRevisionFence
   ): Promise<readonly EvidenceGrantRecord[]> {
-    const prepared = requests.map((request) => {
-      const plan = normalizeGrantRequest(request);
+    const plans = requests.map((request) => normalizeGrantRequest(request));
+    const fence = normalizeScopeRevisionFence(
+      expectedScopeRevisionFence,
+      plans
+    );
+    if (fence !== null) {
+      assertScopeRevisionFenceCurrent(
+        fence,
+        this.scopeRevisions.get(fence.scope_binding) ?? null
+      );
+    }
+    const prepared = plans.map((plan) => {
       const scope = this.scopeRevisions.get(plan.scope_binding);
       if (scope === undefined) {
         throw evidenceError(
@@ -1581,6 +1595,12 @@ export class MemoryBackend
     return { ...next };
   }
 
+  /** Read a detached immutable admission fence for one authorized Query snapshot. */
+  getScopeRevisions(scopeBinding: string): ScopeRevisionFence | null {
+    const scope = this.scopeRevisions.get(scopeBinding);
+    return scope === undefined ? null : Object.freeze({ ...scope });
+  }
+
   /**
    * The scope's current authorization revision, read by the shared write
    * authority before it takes any lock.
@@ -1590,7 +1610,9 @@ export class MemoryBackend
    * so this is the seam's deny-before-write check rather than a post-hoc filter.
    */
   authorizationRevision(scopeBinding: string): string | null {
-    return this.scopeRevisions.get(scopeBinding)?.authorization_revision ?? null;
+    return (
+      this.scopeRevisions.get(scopeBinding)?.authorization_revision ?? null
+    );
   }
 
   async markSourceVersionRetired(

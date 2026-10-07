@@ -35,6 +35,7 @@ import { sqlTextList, sqlTextLiteral } from "./schema-sql.js";
 import type { SchemaBootstrapClient } from "./schema-sql.js";
 import { upSchemaMaintenanceWork } from "./schema-maintenance-work.js";
 import { upSchemaPublication } from "./schema-publication.js";
+import { upSchemaStructuredPurge } from "./schema-structured-purge.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 export type { SchemaBootstrapClient } from "./schema-sql.js";
 
@@ -831,6 +832,10 @@ export async function upSchemaBootstrap(
     await upSchemaProjection(client);
     await upSchemaMaintenanceWork(client);
     await upSchemaPublication(client);
+    // After upSchemaPublication: the tombstone and the read lease both key on a
+    // source the publication tables own, and the purge transaction refuses a
+    // source it cannot lock there.
+    await upSchemaStructuredPurge(client);
     // ALTER chunks back-pointers must come after `source_documents` exists
     // (FK target) and after `chunks` itself exists (caller's responsibility —
     // `PgvectorBackend.ensureTable` creates it before invoking us).

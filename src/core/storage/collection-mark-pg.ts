@@ -190,30 +190,13 @@ export class PgCollectionMarkStore {
         if (unbound !== null) return unbound;
       }
 
-      // A payload that already carries a mark row is refused, not overwritten and
-      // not left to collide on the primary key. Which of those two it is used to do
-      // is the caller's decision, and both lanes must give the same answer: a bare
-      // INSERT raised an untyped unique_violation here while the memory lane
-      // silently replaced the row.
+      // A LIVE mark is refused outright; a cancelled one is overwritten below. Both
+      // lanes must answer the same way, and they did not for a while: this store
+      // raised an untyped unique_violation where the memory lane replaced the row.
       const clash = await refuseIfAlreadyMarked(work.client, outcome.plan.mark);
       if (clash !== null) return clash;
 
-      await work.client.query(
-        `INSERT INTO structured_collection_marks
-           (payload_class, payload_ref, scope_binding, source_version_id,
-            expected_lifecycle_revision, deadline_at, marked_at, state)
-         VALUES ($1, $2, $3, $4, $5::bigint, $6::timestamptz, $7::timestamptz, $8)`,
-        [
-          outcome.plan.mark.payloadClass,
-          outcome.plan.mark.payloadRef,
-          outcome.plan.mark.scopeBinding,
-          outcome.plan.mark.sourceVersionId,
-          outcome.plan.mark.expectedLifecycleRevision,
-          outcome.plan.mark.deadlineAt,
-          outcome.plan.mark.markedAt,
-          outcome.plan.mark.state,
-        ]
-      );
+      await upsertMarkRow(work.client, outcome.plan.mark);
 
       if (outcome.plan.stopsObligations) {
         // STAMP_SQL's closed map, reused through its client-scoped executor: the
@@ -259,7 +242,7 @@ export class PgCollectionMarkStore {
         );
       }
 
-      const facts = await readMarkSourceFacts(work.client, input.sourceVersionId);
+      const facts = await readSourceVersionFacts(work.client, input.sourceVersionId);
       const unbound = refuseIfUnstammable(
         facts,
         `source version ${String(input.sourceVersionId)} is not held by the store, so its mark cannot be reactivated`
@@ -383,20 +366,6 @@ export class PgCollectionMarkStore {
   }
 }
 
-/**
- * The source-version facts a mark decision reads, with the object-scoped shape
- * folded in.
- *
- * A mark on one of the two object-scoped classes has no source version at all, and
- * that is not the same fact as one whose source version is missing from the store —
- * the first is a valid mark, the second is a binding the store cannot honour.
- */
-async function readMarkSourceFacts(
-  client: EvidenceClient,
-  sourceVersionId: string | null
-): Promise<SourceVersionFacts> {
-  return readSourceVersionFacts(client, sourceVersionId);
-}
 
 /**
  * Refuse a source version the store does not hold.
@@ -411,6 +380,46 @@ function refuseIfUnstammable(
 ): { readonly refused: true; readonly code: "unsupported_source_binding"; readonly detail: string } | null {
   if (facts.exists) return null;
   return { refused: true, code: "unsupported_source_binding", detail };
+}
+
+/**
+ * Write the mark, replacing a CANCELLED row for the same payload.
+ *
+ * ON CONFLICT DO UPDATE rather than a bare INSERT: the caller has already refused
+ * any LIVE mark, so the only row reachable here is a CANCELLED one, and overwriting
+ * it is spec:307's cancel, re-evaluate, mark-again branch. A bare INSERT raised
+ * 23505 there instead, which left the durable lane unable to re-mark anything it
+ * had ever marked — while the memory lane, whose `marks.set` replaces, could.
+ */
+async function upsertMarkRow(
+  client: EvidenceClient,
+  mark: CollectionMark
+): Promise<void> {
+  await client.query(
+    `INSERT INTO structured_collection_marks
+       (payload_class, payload_ref, scope_binding, source_version_id,
+        expected_lifecycle_revision, deadline_at, marked_at, state)
+     VALUES ($1, $2, $3, $4, $5::bigint, $6::timestamptz, $7::timestamptz, $8)
+     ON CONFLICT (payload_class, payload_ref) DO UPDATE
+        SET scope_binding = EXCLUDED.scope_binding,
+            source_version_id = EXCLUDED.source_version_id,
+            expected_lifecycle_revision = EXCLUDED.expected_lifecycle_revision,
+            deadline_at = EXCLUDED.deadline_at,
+            marked_at = EXCLUDED.marked_at,
+            state = EXCLUDED.state,
+            cancelled_at = NULL,
+            cancelled_reason = NULL`,
+    [
+      mark.payloadClass,
+      mark.payloadRef,
+      mark.scopeBinding,
+      mark.sourceVersionId,
+      mark.expectedLifecycleRevision,
+      mark.deadlineAt,
+      mark.markedAt,
+      mark.state,
+    ]
+  );
 }
 
 /**

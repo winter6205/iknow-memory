@@ -759,6 +759,77 @@ describeAcceptance("M15-M18 acceptance — collection marks on the real boundary
     expect(resumed.refused).toBe(false);
     expect(await obligationsStoppedAt(source)).toBeNull();
   });
+
+  it("re-marks a cancelled payload, which is spec:307's re-evaluation branch", async () => {
+    const retiredLongAgo = daysBeforeNow(200);
+    const source = await seedSourceVersion("s1", retiredLongAgo);
+    await seedScope(["s1"]);
+    const eligibility = await decide(candidate("s1", retiredLongAgo), new Date());
+    const identity = { payloadClass: "retired_unreferenced" as const, payloadRef: "s1" };
+
+    const first = await marks.markCollectionCandidate({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+      sourceVersionId: source,
+      eligibility,
+    });
+    if (first.refused) throw new Error(`mark refused ${first.code}: ${first.detail}`);
+
+    // A live mark refuses a second mark.
+    const clash = (await marks.markCollectionCandidate({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+      sourceVersionId: source,
+      eligibility,
+    })) as { refused: boolean; code?: string };
+    expect(clash.refused).toBe(true);
+    expect(clash.code).toBe("input_stale");
+
+    const atMark = String(
+      (await authority.withAuthorizedScope(context(["s1"]), async (work) =>
+        (await work.readMaintenanceInputs([])).maintenanceRevision
+      )) ?? ""
+    );
+    const cancelled = await marks.cancelStaleCollectionMark({
+      context: context(["s1"]),
+      scopeBinding: SCOPE,
+      payloadClass: identity.payloadClass,
+      payloadRef: identity.payloadRef,
+      observedLifecycleRevision: atMark,
+    });
+    expect(cancelled.refused).toBe(false);
+
+    // spec:307 sends a changed mark down cancel, re-evaluate, mark again. On the
+    // primary key (payload_class, payload_ref) this is an overwrite, so a bare
+    // INSERT would raise 23505 here and leave the durable lane unable to re-mark
+    // anything it had ever marked.
+    const again = await marks.markCollectionCandidate({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+      sourceVersionId: source,
+      eligibility,
+    });
+    expect(again.refused).toBe(false);
+    if (again.refused) return;
+    expect(again.plan.mark.state).toBe("marked");
+    expect(again.plan.mark.cancelledAt).toBeNull();
+    expect(again.plan.mark.cancelledReason).toBeNull();
+
+    // And the row really was replaced, not left as a cancelled one.
+    const persisted = await marks.readCollectionMark({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+    });
+    expect(persisted?.found).toBe(true);
+    if (persisted?.found === true) {
+      expect(persisted.mark.state).toBe("marked");
+      expect(persisted.mark.cancelledReason).toBeNull();
+    }
+  });
 });
 
 /** The recheck verdict of a read that found a marked row, or a named failure. */

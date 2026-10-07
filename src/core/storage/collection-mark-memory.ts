@@ -172,10 +172,13 @@ export class InMemoryCollectionMarkStorage {
       if (target !== null && !target.ok) return target.refusal;
 
       const key = markKey(mark.payloadClass, mark.payloadRef);
-      // Refuse an existing mark rather than replacing it, so this lane answers the
-      // same as PostgreSQL — which refuses it too. Whether a payload that was marked
-      // and then cancelled may be marked again is a retention policy question, and
-      // until MP15 states one, the safe answer is that it may not.
+      // Only a LIVE mark refuses. A payload that was marked and then cancelled is
+      // exactly the case spec:307 sends down this path — cancel, re-evaluate, and
+      // if it is still eligible mark it again — so refusing a cancelled row would
+      // make the re-evaluation branch unreachable and strand the payload: never
+      // markable, never collected. The earlier mark's cancellation is overwritten
+      // rather than kept; MP15 deletes this row with the payload, and if the history
+      // of a first cancellation is ever needed it belongs in MP15/MP16's tombstone.
       const existing = this.marks.get(key);
       if (existing !== undefined && existing.state === "marked") {
         return {

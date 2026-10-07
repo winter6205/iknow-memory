@@ -28,6 +28,7 @@ import {
   INDEX_JOB_STATUS,
   type SourceDocStatus,
 } from "../types.js";
+import { upSchemaInvalidation } from "./schema-invalidation.js";
 import { upSchemaProjection } from "./schema-projection.js";
 import { createEvidenceTables } from "./schema-evidence.js";
 import { sqlTextList, sqlTextLiteral } from "./schema-sql.js";
@@ -823,6 +824,10 @@ export async function upSchemaBootstrap(
     await createIndexJobs(client);
     await createStructuredIdentities(client);
     await createEvidenceTables(client);
+    // After createEvidenceTables: the outbox's `evidence_ref` is conceptually a
+    // grant reference, and it carries no FK to that table (see the module's
+    // docblock) — so this is ordering of meaning, not of dependency.
+    await upSchemaInvalidation(client);
     await upSchemaProjection(client);
     await upSchemaMaintenanceWork(client);
     await upSchemaPublication(client);

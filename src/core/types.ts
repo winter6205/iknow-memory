@@ -468,6 +468,18 @@ interface GrantRequestBase {
   readonly context: Readonly<Record<string, unknown>>;
   /** The exact row or count receipt the query returned. */
   readonly value: unknown;
+  /**
+   * The trusted stream this grant belongs to, from the transport binding
+   * (ADR 0097 §2.1; register §1b.3).
+   *
+   * On the request rather than on the plan, because the plan is computed from a
+   * read that never saw a binding: which consumer a grant belongs to is a
+   * property of who was served, not of what the query returned. Required rather
+   * than optional because a grant whose stream is unknown could never be
+   * invalidated — its revocation would be silent, which is the failure the
+   * per-consumer outbox exists to make loud.
+   */
+  readonly consumerId: string;
 }
 
 export interface RowGrantRequest extends GrantRequestBase {
@@ -504,6 +516,8 @@ export interface EvidenceGrantRecord {
   result_count: number | null;
   /** Set for count grants only: the shared bounded authorization receipt. */
   authorization_receipt_id: string | null;
+  /** The per-consumer stream this grant's invalidation would be published to. */
+  consumer_id: string;
 }
 
 /** The live admission revisions of one trusted scope. */

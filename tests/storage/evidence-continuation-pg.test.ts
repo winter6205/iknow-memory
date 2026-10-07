@@ -24,7 +24,10 @@ import {
   type EvidenceSupportRead,
   type SupportContinuationRequest,
 } from "../../src/core/storage/evidence-continuation.js";
-import { canonicalJson, contentDigestOf } from "../../src/core/storage/evidence-source.js";
+import {
+  canonicalJson,
+  contentDigestOf,
+} from "../../src/core/storage/evidence-source.js";
 import { MAX_EVIDENCE_BYTES } from "../../src/core/storage/evidence-store.js";
 import { supportsEvidenceStore } from "../../src/core/storage/backend.js";
 import { PgvectorBackend } from "../../src/core/storage/pgvector-backend.js";
@@ -106,7 +109,10 @@ beforeAll(async () => {
     throw new Error("PgvectorBackend does not expose the evidence capability");
   }
   store = backend;
-  pool = new pg.Pool({ connectionString: harness.schemaConnectionString, max: 4 });
+  pool = new pg.Pool({
+    connectionString: harness.schemaConnectionString,
+    max: 4,
+  });
 });
 
 afterAll(async () => {
@@ -132,7 +138,10 @@ interface SeededCase {
   readonly units: number;
 }
 
-async function seedCase(units: number, sourceRefSuffix = ""): Promise<SeededCase> {
+async function seedCase(
+  units: number,
+  sourceRefSuffix = ""
+): Promise<SeededCase> {
   const caseId = nextCaseId();
   const sourceRef = `${caseId}-source${sourceRefSuffix}`;
   const { record } = await store.registerSourceVersion({
@@ -174,7 +183,8 @@ async function recordUnits(
   } = {}
 ): Promise<readonly EvidenceSupportRef[]> {
   const firstUnit = options.firstUnit ?? 1;
-  const extractionRef = options.extractionRef ?? (() => `${seeded.caseId}-extraction-1`);
+  const extractionRef =
+    options.extractionRef ?? (() => `${seeded.caseId}-extraction-1`);
   const refs: EvidenceSupportRef[] = [];
   for (let unit = firstUnit; unit < firstUnit + count; unit += 1) {
     const { support } = await store.recordSupport({
@@ -182,17 +192,27 @@ async function recordUnits(
       result_id: `${seeded.caseId}-result`,
       source_ref: seeded.sourceRef,
       source_version: "v1",
-      location: { document_id: `${seeded.caseId}-doc`, version: "frozen-v1", unit },
+      location: {
+        document_id: `${seeded.caseId}-doc`,
+        version: "frozen-v1",
+        unit,
+      },
       span: null,
       extraction_ref: extractionRef(unit),
       extractedAt: EXTRACTED_AT,
     });
-    refs.push({ support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE });
+    refs.push({
+      support_id: support.support_id,
+      role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+    });
   }
   return refs;
 }
 
-function rowGrantFor(seeded: SeededCase, supports: readonly EvidenceSupportRef[]): GrantRequest {
+function rowGrantFor(
+  seeded: SeededCase,
+  supports: readonly EvidenceSupportRef[]
+): GrantRequest {
   return {
     kind: EVIDENCE_GRANT_KIND.ROW,
     subject: EVIDENCE_SUBJECT_KIND.ENTITY,
@@ -204,6 +224,7 @@ function rowGrantFor(seeded: SeededCase, supports: readonly EvidenceSupportRef[]
     context: { coverage: "stored_structured_subjects" },
     value: { entity_id: `${seeded.caseId}-result`, name: "某公司" },
     supports,
+    consumerId: `${seeded.caseId}-consumer`,
   } as GrantRequest;
 }
 
@@ -232,10 +253,15 @@ function continue_(
   evidenceRef: string,
   patch: Partial<SupportContinuationRequest> = {}
 ): Promise<EvidenceSupportRead> {
-  return readGrantSupportContinuation(lease, requestFor(seeded, evidenceRef, patch));
+  return readGrantSupportContinuation(
+    lease,
+    requestFor(seeded, evidenceRef, patch)
+  );
 }
 
-function expectGranted(outcome: EvidenceSupportRead): Extract<EvidenceSupportRead, { state: "granted" }> {
+function expectGranted(
+  outcome: EvidenceSupportRead
+): Extract<EvidenceSupportRead, { state: "granted" }> {
   expect(outcome.state, JSON.stringify(outcome)).toBe("granted");
   if (outcome.state !== "granted") throw new Error("unreachable");
   return outcome;
@@ -253,7 +279,9 @@ function expectWithheld(
 }
 
 async function fingerprintGrants(): Promise<Record<string, unknown>> {
-  const observer = new pg.Client({ connectionString: harness.schemaConnectionString });
+  const observer = new pg.Client({
+    connectionString: harness.schemaConnectionString,
+  });
   await observer.connect();
   try {
     const grants = await observer.query<Record<string, unknown>>(
@@ -292,7 +320,9 @@ async function fingerprintGrants(): Promise<Record<string, unknown>> {
 }
 
 function decodedCursor(cursor: string): Record<string, string> {
-  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Record<string, string>;
+  return JSON.parse(
+    Buffer.from(cursor, "base64url").toString("utf8")
+  ) as Record<string, string>;
 }
 
 function encodeCursor(payload: Record<string, string>): string {
@@ -334,14 +364,18 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("pages the frozen supports in stable UUID order, eight at a time, inside the 32 KiB envelope", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const ascending = [...refs]
       .map((ref) => ref.support_id)
       .sort((left, right) => (left === right ? 0 : left < right ? -1 : 1));
 
     const first = expectGranted(await continue_(seeded, evidenceRef));
     expect(first.supports).toHaveLength(MAX_EVIDENCE_SUPPORTS_PER_PAGE);
-    expect(first.supports.map((entry) => entry.support_id)).toEqual(ascending.slice(0, 8));
+    expect(first.supports.map((entry) => entry.support_id)).toEqual(
+      ascending.slice(0, 8)
+    );
     expect(first.total_supports).toBe(PINNED_UNITS);
     expect(first.next_cursor).not.toBeNull();
     expect(first.expires_at).toBe(EXPIRES_AT_TEXT);
@@ -351,7 +385,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     const second = expectGranted(
       await continue_(seeded, evidenceRef, { cursor: first.next_cursor })
     );
-    expect(second.supports.map((entry) => entry.support_id)).toEqual(ascending.slice(8));
+    expect(second.supports.map((entry) => entry.support_id)).toEqual(
+      ascending.slice(8)
+    );
     expect(second.next_cursor).toBeNull();
     const secondBytes = Buffer.byteLength(JSON.stringify(second), "utf8");
     expect(secondBytes).toBeLessThanOrEqual(MAX_EVIDENCE_BYTES);
@@ -377,7 +413,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("refuses a request carrying both a continuation cursor and a selected support id", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
     expectWithheld(
       await continue_(seeded, evidenceRef, {
@@ -398,7 +436,10 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     const endpointSupportId = ascending[ascending.length - 1]!;
     const endpointRefs = refs.map((ref) =>
       ref.support_id === endpointSupportId
-        ? { support_id: ref.support_id, role: EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY }
+        ? {
+            support_id: ref.support_id,
+            role: EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY,
+          }
         : ref
     );
     const { evidence_ref: evidenceRef } = await store.issueGrant(
@@ -409,7 +450,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     const foreign = otherRefs[0]!.support_id;
 
     const first = expectGranted(await continue_(seeded, evidenceRef));
-    expect(first.supports.map((entry) => entry.support_id)).not.toContain(endpointSupportId);
+    expect(first.supports.map((entry) => entry.support_id)).not.toContain(
+      endpointSupportId
+    );
 
     const selected = expectGranted(
       await continue_(seeded, evidenceRef, { supportId: endpointSupportId })
@@ -417,7 +460,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     expect(selected.selected).toBe(true);
     expect(selected.supports).toHaveLength(1);
     expect(selected.supports[0]!.support_id).toBe(endpointSupportId);
-    expect(selected.supports[0]!.role).toBe(EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY);
+    expect(selected.supports[0]!.role).toBe(
+      EVIDENCE_SUPPORT_ROLE.ENDPOINT_DISPLAY
+    );
     expect(selected.next_cursor).toBeNull();
 
     expectWithheld(
@@ -446,6 +491,7 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
       context: { coverage: "stored_structured_subjects" },
       value: { count: 1, operation: "count" },
       count: 1,
+      consumerId: `${seeded.caseId}-consumer`,
     } as GrantRequest);
     expectWithheld(
       await continue_(seeded, evidenceRef),
@@ -457,12 +503,17 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("withholds the whole grant when the trusted caller's scope is another scope", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     expectWithheld(
       await readGrantSupportContinuation(lease, {
         evidenceRef,
         at: READ_AT,
-        caller: { scopeBinding: `${seeded.scope}-other`, authorizedSourceRefs: [seeded.sourceRef] },
+        caller: {
+          scopeBinding: `${seeded.scope}-other`,
+          authorizedSourceRefs: [seeded.sourceRef],
+        },
       }),
       EVIDENCE_FAILURE.ACCESS_DENIED,
       EVIDENCE_DENIAL_REASON.AUTHORIZATION_REVOKED
@@ -472,12 +523,17 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("withholds the whole grant when the trusted caller's authorized subset excludes a pinned source", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     expectWithheld(
       await readGrantSupportContinuation(lease, {
         evidenceRef,
         at: READ_AT,
-        caller: { scopeBinding: seeded.scope, authorizedSourceRefs: ["a-source-it-cannot-read"] },
+        caller: {
+          scopeBinding: seeded.scope,
+          authorizedSourceRefs: ["a-source-it-cannot-read"],
+        },
       }),
       EVIDENCE_FAILURE.ACCESS_DENIED,
       EVIDENCE_DENIAL_REASON.AUTHORIZATION_REVOKED
@@ -487,7 +543,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("withholds the whole grant when the fixed lifetime has ended", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
     expect(first.next_cursor).not.toBeNull();
     expectWithheld(
@@ -503,7 +561,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("withholds the whole grant when the scope's purge revision advanced", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
     await store.setScopeRevisions(seeded.scope, { purgeRevision: "purge-2" });
     expectWithheld(
@@ -521,9 +581,13 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("withholds the whole grant when the scope's authorization revision advanced", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
-    await store.setScopeRevisions(seeded.scope, { authorizationRevision: "auth-2" });
+    await store.setScopeRevisions(seeded.scope, {
+      authorizationRevision: "auth-2",
+    });
     expectWithheld(
       await continue_(seeded, evidenceRef, { cursor: first.next_cursor }),
       EVIDENCE_FAILURE.ACCESS_DENIED,
@@ -539,9 +603,14 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("withholds the whole grant when one pinned source version stopped accepting obligations", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
-    await store.stopAcceptingObligations(seeded.sourceVersionId, "2026-09-01T00:00:00.000Z");
+    await store.stopAcceptingObligations(
+      seeded.sourceVersionId,
+      "2026-09-01T00:00:00.000Z"
+    );
     expectWithheld(
       await continue_(seeded, evidenceRef, { cursor: first.next_cursor }),
       EVIDENCE_FAILURE.UNAVAILABLE,
@@ -562,7 +631,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("mints a cursor bound to one reference, one caller and one expiry, and refuses every other combination", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const siblingRefs = refs.slice(0, PINNED_UNITS - 3);
     const { evidence_ref: siblingRef } = await store.issueGrant({
       ...rowGrantFor(seeded, siblingRefs),
@@ -571,7 +642,13 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     const first = expectGranted(await continue_(seeded, evidenceRef));
     const cursor = String(first.next_cursor);
     const payload = decodedCursor(cursor);
-    expect(Object.keys(payload).sort()).toEqual(["after", "exp", "ref", "scope", "v"]);
+    expect(Object.keys(payload).sort()).toEqual([
+      "after",
+      "exp",
+      "ref",
+      "scope",
+      "v",
+    ]);
     expect(payload["ref"]).toBe(evidenceRef);
     expect(payload["scope"]).toBe(seeded.scope);
     expect(payload["exp"]).toBe(EXPIRES_AT_TEXT);
@@ -642,7 +719,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     );
 
     expectWithheld(
-      await continue_(seeded, evidenceRef, { cursor: "A".repeat(MAX_EVIDENCE_BYTES + 1) }),
+      await continue_(seeded, evidenceRef, {
+        cursor: "A".repeat(MAX_EVIDENCE_BYTES + 1),
+      }),
       EVIDENCE_FAILURE.TOO_LARGE,
       "contract_violation"
     );
@@ -652,7 +731,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     const padding = "x".repeat(5500);
     const seeded = await seedCase(8, `-${padding}`);
     const refs = await recordUnits(seeded, 8);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     expectWithheld(
       await continue_(seeded, evidenceRef),
       EVIDENCE_FAILURE.TOO_LARGE,
@@ -663,9 +744,13 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("does not requery current supports, mint no grant and leave the expiry byte-identical", async () => {
     const seeded = await seedCase(PINNED_UNITS + 4);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const stamp = async (): Promise<Record<string, unknown>> => {
-      const observer = new pg.Client({ connectionString: harness.schemaConnectionString });
+      const observer = new pg.Client({
+        connectionString: harness.schemaConnectionString,
+      });
       await observer.connect();
       try {
         const grant = await observer.query<Record<string, unknown>>(
@@ -678,7 +763,10 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
           `SELECT count(*)::int AS total FROM evidence_grants WHERE scope_binding = $1`,
           [seeded.scope]
         );
-        return { grant: grant.rows[0], grants_under_scope: count.rows[0]?.total };
+        return {
+          grant: grant.rows[0],
+          grants_under_scope: count.rows[0]?.total,
+        };
       } finally {
         await observer.end();
       }
@@ -699,19 +787,27 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
       result_id: `${seeded.caseId}-result`,
       source_ref: seeded.sourceRef,
       source_version: "v1",
-      location: { document_id: `${seeded.caseId}-doc`, version: "frozen-v1", unit: 1 },
+      location: {
+        document_id: `${seeded.caseId}-doc`,
+        version: "frozen-v1",
+        unit: 1,
+      },
       span: null,
       extraction_ref: `${seeded.caseId}-extraction-3`,
       extractedAt: EXTRACTED_AT,
     });
 
     const after = await fingerprintGrants();
-    expect(after, "a continuation minted or changed a grant row").toEqual(before);
+    expect(after, "a continuation minted or changed a grant row").toEqual(
+      before
+    );
 
     const second = expectGranted(
       await continue_(seeded, evidenceRef, { cursor: first.next_cursor })
     );
-    const sequence = [...first.supports, ...second.supports].map((entry) => entry.support_id);
+    const sequence = [...first.supports, ...second.supports].map(
+      (entry) => entry.support_id
+    );
     const pinnedAscending = [...refs]
       .map((ref) => ref.support_id)
       .sort((left, right) => (left === right ? 0 : left < right ? -1 : 1));
@@ -723,8 +819,12 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     }
 
     const afterStamp = await stamp();
-    expect(afterStamp.grant?.["queried_at"]).toBe(beforeStamp.grant?.["queried_at"]);
-    expect(afterStamp.grant?.["expires_at"]).toBe(beforeStamp.grant?.["expires_at"]);
+    expect(afterStamp.grant?.["queried_at"]).toBe(
+      beforeStamp.grant?.["queried_at"]
+    );
+    expect(afterStamp.grant?.["expires_at"]).toBe(
+      beforeStamp.grant?.["expires_at"]
+    );
     expect(afterStamp.grants_under_scope).toBe(1);
     expect(beforeStamp.grant?.["queried_at"]).toBe("2026-03-01 12:00:00+00");
     expect(beforeStamp.grant?.["expires_at"]).toBe("2027-03-01 12:00:00+00");
@@ -733,7 +833,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("writes nothing: a fault armed on every evidence table still lets both pages through", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const tables = [
       "evidence_grants",
       "evidence_grant_supports",
@@ -751,15 +853,20 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
       );
       expect(first.supports.length + second.supports.length).toBe(PINNED_UNITS);
     } finally {
-      for (const entry of armed) await disarmWriteFault(entry.suffix, entry.table);
+      for (const entry of armed)
+        await disarmWriteFault(entry.suffix, entry.table);
     }
   });
 
   it("reports a backend failure on its own connection as a typed store failure, not an empty page", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
-    const dead = new pg.Client({ connectionString: harness.schemaConnectionString });
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
+    const dead = new pg.Client({
+      connectionString: harness.schemaConnectionString,
+    });
     await dead.connect();
     await dead.end();
     const broken = {
@@ -768,7 +875,10 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     };
     let caught: unknown;
     try {
-      await readGrantSupportContinuation(async () => broken, requestFor(seeded, evidenceRef));
+      await readGrantSupportContinuation(
+        async () => broken,
+        requestFor(seeded, evidenceRef)
+      );
     } catch (err) {
       caught = err;
     }
@@ -779,9 +889,14 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("withholds the whole grant when a pinned support no longer resolves", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
-    for (const table of ["evidence_grant_supports", "evidence_grant_extractions"]) {
+    for (const table of [
+      "evidence_grant_supports",
+      "evidence_grant_extractions",
+    ]) {
       const constraints = await admin.query<{ conname: string }>(
         `SELECT conname FROM pg_constraint
           WHERE conrelid = $1::regclass AND contype = 'f'`,
@@ -793,9 +908,10 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
         );
       }
     }
-    await admin.query(`DELETE FROM "${harness.schema}".assertion_supports WHERE support_id = $1`, [
-      refs[0]!.support_id,
-    ]);
+    await admin.query(
+      `DELETE FROM "${harness.schema}".assertion_supports WHERE support_id = $1`,
+      [refs[0]!.support_id]
+    );
     expectWithheld(
       await continue_(seeded, evidenceRef, { cursor: first.next_cursor }),
       EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
@@ -811,7 +927,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("refuses a position past the end of the pinned membership instead of an empty page", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
     const ascending = [...refs]
       .map((ref) => ref.support_id)
@@ -824,13 +942,18 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     // Selecting that same support by id must still be granted — a cursor past
     // the end and a named member are different reads.
     expect(ascending.slice(0, 8)).not.toContain(last);
-    const forged = encodeCursor({ ...decodedCursor(first.next_cursor!), after: last });
+    const forged = encodeCursor({
+      ...decodedCursor(first.next_cursor!),
+      after: last,
+    });
     expectWithheld(
       await continue_(seeded, evidenceRef, { cursor: forged }),
       EVIDENCE_FAILURE.MALFORMED_CONTRACT,
       CONTRACT_VIOLATION
     );
-    const selected = expectGranted(await continue_(seeded, evidenceRef, { supportId: last }));
+    const selected = expectGranted(
+      await continue_(seeded, evidenceRef, { supportId: last })
+    );
     expect(selected.supports.map((entry) => entry.support_id)).toEqual([last]);
     expect(selected.selected).toBe(true);
     expect(selected.next_cursor).toBeNull();
@@ -839,12 +962,17 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
   it("answers every caller-supplied input fault with a refusal rather than an exception", async () => {
     const seeded = await seedCase(PINNED_UNITS);
     const refs = await recordUnits(seeded, PINNED_UNITS);
-    const { evidence_ref: evidenceRef } = await store.issueGrant(rowGrantFor(seeded, refs));
+    const { evidence_ref: evidenceRef } = await store.issueGrant(
+      rowGrantFor(seeded, refs)
+    );
     const first = expectGranted(await continue_(seeded, evidenceRef));
 
     const malformed = [
       { label: "non-uuid support_id", patch: { supportId: "not-a-uuid" } },
-      { label: "uppercase-braced support_id", patch: { supportId: `{${randomUUID()}}` } },
+      {
+        label: "uppercase-braced support_id",
+        patch: { supportId: `{${randomUUID()}}` },
+      },
       { label: "blank evidence_ref", patch: { evidenceRef: "   " } },
       { label: "non-instant at", patch: { at: "yesterday" } },
       { label: "date-only at", patch: { at: "2026-10-06" } },
@@ -864,11 +992,21 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     const unbound: Array<[string, unknown, string]> = [
       ["no caller at all", null, "carries no trusted caller binding"],
       ["an undefined caller", undefined, "carries no trusted caller binding"],
-      ["a blank scope binding", { scopeBinding: "", authorizedSourceRefs: [seeded.sourceRef] }, "carries no scope binding"],
-      ["a whitespace scope binding", { scopeBinding: "   ", authorizedSourceRefs: [seeded.sourceRef] }, "carries no scope binding"],
+      [
+        "a blank scope binding",
+        { scopeBinding: "", authorizedSourceRefs: [seeded.sourceRef] },
+        "carries no scope binding",
+      ],
+      [
+        "a whitespace scope binding",
+        { scopeBinding: "   ", authorizedSourceRefs: [seeded.sourceRef] },
+        "carries no scope binding",
+      ],
     ];
     for (const [label, caller, fragment] of unbound) {
-      const outcome = await continue_(seeded, evidenceRef, { caller: caller as never });
+      const outcome = await continue_(seeded, evidenceRef, {
+        caller: caller as never,
+      });
       expectWithheld(
         outcome,
         EVIDENCE_FAILURE.ACCESS_DENIED,
@@ -879,7 +1017,10 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
       }
     }
     const mismatched = await continue_(seeded, evidenceRef, {
-      caller: { scopeBinding: "some-other-scope", authorizedSourceRefs: [seeded.sourceRef] },
+      caller: {
+        scopeBinding: "some-other-scope",
+        authorizedSourceRefs: [seeded.sourceRef],
+      },
     });
     expectWithheld(
       mismatched,
@@ -887,7 +1028,9 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
       EVIDENCE_DENIAL_REASON.AUTHORIZATION_REVOKED
     );
     if (mismatched.state === "denied") {
-      expect(mismatched.detail).toContain("is not the scope this grant was admitted under");
+      expect(mismatched.detail).toContain(
+        "is not the scope this grant was admitted under"
+      );
     }
 
     expectWithheld(
@@ -904,8 +1047,15 @@ describe("T14 EP4 support continuation over real PostgreSQL", () => {
     expect(absent.supports.map((entry) => entry.support_id)).toEqual(
       first.supports.map((entry) => entry.support_id)
     );
-    for (const patch of [{ cursor: null }, { cursor: "" }, { supportId: "" }, { supportId: null }]) {
-      const outcome = expectGranted(await continue_(seeded, evidenceRef, patch));
+    for (const patch of [
+      { cursor: null },
+      { cursor: "" },
+      { supportId: "" },
+      { supportId: null },
+    ]) {
+      const outcome = expectGranted(
+        await continue_(seeded, evidenceRef, patch)
+      );
       expect(outcome.supports.map((entry) => entry.support_id)).toEqual(
         first.supports.map((entry) => entry.support_id)
       );

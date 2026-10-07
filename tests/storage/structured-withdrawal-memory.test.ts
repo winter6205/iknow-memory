@@ -14,7 +14,10 @@ import { createHash } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import { claimNextWork, scheduleWork } from "../../src/core/maintenance/service.js";
+import {
+  claimNextWork,
+  scheduleWork,
+} from "../../src/core/maintenance/service.js";
 import type {
   MaintenanceAttemptGuard,
   MaintenanceDependency,
@@ -205,7 +208,8 @@ async function seedSource(
     ...locator,
     unit,
   }));
-  for (const binding of locatorBindings) await port.evidence.bindSourceLocator(binding);
+  for (const binding of locatorBindings)
+    await port.evidence.bindSourceLocator(binding);
   const declared = await port.publication.declareDesired({
     scopeBinding: SCOPE_BINDING,
     authorizedSourceRefs: [...authorizedSourceRefs],
@@ -215,7 +219,13 @@ async function seedSource(
     desiredExtractionRevision: 1,
     configRevision: CONFIG_REVISION,
   });
-  return { sourceRef, record, locator, locatorBindings, generation: declared.generation };
+  return {
+    sourceRef,
+    record,
+    locator,
+    locatorBindings,
+    generation: declared.generation,
+  };
 }
 
 function dependencyOf(
@@ -256,7 +266,9 @@ async function claimOwnJob(
       `claimed ${guard.jobKey} while waiting for ${scheduled.record.jobKey}`
     );
   }
-  throw new Error(`could not claim job ${scheduled.record.jobKey} for this case`);
+  throw new Error(
+    `could not claim job ${scheduled.record.jobKey} for this case`
+  );
 }
 
 function entityFact(
@@ -296,7 +308,9 @@ function assertionFact(
     tailEntityId,
     validWindow: { from: null, until: null },
   };
-  const resultId = deriveRelationAssertionId(normalizeRelationAssertion(identity));
+  const resultId = deriveRelationAssertionId(
+    normalizeRelationAssertion(identity)
+  );
   return {
     resultId,
     fact: {
@@ -397,14 +411,18 @@ function subjectsOf(
   snapshot: PublicationSnapshot,
   resultIds: readonly string[]
 ): readonly PublicationSnapshot["subjects"][number][] {
-  return snapshot.subjects.filter((subject) => resultIds.includes(subject.resultId));
+  return snapshot.subjects.filter((subject) =>
+    resultIds.includes(subject.resultId)
+  );
 }
 
 function sourcesOf(
   snapshot: PublicationSnapshot,
   sourceRefs: readonly string[]
 ): readonly PublicationSnapshot["sources"][number][] {
-  return snapshot.sources.filter((source) => sourceRefs.includes(source.sourceRef));
+  return snapshot.sources.filter((source) =>
+    sourceRefs.includes(source.sourceRef)
+  );
 }
 
 interface TwoOrigins {
@@ -422,7 +440,10 @@ interface TwoOrigins {
  * The maintenance contract's M3 fixture, built from its own words: two active
  * origins, one shared assertion and one result each origin serves alone.
  */
-async function twoOrigins(port: MemoryPort, label: string): Promise<TwoOrigins> {
+async function twoOrigins(
+  port: MemoryPort,
+  label: string
+): Promise<TwoOrigins> {
   const sourceA = unique(`${label}-a`);
   const sourceB = unique(`${label}-b`);
   const seededA = await seedSource(port, sourceA, [sourceA, sourceB]);
@@ -431,7 +452,14 @@ async function twoOrigins(port: MemoryPort, label: string): Promise<TwoOrigins> 
   const tail = nextEntityId();
   const onlyA = nextEntityId();
   const onlyB = nextEntityId();
-  const sharedA = assertionFact(seededA, "extract-a", "co_founded", 1, head, tail);
+  const sharedA = assertionFact(
+    seededA,
+    "extract-a",
+    "co_founded",
+    1,
+    head,
+    tail
+  );
   const sharedB: PublicationFact = {
     ...sharedA.fact,
     occurrence: {
@@ -443,26 +471,18 @@ async function twoOrigins(port: MemoryPort, label: string): Promise<TwoOrigins> 
   } as PublicationFact;
   await port.seedGraphEntities([head, tail, onlyA, onlyB]);
 
-  const guardA = await claimOwnJob(
-    port,
-    sourceA,
-    "v1",
-    seededA.generation,
-    [dependencyOf(sourceA, seededA.generation)]
-  );
+  const guardA = await claimOwnJob(port, sourceA, "v1", seededA.generation, [
+    dependencyOf(sourceA, seededA.generation),
+  ]);
   await stageReal(port, seededA, guardA, "extract-a", [
     sharedA.fact,
     entityFact(seededA, onlyA, "extract-a", "Only A", 2),
   ]);
   expect(await publishReal(port, seededA, guardA)).toEqual({ published: true });
 
-  const guardB = await claimOwnJob(
-    port,
-    sourceB,
-    "v1",
-    seededB.generation,
-    [dependencyOf(sourceB, seededB.generation)]
-  );
+  const guardB = await claimOwnJob(port, sourceB, "v1", seededB.generation, [
+    dependencyOf(sourceB, seededB.generation),
+  ]);
   await stageReal(port, seededB, guardB, "extract-b", [
     sharedB,
     entityFact(seededB, onlyB, "extract-b", "Only B", 2),
@@ -615,9 +635,20 @@ describe("T11 one or the last supporting source is withdrawn safely (memory)", (
       queriedAt: QUERIED_AT,
       context: { coverage: "stored_structured_subjects" },
       value: { assertion_id: origins.sharedResultId },
+      // The grant contract names the per-consumer stream its invalidation is
+      // published on; a grant issued without one is refused, so this case —
+      // which is about withdrawal, not about issuance — carries an arbitrary
+      // well-formed label rather than none.
+      consumerId: "t11-withdrawal-consumer",
       supports: [
-        { support_id: origins.supportA, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
-        { support_id: origins.supportB, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+        {
+          support_id: origins.supportA,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
+        {
+          support_id: origins.supportB,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
       ],
     } as Parameters<typeof port.evidence.issueGrant>[0]);
 
@@ -629,7 +660,9 @@ describe("T11 one or the last supporting source is withdrawn safely (memory)", (
         origins.sourceA.generation
       )
     ).toEqual({ withdrawn: true, generation: origins.sourceA.generation + 1 });
-    expect(subjectsOf(await readSnapshot(port), [origins.sharedResultId])).toHaveLength(1);
+    expect(
+      subjectsOf(await readSnapshot(port), [origins.sharedResultId])
+    ).toHaveLength(1);
 
     expect(
       await withdrawReal(
@@ -651,22 +684,27 @@ describe("T11 one or the last supporting source is withdrawn safely (memory)", (
       sources.filter((source) => source.active && source.published !== null)
     ).toHaveLength(0);
 
-    const replay = await port.evidence.readGrant(grant.evidence_ref, GRANT_READ_AT);
+    const replay = await port.evidence.readGrant(
+      grant.evidence_ref,
+      GRANT_READ_AT
+    );
     expect(replay.state).toBe("granted");
     if (replay.state !== "granted") return;
-    expect(replay.grant.value).toEqual({ assertion_id: origins.sharedResultId });
+    expect(replay.grant.value).toEqual({
+      assertion_id: origins.sharedResultId,
+    });
+    expect(replay.supports.map((support) => support.support_id).sort()).toEqual(
+      [origins.supportA, origins.supportB].sort()
+    );
     expect(
-      replay.supports.map((support) => support.support_id).sort()
-    ).toEqual([origins.supportA, origins.supportB].sort());
-    expect(
-      (
-        await port.evidence.listGrantPinnedExtractions(grant.evidence_ref)
-      ).map((entry) => entry.extraction_ref).sort()
+      (await port.evidence.listGrantPinnedExtractions(grant.evidence_ref))
+        .map((entry) => entry.extraction_ref)
+        .sort()
     ).toEqual(["extract-a", "extract-b"]);
     expect(await port.evidence.getSupport(origins.supportA)).not.toBeNull();
-    expect(await port.evidence.listSupportExtractions(origins.supportA)).toEqual([
-      "extract-a",
-    ]);
+    expect(
+      await port.evidence.listSupportExtractions(origins.supportA)
+    ).toEqual(["extract-a"]);
   });
 
   it("advances the source generation and both scope revisions in the withdrawal's own commit", async () => {
@@ -697,7 +735,9 @@ describe("T11 one or the last supporting source is withdrawn safely (memory)", (
     expect(sourceAfter.generation).toBe(origins.sourceA.generation + 1);
     expect(outcome.generation).toBe(sourceAfter.generation);
     expect(scopeAfter.readRevision).toBe(scopeBefore.readRevision + 1);
-    expect(scopeAfter.maintenanceRevision).toBe(scopeBefore.maintenanceRevision + 1);
+    expect(scopeAfter.maintenanceRevision).toBe(
+      scopeBefore.maintenanceRevision + 1
+    );
     expect(after.membership).toHaveLength(0);
   });
 
@@ -741,7 +781,9 @@ describe("T11 one or the last supporting source is withdrawn safely (memory)", (
     );
     expect(stale.withdrawn).toBe(false);
     expect(stale.code).toBe("input_stale");
-    expect(await readFingerprint(port, sourceRefs, resultIds)).toEqual(untouched);
+    expect(await readFingerprint(port, sourceRefs, resultIds)).toEqual(
+      untouched
+    );
 
     expect(
       await withdrawReal(
@@ -761,7 +803,9 @@ describe("T11 one or the last supporting source is withdrawn safely (memory)", (
     );
     expect(repeated.withdrawn).toBe(false);
     expect(repeated.code).toBe("input_stale");
-    expect(await readFingerprint(port, sourceRefs, resultIds)).toEqual(afterFirst);
+    expect(await readFingerprint(port, sourceRefs, resultIds)).toEqual(
+      afterFirst
+    );
 
     const unknownSource = await withdrawReal(
       port,
@@ -790,14 +834,17 @@ describe("T11 one or the last supporting source is withdrawn safely (memory)", (
       const outcome = await withdrawReal(
         port,
         (malformed.scopeBinding as string | undefined) ?? SCOPE_BINDING,
-        (malformed.sourceRef as string | undefined) ?? origins.sourceB.sourceRef,
+        (malformed.sourceRef as string | undefined) ??
+          origins.sourceB.sourceRef,
         origins.sourceB.generation,
         malformed
       );
       expect(outcome.withdrawn, JSON.stringify(malformed)).toBe(false);
       expect(outcome.code, JSON.stringify(malformed)).toBe("invalid_input");
     }
-    expect(await readFingerprint(port, sourceRefs, resultIds)).toEqual(afterFirst);
+    expect(await readFingerprint(port, sourceRefs, resultIds)).toEqual(
+      afterFirst
+    );
   });
 
   it("leaves the prior state exactly intact when the outbox preparation fails", async () => {

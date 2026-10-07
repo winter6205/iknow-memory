@@ -14,7 +14,10 @@ import { createHash } from "node:crypto";
 import pg from "pg";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { claimNextWork, scheduleWork } from "../../src/core/maintenance/service.js";
+import {
+  claimNextWork,
+  scheduleWork,
+} from "../../src/core/maintenance/service.js";
 import type {
   MaintenanceAttemptGuard,
   MaintenanceDependency,
@@ -196,7 +199,8 @@ async function seedSource(
     ...locator,
     unit,
   }));
-  for (const binding of locatorBindings) await backend.bindSourceLocator(binding);
+  for (const binding of locatorBindings)
+    await backend.bindSourceLocator(binding);
   const declared = await publication.declareDesired({
     scopeBinding: SCOPE_BINDING,
     authorizedSourceRefs: [...authorizedSourceRefs],
@@ -206,7 +210,13 @@ async function seedSource(
     desiredExtractionRevision: 1,
     configRevision: CONFIG_REVISION,
   });
-  return { sourceRef, record, locator, locatorBindings, generation: declared.generation };
+  return {
+    sourceRef,
+    record,
+    locator,
+    locatorBindings,
+    generation: declared.generation,
+  };
 }
 
 // EXIT: claiming through a back-dated clock writes the real lease and absolute
@@ -224,7 +234,13 @@ async function claimOwnJob(
   const scheduled = await scheduleWork(
     deps,
     { actorId: ACTOR },
-    publishRequest(sourceRef, sourceVersion, generation, dependencies, configRevision)
+    publishRequest(
+      sourceRef,
+      sourceVersion,
+      generation,
+      dependencies,
+      configRevision
+    )
   );
   if ("refused" in scheduled) {
     throw new Error(`scheduleWork refused: ${scheduled.refused}`);
@@ -243,7 +259,9 @@ async function claimOwnJob(
       [guard.jobKey]
     );
   }
-  throw new Error(`could not claim job ${scheduled.record.jobKey} for this case`);
+  throw new Error(
+    `could not claim job ${scheduled.record.jobKey} for this case`
+  );
 }
 
 function entityFact(
@@ -283,7 +301,9 @@ function assertionFact(
     tailEntityId,
     validWindow: { from: null, until: null },
   };
-  const resultId = deriveRelationAssertionId(normalizeRelationAssertion(identity));
+  const resultId = deriveRelationAssertionId(
+    normalizeRelationAssertion(identity)
+  );
   return {
     resultId,
     fact: {
@@ -387,9 +407,7 @@ interface TwoOrigins {
  * The maintenance contract's M3 fixture, built from its own words: two active
  * origins, one shared assertion and one result each origin serves alone.
  */
-async function twoOrigins(
-  label: string
-): Promise<TwoOrigins> {
+async function twoOrigins(label: string): Promise<TwoOrigins> {
   const sourceA = unique(`${label}-a`);
   const sourceB = unique(`${label}-b`);
   const seededA = await seedSource(sourceA, [sourceA, sourceB]);
@@ -398,7 +416,14 @@ async function twoOrigins(
   const tail = nextEntityId();
   const onlyA = nextEntityId();
   const onlyB = nextEntityId();
-  const sharedA = assertionFact(seededA, "extract-a", "co_founded", 1, head, tail);
+  const sharedA = assertionFact(
+    seededA,
+    "extract-a",
+    "co_founded",
+    1,
+    head,
+    tail
+  );
   const sharedB: PublicationFact = {
     ...sharedA.fact,
     occurrence: {
@@ -461,14 +486,18 @@ function subjectsOf(
   snapshot: PublicationSnapshot,
   resultIds: readonly string[]
 ): readonly PublicationSnapshot["subjects"][number][] {
-  return snapshot.subjects.filter((subject) => resultIds.includes(subject.resultId));
+  return snapshot.subjects.filter((subject) =>
+    resultIds.includes(subject.resultId)
+  );
 }
 
 function sourcesOf(
   snapshot: PublicationSnapshot,
   sourceRefs: readonly string[]
 ): readonly PublicationSnapshot["sources"][number][] {
-  return snapshot.sources.filter((source) => sourceRefs.includes(source.sourceRef));
+  return snapshot.sources.filter((source) =>
+    sourceRefs.includes(source.sourceRef)
+  );
 }
 
 async function readSnapshot(): Promise<PublicationSnapshot> {
@@ -479,7 +508,9 @@ async function soleSupportOf(
   sourceRef: string,
   resultId: string
 ): Promise<string> {
-  const observer = new pg.Client({ connectionString: harness.schemaConnectionString });
+  const observer = new pg.Client({
+    connectionString: harness.schemaConnectionString,
+  });
   await observer.connect();
   try {
     const { rows } = await observer.query<{ support_id: string }>(
@@ -508,7 +539,9 @@ interface OutboxRow {
 }
 
 async function readOutbox(resultIds: readonly string[]): Promise<OutboxRow[]> {
-  const observer = new pg.Client({ connectionString: harness.schemaConnectionString });
+  const observer = new pg.Client({
+    connectionString: harness.schemaConnectionString,
+  });
   await observer.connect();
   try {
     const { rows } = await observer.query<Record<string, any>>(
@@ -534,7 +567,9 @@ async function readOutbox(resultIds: readonly string[]): Promise<OutboxRow[]> {
 // `markIntentsDone` documents that the caller owns it; on a bare autocommit
 // client the driver terminated the session instead of updating the rows.
 async function drainOutbox(resultIds: readonly string[]): Promise<number> {
-  const observer = new pg.Client({ connectionString: harness.schemaConnectionString });
+  const observer = new pg.Client({
+    connectionString: harness.schemaConnectionString,
+  });
   await observer.connect();
   try {
     await observer.query("BEGIN");
@@ -547,7 +582,10 @@ async function drainOutbox(resultIds: readonly string[]): Promise<number> {
       await observer.query("COMMIT");
       return 0;
     }
-    const done = await markIntentsDone(observer, rows.map((row) => row.id));
+    const done = await markIntentsDone(
+      observer,
+      rows.map((row) => row.id)
+    );
     await observer.query("COMMIT");
     return done;
   } catch (error) {
@@ -580,7 +618,9 @@ async function readFingerprint(
   sourceRefs: readonly string[],
   resultIds: readonly string[]
 ): Promise<Fingerprint> {
-  const observer = new pg.Client({ connectionString: harness.schemaConnectionString });
+  const observer = new pg.Client({
+    connectionString: harness.schemaConnectionString,
+  });
   await observer.connect();
   try {
     const sources = await observer.query<Record<string, unknown>>(
@@ -697,7 +737,11 @@ type WritePoint = {
 };
 
 const WRITE_POINTS: readonly WritePoint[] = [
-  { label: "durable projection intent", table: "projection_outbox", event: "INSERT" },
+  {
+    label: "durable projection intent",
+    table: "projection_outbox",
+    event: "INSERT",
+  },
   {
     label: "current membership removal",
     table: "structured_publication_membership",
@@ -772,7 +816,10 @@ async function publishedThenStaged(label: string): Promise<StagedWithdrawal> {
   const origins = await twoOrigins(label);
   const declared = await publication.declareDesired({
     scopeBinding: SCOPE_BINDING,
-    authorizedSourceRefs: [origins.sourceA.sourceRef, origins.sourceB.sourceRef],
+    authorizedSourceRefs: [
+      origins.sourceA.sourceRef,
+      origins.sourceB.sourceRef,
+    ],
     sourceRef: origins.sourceA.sourceRef,
     sourceVersion: origins.sourceA.record,
     locatorBindings: origins.sourceA.locatorBindings,
@@ -786,12 +833,15 @@ async function publishedThenStaged(label: string): Promise<StagedWithdrawal> {
     [dependencyOf(origins.sourceA.sourceRef, declared.generation, 1)],
     "extractor-v2"
   );
-  await stageReal(
-    origins.sourceA,
-    guard,
-    "extract-a-v2",
-    [entityFact(origins.sourceA, origins.onlyAResultId, "extract-a-v2", "Only A v2", 2)]
-  );
+  await stageReal(origins.sourceA, guard, "extract-a-v2", [
+    entityFact(
+      origins.sourceA,
+      origins.onlyAResultId,
+      "extract-a-v2",
+      "Only A v2",
+      2
+    ),
+  ]);
   return { origins, stagedGeneration: declared.generation };
 }
 
@@ -805,7 +855,10 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
       poolOptions: { max: 6 },
     });
     await backend.initialize();
-    pool = new pg.Pool({ connectionString: harness.schemaConnectionString, max: 4 });
+    pool = new pg.Pool({
+      connectionString: harness.schemaConnectionString,
+      max: 4,
+    });
     clock = createPublicationTestClock(new Date());
     const composed = backend as PgvectorBackend & {
       structuredPublication?: StructuredPublicationStorage;
@@ -841,14 +894,19 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
   it("keeps a shared assertion current and visible when one of two origins is withdrawn", async () => {
     const origins = await twoOrigins("one-of-two");
     const before = await readSnapshot();
-    expect(subjectsOf(before, [origins.sharedResultId])[0]?.supportIds).toHaveLength(2);
+    expect(
+      subjectsOf(before, [origins.sharedResultId])[0]?.supportIds
+    ).toHaveLength(2);
 
     const outcome = await withdrawReal(
       SCOPE_BINDING,
       origins.sourceA.sourceRef,
       origins.sourceA.generation
     );
-    expect(outcome).toEqual({ withdrawn: true, generation: origins.sourceA.generation + 1 });
+    expect(outcome).toEqual({
+      withdrawn: true,
+      generation: origins.sourceA.generation + 1,
+    });
 
     const after = await readSnapshot();
     const shared = subjectsOf(after, [origins.sharedResultId]);
@@ -865,7 +923,10 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
     const survivor = sourcesOf(after, [origins.sourceB.sourceRef]);
     expect(survivor[0]?.active).toBe(true);
     expect(survivor[0]?.generation).toBe(origins.sourceB.generation);
-    expect(survivor[0]?.published).toEqual({ sourceVersion: "v1", extractionRevision: 1 });
+    expect(survivor[0]?.published).toEqual({
+      sourceVersion: "v1",
+      extractionRevision: 1,
+    });
   });
 
   it("removes the assertion from current reads when the last support is withdrawn and retains its authorized history", async () => {
@@ -880,9 +941,20 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
       queriedAt: QUERIED_AT,
       context: { coverage: "stored_structured_subjects" },
       value: { assertion_id: origins.sharedResultId },
+      // The grant contract names the per-consumer stream its invalidation is
+      // published on; a grant issued without one is refused, so this case —
+      // which is about withdrawal, not about issuance — carries an arbitrary
+      // well-formed label rather than none.
+      consumerId: "t11-withdrawal-consumer",
       supports: [
-        { support_id: origins.supportA, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
-        { support_id: origins.supportB, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+        {
+          support_id: origins.supportA,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
+        {
+          support_id: origins.supportB,
+          role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE,
+        },
       ],
     } as Parameters<typeof backend.issueGrant>[0]);
 
@@ -895,7 +967,9 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
       withdrawn: true,
       generation: origins.sourceA.generation + 1,
     });
-    expect(subjectsOf(await readSnapshot(), [origins.sharedResultId])).toHaveLength(1);
+    expect(
+      subjectsOf(await readSnapshot(), [origins.sharedResultId])
+    ).toHaveLength(1);
 
     const second = await withdrawReal(
       SCOPE_BINDING,
@@ -921,14 +995,16 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
     const replay = await backend.readGrant(grant.evidence_ref, GRANT_READ_AT);
     expect(replay.state).toBe("granted");
     if (replay.state !== "granted") return;
-    expect(replay.grant.value).toEqual({ assertion_id: origins.sharedResultId });
+    expect(replay.grant.value).toEqual({
+      assertion_id: origins.sharedResultId,
+    });
+    expect(replay.supports.map((support) => support.support_id).sort()).toEqual(
+      [origins.supportA, origins.supportB].sort()
+    );
     expect(
-      replay.supports.map((support) => support.support_id).sort()
-    ).toEqual([origins.supportA, origins.supportB].sort());
-    expect(
-      (
-        await backend.listGrantPinnedExtractions(grant.evidence_ref)
-      ).map((entry) => entry.extraction_ref).sort()
+      (await backend.listGrantPinnedExtractions(grant.evidence_ref))
+        .map((entry) => entry.extraction_ref)
+        .sort()
     ).toEqual(["extract-a", "extract-b"]);
     expect(await backend.getSupport(origins.supportA)).not.toBeNull();
     expect(await backend.listSupportExtractions(origins.supportA)).toEqual([
@@ -958,9 +1034,13 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
     );
     const sourceAfter = after.sources[0]!;
     const scopeAfter = after.scope[0]!;
-    expect(Number(sourceAfter.generation)).toBe(Number(sourceBefore.generation) + 1);
+    expect(Number(sourceAfter.generation)).toBe(
+      Number(sourceBefore.generation) + 1
+    );
     expect(outcome.generation).toBe(Number(sourceAfter.generation));
-    expect(Number(scopeAfter.read_revision)).toBe(Number(scopeBefore.read_revision) + 1);
+    expect(Number(scopeAfter.read_revision)).toBe(
+      Number(scopeBefore.read_revision) + 1
+    );
     expect(Number(scopeAfter.maintenance_revision)).toBe(
       Number(scopeBefore.maintenance_revision) + 1
     );
@@ -985,7 +1065,9 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
       [origins.sharedResultId, origins.onlyAResultId].sort()
     );
     expect(new Set(pendingIds).size).toBe(pendingIds.length);
-    const survivor = outbox.filter((row) => row.subject_id === origins.onlyBResultId);
+    const survivor = outbox.filter(
+      (row) => row.subject_id === origins.onlyBResultId
+    );
     expect(survivor.map((row) => row.status)).toEqual(["done"]);
   });
 
@@ -1066,7 +1148,8 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
     ]) {
       const outcome = await withdrawReal(
         (malformed.scopeBinding as string | undefined) ?? SCOPE_BINDING,
-        (malformed.sourceRef as string | undefined) ?? origins.sourceB.sourceRef,
+        (malformed.sourceRef as string | undefined) ??
+          origins.sourceB.sourceRef,
         origins.sourceB.generation,
         malformed
       );
@@ -1079,7 +1162,9 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
   it.each(WRITE_POINTS.map((point) => [point.label, point] as const))(
     "leaves the prior state exactly intact when the %s write fails",
     async (_label, point) => {
-      const fixture = await publishedThenStaged(`fault-${point.label.replace(/\s+/g, "-")}`);
+      const fixture = await publishedThenStaged(
+        `fault-${point.label.replace(/\s+/g, "-")}`
+      );
       const sourceRefs = [fixture.origins.sourceA.sourceRef];
       const resultIds = [
         fixture.origins.sharedResultId,
@@ -1089,7 +1174,9 @@ describe("T11 one or the last supporting source is withdrawn safely (PostgreSQL)
       const before = await readFingerprint(sourceRefs, resultIds);
       expect(before.membership).toHaveLength(2);
       expect(before.stages).toHaveLength(1);
-      expect(Number(before.sources[0]?.generation)).toBe(fixture.stagedGeneration);
+      expect(Number(before.sources[0]?.generation)).toBe(
+        fixture.stagedGeneration
+      );
 
       await armWriteFault(point);
       try {

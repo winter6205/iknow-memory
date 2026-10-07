@@ -68,7 +68,10 @@ const CONSTRAINT_RE = /ALTER\s+TABLE\s+(\w+)[\s\S]*?ADD\s+CONSTRAINT\s+(\w+)/gi;
  * probe and the generic `current_schema()` arm both match that text.
  */
 function recordingClient(
-  answerProbe: (sql: string, values?: unknown[]) => { rows: unknown[] } | undefined
+  answerProbe: (
+    sql: string,
+    values?: unknown[]
+  ) => { rows: unknown[] } | undefined
 ): { client: PoolClient; queries: RecordedQuery[] } {
   const queries: RecordedQuery[] = [];
   const client = {
@@ -87,7 +90,10 @@ function recordingClient(
 }
 
 async function drive(
-  answerProbe: (sql: string, values?: unknown[]) => { rows: unknown[] } | undefined
+  answerProbe: (
+    sql: string,
+    values?: unknown[]
+  ) => { rows: unknown[] } | undefined
 ): Promise<RecordedQuery[]> {
   const { client, queries } = recordingClient(answerProbe);
   await upSchemaBootstrap(client, 1536, 2000);
@@ -139,11 +145,15 @@ function collectPairs(
 
 const emittedColumns = (queries: RecordedQuery[]): Array<[string, string]> =>
   collectPairs(queries, COLUMN_RE);
-const emittedConstraints = (queries: RecordedQuery[]): Array<[string, string]> =>
-  collectPairs(queries, CONSTRAINT_RE);
+const emittedConstraints = (
+  queries: RecordedQuery[]
+): Array<[string, string]> => collectPairs(queries, CONSTRAINT_RE);
 
 /** Every table and index the full DDL path created. */
-async function emittedObjects(): Promise<{ tables: string[]; indexes: string[] }> {
+async function emittedObjects(): Promise<{
+  tables: string[];
+  indexes: string[];
+}> {
   const queries = await runBootstrap(false);
   return { tables: emittedTables(queries), indexes: emittedIndexes(queries) };
 }
@@ -254,7 +264,10 @@ describe("BOOTSTRAP_TABLES / BOOTSTRAP_INDEXES lockstep with the bootstrap DDL",
     // short-circuits the very block that emits the ALTER. The tables/indexes
     // guard could not see this class of object at all.
     const emitted = emittedColumns(await runBootstrap(false));
-    expect(emitted.length, "no forward-compat ADD COLUMN was emitted").toBeGreaterThan(0);
+    expect(
+      emitted.length,
+      "no forward-compat ADD COLUMN was emitted"
+    ).toBeGreaterThan(0);
     const emittedKeys = emitted.map(([table, column]) => `${table}.${column}`);
 
     const { columns } = await probeLists();
@@ -283,16 +296,15 @@ describe("BOOTSTRAP_TABLES / BOOTSTRAP_INDEXES lockstep with the bootstrap DDL",
     const queries = await runBootstrap(false);
     const created = new Set(emittedTables(queries));
     const constraints = emittedConstraints(queries);
-    expect(constraints.length, "no named ADD CONSTRAINT was emitted").toBeGreaterThan(
-      0
-    );
+    expect(
+      constraints.length,
+      "no named ADD CONSTRAINT was emitted"
+    ).toBeGreaterThan(0);
 
     const { probeSql } = await probeLists();
     const named = probeSql.toLowerCase();
     const invisible = constraints
-      .filter(
-        ([table, name]) => !named.includes(name) && !created.has(table)
-      )
+      .filter(([table, name]) => !named.includes(name) && !created.has(table))
       .map(([, name]) => name);
     expect(
       invisible,
@@ -306,6 +318,18 @@ describe("BOOTSTRAP_TABLES / BOOTSTRAP_INDEXES lockstep with the bootstrap DDL",
     // at once, and the name is the only observable difference. Deleting it
     // would leave the destructive entities-type upgrade unable to re-run.
     expect(named).toContain("entities_type_closed_check");
+  });
+
+  it("names the invalidation outbox, its cursor, and the evidence_ref index", async () => {
+    // P3 register §1.1, restated by hand for the same reason the marker above
+    // is: these are brand-new tables on an already-provisioned store, so the
+    // probe entry is the ONLY thing that can create them there. The derivation
+    // above would notice a missing entry, but a future relaxation of it would
+    // not name which contract regressed.
+    const { tables, indexes } = await probeLists();
+    expect(tables).toContain("evidence_invalidation_outbox");
+    expect(tables).toContain("evidence_invalidation_cursors");
+    expect(indexes).toContain("evidence_invalidation_outbox_evidence_ref_idx");
   });
 
   it("the mock itself is pinned: ready must short-circuit before the DDL", async () => {
@@ -355,7 +379,7 @@ describe("a database missing one object the bootstrap creates", () => {
         // Columns ride the probe as two parallel arrays, so they are asked
         // about as `table.column` — reading only $1/$2 here is what let a
         // column go missing from the probe unnoticed by this file.
-        ...(values?.[2] as string[] | undefined ?? []).map(
+        ...((values?.[2] as string[] | undefined) ?? []).map(
           (table, i) => `${table}.${(values?.[3] as string[])[i]}`
         ),
       ];
@@ -374,7 +398,9 @@ describe("a database missing one object the bootstrap creates", () => {
 
     for (const name of names) {
       const queries = await runWithAbsent([name]);
-      const replays = queries.filter(({ sql }) => createStatementFor(name).test(sql));
+      const replays = queries.filter(({ sql }) =>
+        createStatementFor(name).test(sql)
+      );
       expect(
         replays.length,
         `a database missing "${name}" was answered ready — the probe does not ` +
@@ -390,9 +416,10 @@ describe("a database missing one object the bootstrap creates", () => {
     const columns = emittedColumns(await runBootstrap(false)).map(
       ([table, column]) => `${table}.${column}`
     );
-    expect(columns.length, "no forward-compat columns were emitted").toBeGreaterThan(
-      0
-    );
+    expect(
+      columns.length,
+      "no forward-compat columns were emitted"
+    ).toBeGreaterThan(0);
 
     for (const key of columns) {
       const replays = (await runWithAbsent([key])).filter(({ sql }) =>
@@ -417,7 +444,8 @@ describe("a database missing one object the bootstrap creates", () => {
     const probe = queries.find(({ sql }) => READINESS_PROBE_RE.test(sql));
     expect(probe, "readiness probe statement not emitted").toBeDefined();
     expect(
-      queries.filter(({ sql }) => /CREATE\s+(?:UNIQUE\s+)?TABLE/i.test(sql)).length,
+      queries.filter(({ sql }) => /CREATE\s+(?:UNIQUE\s+)?TABLE/i.test(sql))
+        .length,
       `a fully populated database was answered not-ready (${tables.length} tables, ` +
         `${indexes.length} indexes probed)`
     ).toBe(0);

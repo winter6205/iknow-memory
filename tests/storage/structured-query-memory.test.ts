@@ -881,6 +881,10 @@ describe("structured query memory twin", () => {
         sourceRefs: seeded.sourceRefs.join(","),
         authorizationRevision: AUTHORIZATION_REVISION,
         deadlineAt: new Date(lane.clock().getTime() + 60_000).toISOString(),
+        // A grant cannot be issued without one, so this case — which refuses for
+        // the PURGE revision — has to carry a valid consumer or it would refuse
+        // earlier and for a different reason.
+        consumerId: "query-memory-consumer",
       };
       const reader = buildStructuredQueryReader(
         authority,

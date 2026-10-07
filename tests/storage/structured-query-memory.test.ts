@@ -1227,19 +1227,49 @@ describe("structured query memory twin", () => {
     );
   });
 
-  it("refuses a context not minted by this composition", async () => {
+  it("refuses a context not minted by this composition before opening a scope", async () => {
     const lane = openLane();
-    const other = openLane();
     const seeded = await seed(lane, {
       sourceRefs: ["s-a"],
       facts: [
         { subject: "entity", resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: "s-a" },
       ],
     });
+    // Both the reader's own guard and the unit-of-work guard refuse an unminted
+    // context with the SAME code, and the reader's rethrows the unit-of-work's own
+    // message, so neither the code nor the text can say which one refused. What
+    // does separate them is the reader's stated contract — refuse "before any
+    // connection is leased" — so this counts scope openings instead of guessing.
+    let scopesOpened = 0;
+    const countingScope = new Proxy(lane.backend.structuredScopeUnitOfWork, {
+      get(target, property, receiver) {
+        if (property !== "withAuthorizedScope") {
+          return Reflect.get(target, property, receiver);
+        }
+        return (...args: unknown[]) => {
+          scopesOpened += 1;
+          return Reflect.apply(
+            (target as { withAuthorizedScope: (...a: unknown[]) => unknown }).withAuthorizedScope,
+            target,
+            args
+          );
+        };
+      },
+    });
+    const storage = new MemoryStructuredQueryStorage(
+      countingScope,
+      tupleReaderOf(lane.backend.structuredIdentityStore),
+      supportReaderOf(lane.backend),
+      undefined,
+      CURSOR_KEY,
+      lane.clock
+    );
+    const forged = { ...seeded.context } as AuthorizedScopeContext;
     await expectRefusal(
-      () => other.storage.readStructuredQuery(seeded.context, list()),
+      () => storage.readStructuredQuery(forged, list()),
       "authorization_denied"
     );
+    expect(scopesOpened).toBe(0);
   });
 
   it("names endpoint display supports with their own grant role", async () => {

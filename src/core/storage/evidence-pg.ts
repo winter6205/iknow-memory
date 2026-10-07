@@ -53,7 +53,7 @@ const QUALIFIED_SUPPORT_COLUMNS = `s.support_id, s.subject, s.result_id,
 
 const GRANT_COLUMNS = `evidence_ref, grant_kind, subject, operation, query_digest,
   scope_binding, read_revision, authorization_revision, purge_revision, queried_at,
-  expires_at, context, value, result_count, authorization_receipt_id`;
+  expires_at, context, value, result_count, authorization_receipt_id, consumer_id`;
 
 const RECEIPT_COLUMNS = `receipt_id, scope_binding, authorization_revision,
   purge_revision, created_at`;
@@ -128,6 +128,7 @@ function toGrantRecord(row: Record<string, any>): EvidenceGrantRecord {
       row.authorization_receipt_id === null
         ? null
         : (row.authorization_receipt_id as string),
+    consumer_id: String(row.consumer_id),
   };
 }
 
@@ -683,9 +684,10 @@ async function insertGrantRow(
     `INSERT INTO evidence_grants
        (evidence_ref, grant_kind, subject, operation, query_digest, scope_binding,
         read_revision, authorization_revision, purge_revision, queried_at,
-        expires_at, context, value, result_count, authorization_receipt_id)
+        expires_at, context, value, result_count, authorization_receipt_id,
+        consumer_id)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz,
-             $12::jsonb, $13::jsonb, $14, $15)
+             $12::jsonb, $13::jsonb, $14, $15, $16)
      RETURNING ${GRANT_COLUMNS}`,
     [
       plan.evidenceRef,
@@ -703,6 +705,7 @@ async function insertGrantRow(
       JSON.stringify(plan.grant.value),
       plan.grant.count,
       receiptId,
+      plan.grant.consumer_id,
     ]
   );
   return toGrantRecord(requireRow(rows, "the grant insert"));

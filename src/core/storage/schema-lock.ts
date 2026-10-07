@@ -68,6 +68,12 @@ const BOOTSTRAP_COLUMNS = [
   ["structured_publication_extraction_bindings", "config_revision"],
   ["structured_publication_extraction_bindings", "extraction_ref"],
   ["structured_publication_extraction_bindings", "payload_digest"],
+  // P3 register §1b.3: `evidence_grants` is an ALREADY-DEPLOYED table (commit
+  // a932d5c), so the column its invalidation stream rides on cannot come from
+  // the CREATE statement — only from the forward-compat ALTER in
+  // createEvidenceGrants. Probing it is what makes a store that predates the
+  // column answer "not ready" so the ALTER actually replays there.
+  ["evidence_grants", "consumer_id"],
 ] as const;
 const BOOTSTRAP_TABLES = [
   "entities",
@@ -108,6 +114,11 @@ const BOOTSTRAP_TABLES = [
   "structured_publication_display",
   "structured_publication_stages",
   "structured_publication_extraction_bindings",
+  // The invalidation outbox and its per-consumer cursor: brand-new tables, same
+  // rule as index_jobs, so the probe names them or a deployed store would
+  // short-circuit before replaying their CREATE statements.
+  "evidence_invalidation_outbox",
+  "evidence_invalidation_cursors",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -160,6 +171,8 @@ const BOOTSTRAP_INDEXES = [
   "structured_publication_stages_guard_idx",
   "structured_publication_display_pkey",
   "structured_publication_extraction_bindings_pkey",
+  // The retention scan and the purge path key on the reference, not the consumer.
+  "evidence_invalidation_outbox_evidence_ref_idx",
 ] as const;
 
 /**

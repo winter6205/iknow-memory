@@ -10,12 +10,14 @@ import {
   type SchemaBootstrapClient,
 } from "./schema-sql.js";
 
-const EVIDENCE_SUBJECT_KIND_VALUES: readonly string[] =
-  Object.values(EVIDENCE_SUBJECT_KIND);
+const EVIDENCE_SUBJECT_KIND_VALUES: readonly string[] = Object.values(
+  EVIDENCE_SUBJECT_KIND
+);
 const EVIDENCE_GRANT_KIND_VALUES: readonly string[] =
   Object.values(EVIDENCE_GRANT_KIND);
-const EVIDENCE_SUPPORT_ROLE_VALUES: readonly string[] =
-  Object.values(EVIDENCE_SUPPORT_ROLE);
+const EVIDENCE_SUPPORT_ROLE_VALUES: readonly string[] = Object.values(
+  EVIDENCE_SUPPORT_ROLE
+);
 
 /**
  * The immutable source/support records and the finite grants
@@ -189,6 +191,10 @@ async function createEvidenceGrants(
       context                  jsonb NOT NULL,
       value                    jsonb NOT NULL,
       result_count             integer NULL,
+      -- Which per-consumer stream this grant belongs to, so its eventual
+      -- invalidation has a stream to be published on (ADR 0097 §2.1,
+      -- register §1b.3).
+      consumer_id              text NOT NULL DEFAULT '',
       authorization_receipt_id uuid NULL
         REFERENCES evidence_authorization_receipts(receipt_id) ON DELETE RESTRICT,
       CONSTRAINT evidence_grants_kind_check
@@ -208,6 +214,39 @@ async function createEvidenceGrants(
                 AND result_count IS NULL
                 AND authorization_receipt_id IS NULL))
     )`);
+  // Forward-compat ALTER for `consumer_id`, and the reason a table that
+  // ALREADY SHIPS differs from one that does not.
+  //
+  // `evidence_grants` is not a new table: it was created by commit a932d5c, so
+  // every deployed store already has it, and `CREATE TABLE IF NOT EXISTS`
+  // against an existing table is a no-op — it never compares columns. A column
+  // that exists only in the CREATE therefore reaches brand-new stores and
+  // nothing else, and every grant issuance on a deployed store dies with
+  // SQLSTATE 42703. `evidence_invalidation_outbox` and
+  // `evidence_invalidation_cursors` DO need no ALTER, because they are probed in
+  // BOOTSTRAP_TABLES: their absence keeps the probe answering "not ready", which
+  // is what makes the bootstrap replay their CREATE at all. `evidence_grants` is
+  // probed as a TABLE too, so the probe answered ready on exactly the stores
+  // that lacked the column, and the replay that would have fixed it never ran.
+  //
+  // The pair (`["evidence_grants", "consumer_id"]`) in BOOTSTRAP_COLUMNS is
+  // therefore not optional bookkeeping: `upSchemaBootstrap` short-circuits the
+  // entire DDL block when the probe says ready, so without it this ALTER is dead
+  // code on every deployed database. tests/storage/bootstrap-columns.test.ts
+  // derives the probe's contents from the ALTERs emitted here, so the two cannot
+  // drift.
+  //
+  // `DEFAULT ''` is for rows that predate the column, which have no consumer
+  // because the grant was issued before invalidation streams existed. They are
+  // NOT trusted: an empty consumer is refused at issuance (`assertFilled` in
+  // evidence-store.ts), and the cursor a new event is published on can never be
+  // an empty one, so a backfilled row cannot receive an invalidation nobody
+  // drains. Without the default the ALTER would need a nullable column plus a
+  // later backfill, and NOT NULL is the property that makes the "no stream" case
+  // impossible to store silently.
+  await client.query(`
+    ALTER TABLE evidence_grants
+      ADD COLUMN IF NOT EXISTS consumer_id text NOT NULL DEFAULT ''`);
   await client.query(`
     CREATE INDEX IF NOT EXISTS evidence_grants_expires_at_idx
       ON evidence_grants (expires_at)`);

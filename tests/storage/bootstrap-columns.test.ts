@@ -172,6 +172,25 @@ describe("BOOTSTRAP_COLUMNS lockstep with the forward-compat ALTERs", () => {
     // pair keys on — restated by hand so a future relaxation of the
     // derivation still names the concrete column a deployed database must get.
     expect(pairs).toContainEqual(["source_documents", "content_identity"]);
+    // P3 register §1b.3: `evidence_grants.consumer_id`. `evidence_grants`
+    // shipped in a932d5c, so it is an EXISTING table and the column can only
+    // reach a deployed store through a forward-compat ALTER — which makes this
+    // pair load-bearing rather than bookkeeping.
+    expect(pairs).toContainEqual(["evidence_grants", "consumer_id"]);
+  });
+
+  it("the invalidation tables and the grant's consumer_id column ride the probe", async () => {
+    const { pairs, pairKeys } = await observeReadinessProbe(true);
+    // Positive, and deliberately the opposite of what this file used to pin.
+    // The two invalidation tables are brand-new, so their CREATE statements
+    // need no ALTER — the probe naming them as tables is what makes the
+    // bootstrap replay those CREATEs at all. `evidence_grants` is NOT new: it
+    // predates this branch, so its `consumer_id` arrives by ALTER instead, and
+    // a probe that omitted the pair answered "ready" on exactly the stores that
+    // lacked the column, leaving every grant issuance there to fail with
+    // SQLSTATE 42703 and no second replay to repair it.
+    expect(pairKeys).toContain("evidence_grants.consumer_id");
+    expect(pairs.length).toBeGreaterThan(0);
   });
 
   it("the mock itself is pinned: ready must short-circuit before the DDL", async () => {
@@ -236,7 +255,9 @@ describePg(
       const c = client!;
 
       // First deployment: full DDL.
-      const first = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
+      const first = new PgvectorBackend(SCHEMA_URL, DIM, {
+        annMaxDimensions: 2000,
+      });
       try {
         await first.initialize();
       } finally {
@@ -257,7 +278,9 @@ describePg(
       expect(gone.rowCount).toBe(0);
 
       // Redeploy: the same bootstrap a restarted server runs.
-      const second = new PgvectorBackend(SCHEMA_URL, DIM, { annMaxDimensions: 2000 });
+      const second = new PgvectorBackend(SCHEMA_URL, DIM, {
+        annMaxDimensions: 2000,
+      });
       try {
         await second.initialize();
       } finally {
@@ -293,6 +316,80 @@ describePg(
             source_chunk_id, evidence_span, valid_window)
            VALUES ($1, $2, $3, 'raw', 'norm', 0.5, NULL, 'span', tstzrange($4, NULL, '[)'))`,
           [randomUUID(), head, tail, "2026-01-01T00:00:00Z"]
+        )
+      ).resolves.toBeDefined();
+    });
+
+    it("re-adds evidence_grants.consumer_id and lets the production grant INSERT succeed", async () => {
+      const c = client!;
+      const bootstrap = async (): Promise<void> => {
+        const backend = new PgvectorBackend(SCHEMA_URL, DIM, {
+          annMaxDimensions: 2000,
+        });
+        try {
+          await backend.initialize();
+        } finally {
+          await backend.close();
+        }
+      };
+      const columnPresent = async (
+        table: string,
+        column: string
+      ): Promise<number> => {
+        const found = await c.query<{ column_name: string }>(
+          `SELECT column_name FROM information_schema.columns
+           WHERE table_schema = $1 AND table_name = $2 AND column_name = $3`,
+          [SCHEMA, table, column]
+        );
+        return found.rowCount ?? 0;
+      };
+
+      await bootstrap();
+      // The BASE shape, exactly: `git show e5009a1:src/core/storage/schema-evidence.ts`
+      // creates `evidence_grants` with no `consumer_id`, so every store
+      // bootstrapped at or before that commit has the table without the column.
+      // Unlike `triples`, `evidence_grants` is ALSO in BOOTSTRAP_TABLES, so
+      // without the column pair in BOOTSTRAP_COLUMNS the probe answers ready on
+      // exactly these stores — the replay that would add it never runs, and the
+      // one replay that does run is spent creating the two new outbox tables.
+      await c.query(
+        `ALTER TABLE evidence_grants DROP COLUMN IF EXISTS consumer_id`
+      );
+      expect(await columnPresent("evidence_grants", "consumer_id")).toBe(0);
+
+      await bootstrap();
+
+      expect(
+        await columnPresent("evidence_grants", "consumer_id"),
+        "evidence_grants.consumer_id was not re-added — the probe reported ready " +
+          "and the forward-compat ALTER never ran"
+      ).toBe(1);
+
+      // And the production statement — the exact column list
+      // src/core/storage/evidence-pg.ts `insertGrantRow` sends — now works. It
+      // is the assertion that matters: a re-added column with a still-refused
+      // INSERT would leave the deploy break exactly where it started.
+      const receiptId = randomUUID();
+      await c.query(
+        `INSERT INTO evidence_authorization_receipts
+           (receipt_id, scope_binding, authorization_revision, purge_revision,
+            created_at)
+         VALUES ($1, 'probe-scope', 'auth-1', 'purge-1', now())`,
+        [receiptId]
+      );
+      await expect(
+        c.query(
+          `INSERT INTO evidence_grants
+             (evidence_ref, grant_kind, subject, operation, query_digest,
+              scope_binding, read_revision, authorization_revision,
+              purge_revision, queried_at, expires_at, context, value,
+              result_count, authorization_receipt_id, consumer_id)
+           VALUES ($1, 'count', 'assertion', 'count', 'digest-1', 'probe-scope',
+                   'read-1', 'auth-1', 'purge-1',
+                   '2026-01-05T00:00:00Z'::timestamptz,
+                   '2027-01-05T00:00:00Z'::timestamptz, '{}'::jsonb,
+                   '{"count":3}'::jsonb, 3, $2, $3)`,
+          [randomUUID(), receiptId, "probe-consumer"]
         )
       ).resolves.toBeDefined();
     });

@@ -798,3 +798,106 @@ describe("MP14 memory lane — a second mark and an empty cancellation", () => {
     expect(outcome.code).toBe("access_denied");
   });
 });
+
+/**
+ * The reactivation of a payload that carries no mark, and of one already cancelled.
+ *
+ * Two cases the review forced apart, and they must not be collapsed into one rule:
+ * a payload that was NEVER marked has nothing to reactivate, while a payload whose
+ * mark is already cancelled has satisfied spec:304's precondition and still needs
+ * its obligations resumed. Refusing the second would leave `obligations_stopped_at`
+ * set, and `decideGrantRead` denies on exactly that — the payload could never be
+ * served again.
+ */
+describe("MP14 memory lane — reactivating a payload with no live mark", () => {
+  it("refuses a payload that was never marked, and leaves no phantom row", async () => {
+    const target = await lane("react-phantom");
+    const revision = String(await target.maintenanceRevision());
+    target.clock.set(atDay(90));
+
+    const outcome = await target.marks.reactivateCollectionCandidate({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      sourceVersionId: SOURCE_VERSION_ID,
+      expectedLifecycleRevision: revision,
+    });
+    expect(outcome.refused).toBe(true);
+    if (!outcome.refused) return;
+    expect(outcome.code).toBe("input_stale");
+
+    // No phantom row: a key written with only state and cancellation fields would
+    // refuse every future mark for this identity, for ever.
+    expect(await target.marks.readCollectionMark(target.identity)).toBeNull();
+
+    // And the identity is still markable afterwards.
+    const later = await target.marks.markCollectionCandidate({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      sourceVersionId: SOURCE_VERSION_ID,
+      eligibility: eligibilityFor("retired_unreferenced"),
+    });
+    expect(later.refused).toBe(false);
+  });
+
+  it("resumes obligations when reactivating an already-cancelled mark", async () => {
+    const target = await lane("react-cancelled");
+    await marked(target);
+    const first = String(await target.maintenanceRevision());
+    const cancelled = await target.marks.cancelStaleCollectionMark({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      observedLifecycleRevision: first,
+    });
+    expect(cancelled.refused).toBe(false);
+    expect(await target.marks.readObligationsStoppedAt(SOURCE_VERSION_ID)).not.toBeNull();
+
+    const second = String(await target.maintenanceRevision());
+    const outcome = await target.marks.reactivateCollectionCandidate({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      sourceVersionId: SOURCE_VERSION_ID,
+      expectedLifecycleRevision: second,
+    });
+    expect(outcome.refused).toBe(false);
+    // The whole point: the payload goes back into service.
+    expect(await target.marks.readObligationsStoppedAt(SOURCE_VERSION_ID)).toBeNull();
+  });
+
+  it("re-marks a cancelled payload, which is spec:307's re-evaluation branch", async () => {
+    const target = await lane("remark-after-cancel");
+    await marked(target);
+    const revision = String(await target.maintenanceRevision());
+    const cancelled = await target.marks.cancelStaleCollectionMark({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      observedLifecycleRevision: revision,
+    });
+    expect(cancelled.refused).toBe(false);
+
+    // spec:307 sends a changed mark down cancel, re-evaluate, mark again. If a
+    // cancelled row refused re-marking, that branch would be unreachable and the
+    // payload could never be collected at all.
+    const again = await target.marks.markCollectionCandidate({
+      context: target.context,
+      scopeBinding: target.context.ownerScopeBinding,
+      payloadClass: "retired_unreferenced",
+      payloadRef: PAYLOAD_REF,
+      sourceVersionId: SOURCE_VERSION_ID,
+      eligibility: eligibilityFor("retired_unreferenced"),
+    });
+    expect(again.refused).toBe(false);
+    if (again.refused) return;
+    expect(again.plan.mark.state).toBe("marked");
+    expect(again.plan.mark.cancelledAt).toBeNull();
+  });
+});

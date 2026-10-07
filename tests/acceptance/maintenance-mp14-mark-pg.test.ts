@@ -691,6 +691,74 @@ describeAcceptance("M15-M18 acceptance — collection marks on the real boundary
     })) as { refused: boolean };
     expect(nothing.refused).toBe(true);
   });
+
+  it("refuses reactivating a never-marked payload, but resumes an already-cancelled one", async () => {
+    const retiredLongAgo = daysBeforeNow(200);
+    const source = await seedSourceVersion("s1", retiredLongAgo);
+    await seedScope(["s1"]);
+    const eligibility = await decide(candidate("s1", retiredLongAgo), new Date());
+    const identity = { payloadClass: "retired_unreferenced" as const, payloadRef: "s1" };
+    const revision = async (): Promise<string> =>
+      String(
+        (await authority.withAuthorizedScope(context(["s1"]), async (work) =>
+          (await work.readMaintenanceInputs([])).maintenanceRevision
+        )) ?? ""
+      );
+
+    // Nothing to reactivate: PG refuses, and the memory lane must agree.
+    const phantom = (await marks.reactivateCollectionCandidate({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+      sourceVersionId: source,
+      expectedLifecycleRevision: await revision(),
+    })) as { refused: boolean; code?: string };
+    expect(phantom.refused).toBe(true);
+    expect(phantom.code).toBe("input_stale");
+    const afterPhantom = await marks.readCollectionMark({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+    });
+    expect(afterPhantom?.found).toBe(false);
+
+    const first = await marks.markCollectionCandidate({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+      sourceVersionId: source,
+      eligibility,
+    });
+    if (first.refused) throw new Error(`mark refused ${first.code}: ${first.detail}`);
+
+    // A cancelled mark whose obligations are then resumed by a reactivation. The
+    // mark is already cancelled, so spec:304's precondition is satisfied — refusing
+    // here would leave obligations_stopped_at set and decideGrantRead would deny the
+    // payload for ever.
+    const atMark = String(
+      (await authority.withAuthorizedScope(context(["s1"]), async (work) =>
+        (await work.readMaintenanceInputs([])).maintenanceRevision
+      )) ?? ""
+    );
+    const cancelled = await marks.cancelStaleCollectionMark({
+      context: context(["s1"]),
+      scopeBinding: SCOPE,
+      payloadClass: identity.payloadClass,
+      payloadRef: identity.payloadRef,
+      observedLifecycleRevision: atMark,
+    });
+    expect(cancelled.refused).toBe(false);
+
+    const resumed = await marks.reactivateCollectionCandidate({
+      context: context(["s1"]),
+      identity,
+      scopeBinding: SCOPE,
+      sourceVersionId: source,
+      expectedLifecycleRevision: await revision(),
+    });
+    expect(resumed.refused).toBe(false);
+    expect(await obligationsStoppedAt(source)).toBeNull();
+  });
 });
 
 /** The recheck verdict of a read that found a marked row, or a named failure. */

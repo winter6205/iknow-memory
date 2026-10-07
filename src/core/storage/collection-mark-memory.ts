@@ -176,11 +176,12 @@ export class InMemoryCollectionMarkStorage {
       // same as PostgreSQL — which refuses it too. Whether a payload that was marked
       // and then cancelled may be marked again is a retention policy question, and
       // until MP15 states one, the safe answer is that it may not.
-      if (this.marks.has(key)) {
+      const existing = this.marks.get(key);
+      if (existing !== undefined && existing.state === "marked") {
         return {
           refused: true,
           code: "input_stale",
-          detail: `payload ${mark.payloadRef} already carries a mark, so marking it again must cancel or delete that one first`,
+          detail: `payload ${mark.payloadRef} already carries a live mark, so marking it again must cancel or delete that one first`,
         };
       }
       work.prepare(() => {
@@ -239,10 +240,27 @@ export class InMemoryCollectionMarkStorage {
 
       const { plan } = outcome;
       const key = markKey(plan.identity.payloadClass, plan.identity.payloadRef);
+      // A payload that was never marked has nothing to reactivate, and writing one
+      // here would store a row with no class, ref, scope or deadline — a key that
+      // then refuses every future mark for that identity forever. The plan does not
+      // require the mark to exist, so the store must check.
+      //
+      // An ALREADY-CANCELLED mark is deliberately not refused. spec:304's
+      // precondition is then already satisfied, and the call's whole purpose is to
+      // put the payload back in service — refusing it would leave
+      // obligations_stopped_at set, and decideGrantRead denies on exactly that
+      // (`evidence-store.ts:449-454`), so the payload could never be served again.
+      const live = this.marks.get(key);
+      if (live === undefined) {
+        return {
+          refused: true,
+          code: "input_stale",
+          detail: `payload ${plan.identity.payloadRef} has no collection mark to reactivate`,
+        };
+      }
       work.prepare(() => {
-        const live = this.marks.get(key);
         this.marks.set(key, {
-          ...(live as CollectionMark),
+          ...live,
           state: "cancelled",
           cancelledAt: plan.cancelledAt,
           cancelledReason: plan.reason,
@@ -274,7 +292,10 @@ export class InMemoryCollectionMarkStorage {
   async cancelStaleCollectionMark(
     request: MemoryStaleCancellationRequest
   ): Promise<CollectionMarkCancellationOutcome> {
-    const outcome = planStaleMarkCancellation(request, this.now());
+    const outcome = planStaleMarkCancellation(
+      { payloadClass: request.payloadClass, payloadRef: request.payloadRef },
+      this.now()
+    );
     if (outcome.refused) return outcome;
     return this.scope.withAuthorizedScope(request.context, async (work) => {
       const owned = this.requireOwnedScope(request.context, request.scopeBinding);

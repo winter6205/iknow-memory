@@ -68,6 +68,7 @@ import {
   readPgStatusRevisions,
 } from "./structured-status-reads.js";
 import { buildPgAcceptedSnapshot } from "./structured-scope-reads.js";
+import { withStructuredReadLease } from "./structured-purge-pg.js";
 import {
   scopeAuthorityOf,
   StructuredScopeError,
@@ -1580,54 +1581,72 @@ export class PgStructuredQueryStorage implements StructuredQueryStorage {
       context,
       requestedSourceRefs ?? context.authorizedSourceRefs
     );
+    // Taken BEFORE the lease is registered, and that order is load-bearing. The
+    // lease expires `ttlMs` after its own insert; the read refuses `ttlMs` after
+    // this instant, which is not later. So the lease can only ever outlive the
+    // reader it names — never expire while this read is still running, which is
+    // what lets a purge trust the expiry instead of a cancellation signal.
     const startedAt = this.now().getTime();
     try {
-      return await this.scope.runTransaction(
-        async (client) => {
-          const scopeRevisions = await readScopeRevisions(
-            client,
-            context.ownerScopeBinding
-          );
-          const issuanceFence = assertCurrentAuthorization(
-            scopeRevisions,
-            context
-          );
-          const revisions = await readPgStatusRevisions(
-            client,
-            context.ownerScopeBinding
-          );
-          const snapshot = await buildPgAcceptedSnapshot(
-            client,
-            context,
-            refs,
-            revisions.readRevision
-          );
-          const maintenance = await buildPgMaintenanceStatus(
-            client,
-            context,
-            refs
-          );
-          return assembleRead({
-            request,
-            context,
-            snapshot,
-            maintenance,
-            readRevision: String(revisions.readRevision),
-            issuanceFence,
-            tuples: new PgStructuredQueryTupleReader(client),
-            supports: new PgStructuredQuerySupportReader(client),
-            now: this.now(),
-            startedAtMs: startedAt,
-            cursorKey: this.cursorKey,
-          });
+      return await withStructuredReadLease(
+        this.scope,
+        {
+          scopeBinding: context.ownerScopeBinding,
+          sourceRefs: refs,
+          readerKind: "query",
+          // The read's own execution bound, so the lease can never outlive the
+          // reader it names: `assertReaderLease` refuses this read at the same
+          // instant, and a row that outlived its reader would only slow a purge.
+          ttlMs: STRUCTURED_QUERY_READER_LEASE_MS,
         },
-        // The transaction re-types an error it does not recognise as a scope
-        // failure, which would replace this reader's typed refusal with
-        // `structured_search_unavailable`. `fail` keeps the code the caller
-        // actually threw, and keeps the rollback diagnostics on that same object.
-        { readOnly: true, fail: asStructuredFailure }
-      );
-    } catch (error) {
+        () =>
+          this.scope.runTransaction(
+            async (client) => {
+              const scopeRevisions = await readScopeRevisions(
+                client,
+                context.ownerScopeBinding
+              );
+              const issuanceFence = assertCurrentAuthorization(
+                scopeRevisions,
+                context
+              );
+              const revisions = await readPgStatusRevisions(
+                client,
+                context.ownerScopeBinding
+              );
+              const snapshot = await buildPgAcceptedSnapshot(
+                client,
+                context,
+                refs,
+                revisions.readRevision
+              );
+              const maintenance = await buildPgMaintenanceStatus(
+                client,
+                context,
+                refs
+              );
+              return assembleRead({
+                request,
+                context,
+                snapshot,
+                maintenance,
+                readRevision: String(revisions.readRevision),
+                issuanceFence,
+                tuples: new PgStructuredQueryTupleReader(client),
+                supports: new PgStructuredQuerySupportReader(client),
+                now: this.now(),
+                startedAtMs: startedAt,
+                cursorKey: this.cursorKey,
+              });
+            },
+            // The transaction re-types an error it does not recognise as a scope
+            // failure, which would replace this reader's typed refusal with
+            // `structured_search_unavailable`. `fail` keeps the code the caller
+            // actually threw, and keeps the rollback diagnostics on that same object.
+            { readOnly: true, fail: asStructuredFailure }
+            )
+        );
+      } catch (error) {
       throw asStructuredFailure(error);
     }
   }

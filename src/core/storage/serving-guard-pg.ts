@@ -52,6 +52,9 @@ export function servingGuardClause(alias: string): string {
       )`;
 }
 
+/** The aliases the clause above binds internally; see `assertChunkAlias`. */
+const RESERVED_CLAUSE_ALIASES: ReadonlySet<string> = new Set(["sv", "ps"]);
+
 /**
  * The clause's two halves, both required:
  *
@@ -89,8 +92,21 @@ export const SERVING_GUARD_CLAUSE = servingGuardClause("chunks");
  * A bare SQL identifier: letters, digits and underscores, not starting with a
  * digit. Narrow on purpose — an alias that needed quoting would already be a
  * sign the call site is doing something this function cannot vouch for.
+ *
+ * The clause's own inner aliases are reserved as well. They are not injectable —
+ * they are written here — but a call site that passed `sv` or `ps` would make
+ * the join self-referential (`sv.source_ref = sv.source_ref`), and a tautology
+ * matches every row, so the guard would silently pass everything. That failure
+ * is invisible while the data is healthy and appears only once a source is
+ * actually withdrawn.
  */
 function assertChunkAlias(alias: string): void {
+  if (RESERVED_CLAUSE_ALIASES.has(alias)) {
+    throw new GraphragError(
+      `serving-guard-pg: reserved chunks alias "${alias}"`,
+      "STORAGE_ERROR"
+    );
+  }
   if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) return;
   throw new GraphragError(
     `serving-guard-pg: unsafe chunks alias "${alias}"`,

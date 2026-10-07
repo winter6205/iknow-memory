@@ -53,4 +53,13 @@ describe("MP12 SQL clause — alias binding", () => {
       expect(() => servingGuardClause(alias)).toThrow(GraphragError);
     }
   });
+
+  it("refuses the clause's own inner aliases, which would make the join tautological", () => {
+    // `servingGuardClause("sv")` is syntactically fine and emits
+    // `sv.source_ref = sv.source_ref`. A tautology matches every row, so the
+    // guard would pass everything and only fail once a source is withdrawn.
+    for (const alias of ["sv", "ps"]) {
+      expect(() => servingGuardClause(alias)).toThrow(GraphragError);
+    }
+  });
 });

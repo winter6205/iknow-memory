@@ -95,7 +95,7 @@ and 2 (`buildPprCypher`, `neo4j-ppr.ts:109`) read no chunk text: the seed query 
 `id, canonical_name, score`, and PPR returns only `entityId, score` (`neo4j-ppr.ts:125`).
 Step 3 is the single choke point where the graph tier emits chunk **content**, because
 chunks never enter the graph (ADR-0001). So guarding `ENTITY_CHUNKS_SQL`
-(`pgvector-backend.ts:295`) covers the graph tier completely — `neo4j-graph-arm.ts`
+(`ENTITY_CHUNKS_SQL` in `pgvector-backend.ts`) covers the graph tier completely — `neo4j-graph-arm.ts`
 needs no change at all, and the `source_ref` the clause matches on is already selected
 at `:295` and mapped to the hit at `neo4j-graph-arm.ts:261`.
 
@@ -122,7 +122,7 @@ carried by the single definition, and the HNSW regression stays pinned by
 ### The archived one-hop twin is deliberately NOT guarded
 
 `buildOneHopChunksSql` (`query-builder.ts:46`) mirrors `ONE_HOP_CHUNKS_SQL`
-(`pgvector-backend.ts:266`) and stays unguarded, on two grounds that are facts about
+(`ONE_HOP_CHUNKS_SQL` in `pgvector-backend.ts`) and stays unguarded, on two grounds that are facts about
 the code rather than convenience:
 
 1. It is production-unreachable. `graph-arm.ts:4-11` and `buildRetrieveDeps`
@@ -130,7 +130,7 @@ the code rather than convenience:
    so `assembleRetrievalResult` never reaches the archived arm (#58 / #62).
 2. It cannot be executed against production anyway. It filters
    `c.valid_window @> $2::timestamptz`, and the production `chunks` table has no
-   `valid_window` column at all (`pgvector-backend.ts:927-936` carries the
+   `valid_window` column at all (the production `chunks` DDL in `PgvectorBackend.ensureTable` carries the
    `valid_from` / `valid_until` pair). Only the P0 test fixtures ever created a
    generated `valid_window`. Guarding SQL that cannot run would assert a protection
    nobody can observe.
@@ -141,8 +141,8 @@ archived arm is ever revived, `ENTITY_CHUNKS_SQL` is the query to revive it from
 ### Architecture gate — graph tier
 
 bounded-context-guardian: yes — the guard stays in `serving-guard-pg.ts`; the change is one alias-parametrized builder in that module plus one clause appended in `pgvector-backend.ts`. No new module, no directory, no cross-store import, and no edit at all in `core/retrieval/`.
-input-contract-tests: yes — the changed surface is emitted SQL, so the cases run against real Postgres: empty entity-id set (existing short-circuit, `pgvector-backend.ts:2365`), live source, sole-purged source, withdrawn-but-uncollected source, ingested-but-unpublished source, and a source with no lifecycle row at all.
-error-handling-enforcer: yes — the guard adds a `WHERE` predicate, so an unservable source yields zero rows (an ordinary empty result), not a throw. The existing `GraphragError` / `STORAGE_ERROR` wrapper at `pgvector-backend.ts:2391` is untouched, and no new error code, magic string, or fallback branch is introduced.
+input-contract-tests: yes — the changed surface is emitted SQL, so the cases run against real Postgres: empty entity-id set (existing short-circuit in `PgvectorBackend.chunksByEntityIds`), live source, sole-purged source, withdrawn-but-uncollected source, ingested-but-unpublished source, and a source with no lifecycle row at all.
+error-handling-enforcer: yes — the guard adds a `WHERE` predicate, so an unservable source yields zero rows (an ordinary empty result), not a throw. The existing `GraphragError` / `STORAGE_ERROR` wrapper in `PgvectorBackend.chunksByEntityIds` is untouched, and no new error code, magic string, or fallback branch is introduced.
 complexity-anti-drift: yes — the alias is a call-site literal passed through a narrow identifier check mirroring `assertEmbeddingSlotIdentifier`, and the clause is one template literal; no touched function grows a branch or a parameter. Confirmed by `lint:s5` before commit, not assumed.
 minimal-change-verifier: yes — one clause on one query. The lexical tier is documented as NOT done, three unguarded read paths are named as follow-ups rather than fixed, and the archived twin is left alone on stated grounds.
 
@@ -187,9 +187,9 @@ guard". Until that lands, **the lexical tier is unguarded and the register must 
   - `src/core/storage/memory-backend.ts:216` — `MemoryBackend`, the in-memory
     `StorageBackend`. It has no lifecycle tables to join, so guarding it means
     deciding what a fake store claims about sources it never saw.
-  - `src/core/storage/pgvector-backend.ts:438` — `NEIGHBOR_CHUNKS_SQL`, the
+  - `src/core/storage/pgvector-backend.ts` — `NEIGHBOR_CHUNKS_SQL`, the
     same-source neighbour expansion used by the neighbouring-chunk arm.
-  - `src/core/storage/pgvector-backend.ts:476` — `PARENT_WINDOWS_SQL`, the 档 A
+  - `src/core/storage/pgvector-backend.ts` — `PARENT_WINDOWS_SQL`, the 档 A
     child→parent window read. It joins `source_documents` and does not select
     `chunks.source_ref` at all, so it needs a decision about whether the parent's
     source or the child's is the guard key before a clause can be written.

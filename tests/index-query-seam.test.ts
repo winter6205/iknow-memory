@@ -54,6 +54,7 @@ import type {
   EvidenceGrantRecord,
   EvidenceStore,
   GrantRequest,
+  ScopeRevisionFence,
 } from "../src/core/types.js";
 import { normalizeGrantRequest } from "../src/core/storage/evidence-store.js";
 import { structuredErrorEnvelope } from "../src/core/structured/errors.js";
@@ -63,6 +64,11 @@ const OWNER_SCOPE = "scope-query-seam";
 const READER = "reader-query-seam";
 const SOURCE_REF = "docs/query-seam.md";
 const AUTHORIZATION_REVISION = "auth-query-seam-1";
+const ISSUANCE_FENCE: ScopeRevisionFence = Object.freeze({
+  scope_binding: OWNER_SCOPE,
+  authorization_revision: AUTHORIZATION_REVISION,
+  purge_revision: "purge-query-seam-1",
+});
 const QUERIED_AT = "2026-02-03T04:05:06Z";
 const READ_REVISION = "42";
 const QUERY_DIGEST = "sha256:0f".padEnd(71, "a");
@@ -108,9 +114,7 @@ function entityRow(ordinal: number): StructuredQueryEntityRowPlan {
 }
 
 /** The grant a row's citation is issued from — field-for-field the grant request. */
-function rowGrant(
-  row: StructuredQueryEntityRowPlan
-): StructuredQueryGrantPlan {
+function rowGrant(row: StructuredQueryEntityRowPlan): StructuredQueryGrantPlan {
   return {
     kind: "row",
     subject: "entity",
@@ -145,6 +149,7 @@ function listPlan(
     readerBinding: READER,
     authorizationRevision: AUTHORIZATION_REVISION,
     readRevision: READ_REVISION,
+    issuanceFence: ISSUANCE_FENCE,
     queriedAt: QUERIED_AT,
     maintenance: MAINTENANCE,
     rows,
@@ -164,6 +169,7 @@ function countPlan(count: number | null): StructuredQueryReadPlan {
     readerBinding: READER,
     authorizationRevision: AUTHORIZATION_REVISION,
     readRevision: READ_REVISION,
+    issuanceFence: ISSUANCE_FENCE,
     queriedAt: QUERIED_AT,
     maintenance: MAINTENANCE,
     rows: [],
@@ -223,7 +229,9 @@ function recordingAuthority(): {
 } {
   const minted: AuthorizedScopeContextInput[] = [];
   const unreachable = (): never => {
-    throw new Error("the seam reached a transaction instead of the injected reader");
+    throw new Error(
+      "the seam reached a transaction instead of the injected reader"
+    );
   };
   return {
     minted,
@@ -262,12 +270,16 @@ function recordingGrants(
 ): {
   readonly grants: Pick<EvidenceStore, "issueGrants">;
   readonly issued: GrantRequest[];
+  readonly fences: (ScopeRevisionFence | undefined)[];
 } {
   const issued: GrantRequest[] = [];
+  const fences: (ScopeRevisionFence | undefined)[] = [];
   return {
     issued,
+    fences,
     grants: {
-      issueGrants: async (requests) => {
+      issueGrants: async (requests, expectedScopeRevisionFence) => {
+        fences.push(expectedScopeRevisionFence);
         // `normalizeGrantRequest` FIRST, so this double enforces the same
         // arm-exclusivity the real store does. Without it the double accepted a
         // request no store would take, which is exactly how forwarding a count
@@ -294,8 +306,7 @@ function recordingGrants(
             context: { ...plan.context },
             value: plan.value,
             result_count: plan.count,
-            authorization_receipt_id:
-              plan.kind === "count" ? uuid(900) : null,
+            authorization_receipt_id: plan.kind === "count" ? uuid(900) : null,
           };
         });
       },
@@ -314,7 +325,10 @@ function recordingGrants(
  *     looping `issueGrant` did and what the negative case below needs in order to
  *     show the assertion can fail.
  */
-function throwingGrants(failsAt: number, atomic: boolean): {
+function throwingGrants(
+  failsAt: number,
+  atomic: boolean
+): {
   readonly grants: Pick<EvidenceStore, "issueGrants">;
   readonly committed: string[];
 } {
@@ -430,7 +444,7 @@ describe("the Query seam — issued evidence references (H1/M3)", () => {
     const rows = [entityRow(1), entityRow(2)];
     const { authority } = recordingAuthority();
     const { reader } = recordingReader(listPlan(rows));
-    const { grants, issued } = recordingGrants();
+    const { grants, issued, fences } = recordingGrants();
 
     const outcome = await buildStructuredQueryReader(
       authority,
@@ -442,6 +456,7 @@ describe("the Query seam — issued evidence references (H1/M3)", () => {
     expect(outcome.kind).toBe("list");
     if (outcome.kind !== "list") throw new Error("expected a list");
     expect(issued).toHaveLength(rows.length);
+    expect(fences).toEqual([ISSUANCE_FENCE]);
     expect(outcome.rows.map((row) => row.evidenceRef)).toEqual([
       uuid(500),
       uuid(501),
@@ -502,6 +517,56 @@ describe("the Query seam — issued evidence references (H1/M3)", () => {
     expect(issued[0]?.kind).toBe("count");
   });
 
+  it("refuses an empty page whose issuance fence names another scope", async () => {
+    const { authority } = recordingAuthority();
+    const { reader } = recordingReader({
+      ...listPlan([]),
+      issuanceFence: Object.freeze({
+        ...ISSUANCE_FENCE,
+        scope_binding: "another-scope",
+      }),
+    });
+    const { grants, issued, fences } = recordingGrants();
+
+    const error = await capturedStructuredError(() =>
+      buildStructuredQueryReader(
+        authority,
+        grants,
+        reader,
+        connectionIdentity("session-a")
+      ).readStructuredQuery(LIST)
+    );
+
+    expect(error.code).toBe("structured_search_unavailable");
+    expect(fences).toHaveLength(0);
+    expect(issued).toHaveLength(0);
+  });
+
+  it("refuses an empty page when its read plan has no issuance fence", async () => {
+    const { authority } = recordingAuthority();
+    const malformedPlan = {
+      ...listPlan([]),
+    } as Partial<StructuredQueryReadPlan>;
+    delete malformedPlan.issuanceFence;
+    const { reader } = recordingReader(
+      malformedPlan as StructuredQueryReadPlan
+    );
+    const { grants, issued, fences } = recordingGrants();
+
+    const error = await capturedStructuredError(() =>
+      buildStructuredQueryReader(
+        authority,
+        grants,
+        reader,
+        connectionIdentity("session-a")
+      ).readStructuredQuery(LIST)
+    );
+
+    expect(error.code).toBe("structured_search_unavailable");
+    expect(fences).toHaveLength(0);
+    expect(issued).toHaveLength(0);
+  });
+
   it("mints a reference only for the authorized row this read returned", async () => {
     // spec/structured-corpus-evidence.md:147 — a model must never receive fields
     // derived solely from an unauthorized support. The reference is minted from
@@ -553,9 +618,9 @@ describe("the Query seam — issued evidence references (H1/M3)", () => {
       reader,
       connectionIdentity("session-a")
     );
-    expect(
-      await refusalCode(() => seam.readStructuredQuery(LIST))
-    ).toBe("structured_search_unavailable");
+    expect(await refusalCode(() => seam.readStructuredQuery(LIST))).toBe(
+      "structured_search_unavailable"
+    );
   });
 });
 

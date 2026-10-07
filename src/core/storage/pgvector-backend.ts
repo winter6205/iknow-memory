@@ -35,6 +35,7 @@ import type {
   IndexJobTerminalOutcome,
   NewSourceVersion,
   RetrievedChunk,
+  ScopeRevisionFence,
   ScopeRevisionRecord,
   SearchOptions,
   SourceDocRecord,
@@ -123,11 +124,17 @@ import {
   normalizeSourceVersion,
   type SourceVersionStamp,
 } from "./evidence-source.js";
-import { decideGrantRead, normalizeGrantRequest } from "./evidence-store.js";
+import {
+  assertScopeRevisionFenceCurrent,
+  decideGrantRead,
+  normalizeGrantRequest,
+  normalizeScopeRevisionFence,
+} from "./evidence-store.js";
 import {
   bindSourceLocatorRow,
   inEvidenceTransaction,
   issueGrantRows,
+  lockScopeRevisions,
   readGrantDependenciesByRef,
   readGrantFacts,
   readGrantPinnedExtractions,
@@ -2102,16 +2109,25 @@ export class PgvectorBackend
    * dependencies it can never hand to anyone.
    */
   async issueGrants(
-    requests: readonly GrantRequest[]
+    requests: readonly GrantRequest[],
+    expectedScopeRevisionFence?: ScopeRevisionFence
   ): Promise<readonly EvidenceGrantRecord[]> {
     const plans = requests.map((request) => ({
       grant: normalizeGrantRequest(request),
       evidenceRef: randomUUID(),
       receiptId: randomUUID(),
     }));
+    const fence = normalizeScopeRevisionFence(
+      expectedScopeRevisionFence,
+      plans.map((plan) => plan.grant)
+    );
     return inEvidenceTransaction(
       async () => (await this.ensureReady()).connect(),
       async (client) => {
+        if (fence !== null) {
+          const current = await lockScopeRevisions(client, fence.scope_binding);
+          assertScopeRevisionFenceCurrent(fence, current);
+        }
         const issued: EvidenceGrantRecord[] = [];
         for (const plan of plans) {
           issued.push(await issueGrantRows(client, plan));

@@ -79,7 +79,10 @@ import type {
   ScopeTransactionOwner,
 } from "../../src/core/storage/structured-scope-types.js";
 import { createPublicationTestClock } from "../storage/publication-contract.js";
-import { openStrictPgDriver, requireFullyRunnable } from "./strict-pg-driver.js";
+import {
+  openStrictPgDriver,
+  requireFullyRunnable,
+} from "./strict-pg-driver.js";
 
 const EXPECTED_COMMAND =
   "STRUCTURED_QUERY_PG=1 GRAPHRAG_MEMORY_DB_URL=<isolated-development-dsn> npx vitest run tests/acceptance/structured-query-pg.test.ts";
@@ -140,7 +143,9 @@ function opaqueDigest(text: string): string {
 admin = new pg.Client({ connectionString: SCHEMA_URL });
 await admin.connect();
 await driver.harness.resetSchema(admin);
-backend = new PgvectorBackend(SCHEMA_URL, DIMENSIONS, { annMaxDimensions: 2000 });
+backend = new PgvectorBackend(SCHEMA_URL, DIMENSIONS, {
+  annMaxDimensions: 2000,
+});
 await backend.initialize();
 pool = new pg.Pool({ connectionString: SCHEMA_URL, max: 6 });
 clock = createPublicationTestClock(new Date());
@@ -218,7 +223,11 @@ async function declare(
   units: number,
   extractionRevision = 1
 ): Promise<number> {
-  const { record, locators } = await registerVersion(sourceRef, sourceVersion, units);
+  const { record, locators } = await registerVersion(
+    sourceRef,
+    sourceVersion,
+    units
+  );
   const declared = await publication.declareDesired({
     scopeBinding,
     authorizedSourceRefs,
@@ -376,10 +385,12 @@ async function seed(spec: SeedSpec): Promise<Seeded> {
   // The durable-work ledger is one shared queue whose claims cannot be released,
   // so a job a previous case left pending would be claimed by this one.
   await pool.query("DELETE FROM maintenance_jobs");
-  const sourceRefs = [...new Set([
-    ...spec.facts.map((fact) => fact.sourceRef),
-    ...(spec.relations ?? []).map((relation) => relation.sourceRef),
-  ])];
+  const sourceRefs = [
+    ...new Set([
+      ...spec.facts.map((fact) => fact.sourceRef),
+      ...(spec.relations ?? []).map((relation) => relation.sourceRef),
+    ]),
+  ];
   const generations = new Map<string, number>();
   const extractionRefs = new Map<string, string>();
   for (const sourceRef of sourceRefs) {
@@ -401,7 +412,10 @@ async function seed(spec: SeedSpec): Promise<Seeded> {
   for (const fact of spec.facts) {
     const unit = nextUnit(fact.sourceRef);
     bySource.get(fact.sourceRef)!.push({
-      identity: { kind: "entity", input: { entityId: fact.resultId, type: fact.entityType } },
+      identity: {
+        kind: "entity",
+        input: { entityId: fact.resultId, type: fact.entityType },
+      },
       occurrence: {
         subject: "entity",
         result_id: fact.resultId,
@@ -428,7 +442,9 @@ async function seed(spec: SeedSpec): Promise<Seeded> {
     };
     // The assertion id IS its exact tuple, so the reader is handed the same
     // derived UUID the publication lane stored.
-    const assertionId = deriveRelationAssertionId(normalizeRelationAssertion(input));
+    const assertionId = deriveRelationAssertionId(
+      normalizeRelationAssertion(input)
+    );
     assertionIds.push(assertionId);
     const unit = nextUnit(relation.sourceRef);
     bySource.get(relation.sourceRef)!.push({
@@ -470,7 +486,9 @@ async function seed(spec: SeedSpec): Promise<Seeded> {
   };
 }
 
-function list(overrides: Partial<ValidatedStructuredQuery> = {}): ValidatedStructuredQuery {
+function list(
+  overrides: Partial<ValidatedStructuredQuery> = {}
+): ValidatedStructuredQuery {
   return {
     subject: "entity",
     operation: "list",
@@ -526,7 +544,9 @@ function cursorBody(raw: string): Record<string, unknown> {
  * the honest shape of an attacker's edit.
  */
 function tamperCursor(raw: string, payload: Record<string, unknown>): string {
-  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString(
+    "base64url"
+  );
   const separator = raw.indexOf(".");
   return separator < 0 ? body : `${body}.${raw.slice(separator + 1)}`;
 }
@@ -572,9 +592,15 @@ function emittedEnvelope(
   plan: Awaited<ReturnType<StructuredQueryStorage["readStructuredQuery"]>>,
   now: Date
 ): string {
-  const issued = plan.rows.map(() => STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER);
+  const issued = plan.rows.map(
+    () => STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER
+  );
   return JSON.stringify(
-    buildStructuredResult(request, structuredQueryReadOutcome(plan, issued), now)
+    buildStructuredResult(
+      request,
+      structuredQueryReadOutcome(plan, issued),
+      now
+    )
   );
 }
 
@@ -595,7 +621,13 @@ function relationRead(window: {
         sourcesInScope: 1,
         publishedSources: 1,
         desiredIndex: { pending: 0, running: 0, ready: 1, failed: 0, stale: 0 },
-        conflictChecks: { pending: 0, running: 0, ready: 1, failed: 0, stale: 0 },
+        conflictChecks: {
+          pending: 0,
+          running: 0,
+          ready: 1,
+          failed: 0,
+          stale: 0,
+        },
         rulesetRevision: "ruleset-1",
       },
     },
@@ -653,8 +685,18 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "one-row",
       facts: [
-        { resultId: ANCHOR, name: "Widget", entityType: "organization", sourceRef: unique("multi-a") },
-        { resultId: ANCHOR, name: "Widget", entityType: "organization", sourceRef: unique("multi-b") },
+        {
+          resultId: ANCHOR,
+          name: "Widget",
+          entityType: "organization",
+          sourceRef: unique("multi-a"),
+        },
+        {
+          resultId: ANCHOR,
+          name: "Widget",
+          entityType: "organization",
+          sourceRef: unique("multi-b"),
+        },
       ],
     });
     const plan = await storage.readStructuredQuery(seeded.context, list());
@@ -667,8 +709,18 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "order",
       facts: [
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
     const plan = await storage.readStructuredQuery(seeded.context, list());
@@ -686,7 +738,10 @@ describe("structured query strict PostgreSQL", () => {
         sourceRef,
       })),
     });
-    const first = await storage.readStructuredQuery(seeded.context, list({ limit: 2 }));
+    const first = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 2 })
+    );
     expect(first.rows.map((row) => row.id)).toEqual(PAGE_IDS.slice(0, 2));
     expect(first.nextCursor).not.toBeNull();
     const second = await storage.readStructuredQuery(
@@ -702,7 +757,12 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "filters",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
         { resultId: OTHER, name: "Beta", entityType: "place", sourceRef },
       ],
     });
@@ -713,7 +773,11 @@ describe("structured query strict PostgreSQL", () => {
     expect(byName.rows.map((row) => row.id)).toEqual([ANCHOR]);
     const byTypeIn = await storage.readStructuredQuery(
       seeded.context,
-      list({ filters: [{ field: "type", op: "in", values: ["organization", "place"] }] })
+      list({
+        filters: [
+          { field: "type", op: "in", values: ["organization", "place"] },
+        ],
+      })
     );
     expect(byTypeIn.rows).toHaveLength(2);
     const anded = await storage.readStructuredQuery(
@@ -733,13 +797,37 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "one-hop",
       facts: [
-        { resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Other", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef,
+        },
         { resultId: FAR, name: "Far", entityType: "organization", sourceRef },
       ],
       relations: [
-        { head: ANCHOR, relationNorm: "owns", tail: OTHER, sourceRef, validFrom: null, validUntil: null },
-        { head: OTHER, relationNorm: "owns", tail: FAR, sourceRef, validFrom: null, validUntil: null },
+        {
+          head: ANCHOR,
+          relationNorm: "owns",
+          tail: OTHER,
+          sourceRef,
+          validFrom: null,
+          validUntil: null,
+        },
+        {
+          head: OTHER,
+          relationNorm: "owns",
+          tail: FAR,
+          sourceRef,
+          validFrom: null,
+          validUntil: null,
+        },
       ],
     });
     const outgoing = await storage.readStructuredQuery(
@@ -749,7 +837,9 @@ describe("structured query strict PostgreSQL", () => {
         relationship: { anchorEntityId: ANCHOR, direction: "outgoing" },
       })
     );
-    expect(outgoing.rows.map((row) => row.id)).toEqual([seeded.assertionIds[0]]);
+    expect(outgoing.rows.map((row) => row.id)).toEqual([
+      seeded.assertionIds[0],
+    ]);
     const incoming = await storage.readStructuredQuery(
       seeded.context,
       list({
@@ -757,7 +847,9 @@ describe("structured query strict PostgreSQL", () => {
         relationship: { anchorEntityId: FAR, direction: "incoming" },
       })
     );
-    expect(incoming.rows.map((row) => row.id)).toEqual([seeded.assertionIds[1]]);
+    expect(incoming.rows.map((row) => row.id)).toEqual([
+      seeded.assertionIds[1],
+    ]);
   });
 
   it("keeps past and future validity windows visible and countable", async () => {
@@ -765,8 +857,18 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "windows",
       facts: [
-        { resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Other", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
       relations: [
         {
@@ -804,11 +906,28 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "relation-multiplicity",
       facts: [
-        { resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Other", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
       relations: [
-        { head: ANCHOR, relationNorm: "owns", tail: OTHER, sourceRef, validFrom: null, validUntil: null },
+        {
+          head: ANCHOR,
+          relationNorm: "owns",
+          tail: OTHER,
+          sourceRef,
+          validFrom: null,
+          validUntil: null,
+        },
       ],
     });
     const rows = await storage.readStructuredQuery(
@@ -829,19 +948,45 @@ describe("structured query strict PostgreSQL", () => {
     const forward = await seed({
       label: "arrival-forward",
       facts: [
-        { resultId: ANCHOR, name: "Zeta", entityType: "organization", sourceRef: forwardRef },
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: forwardRef },
+        {
+          resultId: ANCHOR,
+          name: "Zeta",
+          entityType: "organization",
+          sourceRef: forwardRef,
+        },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: forwardRef,
+        },
       ],
     });
     const backward = await seed({
       label: "arrival-backward",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: backwardRef },
-        { resultId: ANCHOR, name: "Zeta", entityType: "organization", sourceRef: backwardRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: backwardRef,
+        },
+        {
+          resultId: ANCHOR,
+          name: "Zeta",
+          entityType: "organization",
+          sourceRef: backwardRef,
+        },
       ],
     });
-    const firstPlan = await storage.readStructuredQuery(forward.context, list());
-    const secondPlan = await storage.readStructuredQuery(backward.context, list());
+    const firstPlan = await storage.readStructuredQuery(
+      forward.context,
+      list()
+    );
+    const secondPlan = await storage.readStructuredQuery(
+      backward.context,
+      list()
+    );
     expect(firstPlan.rows[0]!.canonicalName).toBe("Alpha");
     expect(secondPlan.rows[0]!.canonicalName).toBe("Alpha");
     // The chosen support must be one of the row's own current supports, and the
@@ -867,13 +1012,30 @@ describe("structured query strict PostgreSQL", () => {
     const wideB = unique("scope-wide-b");
     const narrow = await seed({
       label: "scope-narrow",
-      facts: [{ resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: narrowRef }],
+      facts: [
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: narrowRef,
+        },
+      ],
     });
     const wide = await seed({
       label: "scope-wide",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: wideA },
-        { resultId: OTHER, name: "Beta", entityType: "place", sourceRef: wideB },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: wideA,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "place",
+          sourceRef: wideB,
+        },
       ],
     });
     const narrowPlan = await storage.readStructuredQuery(
@@ -912,7 +1074,10 @@ describe("structured query strict PostgreSQL", () => {
       list({ operation: "count" })
     );
     expect(counted.count).toBe(PAGE_IDS.length);
-    const paged = await storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const paged = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     expect(paged.rows).toHaveLength(1);
     expect(paged.nextCursor).not.toBeNull();
   });
@@ -922,11 +1087,24 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "cursor-revision",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
-    const first = await storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     // Publishing a second desired version is a DATA change: the row set the
     // cursor was walking is no longer the set this revision holds.
     const generation = await declare(
@@ -946,7 +1124,10 @@ describe("structured query strict PostgreSQL", () => {
       dependencyExtractionRevision: 1,
       accepted: [
         {
-          identity: { kind: "entity", input: { entityId: OTHER, type: "organization" } },
+          identity: {
+            kind: "entity",
+            input: { entityId: OTHER, type: "organization" },
+          },
           occurrence: {
             subject: "entity",
             result_id: OTHER,
@@ -980,11 +1161,24 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "cursor-query",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
-    const first = await storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     await expectRefusal(
       () =>
         storage.readStructuredQuery(
@@ -1011,7 +1205,10 @@ describe("structured query strict PostgreSQL", () => {
         sourceRef,
       })),
     });
-    const first = await storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     // A conflict-check job moves the durable-work ledger the status counts and
     // touches no corpus row. That is PROGRESS, so the read revision stands.
     const dependencies = extractDependencies(
@@ -1044,21 +1241,41 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "cursor-refusal",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
     await expectRefusal(
-      () => storage.readStructuredQuery(seeded.context, list({ cursor: "not-a-cursor!!" })),
+      () =>
+        storage.readStructuredQuery(
+          seeded.context,
+          list({ cursor: "not-a-cursor!!" })
+        ),
       "invalid_cursor"
     );
-    const first = await storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     // The same scope and authority, read eleven minutes later. Only the instant
     // differs, so the refusal observed is the expiry.
     clock.advance(11 * 60_000);
     await expectRefusal(
       () =>
-        storage.readStructuredQuery(seeded.context, list({ limit: 1, cursor: first.nextCursor! })),
+        storage.readStructuredQuery(
+          seeded.context,
+          list({ limit: 1, cursor: first.nextCursor! })
+        ),
       "cursor_expired"
     );
   });
@@ -1067,7 +1284,14 @@ describe("structured query strict PostgreSQL", () => {
     const sourceRef = unique("status-unavailable");
     const seeded = await seed({
       label: "status-unavailable",
-      facts: [{ resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef }],
+      facts: [
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+      ],
     });
     // Two persisted check records in one scope that disagree on the ruleset are
     // exactly what an unreadable status row looks like to this reader.
@@ -1093,7 +1317,12 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "too-large",
       facts: [
-        { resultId: ANCHOR, name: "x".repeat(64 * 1024), entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "x".repeat(64 * 1024),
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
     await expectRefusal(
@@ -1106,7 +1335,14 @@ describe("structured query strict PostgreSQL", () => {
     const sourceRef = unique("foreign-context");
     const seeded = await seed({
       label: "foreign-context",
-      facts: [{ resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef }],
+      facts: [
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+      ],
     });
     // The same context text, assembled structurally rather than minted here.
     const forged = { ...seeded.context } as AuthorizedScopeContext;
@@ -1121,11 +1357,28 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "grant-roles",
       facts: [
-        { resultId: ANCHOR, name: "Anchor", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Other", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Anchor",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Other",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
       relations: [
-        { head: ANCHOR, relationNorm: "owns", tail: OTHER, sourceRef, validFrom: null, validUntil: null },
+        {
+          head: ANCHOR,
+          relationNorm: "owns",
+          tail: OTHER,
+          sourceRef,
+          validFrom: null,
+          validUntil: null,
+        },
       ],
     });
     const plan = await storage.readStructuredQuery(
@@ -1134,7 +1387,9 @@ describe("structured query strict PostgreSQL", () => {
     );
     const roles = new Set(plan.grants[0]!.supports.map((ref) => ref.role));
     expect(roles.has(STRUCTURED_QUERY_SUPPORT_ROLE.OCCURRENCE)).toBe(true);
-    expect(roles.has(STRUCTURED_QUERY_SUPPORT_ROLE.ENDPOINT_DISPLAY)).toBe(true);
+    expect(roles.has(STRUCTURED_QUERY_SUPPORT_ROLE.ENDPOINT_DISPLAY)).toBe(
+      true
+    );
   });
 
   it("reads rows and count from one snapshot without advancing a revision", async () => {
@@ -1142,27 +1397,49 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "one-snapshot",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
     const before = await readScopeRevisions(seeded.scopeBinding);
     const rows = await storage.readStructuredQuery(seeded.context, list());
-    const counted = await storage.readStructuredQuery(seeded.context, list({ operation: "count" }));
+    const counted = await storage.readStructuredQuery(
+      seeded.context,
+      list({ operation: "count" })
+    );
     // The read is READ ONLY: it must leave the scope's own revisions alone, which
     // is exactly what the free `withAuthorizedScope` would have broken.
     expect(await readScopeRevisions(seeded.scopeBinding)).toEqual(before);
     expect(rows.readRevision).toBe(counted.readRevision);
     expect(rows.readRevision).toBe(before.read_revision);
     expect(counted.count).toBe(rows.rows.length);
-    expect(rows.maintenance.maintenanceRevision).toBe(counted.maintenance.maintenanceRevision);
+    expect(rows.maintenance.maintenanceRevision).toBe(
+      counted.maintenance.maintenanceRevision
+    );
   });
 
   it("refuses to project a row with no issued evidence reference", async () => {
     const sourceRef = unique("unissued");
     const seeded = await seed({
       label: "unissued",
-      facts: [{ resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef }],
+      facts: [
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+      ],
     });
     const plan = await storage.readStructuredQuery(seeded.context, list());
     await expectRefusal(
@@ -1176,8 +1453,18 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "grant-shape",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
     const listPlan = await storage.readStructuredQuery(seeded.context, list());
@@ -1207,22 +1494,40 @@ describe("structured query strict PostgreSQL", () => {
     // over the envelope, and only a row-boundary cut keeps the remainder
     // reachable. A single oversized row would be `result_too_large` instead.
     const ids = manyIds(20);
-    const sourceRefs = ["sq-fat-1", "sq-fat-2", "sq-fat-3", "sq-fat-4", "sq-fat-5", "sq-fat-6", "sq-fat-7", "sq-fat-8"];
+    const sourceRefs = [
+      "sq-fat-1",
+      "sq-fat-2",
+      "sq-fat-3",
+      "sq-fat-4",
+      "sq-fat-5",
+      "sq-fat-6",
+      "sq-fat-7",
+      "sq-fat-8",
+    ];
     const seeded = await seed({
       label: "envelope-bound",
       facts: ids.flatMap((resultId) =>
-        sourceRefs.map((sourceRef) => ({ resultId, name: "Widget", entityType: "organization", sourceRef }))
+        sourceRefs.map((sourceRef) => ({
+          resultId,
+          name: "Widget",
+          entityType: "organization",
+          sourceRef,
+        }))
       ),
     });
 
     const first = await storage.readStructuredQuery(seeded.context, list());
     expect(first.rows.length).toBeGreaterThan(0);
     expect(first.rows.length).toBeLessThan(ids.length);
-    expect(first.rows.map((row) => row.id)).toEqual(ids.slice(0, first.rows.length));
+    expect(first.rows.map((row) => row.id)).toEqual(
+      ids.slice(0, first.rows.length)
+    );
     expect(first.nextCursor).not.toBeNull();
 
     const emitted = emittedEnvelope(list(), first, clock());
-    expect(Buffer.byteLength(emitted, "utf8")).toBeLessThanOrEqual(STRUCTURED_RESULT_MAX_BYTES);
+    expect(Buffer.byteLength(emitted, "utf8")).toBeLessThanOrEqual(
+      STRUCTURED_RESULT_MAX_BYTES
+    );
 
     const second = await storage.readStructuredQuery(
       seeded.context,
@@ -1245,7 +1550,9 @@ describe("structured query strict PostgreSQL", () => {
       rows: [...first.rows, probe.rows[0]!],
       nextCursor: probe.nextCursor,
     };
-    expect(envelopeBytes(list(), oneMore, clock())).toBeGreaterThan(STRUCTURED_RESULT_MAX_BYTES);
+    expect(envelopeBytes(list(), oneMore, clock())).toBeGreaterThan(
+      STRUCTURED_RESULT_MAX_BYTES
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -1264,14 +1571,21 @@ describe("structured query strict PostgreSQL", () => {
         sourceRef,
       })),
     });
-    const first = await storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     const real = first.nextCursor!;
     const payload = cursorBody(real);
 
     // A hand-built cursor whose every field is correct; nothing is wrong with it
     // except that this build never signed it.
     await expectRefusal(
-      () => storage.readStructuredQuery(seeded.context, list({ limit: 1, cursor: forgeCursor(payload) })),
+      () =>
+        storage.readStructuredQuery(
+          seeded.context,
+          list({ limit: 1, cursor: forgeCursor(payload) })
+        ),
       "invalid_cursor"
     );
 
@@ -1279,7 +1593,14 @@ describe("structured query strict PostgreSQL", () => {
     // the middle of the set, re-encode. Every field the transaction checks still
     // agrees; only the position was rewritten.
     await expectRefusal(
-      () => storage.readStructuredQuery(seeded.context, list({ limit: 1, cursor: tamperCursor(real, { ...payload, aft: ids[1]! }) })),
+      () =>
+        storage.readStructuredQuery(
+          seeded.context,
+          list({
+            limit: 1,
+            cursor: tamperCursor(real, { ...payload, aft: ids[1]! }),
+          })
+        ),
       "invalid_cursor"
     );
 
@@ -1287,13 +1608,23 @@ describe("structured query strict PostgreSQL", () => {
     // row, so the read resumes past the whole set and answers a successful EMPTY
     // page — indistinguishable from a genuinely empty result.
     await expectRefusal(
-      () => storage.readStructuredQuery(seeded.context, list({ limit: 1, cursor: tamperCursor(real, { ...payload, aft: "garbage" }) })),
+      () =>
+        storage.readStructuredQuery(
+          seeded.context,
+          list({
+            limit: 1,
+            cursor: tamperCursor(real, { ...payload, aft: "garbage" }),
+          })
+        ),
       "invalid_cursor"
     );
 
     // NEGATIVE CONTROL: the untouched cursor still continues, so the three
     // refusals above cannot be passing because every cursor is refused.
-    const second = await storage.readStructuredQuery(seeded.context, list({ limit: 1, cursor: real }));
+    const second = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1, cursor: real })
+    );
     expect(second.rows.map((row) => row.id)).toEqual(ids.slice(1, 2));
   });
 
@@ -1309,7 +1640,10 @@ describe("structured query strict PostgreSQL", () => {
         sourceRef,
       })),
     });
-    const first = await storage.readStructuredQuery(seeded.context, list({ limit: 1 }));
+    const first = await storage.readStructuredQuery(
+      seeded.context,
+      list({ limit: 1 })
+    );
     const second = await storage.readStructuredQuery(
       seeded.context,
       list({ limit: 1, cursor: first.nextCursor! })
@@ -1317,7 +1651,9 @@ describe("structured query strict PostgreSQL", () => {
     expect(second.rows.map((row) => row.id)).toEqual(ids.slice(1, 2));
     // Carried forward, not re-opened: a renewed expiry would make the fixed
     // ten-minute window a rolling one that no test reading page one would see.
-    expect(cursorBody(second.nextCursor!).exp).toBe(cursorBody(first.nextCursor!).exp);
+    expect(cursorBody(second.nextCursor!).exp).toBe(
+      cursorBody(first.nextCursor!).exp
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -1349,7 +1685,10 @@ describe("structured query strict PostgreSQL", () => {
     }
     expect(new Set(walked).size).toBe(walked.length);
     expect(walked.length).toBeGreaterThan(20);
-    const counted = await storage.readStructuredQuery(seeded.context, list({ operation: "count" }));
+    const counted = await storage.readStructuredQuery(
+      seeded.context,
+      list({ operation: "count" })
+    );
     expect(counted.count).toBe(walked.length);
     expect(counted.count).toBe(new Set(walked).size);
   });
@@ -1362,18 +1701,32 @@ describe("structured query strict PostgreSQL", () => {
     const sourceRef = unique("lease");
     const seeded = await seed({
       label: "lease",
-      facts: [{ resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef }],
+      facts: [
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+      ],
     });
     // The reader stamps its start and its page from the SAME injected clock, so a
     // clock that advances past the lease between the two readings is the whole
     // condition. The shared authority keeps its own clock, so only the reader's
     // lease can fire.
     const start = clock().getTime();
-    const late = new PgStructuredQueryStorage(authority, CURSOR_KEY, (() => {
-      let reading = 0;
-      return () => new Date(start + (reading++ === 0 ? 0 : 61_000));
-    })());
-    await expectRefusal(() => late.readStructuredQuery(seeded.context, list()), "query_timeout");
+    const late = new PgStructuredQueryStorage(
+      authority,
+      CURSOR_KEY,
+      (() => {
+        let reading = 0;
+        return () => new Date(start + (reading++ === 0 ? 0 : 61_000));
+      })()
+    );
+    await expectRefusal(
+      () => late.readStructuredQuery(seeded.context, list()),
+      "query_timeout"
+    );
     // NEGATIVE CONTROL: the same read on a clock that does not pass the lease.
     const inside = await storage.readStructuredQuery(seeded.context, list());
     expect(inside.rows.map((row) => row.id)).toEqual([ANCHOR]);
@@ -1388,21 +1741,36 @@ describe("structured query strict PostgreSQL", () => {
     const seeded = await seed({
       label: "narrowing",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef: sourceRefs[0]! },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef: sourceRefs[1]! },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: sourceRefs[0]!,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef: sourceRefs[1]!,
+        },
       ],
     });
     const whole = await storage.readStructuredQuery(seeded.context, list());
     expect(whole.rows.map((row) => row.id)).toEqual([ANCHOR, OTHER]);
 
     // Narrowing is allowed, and is what the authorized subset means.
-    const narrowed = await storage.readStructuredQuery(seeded.context, list(), [sourceRefs[1]!]);
+    const narrowed = await storage.readStructuredQuery(seeded.context, list(), [
+      sourceRefs[1]!,
+    ]);
     expect(narrowed.rows.map((row) => row.id)).toEqual([OTHER]);
 
     // Widening is not, and the guard is reachable precisely because the requested
     // set is a caller's second argument rather than the context's own array.
     await expectRefusal(
-      () => storage.readStructuredQuery(seeded.context, list(), ["sq-never-authorized"]),
+      () =>
+        storage.readStructuredQuery(seeded.context, list(), [
+          "sq-never-authorized",
+        ]),
       "authorization_denied"
     );
   });
@@ -1411,9 +1779,10 @@ describe("structured query strict PostgreSQL", () => {
     // A short key HMACs perfectly well and is reproducible by anyone, which is
     // the failure the signature exists to prevent — so it is refused at
     // composition rather than shipped as a cursor anyone can forge.
-    expect(() => new PgStructuredQueryStorage(authority, Buffer.alloc(8), () => clock())).toThrow(
-      /cursor key/
-    );
+    expect(
+      () =>
+        new PgStructuredQueryStorage(authority, Buffer.alloc(8), () => clock())
+    ).toThrow(/cursor key/);
     // NEGATIVE CONTROL: this lane's own full-width key composes and is in use.
     expect(CURSOR_KEY.length).toBeGreaterThanOrEqual(32);
     expect(storage).toBeDefined();
@@ -1430,7 +1799,10 @@ describe("structured query strict PostgreSQL", () => {
     expect(
       buildStructuredResult(
         request,
-        relationRead({ from: "2020-01-01T00:00:00Z", until: "2021-01-01T00:00:00Z" }),
+        relationRead({
+          from: "2020-01-01T00:00:00Z",
+          until: "2021-01-01T00:00:00Z",
+        }),
         instant
       ).schema
     ).toBe("iknow.structured_result");
@@ -1440,7 +1812,10 @@ describe("structured query strict PostgreSQL", () => {
       () =>
         buildStructuredResult(
           request,
-          relationRead({ from: "2021-01-01T00:00:00Z", until: "2020-01-01T00:00:00Z" }),
+          relationRead({
+            from: "2021-01-01T00:00:00Z",
+            until: "2020-01-01T00:00:00Z",
+          }),
           instant
         ),
       "structured_search_unavailable"
@@ -1450,7 +1825,10 @@ describe("structured query strict PostgreSQL", () => {
       () =>
         buildStructuredResult(
           request,
-          relationRead({ from: "2020-01-01T00:00:00Z", until: "2020-01-01T00:00:00Z" }),
+          relationRead({
+            from: "2020-01-01T00:00:00Z",
+            until: "2020-01-01T00:00:00Z",
+          }),
           instant
         ),
       "structured_search_unavailable"
@@ -1593,6 +1971,55 @@ function withoutHandle(row: Record<string, unknown>): Record<string, unknown> {
   return rest;
 }
 
+async function grantArtifactsForScope(scopeBinding: string): Promise<{
+  readonly grants: number;
+  readonly receipts: number;
+  readonly supportDependencies: number;
+  readonly extractionDependencies: number;
+}> {
+  const { rows } = await pool.query<{
+    grants: number;
+    receipts: number;
+    supportDependencies: number;
+    extractionDependencies: number;
+  }>(
+    `SELECT
+       (SELECT count(*)::int FROM evidence_grants WHERE scope_binding = $1) AS grants,
+       (SELECT count(*)::int FROM evidence_authorization_receipts WHERE scope_binding = $1) AS receipts,
+       (SELECT count(*)::int
+          FROM evidence_grant_supports d
+          JOIN evidence_grants g USING (evidence_ref)
+         WHERE g.scope_binding = $1) AS "supportDependencies",
+       (SELECT count(*)::int
+          FROM evidence_grant_extractions d
+          JOIN evidence_grants g USING (evidence_ref)
+         WHERE g.scope_binding = $1) AS "extractionDependencies"`,
+    [scopeBinding]
+  );
+  return rows[0]!;
+}
+
+async function captureSeamRead(
+  reader: StructuredQueryReader,
+  request: ValidatedStructuredQuery
+): Promise<
+  | {
+      readonly kind: "success";
+      readonly outcome: Awaited<
+        ReturnType<StructuredQueryReader["readStructuredQuery"]>
+      >;
+    }
+  | { readonly kind: "failure"; readonly error: unknown }
+> {
+  try {
+    const outcome = await reader.readStructuredQuery(request);
+    trackSeamRead(outcome);
+    return { kind: "success", outcome };
+  } catch (error) {
+    return { kind: "failure", error };
+  }
+}
+
 describe("structured query strict PostgreSQL — issued references resolve", () => {
   afterAll(async () => {
     // The pins cascade to both pin tables, so one statement removes the grant
@@ -1632,18 +2059,135 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
     expect(pins.rows[0]!.total).toBe(0);
   });
 
+  it("refuses row grants when authorization advances after the query snapshot", async () => {
+    const sourceRef = unique("auth-advance-after-read");
+    const seeded = await seed({
+      label: "auth-advance-after-read",
+      facts: [
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+      ],
+    });
+    seamScopes.push(seeded.scopeBinding);
+    const before = await grantArtifactsForScope(seeded.scopeBinding);
+
+    const reader = buildStructuredQueryReader(
+      authority,
+      {
+        issueGrants: async (requests, expectedScopeRevisionFence) => {
+          // The builder reaches this boundary only after the real PostgreSQL
+          // storage has committed the authorized read plan.
+          await backend.setScopeRevisions(seeded.scopeBinding, {
+            authorizationRevision: unique("authorization-advanced"),
+          });
+          const issued = await backend.issueGrants(
+            requests,
+            expectedScopeRevisionFence
+          );
+          seamReferences.push(...issued.map((grant) => grant.evidence_ref));
+          return issued;
+        },
+      },
+      storage,
+      seamIdentity(seeded)
+    );
+
+    const attempt = await captureSeamRead(reader, list());
+    const after = await grantArtifactsForScope(seeded.scopeBinding);
+    const refusalCode =
+      attempt.kind === "failure" &&
+      attempt.error instanceof StructuredQueryError
+        ? attempt.error.code
+        : null;
+    expect({ refusalCode, artifacts: after }).toEqual({
+      refusalCode: "authorization_denied",
+      artifacts: before,
+    });
+  });
+
+  it("refuses a count receipt when purge advances after the count snapshot", async () => {
+    const sourceRef = unique("purge-advance-after-read");
+    const seeded = await seed({
+      label: "purge-advance-after-read",
+      facts: [
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+      ],
+    });
+    seamScopes.push(seeded.scopeBinding);
+    const before = await grantArtifactsForScope(seeded.scopeBinding);
+
+    const reader = buildStructuredQueryReader(
+      authority,
+      {
+        issueGrants: async (requests, expectedScopeRevisionFence) => {
+          // Count grants carry no row dependencies, so this race is observable
+          // only if the bounded receipt and its authorization receipt are safe.
+          await backend.setScopeRevisions(seeded.scopeBinding, {
+            purgeRevision: unique("purge-advanced"),
+          });
+          const issued = await backend.issueGrants(
+            requests,
+            expectedScopeRevisionFence
+          );
+          seamReferences.push(...issued.map((grant) => grant.evidence_ref));
+          return issued;
+        },
+      },
+      storage,
+      seamIdentity(seeded)
+    );
+
+    const attempt = await captureSeamRead(
+      reader,
+      list({
+        operation: "count",
+        filters: [{ field: "canonical_name", op: "eq", value: "No match" }],
+      })
+    );
+    const after = await grantArtifactsForScope(seeded.scopeBinding);
+    const refusalCode =
+      attempt.kind === "failure" &&
+      attempt.error instanceof StructuredQueryError
+        ? attempt.error.code
+        : null;
+    expect({ refusalCode, artifacts: after }).toEqual({
+      refusalCode: "structured_search_unavailable",
+      artifacts: before,
+    });
+  });
+
   it("cites a row with a reference the real evidence store minted, holding that exact row", async () => {
     const sourceRef = unique("cite-row");
     const seeded = await seed({
       label: "cite-row",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
     seamScopes.push(seeded.scopeBinding);
     const page = await realSeam(seeded).readStructuredQuery(list());
-    if (page.kind !== "list") throw new Error("expected a list page from the seam");
+    if (page.kind !== "list")
+      throw new Error("expected a list page from the seam");
     trackSeamRead(page);
     expect(page.rows).toHaveLength(2);
 
@@ -1667,14 +2211,19 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
     // for the same request. The first is the end-to-end claim; the second is
     // what makes it a claim about the QUERY rather than about the projection.
     const plan = await storage.readStructuredQuery(seeded.context, list());
-    expect(canonicalBytes(withoutHandle(page.rows[0] as unknown as Record<string, unknown>))).toBe(
-      canonicalBytes(grant.value)
-    );
+    expect(
+      canonicalBytes(
+        withoutHandle(page.rows[0] as unknown as Record<string, unknown>)
+      )
+    ).toBe(canonicalBytes(grant.value));
     expect(canonicalBytes(grant.value)).toBe(canonicalBytes(plan.rows[0]));
 
     // The comparison above is only worth anything if it can fail, so the one
     // member this case is really about is checked against a changed value too.
-    const tampered = { ...(withoutHandle(page.rows[0] as unknown as Record<string, unknown>)), canonicalName: "Renamed" };
+    const tampered = {
+      ...withoutHandle(page.rows[0] as unknown as Record<string, unknown>),
+      canonicalName: "Renamed",
+    };
     expect(canonicalBytes(tampered)).not.toBe(canonicalBytes(grant.value));
 
     // The grant is bound to the read that minted it: a reference that resolved
@@ -1686,14 +2235,21 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
 
     // A row grant with no retained dependencies would replay as an empty
     // provenance, so the support set the page showed is the set it holds.
-    const shown = new Set(plan.rows[0]!.supports.map((support) => support.supportId));
+    const shown = new Set(
+      plan.rows[0]!.supports.map((support) => support.supportId)
+    );
     expect(shown.size).toBeGreaterThan(0);
-    expect(new Set(replayed.supports.map((support) => support.support_id))).toEqual(shown);
+    expect(
+      new Set(replayed.supports.map((support) => support.support_id))
+    ).toEqual(shown);
 
     // NEGATIVE CONTROL: a reference shaped like a real one but never issued is
     // refused by name. Without this the case could not tell a store that
     // resolved a grant apart from one that answered anything it was asked.
-    const forged = await backend.readGrant(`${rowRef}-never-issued`, clock().toISOString());
+    const forged = await backend.readGrant(
+      `${rowRef}-never-issued`,
+      clock().toISOString()
+    );
     if (forged.state !== "denied") {
       throw new Error("a reference that was never issued resolved as granted");
     }
@@ -1705,15 +2261,28 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
     const seeded = await seed({
       label: "cite-count",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
         { resultId: FAR, name: "Gamma", entityType: "organization", sourceRef },
       ],
     });
     seamScopes.push(seeded.scopeBinding);
     const reader = realSeam(seeded);
-    const counted = await reader.readStructuredQuery(list({ operation: "count" }));
-    if (counted.kind !== "count") throw new Error("expected a count outcome from the seam");
+    const counted = await reader.readStructuredQuery(
+      list({ operation: "count" })
+    );
+    if (counted.kind !== "count")
+      throw new Error("expected a count outcome from the seam");
     trackSeamRead(counted);
     expect(counted.count).toBe(3);
 
@@ -1740,12 +2309,15 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
     expect(replayed.supports).toHaveLength(0);
     expect(replayed.authorization).not.toBeNull();
     expect(replayed.authorization!.scope_binding).toBe(seeded.scopeBinding);
-    expect(grant.authorization_receipt_id).toBe(replayed.authorization!.receipt_id);
+    expect(grant.authorization_receipt_id).toBe(
+      replayed.authorization!.receipt_id
+    );
 
     // The count the receipt holds is the count the LIST measured, so a receipt
     // cannot be resolved into a number the page contradicts.
     const page = await reader.readStructuredQuery(list());
-    if (page.kind !== "list") throw new Error("expected a list page from the seam");
+    if (page.kind !== "list")
+      throw new Error("expected a list page from the seam");
     trackSeamRead(page);
     const rowRef = page.rows[0]!.evidenceRef;
     expect(grant.result_count).toBe(page.rows.length);
@@ -1771,8 +2343,18 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
     const seeded = await seed({
       label: "cite-atomic",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
         { resultId: FAR, name: "Gamma", entityType: "organization", sourceRef },
       ],
     });
@@ -1795,9 +2377,10 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
         : grant
     );
 
-    const issued = await backend
-      .issueGrants(requests)
-      .then(() => null, (caught) => caught as { failureToken?: string });
+    const issued = await backend.issueGrants(requests).then(
+      () => null,
+      (caught) => caught as { failureToken?: string }
+    );
     expect(issued?.failureToken).toBe("unsupported_source_binding");
 
     // The decisive assertion: neither neighbour committed. A per-grant
@@ -1815,8 +2398,18 @@ describe("structured query strict PostgreSQL — issued references resolve", () 
     const seeded = await seed({
       label: "cite-fresh",
       facts: [
-        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
-        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        {
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef,
+        },
+        {
+          resultId: OTHER,
+          name: "Beta",
+          entityType: "organization",
+          sourceRef,
+        },
       ],
     });
     seamScopes.push(seeded.scopeBinding);

@@ -400,7 +400,10 @@ export interface SourceLocatorBinding {
 }
 
 /** The supplied identity of one source version; the store mints the id. */
-export type NewSourceVersion = Omit<SourceVersionRecord, "source_version_id"> & {
+export type NewSourceVersion = Omit<
+  SourceVersionRecord,
+  "source_version_id"
+> & {
   readonly source_version_id?: string;
 };
 
@@ -511,6 +514,16 @@ export interface ScopeRevisionRecord {
 }
 
 /**
+ * Immutable authorization and purge snapshot carried from Query read to grant
+ * issuance.
+ */
+export interface ScopeRevisionFence {
+  readonly scope_binding: string;
+  readonly authorization_revision: string;
+  readonly purge_revision: string;
+}
+
+/**
  * The shared `(scope_binding, authorization_revision, purge_revision)` receipt
  * a count grant replays against. One row serves every reference admitted
  * under that triple, so the receipt is stored once and joined, not copied.
@@ -613,9 +626,14 @@ export interface EvidenceStore {
    * validate and commit the batch as a unit rather than looping `issueGrant`,
    * whose per-call transaction is correct for one reference and is exactly the
    * shape that strands the first two when the third fails.
+   *
+   * Query supplies the authorization and purge revisions captured by its read
+   * unit of work. A store checks this optional fence under the batch write lock
+   * before inserting any member; omission preserves legacy Evidence callers.
    */
   issueGrants(
-    requests: readonly GrantRequest[]
+    requests: readonly GrantRequest[],
+    expectedScopeRevisionFence?: ScopeRevisionFence
   ): Promise<readonly EvidenceGrantRecord[]>;
   /** Replay one grant at the caller's instant; never renews it. */
   readGrant(evidenceRef: string, at: string): Promise<EvidenceGrantRead>;
@@ -623,7 +641,9 @@ export interface EvidenceStore {
    * The row grant's retained dependencies, by support UUID, with the reason
    * each is held. Empty for a count grant: it retains no membership.
    */
-  listGrantSupports(evidenceRef: string): Promise<readonly GrantDependencyFact[]>;
+  listGrantSupports(
+    evidenceRef: string
+  ): Promise<readonly GrantDependencyFact[]>;
   /**
    * The extraction links the row grant pinned at issue time. A later
    * extraction does not widen what a historical citation holds, which is why
@@ -655,10 +675,7 @@ export interface EvidenceStore {
     collectedAt: string
   ): Promise<void>;
   /** A purge candidate: no new grant may pin evidence to this version. */
-  stopAcceptingObligations(
-    sourceVersionId: string,
-    at: string
-  ): Promise<void>;
+  stopAcceptingObligations(sourceVersionId: string, at: string): Promise<void>;
 }
 
 /**

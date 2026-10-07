@@ -16,6 +16,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
 import pg from "pg";
 
+import { buildStructuredQueryReader } from "../../src/index.js";
+
 import {
   claimNextWork,
   scheduleWork,
@@ -45,14 +47,26 @@ import {
   structuredQueryReadOutcome,
 } from "../../src/core/storage/structured-query-reads.js";
 import {
+  QUERY_SCOPE_ENV_VARS,
+  queryScopeIdentityFromEnv,
+  type QueryScopeIdentity,
+} from "../../src/core/storage/structured-query-scope.js";
+import {
   buildStructuredResult,
+  STRUCTURED_RESULT_COUNT_COVERAGE,
   STRUCTURED_RESULT_EVIDENCE_REF_PLACEHOLDER,
   STRUCTURED_RESULT_MAX_BYTES,
   structuredResultEnvelopeBytes,
   type StructuredListRead,
   type StructuredMaintenanceRecord,
+  type StructuredQueryReader,
   type StructuredRelationRowRecord,
 } from "../../src/core/structured/result.js";
+import {
+  EVIDENCE_DENIAL_REASON,
+  EVIDENCE_GRANT_KIND,
+  type EvidenceGrantRead,
+} from "../../src/core/types.js";
 import { PgMaintenanceWorkStore } from "../../src/core/storage/maintenance-work-pg.js";
 import {
   upSchemaScreening,
@@ -1440,6 +1454,397 @@ describe("structured query strict PostgreSQL", () => {
           instant
         ),
       "structured_search_unavailable"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The seam's references, resolved through the real evidence read path
+// ---------------------------------------------------------------------------
+//
+// Everything above drives the storage read plan directly, so a reference is only
+// ever a string the projection was handed. What is left unproved — and what the
+// merged base could not do at all — is that the reference a row is CITED by is
+// one the evidence store actually minted, and that resolving it returns the row
+// the query returned. So the cases below run the real `buildStructuredQueryReader`
+// over this lane's real capabilities, then take the reference out of the returned
+// page and read it back through the backend's own evidence read surface.
+
+/**
+ * Every reference this section minted, and every scope it minted one for.
+ *
+ * The lane's own `afterAll` drops the whole schema, but a grant is the first row
+ * these cases create that no case above it creates, so they are removed by name
+ * instead of being left to the drop. The two lists are also what the closing
+ * assertions are checked against: a reference minted here and forgotten in this
+ * list is a reference neither the cleanup nor the leak check can see, which is
+ * exactly the state the leak check is there to catch.
+ */
+const seamReferences: string[] = [];
+const seamScopes: string[] = [];
+
+/**
+ * Record every reference one seam read minted, so the cleanup below and the leak
+ * check in it see the whole read rather than only the row a case goes on to make
+ * a claim about. A page mints one grant per row, so a case that tracked just the
+ * row it asserted on would leave the rest live — which is exactly what the leak
+ * check caught the first time this section ran.
+ */
+function trackSeamRead(
+  outcome: Awaited<ReturnType<StructuredQueryReader["readStructuredQuery"]>>
+): void {
+  if (outcome.kind === "count") {
+    seamReferences.push(outcome.context.evidenceRef);
+    return;
+  }
+  for (const row of outcome.rows) seamReferences.push(row.evidenceRef);
+}
+
+/**
+ * The identity this lane's connection is bound to, read the way the host reads
+ * it.
+ *
+ * `queryScopeIdentityFromEnv` is the production channel — `buildDeps` calls it on
+ * the session's own environment at composition — so building the binding through
+ * it here means this lane exercises the same path a served session does rather
+ * than a hand-assembled record that could drift from it.
+ */
+function seamIdentity(seeded: Seeded): QueryScopeIdentity {
+  return queryScopeIdentityFromEnv({
+    [QUERY_SCOPE_ENV_VARS.actorId]: ACTOR,
+    [QUERY_SCOPE_ENV_VARS.ownerScopeBinding]: seeded.scopeBinding,
+    [QUERY_SCOPE_ENV_VARS.readerBinding]: seeded.scopeBinding,
+    [QUERY_SCOPE_ENV_VARS.sourceRefs]: seeded.sourceRefs.join(","),
+    [QUERY_SCOPE_ENV_VARS.authorizationRevision]: AUTHORIZATION_REVISION,
+    // A deployment lease, not a case deadline. The shared authority checks it
+    // against the wall clock, so it has to be live for the whole lane run; the
+    // reader's own sixty-second execution lease is separate and is the case
+    // clock, which is what the existing lease case drives.
+    [QUERY_SCOPE_ENV_VARS.deadlineAt]: "2099-01-01T00:00:00.000Z",
+  });
+}
+
+/**
+ * The real seam over this lane's real capabilities, with nothing stood in for:
+ * the shared scope authority it mints a context with, this lane's own
+ * `PgStructuredQueryStorage` for the read, and the backend's own `issueGrants`
+ * for the references. That is the composition `buildRetrieveDeps` performs in
+ * `src/index.ts` — the same four objects a served process would use — so a
+ * reference resolved below was minted by the same issuance path and stored in
+ * the same table a citation would later be replayed from.
+ */
+function realSeam(seeded: Seeded): StructuredQueryReader {
+  return buildStructuredQueryReader(
+    authority,
+    backend,
+    storage,
+    seamIdentity(seeded)
+  );
+}
+
+/**
+ * Replay one reference at the case clock and require it to be granted.
+ *
+ * The refusal arm is turned into a named failure rather than an `expect` on a
+ * field that only the denied arm carries, so a reference that does NOT resolve
+ * reports which reason denied it instead of reading as a missing property.
+ */
+async function replayGranted(
+  evidenceRef: string,
+  label: string
+): Promise<Extract<EvidenceGrantRead, { readonly state: "granted" }>> {
+  const read = await backend.readGrant(evidenceRef, clock().toISOString());
+  if (read.state !== "granted") {
+    throw new Error(
+      `${label} reference ${evidenceRef} did not resolve: ${read.reason}`
+    );
+  }
+  return read;
+}
+
+/** Object keys in a fixed order, so two values can be compared as bytes. */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, member]) => [key, canonicalValue(member)])
+  );
+}
+
+/**
+ * The value as BYTES, both sides canonicalized first.
+ *
+ * A grant's `value` is stored in `jsonb`, which reorders object keys on the way
+ * in, so comparing the raw serializations would compare PostgreSQL's key order
+ * against the reader's. Sorting on both sides keeps the comparison a byte
+ * comparison of the same canonical form, which still fails on any field added,
+ * dropped, renamed or re-valued — and on any reordering of a list, which is
+ * NOT sorted, because array order is part of what the value says.
+ */
+function canonicalBytes(value: unknown): string {
+  return JSON.stringify(canonicalValue(value));
+}
+
+/** The row as the query returned it, minus the reference that cites it. */
+function withoutHandle(row: Record<string, unknown>): Record<string, unknown> {
+  const { evidenceRef: _handle, ...rest } = row;
+  return rest;
+}
+
+describe("structured query strict PostgreSQL — issued references resolve", () => {
+  afterAll(async () => {
+    // The pins cascade to both pin tables, so one statement removes the grant
+    // and everything it held. The receipt is a shared row that a count grant
+    // joins rather than copies, so it is removed only once no grant still
+    // points at it — a receipt another section's grant needs is left alone.
+    await pool.query(
+      "DELETE FROM evidence_grants WHERE evidence_ref = ANY($1::text[])",
+      [seamReferences]
+    );
+    await pool.query(
+      `DELETE FROM evidence_authorization_receipts r
+        WHERE r.scope_binding = ANY($1::text[])
+          AND NOT EXISTS (
+            SELECT 1 FROM evidence_grants g
+             WHERE g.authorization_receipt_id = r.receipt_id)`,
+      [seamScopes]
+    );
+    // The leak check, and the reason the lists above are recorded: nothing this
+    // section minted may survive it. A reference minted and not recorded shows
+    // up here as a live row, so the check fails rather than passing by
+    // inspecting only what the cleanup already removed.
+    const grants = await pool.query<{ total: number }>(
+      "SELECT count(*)::int AS total FROM evidence_grants WHERE scope_binding = ANY($1::text[])",
+      [seamScopes]
+    );
+    expect(grants.rows[0]!.total).toBe(0);
+    const receipts = await pool.query<{ total: number }>(
+      "SELECT count(*)::int AS total FROM evidence_authorization_receipts WHERE scope_binding = ANY($1::text[])",
+      [seamScopes]
+    );
+    expect(receipts.rows[0]!.total).toBe(0);
+    const pins = await pool.query<{ total: number }>(
+      "SELECT count(*)::int AS total FROM evidence_grant_supports WHERE evidence_ref = ANY($1::text[])",
+      [seamReferences]
+    );
+    expect(pins.rows[0]!.total).toBe(0);
+  });
+
+  it("cites a row with a reference the real evidence store minted, holding that exact row", async () => {
+    const sourceRef = unique("cite-row");
+    const seeded = await seed({
+      label: "cite-row",
+      facts: [
+        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
+        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+      ],
+    });
+    seamScopes.push(seeded.scopeBinding);
+    const page = await realSeam(seeded).readStructuredQuery(list());
+    if (page.kind !== "list") throw new Error("expected a list page from the seam");
+    trackSeamRead(page);
+    expect(page.rows).toHaveLength(2);
+
+    // The reference the page CITES the first row by, taken from the page rather
+    // than from a plan, so this reads the reference a caller would receive.
+    const rowRef = page.rows[0]!.evidenceRef;
+    const replayed = await replayGranted(rowRef, "row");
+    const grant = replayed.grant;
+
+    // The reference is the store's own handle, and what it names is a row grant:
+    // a receipt wearing a row's name would carry a count, and this one carries
+    // none, so the two arms cannot be confused by a caller that reads either.
+    expect(grant.evidence_ref).toBe(rowRef);
+    expect(grant.kind).toBe(EVIDENCE_GRANT_KIND.ROW);
+    expect(grant.result_count).toBeNull();
+    expect(replayed.authorization).toBeNull();
+
+    // The value the reference resolves to IS the value the query returned, byte
+    // for byte: once against the page the seam handed the caller, with only the
+    // citing handle removed, and once against what the query lane itself planned
+    // for the same request. The first is the end-to-end claim; the second is
+    // what makes it a claim about the QUERY rather than about the projection.
+    const plan = await storage.readStructuredQuery(seeded.context, list());
+    expect(canonicalBytes(withoutHandle(page.rows[0] as unknown as Record<string, unknown>))).toBe(
+      canonicalBytes(grant.value)
+    );
+    expect(canonicalBytes(grant.value)).toBe(canonicalBytes(plan.rows[0]));
+
+    // The comparison above is only worth anything if it can fail, so the one
+    // member this case is really about is checked against a changed value too.
+    const tampered = { ...(withoutHandle(page.rows[0] as unknown as Record<string, unknown>)), canonicalName: "Renamed" };
+    expect(canonicalBytes(tampered)).not.toBe(canonicalBytes(grant.value));
+
+    // The grant is bound to the read that minted it: a reference that resolved
+    // to a real row of some OTHER read would satisfy every assertion above and
+    // still be the wrong citation.
+    expect(grant.query_digest).toBe(plan.queryDigest);
+    expect(grant.scope_binding).toBe(seeded.scopeBinding);
+    expect(grant.read_revision).toBe(plan.readRevision);
+
+    // A row grant with no retained dependencies would replay as an empty
+    // provenance, so the support set the page showed is the set it holds.
+    const shown = new Set(plan.rows[0]!.supports.map((support) => support.supportId));
+    expect(shown.size).toBeGreaterThan(0);
+    expect(new Set(replayed.supports.map((support) => support.support_id))).toEqual(shown);
+
+    // NEGATIVE CONTROL: a reference shaped like a real one but never issued is
+    // refused by name. Without this the case could not tell a store that
+    // resolved a grant apart from one that answered anything it was asked.
+    const forged = await backend.readGrant(`${rowRef}-never-issued`, clock().toISOString());
+    if (forged.state !== "denied") {
+      throw new Error("a reference that was never issued resolved as granted");
+    }
+    expect(forged.reason).toBe(EVIDENCE_DENIAL_REASON.UNKNOWN_REFERENCE);
+  });
+
+  it("cites a count receipt with its own reference, holding the measured count", async () => {
+    const sourceRef = unique("cite-count");
+    const seeded = await seed({
+      label: "cite-count",
+      facts: [
+        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
+        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        { resultId: FAR, name: "Gamma", entityType: "organization", sourceRef },
+      ],
+    });
+    seamScopes.push(seeded.scopeBinding);
+    const reader = realSeam(seeded);
+    const counted = await reader.readStructuredQuery(list({ operation: "count" }));
+    if (counted.kind !== "count") throw new Error("expected a count outcome from the seam");
+    trackSeamRead(counted);
+    expect(counted.count).toBe(3);
+
+    // The reference the RECEIPT carries, which is the context's own rather than
+    // any row's: a count answers about a number, so there is no row to cite.
+    const countRef = counted.context.evidenceRef;
+    const replayed = await replayGranted(countRef, "count");
+    const grant = replayed.grant;
+
+    expect(grant.evidence_ref).toBe(countRef);
+    expect(grant.kind).toBe(EVIDENCE_GRANT_KIND.COUNT);
+    // The number is held twice — as the count the read measured and inside the
+    // receipt's own value — and both must be the number the caller was told.
+    expect(grant.result_count).toBe(counted.count);
+    expect(canonicalBytes(grant.value)).toBe(
+      canonicalBytes({
+        subject: "entity",
+        count: counted.count,
+        coverage: STRUCTURED_RESULT_COUNT_COVERAGE,
+      })
+    );
+    // A count grant is a receipt and its admission, never a membership: the
+    // supports it holds are empty and it joins the shared authorization receipt.
+    expect(replayed.supports).toHaveLength(0);
+    expect(replayed.authorization).not.toBeNull();
+    expect(replayed.authorization!.scope_binding).toBe(seeded.scopeBinding);
+    expect(grant.authorization_receipt_id).toBe(replayed.authorization!.receipt_id);
+
+    // The count the receipt holds is the count the LIST measured, so a receipt
+    // cannot be resolved into a number the page contradicts.
+    const page = await reader.readStructuredQuery(list());
+    if (page.kind !== "list") throw new Error("expected a list page from the seam");
+    trackSeamRead(page);
+    const rowRef = page.rows[0]!.evidenceRef;
+    expect(grant.result_count).toBe(page.rows.length);
+    // Two references, not one handle used twice: the row's citation and the
+    // receipt's citation are minted separately, so resolving one can never be
+    // mistaken for resolving the other.
+    expect(countRef).not.toBe(rowRef);
+    const rowReplay = await replayGranted(rowRef, "row");
+    expect(rowReplay.grant.kind).toBe(EVIDENCE_GRANT_KIND.ROW);
+    expect(rowReplay.grant.result_count).toBeNull();
+  });
+
+  it("rolls the whole page back when one request in the middle cannot be issued", async () => {
+    // The real store's half of the all-or-nothing claim. The seam suite proves
+    // the seam issues a page as ONE write; this proves the store honours that by
+    // committing none of it, so a refusal cannot leave a caller holding
+    // dependencies pinned for a reference it never received.
+    //
+    // The failure is a support that does not resolve, which
+    // `readPinnableDependencies` refuses at the write — the same refusal the
+    // memory twin's `requireGrantable` raises, reached here against the cluster.
+    const sourceRef = unique("cite-atomic");
+    const seeded = await seed({
+      label: "cite-atomic",
+      facts: [
+        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
+        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+        { resultId: FAR, name: "Gamma", entityType: "organization", sourceRef },
+      ],
+    });
+    seamScopes.push(seeded.scopeBinding);
+    const plan = await storage.readStructuredQuery(seeded.context, list());
+    expect(plan.grants.length).toBe(3);
+    const ABSENT_SUPPORT = "00000000-0000-4000-8000-00000000dead";
+    // Built as grant REQUESTS rather than passed as plans: the plan carries both
+    // arms on every grant, and `normalizeGrantRequest` refuses a row grant that
+    // still names a count — which is the arm-exclusivity the seam's
+    // `grantRequestOf` enforces and this case has to honour too.
+    const requests = plan.grants.map(({ count: _count, ...grant }, index) =>
+      index === 1
+        ? {
+            ...grant,
+            supports: [
+              { support_id: ABSENT_SUPPORT, role: grant.supports[0]!.role },
+            ],
+          }
+        : grant
+    );
+
+    const issued = await backend
+      .issueGrants(requests)
+      .then(() => null, (caught) => caught as { failureToken?: string });
+    expect(issued?.failureToken).toBe("unsupported_source_binding");
+
+    // The decisive assertion: neither neighbour committed. A per-grant
+    // transaction would have left rows 0 and 2 granted here, each pinning
+    // dependencies for 365 days behind a refusal the caller never sees.
+    const refs = await pool.query<{ total: number }>(
+      "SELECT count(*)::int AS total FROM evidence_grants WHERE scope_binding = $1",
+      [seeded.scopeBinding]
+    );
+    expect(refs.rows[0]!.total).toBe(0);
+  });
+
+  it("mints a fresh reference for each read of one unchanged row", async () => {
+    const sourceRef = unique("cite-fresh");
+    const seeded = await seed({
+      label: "cite-fresh",
+      facts: [
+        { resultId: ANCHOR, name: "Alpha", entityType: "organization", sourceRef },
+        { resultId: OTHER, name: "Beta", entityType: "organization", sourceRef },
+      ],
+    });
+    seamScopes.push(seeded.scopeBinding);
+    const reader = realSeam(seeded);
+    const first = await reader.readStructuredQuery(list());
+    const second = await reader.readStructuredQuery(list());
+    if (first.kind !== "list" || second.kind !== "list") {
+      throw new Error("expected list pages from the seam");
+    }
+    trackSeamRead(first);
+    trackSeamRead(second);
+    // The same row, from the same snapshot, on both reads — so any difference
+    // between the two references is the issuance and not the corpus.
+    expect(second.rows[0]!.id).toBe(first.rows[0]!.id);
+    expect(second.rows[0]!.canonicalName).toBe(first.rows[0]!.canonicalName);
+    const firstRef = first.rows[0]!.evidenceRef;
+    const secondRef = second.rows[0]!.evidenceRef;
+    expect(secondRef).not.toBe(firstRef);
+
+    // BOTH still resolve, and to the same value: a reference is the receipt of
+    // ONE read rather than a handle onto the row, so it is not renewable and
+    // not stable, while what it attests to has not moved.
+    const firstReplay = await replayGranted(firstRef, "first");
+    const secondReplay = await replayGranted(secondRef, "second");
+    expect(firstReplay.grant.kind).toBe(EVIDENCE_GRANT_KIND.ROW);
+    expect(secondReplay.grant.kind).toBe(EVIDENCE_GRANT_KIND.ROW);
+    expect(canonicalBytes(secondReplay.grant.value)).toBe(
+      canonicalBytes(firstReplay.grant.value)
     );
   });
 });

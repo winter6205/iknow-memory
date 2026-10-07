@@ -1359,40 +1359,72 @@ export class MemoryBackend
    * transaction.
    */
   async issueGrant(request: GrantRequest): Promise<EvidenceGrantRecord> {
-    const plan = normalizeGrantRequest(request);
-    const scope = this.scopeRevisions.get(plan.scope_binding);
-    if (scope === undefined) {
-      throw evidenceError(
-        EVIDENCE_FAILURE.UNAVAILABLE,
-        `grant: admission scope "${plan.scope_binding}" has no revisions on record`
+    const [grant] = await this.issueGrants([request]);
+    // A one-element batch is a one-grant write, so this branch is unreachable
+    // rather than merely unlikely — and saying so beats indexing a possibly
+    // undefined element into a promise the caller awaits.
+    if (grant === undefined) {
+      throw new Error(
+        "memory evidence store: issueGrants returned no grant for a one-request batch"
       );
     }
-    const evidenceRef = randomUUID();
-    const isCount = plan.kind === EVIDENCE_GRANT_KIND.COUNT;
-    const receipt = isCount ? this.joinReceipt(scope, plan.queried_at) : null;
-    for (const ref of plan.supports) {
-      this.requireGrantable(ref.support_id);
+    return grant;
+  }
+
+  /**
+   * A whole page as one write, the twin of the PostgreSQL transaction.
+   *
+   * Every request is normalized, its scope resolved and every named support
+   * checked BEFORE the first row is written, so a request that would be refused
+   * refuses the batch whole — the same all-or-nothing answer the cluster gives
+   * by rolling back.
+   */
+  async issueGrants(
+    requests: readonly GrantRequest[]
+  ): Promise<readonly EvidenceGrantRecord[]> {
+    const prepared = requests.map((request) => {
+      const plan = normalizeGrantRequest(request);
+      const scope = this.scopeRevisions.get(plan.scope_binding);
+      if (scope === undefined) {
+        throw evidenceError(
+          EVIDENCE_FAILURE.UNAVAILABLE,
+          `grant: admission scope "${plan.scope_binding}" has no revisions on record`
+        );
+      }
+      for (const ref of plan.supports) {
+        this.requireGrantable(ref.support_id);
+      }
+      return { plan, scope };
+    });
+    // Committed only after every request above proved itself, so a refused
+    // member of the page cannot leave its siblings granted.
+    const issued: EvidenceGrantRecord[] = [];
+    for (const { plan, scope } of prepared) {
+      const evidenceRef = randomUUID();
+      const isCount = plan.kind === EVIDENCE_GRANT_KIND.COUNT;
+      const receipt = isCount ? this.joinReceipt(scope, plan.queried_at) : null;
+      const grant: EvidenceGrantRecord = {
+        evidence_ref: evidenceRef,
+        kind: plan.kind,
+        subject: plan.subject,
+        operation: plan.operation,
+        query_digest: plan.query_digest,
+        scope_binding: plan.scope_binding,
+        read_revision: plan.read_revision,
+        authorization_revision: scope.authorization_revision,
+        purge_revision: scope.purge_revision,
+        queried_at: plan.queried_at,
+        expires_at: plan.expires_at,
+        context: plan.context,
+        value: plan.value,
+        result_count: plan.count,
+        authorization_receipt_id: receipt?.receipt_id ?? null,
+      };
+      this.grants.set(evidenceRef, grant);
+      if (!isCount) this.pinGrantDependencies(evidenceRef, plan);
+      issued.push({ ...grant });
     }
-    const grant: EvidenceGrantRecord = {
-      evidence_ref: evidenceRef,
-      kind: plan.kind,
-      subject: plan.subject,
-      operation: plan.operation,
-      query_digest: plan.query_digest,
-      scope_binding: plan.scope_binding,
-      read_revision: plan.read_revision,
-      authorization_revision: scope.authorization_revision,
-      purge_revision: scope.purge_revision,
-      queried_at: plan.queried_at,
-      expires_at: plan.expires_at,
-      context: plan.context,
-      value: plan.value,
-      result_count: plan.count,
-      authorization_receipt_id: receipt?.receipt_id ?? null,
-    };
-    this.grants.set(evidenceRef, grant);
-    if (!isCount) this.pinGrantDependencies(evidenceRef, plan);
-    return { ...grant };
+    return issued;
   }
 
   /** The shared receipt under one scope/revision pair, created on first use. */

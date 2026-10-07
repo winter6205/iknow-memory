@@ -385,6 +385,8 @@ async function issuePage(
     // from the code alone, so the detail reaches `logger.error` and never the
     // wire, while the envelope still carries only `code` + `retryable`.
     if (error instanceof StructuredQueryError) throw error;
+    // EXIT: Non-authorization issuer refusals (including stale purge and invalid or
+    // unavailable fences) block artifacts and retain the typed unavailable envelope.
     throw new StructuredQueryError(
       error instanceof Error ? error.message : String(error),
       failureTokenOf(error) === EVIDENCE_FAILURE.ACCESS_DENIED

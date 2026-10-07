@@ -34,6 +34,11 @@ const FNV1A_PRIME = 1099511628211n;
  * so the next forward-compat column fails a test instead of shipping.
  */
 const BOOTSTRAP_COLUMNS = [
+  // MP14: the mark's cancellation pair is a forward-compat ADD COLUMN, so a
+  // deployed store that predates MP14 never receives it unless the probe names
+  // both — same rule as source_documents.content_identity below.
+  ["structured_collection_marks", "cancelled_at"],
+  ["structured_collection_marks", "cancelled_reason"],
   ["triples", "superseded_by"],
   ["triples", "evidence_span"],
   ["triples", "extractor"],
@@ -89,6 +94,11 @@ const BOOTSTRAP_TABLES = [
   // corpus-index-job T2: a brand-new table — CREATE IF NOT EXISTS alone never
   // reaches a deployed store once the probe says ready, so the probe names it.
   "index_jobs",
+  // MP14: the collection marks. Brand-new, so the probe names it — a table the
+  // probe does not name never reaches a deployed store, and one it names without
+  // upSchemaCollectionMark creating it would keep the probe answering "not ready"
+  // forever. schema-bootstrap.ts calls both halves in the same transaction.
+  "structured_collection_marks",
   // QP3: the structured-query identity registry, brand-new tables — same rule as
   // index_jobs, so the probe names them or they never reach a deployed store.
   "structured_entity_identities",

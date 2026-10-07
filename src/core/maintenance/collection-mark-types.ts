@@ -86,6 +86,12 @@ export interface CollectionMark extends CollectionMarkIdentity {
   readonly deadlineAt: string;
   readonly markedAt: string;
   readonly state: CollectionMarkState;
+  /** When the mark was cancelled, or null while it stands. Recorded because a
+   *  cancelled mark and a live mark are different claims about a payload, and
+   *  MP15 must be able to tell "someone reactivated this" from "this went stale"
+   *  without re-deriving it from a scan it no longer has. */
+  readonly cancelledAt: string | null;
+  readonly cancelledReason: CollectionMarkCancelReason | null;
 }
 
 /**
@@ -123,6 +129,9 @@ export interface CollectionReactivatePlan {
   readonly sourceVersionId: string | null;
   readonly resumedObligations: boolean;
   readonly cancelledAt: string;
+  /** Carried on the plan rather than hardcoded in a lane, so the recorded reason
+   *  comes from the closed vocabulary and not from whichever store wrote it. */
+  readonly reason: CollectionMarkCancelReason;
 }
 
 export type CollectionReactivateOutcome =
@@ -156,6 +165,21 @@ export type CollectionMarkRecheckOutcome =
       readonly detail: string;
     }
   | { readonly refused: false; readonly recheck: CollectionMarkRecheck };
+
+/** One cancellation of a persisted mark, live or stale. */
+export interface CollectionMarkCancellation {
+  readonly identity: CollectionMarkIdentity;
+  readonly cancelledAt: string;
+  readonly reason: CollectionMarkCancelReason;
+}
+
+export type CollectionMarkCancellationOutcome =
+  | {
+      readonly refused: true;
+      readonly code: MaintenanceWorkFailureCode;
+      readonly detail: string;
+    }
+  | { readonly refused: false; readonly cancellation: CollectionMarkCancellation };
 
 /**
  * What a mark decision needs beyond the candidate.

@@ -86,10 +86,20 @@ affects:
 - src/core/storage/collection-mark-memory.ts
 - src/core/storage/schema-collection-mark.ts
 - src/core/storage/schema-lock.ts
+- src/core/storage/schema-bootstrap.ts
 - tests/core/maintenance/collection-mark.unit.test.ts
 - tests/storage/collection-mark-memory.test.ts
 - tests/acceptance/maintenance-mp14-mark-pg.test.ts
 - plans/structured-corpus-collection-mark-p3-i3.md
+
+`schema-bootstrap.ts` was added to this list during implementation. The DDL is
+useless until something calls it: `upSchemaBootstrap` invokes only the
+invalidation, projection, maintenance-work and publication modules, so a
+`structured_collection_marks` table created but never called would never reach a
+deployed store. `schema-bootstrap.ts` is the sole wiring point, and
+`tests/storage/bootstrap-tables-indexes.test.ts` enforces that the probe's table
+list, the probe's forward-compat column list and the bootstrap's DDL calls agree in
+both directions — so the call and the probe arm had to land together.
 
 ## Architecture review verdicts
 
@@ -111,10 +121,36 @@ minimal-change-verifier: yes — one logical slice (P3-I3), stacked on MP13; the
 6. Tests: unit (fake clock), memory (incl. the A3 serialization-removal test),
    real PostgreSQL under `MAINTENANCE_ACCEPTANCE=1`.
 
-## The A3 obligation (not optional)
+## The A3 obligation — measured, and its wording corrected
 
-P3-I3 acceptance requires a test that goes red when **all** serialization is
-removed. The memory lane is where that is provable: the test drives a mark racing a
-reactivation and asserts exactly one authoritative outcome; removing
-`MemoryStructuredScopeTail.exclusive` from the mark path must make it fail. A test
-that passes with serialization deleted has not proven the invariant.
+P3-I3 acceptance asks for a test that goes red when **all** serialization is
+removed. Measured on this authority, that wording is wrong, and the reason is worth
+keeping.
+
+`MemoryStructuredScopeUnitOfWork.attemptAuthorizedRun` (`structured-scope-uow.ts:747-800`)
+serializes twice through the tail, but what actually prevents the lost update is
+neither of those. It reserves a **routing token** at validation, and the commit
+slice re-reads it; a token that moved since validation throws
+`ScopeRoutingConflict` and the bounded routing loop retries, which re-reads the
+revision and refuses. That is optimistic concurrency, and it is value-based, so it
+holds whether or not a mutex exists.
+
+Both sabotage runs, observed:
+
+| Removed | Mutex | Race tests |
+|---|---|---|
+| `MemoryStructuredScopeTail.exclusive` body | gone | 9/9 still green — invariant unaffected |
+| the routing-token re-read in the commit slice | intact | 2 tests red |
+
+So the tests do have teeth; the lever that proves it is the token check, not the
+tail. A reviewer who sabotages the mutex will see a green suite and wrongly
+conclude the tests are vacuous, which is why the memory lane carries a second race
+test that forces the interleave rather than awaiting it: `readMaintenanceInputs` is
+wrapped in the test to yield to the event loop *after* the read and *before* the
+decision, so both actions are in the same read-to-commit window by construction
+rather than by luck. That wrapper is test-side; the store is untouched.
+
+The invariant under test is "one authoritative state wins" — asserted as the two
+winners directly, `markStands && reactivationStands`, so a failure names the exact
+state it prevents.
+

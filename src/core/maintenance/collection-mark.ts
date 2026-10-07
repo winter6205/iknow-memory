@@ -26,7 +26,9 @@
  */
 import { isSourceBoundCollectionClass } from "./collector-eligibility.js";
 import type {
+  CollectionMarkIdentity,
   CollectionMark,
+  CollectionMarkCancellationOutcome,
   CollectionMarkObservation,
   CollectionMarkOutcome,
   CollectionMarkRecheckOutcome,
@@ -93,6 +95,8 @@ export function planCollectionMark(
     deadlineAt: new Date(deadlineMs).toISOString(),
     markedAt: now.toISOString(),
     state: "marked",
+    cancelledAt: null,
+    cancelledReason: null,
   };
   return {
     refused: false,
@@ -195,6 +199,38 @@ export function planCollectionReactivation(
       sourceVersionId: request.sourceVersionId,
       resumedObligations: request.obligationsStopped,
       cancelledAt: now.toISOString(),
+      reason: "reactivated",
+    },
+  };
+}
+
+/**
+ * Plan the cancellation a stale recheck demands (spec:307).
+ *
+ * This is the other half of "cancelled or re-evaluated". `recheckCollectionMark`
+ * only reports that a mark went stale; without a way to record that cancellation
+ * the report has no consequence and the stale mark would still be sitting there for
+ * MP15 to find. The reason is distinct from `reactivated` on purpose: a mark
+ * cancelled because the world moved is evidence the recheck ran, and collapsing it
+ * into the reactivation reason would make a stale mark indistinguishable from one a
+ * caller deliberately undid.
+ */
+export function planStaleMarkCancellation(
+  identity: CollectionMarkIdentity,
+  now: Date
+): CollectionMarkCancellationOutcome {
+  if (typeof identity?.payloadRef !== "string" || identity.payloadRef.trim().length === 0) {
+    return refusal("invalid_input", "payloadRef is required");
+  }
+  if (Number.isNaN(now.getTime())) {
+    return refusal("invalid_input", "now must be a valid Date");
+  }
+  return {
+    refused: false,
+    cancellation: {
+      identity,
+      cancelledAt: now.toISOString(),
+      reason: "lifecycle_revision_changed",
     },
   };
 }
@@ -268,7 +304,10 @@ function findInvalidReactivationRequest(
 function refusal(
   code: MaintenanceWorkFailureCode,
   detail: string
-): CollectionMarkOutcome & CollectionReactivateOutcome & CollectionMarkRecheckOutcome {
+): CollectionMarkOutcome &
+  CollectionReactivateOutcome &
+  CollectionMarkRecheckOutcome &
+  CollectionMarkCancellationOutcome {
   return { refused: true, code, detail };
 }
 

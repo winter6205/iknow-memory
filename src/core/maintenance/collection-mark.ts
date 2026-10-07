@@ -245,25 +245,13 @@ export function planStaleMarkCancellation(
  * stamping a row that does not exist.
  */
 function findInvalidMarkRequest(request: CollectionMarkRequest): string | null {
-  if (typeof request?.payloadRef !== "string" || request.payloadRef.trim().length === 0) {
-    return "payloadRef is required";
-  }
-  if (typeof request.scopeBinding !== "string" || request.scopeBinding.trim().length === 0) {
-    return "scopeBinding is required";
-  }
-  if (typeof request.lifecycleRevision !== "string" || !DECIMAL_RE.test(request.lifecycleRevision)) {
+  const identity = findInvalidMarkIdentity(request);
+  if (identity !== null) return identity;
+  if (!isDecimal(request.lifecycleRevision)) {
     return "lifecycleRevision must be the decimal revision the mark commits at";
   }
   if (request.eligibility === undefined || request.eligibility === null) {
     return "eligibility is required; a mark is planned against a decided candidate";
-  }
-  const sourceBound = isSourceBoundCollectionClass(request.payloadClass);
-  const hasSource = typeof request.sourceVersionId === "string" && request.sourceVersionId.length > 0;
-  if (sourceBound && !hasSource) {
-    return `${request.payloadClass} is source-bound and requires a sourceVersionId to stop obligations on`;
-  }
-  if (!sourceBound && hasSource) {
-    return `${request.payloadClass} is object-scoped and has no source version to stop obligations on`;
   }
   return null;
 }
@@ -272,33 +260,56 @@ function findInvalidMarkRequest(request: CollectionMarkRequest): string | null {
 function findInvalidReactivationRequest(
   request: CollectionReactivationRequest
 ): string | null {
-  if (typeof request?.payloadRef !== "string" || request.payloadRef.trim().length === 0) {
-    return "payloadRef is required";
-  }
-  if (typeof request.scopeBinding !== "string" || request.scopeBinding.trim().length === 0) {
-    return "scopeBinding is required";
-  }
-  if (
-    typeof request.expectedLifecycleRevision !== "string" ||
-    !DECIMAL_RE.test(request.expectedLifecycleRevision)
-  ) {
+  const identity = findInvalidMarkIdentity(request);
+  if (identity !== null) return identity;
+  if (!isDecimal(request.expectedLifecycleRevision)) {
     return "expectedLifecycleRevision must be a decimal revision string";
   }
-  if (
-    typeof request.observedLifecycleRevision !== "string" ||
-    !DECIMAL_RE.test(request.observedLifecycleRevision)
-  ) {
+  if (!isDecimal(request.observedLifecycleRevision)) {
     return "observedLifecycleRevision must be a decimal revision string";
   }
-  const sourceBound = isSourceBoundCollectionClass(request.payloadClass);
-  const hasSource = typeof request.sourceVersionId === "string" && request.sourceVersionId.length > 0;
-  if (sourceBound && !hasSource) {
-    return `${request.payloadClass} is source-bound and requires a sourceVersionId`;
+  return null;
+}
+
+/**
+ * The checks every mark-shaped request shares, whatever it is asking for.
+ *
+ * A source-bound class must carry the source version it stops obligations on: a
+ * source-bound mark whose `sourceVersionId` is null would set an effect on nothing
+ * while still reporting itself marked. The two object-scoped classes must NOT carry
+ * one, because they have no source version and a lane that wrote it would be
+ * stamping a row that does not exist.
+ *
+ * One helper rather than one per request type, because a mark and a reactivation
+ * that disagree about whether a source-bound class needs a source version would
+ * each be internally consistent and jointly wrong.
+ */
+function findInvalidMarkIdentity(
+  request: CollectionMarkIdentity & {
+    readonly scopeBinding: string;
+    readonly sourceVersionId: string | null;
   }
-  if (!sourceBound && hasSource) {
-    return `${request.payloadClass} is object-scoped and has no source version`;
+): string | null {
+  if (isBlank(request?.payloadRef)) return "payloadRef is required";
+  if (isBlank(request.scopeBinding)) return "scopeBinding is required";
+  const sourceBound = isSourceBoundCollectionClass(request.payloadClass);
+  const hasSource = !isBlank(request.sourceVersionId);
+  if (sourceBound !== hasSource) {
+    return sourceBound
+      ? `${request.payloadClass} is source-bound and requires a sourceVersionId`
+      : `${request.payloadClass} is object-scoped and has no source version`;
   }
   return null;
+}
+
+/** A decimal, unsigned, with no sign and no leading zeros beyond a bare `0`. */
+function isDecimal(value: unknown): value is string {
+  return typeof value === "string" && DECIMAL_RE.test(value);
+}
+
+/** A string that is absent, empty, or only whitespace. */
+function isBlank(value: unknown): boolean {
+  return typeof value !== "string" || value.trim().length === 0;
 }
 
 function refusal(

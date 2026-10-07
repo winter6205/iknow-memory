@@ -603,6 +603,20 @@ export interface EvidenceStore {
    * only — no result membership and no source payload.
    */
   issueGrant(request: GrantRequest): Promise<EvidenceGrantRecord>;
+  /**
+   * Issue a whole page's grants as ONE write: all of them, or none.
+   *
+   * A read that returned three rows mints three references, and a caller that
+   * never receives the page must not leave references behind it — each pins its
+   * dependencies for the grant's whole lifetime, so an orphaned one is a
+   * commitment nobody can cite and nobody can unwind. Both backends therefore
+   * validate and commit the batch as a unit rather than looping `issueGrant`,
+   * whose per-call transaction is correct for one reference and is exactly the
+   * shape that strands the first two when the third fails.
+   */
+  issueGrants(
+    requests: readonly GrantRequest[]
+  ): Promise<readonly EvidenceGrantRecord[]>;
   /** Replay one grant at the caller's instant; never renews it. */
   readGrant(evidenceRef: string, at: string): Promise<EvidenceGrantRead>;
   /**

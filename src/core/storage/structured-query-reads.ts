@@ -324,7 +324,18 @@ function requireIssued(value: string | undefined, label: string): string {
   return value;
 }
 
-function refuseCount(): never {
+/**
+ * A count nobody measured is not a zero.
+ *
+ * Exported because the grant arm has to refuse the same fact BEFORE anything is
+ * written: a count grant retains a receipt claiming
+ * `coverage: stored_structured_subjects`, so a zero written for a missing count
+ * states something about the corpus that was never observed and the store would
+ * hold it for the grant's whole lifetime. One refusal, one code, one message —
+ * restated in a second file it would be two texts that agree until one of them
+ * is edited.
+ */
+export function refuseCount(): never {
   throw new StructuredQueryError(
     "structured count read produced no count",
     "count_unavailable"
@@ -1279,6 +1290,27 @@ function grantContext(context: GrantContext): Readonly<Record<string, unknown>> 
   };
 }
 
+/**
+ * One row grant per returned row.
+ *
+ * P1-I6's second clause — "row grants carry the provenance continuation ref" — is
+ * not met as a field, and this is the record of why. `StructuredQueryGrantPlan`
+ * has no slot for it and neither does `GrantRequest`, because the grant's
+ * persisted shape has no column for it; adding one would be a schema change, not
+ * a wiring change, so a field here would be dropped at the insert and the clause
+ * satisfied only in the type.
+ *
+ * The value is not missing, though, and the grant holds it: `value` retains the
+ * row exactly as this read proved it, which is the full `supports` array the
+ * bounded provenance was cut from, and `supports` on the request names that same
+ * set with each id's role. `boundProvenance` orders by support id and names the
+ * first omitted one, and `normalizeRowSupports` preserves the order it was given,
+ * so the continuation ref is a deterministic function of what the grant already
+ * retains: a holder of the reference can recompute it and gets the same id the
+ * caller was shown. It is recoverable rather than carried, which is weaker than
+ * the clause asked for and is stated here rather than left for a reader to
+ * discover.
+ */
 function rowGrants(
   context: GrantContext,
   rows: readonly StructuredQueryRowPlan[]

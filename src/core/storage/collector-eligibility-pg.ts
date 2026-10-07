@@ -52,7 +52,7 @@ export interface CollectionEligibilityPool {
  */
 const FACTS_SQL = `
 WITH target AS (
-  SELECT source_version_id, payload_collected_at
+  SELECT source_version_id, payload_collected_at, retired_at
     FROM source_versions
    WHERE source_ref = $1 AND source_version = $2
 ),
@@ -66,6 +66,9 @@ SELECT
   COALESCE(
     (SELECT t.payload_collected_at IS NOT NULL FROM target t),
     false) AS payload_collected,
+  COALESCE(
+    (SELECT t.retired_at IS NOT NULL FROM target t),
+    false) AS target_retired,
   COALESCE((
     SELECT jsonb_agg(
              jsonb_build_object('kind', dep.kind, 'holder', dep.holder)
@@ -193,11 +196,11 @@ function storeError(error: unknown): MaintenanceStoreError {
 /**
  * Map the row onto the fact vocabulary.
  *
- * An unreadable column is not silently dropped: a dependency or lease whose
- * identifying value cannot be read becomes an entry the decision still counts,
- * and a malformed expiry is left for the decision to treat as never expiring. The
- * alternative — dropping what cannot be parsed — is exactly how a protected
- * payload ends up looking free.
+ * A column that cannot be read raises instead of mapping to an empty array, and a
+ * lease whose expiry cannot be read is KEPT rather than dropped: the decision
+ * treats an unparseable expiry as never expiring, and that is the path on which a
+ * protected payload looks idle. Dropping what cannot be parsed is exactly how a
+ * protected payload ends up looking free.
  */
 function factsOf(
   row: Record<string, unknown>,
@@ -206,13 +209,17 @@ function factsOf(
   return {
     bindingResolved: row.binding_resolved === true,
     payloadCollected: row.payload_collected === true,
+    targetRetired: row.target_retired === true,
     currentDependencies: dependenciesOf(row.current_dependencies),
     validLeases: [
       ...leasesOf(row.valid_leases, "job"),
       ...activeReaders.map((reader) => ({ ...reader, kind: readerKind(reader) })),
     ],
-    rowReferences: rowsOf<CollectionRowReference>(row.row_references),
-    countOnlyGrants: rowsOf<CollectionCountGrant>(row.count_only_grants),
+    rowReferences: rowsOf<CollectionRowReference>("row_references", row.row_references),
+    countOnlyGrants: rowsOf<CollectionCountGrant>(
+      "count_only_grants",
+      row.count_only_grants
+    ),
   };
 }
 
@@ -224,33 +231,36 @@ function factsOf(
  */
 function dependenciesOf(value: unknown): readonly CollectionCurrentDependency[] {
   const kinds: readonly string[] = COLLECTION_DEPENDENCY_KINDS;
-  return rowsOf<{ readonly kind?: unknown; readonly holder?: unknown }>(value).map(
-    (dep) => {
-      const kind = typeof dep.kind === "string" ? dep.kind : "";
-      if (!kinds.includes(kind)) throw unknownVocabulary("dependency kind", kind);
-      return {
-        kind: kind as CollectionDependencyKind,
-        holder: typeof dep.holder === "string" && dep.holder.length > 0
-          ? dep.holder
-          : "unknown",
-      };
-    }
-  );
+  return rowsOf<{ readonly kind?: unknown; readonly holder?: unknown }>(
+    "current_dependencies",
+    value
+  ).map((dep) => {
+    const kind = typeof dep.kind === "string" ? dep.kind : "";
+    if (!kinds.includes(kind)) throw unknownVocabulary("dependency kind", kind);
+    return { kind: kind as CollectionDependencyKind, holder: holderOf(dep.holder) };
+  });
 }
 
 function leasesOf(
   value: unknown,
   kind: CollectionLeaseKind
 ): readonly CollectionLease[] {
-  return rowsOf<{ readonly holder?: unknown; readonly expiresAt?: unknown }>(value)
-    .filter((lease) => typeof lease.expiresAt === "string")
-    .map((lease) => ({
-      kind,
-      holder: typeof lease.holder === "string" && lease.holder.length > 0
-        ? lease.holder
-        : "unknown",
-      expiresAt: lease.expiresAt as string,
-    }));
+  return rowsOf<{ readonly holder?: unknown; readonly expiresAt?: unknown }>(
+    "valid_leases",
+    value
+  ).map((lease) => ({
+    kind,
+    holder: holderOf(lease.holder),
+    // Kept as a value the decision cannot parse, so it counts as never expiring.
+    // A lease dropped for being unreadable is the one reading that makes a leased
+    // payload look free.
+    expiresAt: String(lease.expiresAt),
+  }));
+}
+
+/** The row naming a dependency or holding a lease, or a marker that it was unreadable. */
+function holderOf(value: unknown): string {
+  return typeof value === "string" && value.length > 0 ? value : "unknown";
 }
 
 function readerKind(reader: CollectionLease): CollectionLeaseKind {
@@ -268,17 +278,32 @@ function unknownVocabulary(what: string, value: string): MaintenanceStoreError {
   );
 }
 
-function rowsOf<T>(value: unknown): readonly T[] {
-  const parsed = typeof value === "string" ? safeParse(value) : value;
-  if (!Array.isArray(parsed)) return [];
+/**
+ * An entry list that could not be read.
+ *
+ * The only other answer available here is "found nothing", and that is the answer
+ * that collects a protected payload: an unreadable `row_references` is not the same
+ * fact as an empty one. Same contract as an unknown dependency kind — a read that
+ * cannot establish a fact stops the collection instead of completing it.
+ */
+function unreadableColumn(column: string): MaintenanceStoreError {
+  return new MaintenanceStoreError(
+    `collector eligibility read could not read ${column} as an entry list`,
+    "backend_unavailable"
+  );
+}
+
+function rowsOf<T>(column: string, value: unknown): readonly T[] {
+  const parsed = typeof value === "string" ? parseColumn(column, value) : value;
+  if (!Array.isArray(parsed)) throw unreadableColumn(column);
   return parsed as readonly T[];
 }
 
-function safeParse(value: string): unknown {
+function parseColumn(column: string, value: string): unknown {
   try {
     return JSON.parse(value) as unknown;
   } catch {
-    return [];
+    throw unreadableColumn(column);
   }
 }
 

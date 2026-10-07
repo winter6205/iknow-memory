@@ -97,6 +97,13 @@ export interface CollectionReadFacts {
   /** `payload_collected_at` is already set: the payload is gone already and
    *  this decision is a no-op, not an eligibility verdict. */
   readonly payloadCollected: boolean;
+  /** `retired_at` is set on the TARGET source version. The `retired_*` classes
+   *  count their deadline from retirement (spec 291-292), so this is the fact
+   *  that makes the class the caller named the class the payload is in: it is a
+   *  store fact, never a caller assertion, and without it a payload that is
+   *  still current looks old enough to collect. Always false for the two
+   *  object-scoped classes, which have no source version at all. */
+  readonly targetRetired: boolean;
   readonly currentDependencies: readonly CollectionCurrentDependency[];
   readonly validLeases: readonly CollectionLease[];
   readonly rowReferences: readonly CollectionRowReference[];

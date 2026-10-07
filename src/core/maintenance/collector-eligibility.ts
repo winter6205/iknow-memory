@@ -87,6 +87,24 @@ export function isSourceBoundCollectionClass(
 }
 
 /**
+ * The classes whose deadline counts from a RETIREMENT the store has to confirm.
+ *
+ * `attempt_stage` and `derived_generation` are deliberately absent: their anchors
+ * are a terminal state and a stable replacement, and their rows legitimately sit
+ * on a source version that is still current (spec 289-290).
+ */
+const RETIREMENT_BOUND_CLASSES = [
+  "retired_unreferenced",
+  "retired_evidence_protected",
+] as const satisfies readonly CollectionPayloadClass[];
+
+function isRetirementBoundClass(
+  value: CollectionPayloadClass
+): value is (typeof RETIREMENT_BOUND_CLASSES)[number] {
+  return (RETIREMENT_BOUND_CLASSES as readonly string[]).includes(value);
+}
+
+/**
  * One read, one decision.
  *
  * The read happens first and the refusal checks follow, in that order, because a
@@ -124,6 +142,12 @@ export function decideCollectionEligibility(
       `source binding ${candidate.source?.sourceRef}/${candidate.source?.sourceVersion} is not in the store`
     );
   }
+  if (isRetirementBoundClass(candidate.payloadClass) && !facts.targetRetired) {
+    return refusal(
+      "invalid_input",
+      `${candidate.payloadClass} requires a retired source version, and ${candidate.source?.sourceVersion} is not retired`
+    );
+  }
 
   const anchorMs = instantMs(candidate.anchorAt);
   if (anchorMs === null) {
@@ -132,30 +156,44 @@ export function decideCollectionEligibility(
     return refusal("invalid_input", "anchorAt must be an ISO 8601 datetime with a timezone");
   }
 
-  const rowUntil = rowProtectedUntilMs(candidate, facts, anchorMs);
-  const earliestCandidateAt = earliestCandidateMs(candidate, facts, anchorMs, rowUntil);
-  const blockingReasons = collectBlockingReasons(facts, now, earliestCandidateAt, rowUntil);
+  const rowUntilMs = rowProtectedUntilMs(candidate, facts, anchorMs);
+  const window: DecisionWindow = {
+    facts,
+    nowMs: now.getTime(),
+    rowUntilMs,
+    earliestCandidateAt: earliestCandidateMs(candidate, anchorMs, rowUntilMs),
+  };
+  const blockingReasons = collectBlockingReasons(window);
 
   return {
     refused: false,
     eligibility: {
       payloadClass: candidate.payloadClass,
       eligible: blockingReasons.length === 0,
-      earliestCandidateAt: new Date(earliestCandidateAt).toISOString(),
+      earliestCandidateAt: new Date(window.earliestCandidateAt).toISOString(),
       physicalPurgeNotBefore: new Date(
-        earliestCandidateAt + COLLECTION_MARK_GRACE_DAYS * COLLECTION_DAY_MS
+        window.earliestCandidateAt + COLLECTION_MARK_GRACE_DAYS * COLLECTION_DAY_MS
       ).toISOString(),
       blockingReasons,
-      nextEvaluationAt: nextEvaluationText(
-        blockingReasons,
-        facts,
-        now,
-        earliestCandidateAt,
-        rowUntil
-      ),
+      nextEvaluationAt: nextEvaluationText(window, blockingReasons),
       ignoredCountGrants: facts.countOnlyGrants.map((grant) => grant.evidenceRef),
     },
   };
+}
+
+/**
+ * Everything one decision derives from its single read, computed once.
+ *
+ * The read, the instant it was made at, and the two deadlines every consumer
+ * needs travel together because passing them separately is what let the 365-day
+ * cap be applied twice, where the second application could never fire.
+ */
+interface DecisionWindow {
+  readonly facts: CollectionReadFacts;
+  readonly nowMs: number;
+  /** When the row grants stop protecting the content, or null when none do. */
+  readonly rowUntilMs: number | null;
+  readonly earliestCandidateAt: number;
 }
 
 /**
@@ -226,14 +264,13 @@ function rowProtectedUntilMs(
  *
  * For `retired_evidence_protected` this is the later of retirement + 90 days and
  * the protected window, which `rowProtectedUntilMs` has already closed at the
- * + 365-day cap. For every other class it is the class deadline: the
- * row-reference block still applies there, but it does not move the deadline,
- * because a payload that is not the protected-evidence class was never granted
- * the extension.
+ * + 365-day cap — the cap is applied there and only there. For every other class
+ * it is the class deadline: the row-reference block still applies there, but it
+ * does not move the deadline, because a payload that is not the
+ * protected-evidence class was never granted the extension.
  */
 function earliestCandidateMs(
   candidate: CollectionCandidate,
-  facts: CollectionReadFacts,
   anchorMs: number,
   rowUntilMs: number | null
 ): number {
@@ -241,15 +278,12 @@ function earliestCandidateMs(
   if (candidate.payloadClass !== "retired_evidence_protected" || rowUntilMs === null) {
     return classDeadline;
   }
-  const extended = Math.max(classDeadline, rowUntilMs);
   // An unreadable expiry leaves a finite, honest deadline to report: the class
   // deadline, under a protection that `row_content_reference` holds open.
-  const deadline = Number.isFinite(extended) ? extended : classDeadline;
-  if (facts.currentDependencies.length > 0) return deadline;
-  return Math.min(deadline, anchorMs + ROW_REFERENCE_CAP_DAYS * COLLECTION_DAY_MS);
+  const extended = Math.max(classDeadline, rowUntilMs);
+  return Number.isFinite(extended) ? extended : classDeadline;
 }
 
-/** Unexpired row references, as absolute instants. */
 /**
  * An expiry that cannot be read is treated as never expiring.
  *
@@ -262,18 +296,16 @@ function expiryMs(value: unknown): number {
 }
 
 function collectBlockingReasons(
-  facts: CollectionReadFacts,
-  now: Date,
-  earliestCandidateAt: number,
-  rowUntilMs: number | null
+  window: DecisionWindow
 ): CollectionEligibility["blockingReasons"] {
-  const nowMs = now.getTime();
   const reasons: CollectionBlockingReason[] = [];
-  if (facts.payloadCollected) reasons.push("already_collected");
-  if (facts.currentDependencies.length > 0) reasons.push("current_dependency");
-  if (hasValidLease(facts.validLeases, nowMs)) reasons.push("valid_lease");
-  if (rowUntilMs !== null && nowMs < rowUntilMs) reasons.push("row_content_reference");
-  if (nowMs < earliestCandidateAt) reasons.push("deadline_not_reached");
+  if (window.facts.payloadCollected) reasons.push("already_collected");
+  if (window.facts.currentDependencies.length > 0) reasons.push("current_dependency");
+  if (hasValidLease(window.facts.validLeases, window.nowMs)) reasons.push("valid_lease");
+  if (window.rowUntilMs !== null && window.nowMs < window.rowUntilMs) {
+    reasons.push("row_content_reference");
+  }
+  if (window.nowMs < window.earliestCandidateAt) reasons.push("deadline_not_reached");
   return reasons;
 }
 
@@ -295,22 +327,22 @@ function hasValidLease(leases: readonly CollectionLease[], nowMs: number): boole
  * nearest deadline.
  */
 function nextEvaluationText(
-  reasons: readonly CollectionBlockingReason[],
-  facts: CollectionReadFacts,
-  now: Date,
-  earliestCandidateAt: number,
-  rowUntilMs: number | null
+  window: DecisionWindow,
+  reasons: readonly CollectionBlockingReason[]
 ): string | null {
   if (reasons.length === 0) return null;
   if (reasons.includes("current_dependency")) return null;
 
-  const nowMs = now.getTime();
   const candidates: number[] = [];
-  if (nowMs < earliestCandidateAt) candidates.push(earliestCandidateAt);
-  if (rowUntilMs !== null && nowMs < rowUntilMs) candidates.push(rowUntilMs);
-  for (const lease of facts.validLeases) {
+  if (window.nowMs < window.earliestCandidateAt) {
+    candidates.push(window.earliestCandidateAt);
+  }
+  if (window.rowUntilMs !== null && window.nowMs < window.rowUntilMs) {
+    candidates.push(window.rowUntilMs);
+  }
+  for (const lease of window.facts.validLeases) {
     const expiresAtMs = expiryMs(lease.expiresAt);
-    if (nowMs < expiresAtMs) candidates.push(expiresAtMs);
+    if (window.nowMs < expiresAtMs) candidates.push(expiresAtMs);
   }
   if (candidates.length === 0) return null;
   const soonest = Math.min(...candidates);

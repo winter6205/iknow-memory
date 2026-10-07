@@ -292,6 +292,21 @@ async function schemaBootstrapIsReady(
             AND k.conname = 'entities_type_closed_check'
        )
        AND EXISTS (
+         -- MP13: the work-kind CHECK is widened by re-adding it, and no CREATE
+         -- can reach an existing table, so a store still carrying the legacy
+         -- three-kind definition has to answer "not ready" for the rebuild in
+         -- schema-maintenance-work.ts to run. Like the entities CHECK above, the
+         -- renamed constraint's presence is the marker — a CHECK has no column
+         -- or index the other arms of this probe could notice instead.
+         SELECT 1
+           FROM pg_constraint k
+           JOIN pg_class t ON t.oid = k.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND t.relname = 'maintenance_jobs'
+            AND k.conname = 'maintenance_jobs_work_kind_closed_check'
+       )
+       AND EXISTS (
          SELECT 1
            FROM pg_trigger tr
            JOIN pg_class t ON t.oid = tr.tgrelid

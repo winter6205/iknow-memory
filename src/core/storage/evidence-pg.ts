@@ -150,10 +150,7 @@ function toScopeRevisions(row: Record<string, any>): ScopeRevisionRecord {
 }
 
 /** A lost write is a storage fault, never a domain miss to be swallowed. */
-function requireRow(
-  rows: unknown[],
-  statement: string
-): Record<string, any> {
+function requireRow(rows: unknown[], statement: string): Record<string, any> {
   const row = rows[0] as Record<string, any> | undefined;
   if (row === undefined) {
     throw new GraphragError(
@@ -431,7 +428,10 @@ async function insertSupport(
   );
   return {
     support: toSupportRecord(
-      requireRow(rows, "the support insert that resolved to an existing occurrence")
+      requireRow(
+        rows,
+        "the support insert that resolved to an existing occurrence"
+      )
     ),
     created: false,
   };
@@ -458,7 +458,9 @@ export async function readSupportRow(
     `SELECT ${SUPPORT_COLUMNS} FROM assertion_supports WHERE support_id = $1`,
     [supportId]
   );
-  return rows.length === 0 ? null : toSupportRecord(rows[0] as Record<string, any>);
+  return rows.length === 0
+    ? null
+    : toSupportRecord(rows[0] as Record<string, any>);
 }
 
 /** Oldest first, with the reference breaking ties so the order is total. */
@@ -483,7 +485,24 @@ export async function readScopeRevisions(
        FROM evidence_scope_revisions WHERE scope_binding = $1`,
     [scopeBinding]
   );
-  return rows.length === 0 ? null : toScopeRevisions(rows[0] as Record<string, any>);
+  return rows.length === 0
+    ? null
+    : toScopeRevisions(rows[0] as Record<string, any>);
+}
+
+/** Lock the admission row so a matching fence stays current through the batch. */
+export async function lockScopeRevisions(
+  client: EvidenceClient,
+  scopeBinding: string
+): Promise<ScopeRevisionRecord | null> {
+  const { rows } = await client.query(
+    `SELECT scope_binding, authorization_revision, purge_revision
+       FROM evidence_scope_revisions WHERE scope_binding = $1 FOR UPDATE`,
+    [scopeBinding]
+  );
+  return rows.length === 0
+    ? null
+    : toScopeRevisions(rows[0] as Record<string, any>);
 }
 
 /**
@@ -517,9 +536,7 @@ export async function writeScopeRevisions(
            RETURNING scope_binding, authorization_revision, purge_revision`,
           [scopeBinding, authorizationRevision, purgeRevision]
         );
-  return toScopeRevisions(
-    requireRow(result.rows, "the scope revision write")
-  );
+  return toScopeRevisions(requireRow(result.rows, "the scope revision write"));
 }
 
 /**
@@ -580,11 +597,26 @@ export async function issueGrantRows(
   }
   const isCount = plan.grant.kind === EVIDENCE_GRANT_KIND.COUNT;
   const receipt = isCount
-    ? await joinAuthorizationReceipt(client, scope, plan.receiptId, plan.grant.queried_at)
+    ? await joinAuthorizationReceipt(
+        client,
+        scope,
+        plan.receiptId,
+        plan.grant.queried_at
+      )
     : null;
   const pinned = await readPinnableDependencies(client, plan.grant);
-  const grant = await insertGrantRow(client, plan, scope, receipt?.receipt_id ?? null);
-  await pinGrantDependencies(client, plan.evidenceRef, plan.grant.supports, pinned);
+  const grant = await insertGrantRow(
+    client,
+    plan,
+    scope,
+    receipt?.receipt_id ?? null
+  );
+  await pinGrantDependencies(
+    client,
+    plan.evidenceRef,
+    plan.grant.supports,
+    pinned
+  );
   return grant;
 }
 
@@ -621,7 +653,10 @@ async function readPinnableDependencies(
         `row grant names support ${ref.support_id}, whose source version binding does not resolve`
       );
     }
-    if (row.obligations_stopped_at !== null && row.obligations_stopped_at !== undefined) {
+    if (
+      row.obligations_stopped_at !== null &&
+      row.obligations_stopped_at !== undefined
+    ) {
       throw evidenceError(
         EVIDENCE_FAILURE.UNAVAILABLE,
         `row grant names support ${ref.support_id}, whose source version stopped accepting obligations at ${isoOrNull(row.obligations_stopped_at)}`
@@ -862,7 +897,11 @@ export async function readGrantPinnedExtractionsForSupports(
 ): Promise<ReadonlyMap<string, readonly string[]>> {
   const bySupport = new Map<string, string[]>(supportIds.map((id) => [id, []]));
   if (supportIds.length === 0) return bySupport;
-  for (const row of await selectGrantPinnedExtractions(client, evidenceRef, supportIds)) {
+  for (const row of await selectGrantPinnedExtractions(
+    client,
+    evidenceRef,
+    supportIds
+  )) {
     bySupport.get(row.support_id)?.push(row.extraction_ref);
   }
   return bySupport;

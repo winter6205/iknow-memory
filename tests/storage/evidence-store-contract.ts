@@ -675,6 +675,93 @@ export function runEvidenceStoreContract(
       );
     });
 
+    it("refuses a whole batch when one member cannot be issued, and leaves the scope issuing", async () => {
+      // A read that returned three rows mints three references, and a caller
+      // that never receives the page must not leave any behind it — each pins
+      // its dependencies for the grant's whole lifetime. So the batch is one
+      // write, not a loop over `issueGrant`.
+      //
+      // What this lane can observe is the REFUSAL and the store's own state, and
+      // the refusal is the whole batch's: one member that cannot be issued takes
+      // the batch with it, under the token that member earned. What it cannot
+      // observe is the absence of the committed references, because the batch
+      // mints them internally and no `EvidenceStore` member lists them — a
+      // per-grant loop refuses identically here. So this case pins the shared,
+      // observable half; the zero-committed half is proven where it IS
+      // observable, against the cluster's own table, in
+      // tests/acceptance/structured-query-pg.test.ts.
+      const store = await open();
+      const caseId = uniqueCase();
+      await admit(store, caseId);
+      const seed = await seedSourceVersion(store, caseId);
+      const support = (await store.recordSupport(occurrenceFor(seed, caseId)))
+        .support;
+      const good = [
+        { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+      ];
+      const ABSENT = "00000000-0000-4000-8000-00000000dead";
+
+      const err = await refusal(
+        store.issueGrants([
+          rowGrant(caseId, good),
+          rowGrant(caseId, [
+            { support_id: ABSENT, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+          ]),
+        ])
+      );
+      // The batch's own token, not a generic one and not the neighbour's: a
+      // store that issued the first member and reported a later failure as a
+      // partial success would answer differently.
+      expect(failureTokenOf(err)).toBe(
+        EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING
+      );
+
+      // The scope still issues, so the refusal was the batch's and not the
+      // scope's: a poisoned or half-consumed scope would answer this with a
+      // different token.
+      const committed = await store.issueGrants([rowGrant(caseId, good)]);
+      expect(committed).toHaveLength(1);
+      const replay = await store.readGrant(committed[0]!.evidence_ref, LATER);
+      expect(replay.state).toBe("granted");
+    });
+
+    it("issues a valid batch whole, one reference per request in order", async () => {
+      // The twin of the case above: a batch that every member survives commits
+      // every member, in the order given, so a page's references line up with
+      // its rows rather than with a store's own iteration order.
+      const store = await open();
+      const caseId = uniqueCase();
+      await admit(store, caseId);
+      const seed = await seedSourceVersion(store, caseId);
+      const support = (await store.recordSupport(occurrenceFor(seed, caseId)))
+        .support;
+      const deps = [
+        { support_id: support.support_id, role: EVIDENCE_SUPPORT_ROLE.OCCURRENCE },
+      ];
+      const requests = [
+        rowGrant(caseId, deps, { queryDigest: `${caseId}-q0` }),
+        rowGrant(caseId, deps, { queryDigest: `${caseId}-q1` }),
+        countGrant(caseId, 3, { queryDigest: `${caseId}-q2` }),
+      ];
+
+      const issued = await store.issueGrants(requests);
+
+      expect(issued).toHaveLength(3);
+      expect(issued.map((grant) => grant.query_digest)).toEqual([
+        `${caseId}-q0`,
+        `${caseId}-q1`,
+        `${caseId}-q2`,
+      ]);
+      // Distinct handles: a batch that reused one reference would make two rows
+      // cite the same receipt.
+      expect(new Set(issued.map((grant) => grant.evidence_ref)).size).toBe(3);
+      for (const grant of issued) {
+        expect((await store.readGrant(grant.evidence_ref, LATER)).state).toBe(
+          "granted"
+        );
+      }
+    });
+
     it("refuses an unknown reference, an unknown scope and a malformed instant", async () => {
       const store = await open();
       const caseId = uniqueCase();

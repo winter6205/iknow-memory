@@ -493,6 +493,151 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
 });
 
 /**
+ * The structured reader's capability gate (#query seam wiring).
+ *
+ * Four things are required together and none alone is usable: a scope seam to
+ * mint with, a cursor key to sign a cursor, an evidence store to mint the
+ * references a row is cited by, and the identity the host bound to this
+ * connection. The gate grew one clause at a time — the evidence store and the
+ * identity arrived after the seam and the key — and a clause with no case is a
+ * clause nothing would notice dropping, so all four states are named here.
+ *
+ * `Object.hasOwn` rather than `=== undefined`: an explicit
+ * `structuredReader: undefined` reads as "wired, currently empty" and would let a
+ * later refactor fill it in without tripping these guards.
+ */
+describe("buildRetrieveDeps — structured reader capability gate", () => {
+  const embedder = new FakeEmbedder(1536);
+  const retrieval = {
+    w_vec: 0.7,
+    w_bm: 0.15,
+    w_graph: 0.15,
+    bm25Enabled: true,
+    graphEnabled: true,
+    rerankEnabled: false,
+    entityLinkTopK: 8,
+    candidateCap: 50,
+    graphArmFloor: 3,
+  };
+  const identity = {
+    actorId: "session-a",
+    ownerScopeBinding: "scope-gate",
+    readerBinding: "scope-gate",
+    sourceRefs: "docs/gate.md",
+    authorizationRevision: "auth-gate-1",
+    deadlineAt: "2099-01-01T00:00:00.000Z",
+  };
+  const allFour = {
+    // `requireCursorKey` refuses anything under 32 bytes, so a short literal
+    // here would fail at construction and read as a gate refusal.
+    queryCursorKey: "cursor-key-for-the-gate-0123456789",
+    queryIdentity: identity,
+  };
+
+  /**
+   * A backend carrying BOTH halves the gate looks for.
+   *
+   * `MemoryBackend` is a full `EvidenceStore`, but its
+   * `structuredScopeUnitOfWork` is a memory scope unit of work with no
+   * `runTransaction` — the half the Query storage reader needs — so the stock
+   * memory backend never opens this gate at all, and these cases would pass
+   * without ever reaching the clause they are about. The pairing added here is
+   * the one `PgvectorBackend` composes in production, stood up without a
+   * cluster.
+   *
+   * The prototype is carried onto the new seam rather than spread: spreading
+   * copies own properties only, and the seam's mint is a prototype method, so a
+   * spread seam would look complete to this file and fail the very guard under
+   * test.
+   */
+  function gateBackend(): MemoryBackend {
+    const backend = new MemoryBackend(1536);
+    const seam = backend.structuredScopeUnitOfWork;
+    Object.assign(backend, {
+      structuredScopeUnitOfWork: Object.assign(
+        Object.create(Object.getPrototypeOf(seam) as object) as typeof seam,
+        seam,
+        {
+          runTransaction: async () => {
+            throw new Error("the capability gate must not run a transaction");
+          },
+        }
+      ),
+    });
+    return backend;
+  }
+
+  it("wires the reader when the seam, key, evidence store and identity are all present", () => {
+    const deps = buildRetrieveDeps(
+      { embedder, storage: gateBackend(), retrieval, ...allFour },
+      false
+    );
+    expect(Object.hasOwn(deps, "structuredReader")).toBe(true);
+    expect(typeof deps.structuredReader?.readStructuredQuery).toBe("function");
+  });
+
+  it("wires no reader when the cursor key is absent", () => {
+    // A key with no seam has nothing to read and a seam with no key cannot sign
+    // the cursor it would have to hand back.
+    const deps = buildRetrieveDeps(
+      { embedder, storage: gateBackend(), retrieval, queryIdentity: identity },
+      false
+    );
+    expect(Object.hasOwn(deps, "structuredReader")).toBe(false);
+  });
+
+  it("wires no reader when the evidence store is absent", () => {
+    // The case that went unnoticed when the gate grew from two clauses to three:
+    // a backend with a scope seam and a key but no way to mint a reference could
+    // only answer with the empty references that make every non-empty page
+    // refuse, so it reads as unprovisioned rather than half-wired. Only the
+    // batch method is removed — the seam is still intact, so this fails on the
+    // evidence clause and not on some other one.
+    const backend = gateBackend();
+    Object.assign(backend, { issueGrants: undefined });
+    const deps = buildRetrieveDeps(
+      { embedder, storage: backend, retrieval, ...allFour },
+      false
+    );
+    expect(Object.hasOwn(deps, "structuredReader")).toBe(false);
+  });
+
+  it("wires no reader when the host bound no identity to this connection", () => {
+    // B1's clause 4: an absent binding is a refusal, not a default. With no
+    // identity there is nothing to refuse WITH either, so the capability is
+    // absent and the tool reports its own `structured_search_unavailable`.
+    const deps = buildRetrieveDeps(
+      {
+        embedder,
+        storage: gateBackend(),
+        retrieval,
+        queryCursorKey: allFour.queryCursorKey,
+      },
+      false
+    );
+    expect(Object.hasOwn(deps, "structuredReader")).toBe(false);
+  });
+
+  it("wires a reader for an INCOMPLETE identity, which then refuses by name", () => {
+    // The other half of the previous case, and why the gate keys on the
+    // identity's presence rather than its completeness: a host that injected a
+    // binding with members missing must get a refusal that NAMES them, not a
+    // silent capability drop with nothing to say about what to inject.
+    const deps = buildRetrieveDeps(
+      {
+        embedder,
+        storage: gateBackend(),
+        retrieval,
+        queryCursorKey: allFour.queryCursorKey,
+        queryIdentity: { actorId: "session-a" },
+      },
+      false
+    );
+    expect(Object.hasOwn(deps, "structuredReader")).toBe(true);
+  });
+});
+
+/**
  * Neo4j PPR arm wiring (#70 T4) — the mirror image of the archive above.
  *
  * The Neo4j arm IS production, so the ranker travels whenever one was

@@ -2080,15 +2080,44 @@ export class PgvectorBackend
    * commit without the dependencies it claims to protect.
    */
   async issueGrant(request: GrantRequest): Promise<EvidenceGrantRecord> {
-    const plan = normalizeGrantRequest(request);
+    const [grant] = await this.issueGrants([request]);
+    // A one-element batch is a one-grant write, so this branch is unreachable
+    // rather than merely unlikely — and saying so beats indexing a possibly
+    // undefined element into a promise the caller awaits.
+    if (grant === undefined) {
+      throw new GraphragError(
+        "evidence store: issueGrants returned no grant for a one-request batch",
+        "STORAGE_ERROR"
+      );
+    }
+    return grant;
+  }
+
+  /**
+   * A whole page in one transaction.
+   *
+   * `inEvidenceTransaction` owns the BEGIN/COMMIT/ROLLBACK pairing, so a failure
+   * on the third of three requests rolls back the first two: the page's caller
+   * receives no references, and no reference is left behind it pinning
+   * dependencies it can never hand to anyone.
+   */
+  async issueGrants(
+    requests: readonly GrantRequest[]
+  ): Promise<readonly EvidenceGrantRecord[]> {
+    const plans = requests.map((request) => ({
+      grant: normalizeGrantRequest(request),
+      evidenceRef: randomUUID(),
+      receiptId: randomUUID(),
+    }));
     return inEvidenceTransaction(
       async () => (await this.ensureReady()).connect(),
-      (client) =>
-        issueGrantRows(client, {
-          grant: plan,
-          evidenceRef: randomUUID(),
-          receiptId: randomUUID(),
-        })
+      async (client) => {
+        const issued: EvidenceGrantRecord[] = [];
+        for (const plan of plans) {
+          issued.push(await issueGrantRows(client, plan));
+        }
+        return issued;
+      }
     );
   }
 

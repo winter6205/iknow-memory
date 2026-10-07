@@ -61,6 +61,7 @@ jobs:
             --exclude tests/acceptance/structured-screening-candidates-pg.test.ts \
             --exclude tests/acceptance/structured-screening-decisions-pg.test.ts \
             --exclude tests/acceptance/structured-withdrawal-pg.test.ts \
+            --exclude tests/acceptance/structured-invalidation-outbox-pg.test.ts \
             --exclude tests/storage/evidence-continuation-pg.test.ts \
             --exclude tests/storage/evidence-store-pg.test.ts
 

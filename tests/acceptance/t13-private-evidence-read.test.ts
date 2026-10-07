@@ -37,10 +37,7 @@ import {
   type AuthorizedScopeContext,
 } from "../../src/core/storage/structured-scope-types.js";
 import { EVIDENCE_FAILURE } from "../../src/core/types.js";
-import {
-  openStrictPgDriver,
-  type NotRunCase,
-} from "./strict-pg-driver.js";
+import { openStrictPgDriver, type NotRunCase } from "./strict-pg-driver.js";
 
 const EXPECTED_COMMAND =
   "STRUCTURED_EVIDENCE_T13_ACCEPTANCE=1 GRAPHRAG_MEMORY_DB_URL=... npx vitest run tests/acceptance/t13-private-evidence-read.test.ts";
@@ -144,7 +141,9 @@ const ROW_VALUE: Record<string, unknown> = {
     kind: "ORG",
     attributes: { founded: "1998", region: "emea" },
   },
-  assertions: [{ predicate: "has_office", object_ref: "fin-t13-office-berlin" }],
+  assertions: [
+    { predicate: "has_office", object_ref: "fin-t13-office-berlin" },
+  ],
 };
 const ROW_CONTEXT: Record<string, unknown> = {
   schema: "iknow.evidence_context",
@@ -176,13 +175,15 @@ interface FrozenCase {
   readonly notRun: NotRunCase;
 }
 
-function frozenCase(entry: Omit<FrozenCase, "notRun"> & {
-  readonly notRun: readonly {
-    readonly claim: string;
-    readonly owner: string;
-    readonly reason: string;
-  }[];
-}): FrozenCase {
+function frozenCase(
+  entry: Omit<FrozenCase, "notRun"> & {
+    readonly notRun: readonly {
+      readonly claim: string;
+      readonly owner: string;
+      readonly reason: string;
+    }[];
+  }
+): FrozenCase {
   return {
     ...entry,
     notRun: {
@@ -212,7 +213,8 @@ const CASES: readonly FrozenCase[] = [
   frozenCase({
     id: "R2",
     owner: "T13",
-    scenario: "a count grant returns the exact stored count and refuses supports",
+    scenario:
+      "a count grant returns the exact stored count and refuses supports",
     scenarioSource:
       "specs/structured-corpus-evidence.md: a count grant is receipt-only and nonrenewing, and has no membership",
     boundary: "real PostgreSQL: the private read on the same persistent seam",
@@ -291,6 +293,11 @@ function bindingEnv(
     [TRUSTED_BINDING_ENV_VARS.sourceRefs]: sourceRefs.join(","),
     [TRUSTED_BINDING_ENV_VARS.authorizationRevision]: revision,
     [TRUSTED_BINDING_ENV_VARS.deadlineAt]: DEADLINE,
+    // The eighth allowlisted name. Absent is a refusal on the whole binding,
+    // and these cases are about what a complete binding can read — so they
+    // inject one, and the file's own absent-variable cases (which drop a
+    // member deliberately) remain the ones that prove the refusal.
+    [TRUSTED_BINDING_ENV_VARS.consumerId]: `t13-consumer-${scope}`,
   };
 }
 
@@ -349,7 +356,16 @@ async function seed(client: pg.Client): Promise<void> {
   ] as const) {
     await client.query(
       `INSERT INTO ${Q("source_versions")} (source_version_id, source_ref, source_version, content_digest, origin_object_ref, parser_revision, unit_manifest, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)`,
-      [id, ref, version, `digest-${id}`, `object-${id}`, "t13-parser-1", JSON.stringify({ units: [1] }), AT]
+      [
+        id,
+        ref,
+        version,
+        `digest-${id}`,
+        `object-${id}`,
+        "t13-parser-1",
+        JSON.stringify({ units: [1] }),
+        AT,
+      ]
     );
   }
   for (const [supportId, ref, versionId, resultId, version] of [
@@ -369,7 +385,20 @@ async function seed(client: pg.Client): Promise<void> {
   ] as const) {
     await client.query(
       `INSERT INTO ${Q("assertion_supports")} (support_id, subject, result_id, source_ref, source_version, source_version_id, document_id, unit_version, unit, span_start, span_end, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [supportId, "entity", resultId, ref, version, versionId, `doc-${supportId}`, "1", 1, 0, 12, AT]
+      [
+        supportId,
+        "entity",
+        resultId,
+        ref,
+        version,
+        versionId,
+        `doc-${supportId}`,
+        "1",
+        1,
+        0,
+        12,
+        AT,
+      ]
     );
     await client.query(
       `INSERT INTO ${Q("support_extractions")} (support_id, extraction_ref, created_at) VALUES ($1, $2, $3)`,
@@ -392,10 +421,29 @@ async function seed(client: pg.Client): Promise<void> {
   ): Promise<void> => {
     await client.query(
       `INSERT INTO ${Q("evidence_grants")} (evidence_ref, grant_kind, subject, operation, query_digest, scope_binding, read_revision, authorization_revision, purge_revision, queried_at, expires_at, context, value, result_count, authorization_receipt_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13::jsonb, $14, $15)`,
-      [ref, kind, "entity", kind === "count" ? "count" : "entity", "t13-digest", SCOPE_A, "0", authRev, PURGE_REV, AT, expiresAt, JSON.stringify(context), JSON.stringify(value), count, receipt]
+      [
+        ref,
+        kind,
+        "entity",
+        kind === "count" ? "count" : "entity",
+        "t13-digest",
+        SCOPE_A,
+        "0",
+        authRev,
+        PURGE_REV,
+        AT,
+        expiresAt,
+        JSON.stringify(context),
+        JSON.stringify(value),
+        count,
+        receipt,
+      ]
     );
   };
-  const pin = async (ref: string, supportIds: readonly string[]): Promise<void> => {
+  const pin = async (
+    ref: string,
+    supportIds: readonly string[]
+  ): Promise<void> => {
     for (const supportId of supportIds) {
       await client.query(
         `INSERT INTO ${Q("evidence_grant_supports")} (evidence_ref, support_id, role) VALUES ($1, $2, $3)`,
@@ -407,23 +455,87 @@ async function seed(client: pg.Client): Promise<void> {
       );
     }
   };
-  await grant(ROW_REF, "row", live, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
+  await grant(
+    ROW_REF,
+    "row",
+    live,
+    ROW_CONTEXT,
+    ROW_VALUE,
+    null,
+    null,
+    AUTH_REV
+  );
   await pin(ROW_REF, [SUPPORT_A1, SUPPORT_A2]);
-  await grant(PAGED_REF, "row", live, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
+  await grant(
+    PAGED_REF,
+    "row",
+    live,
+    ROW_CONTEXT,
+    ROW_VALUE,
+    null,
+    null,
+    AUTH_REV
+  );
   await pin(PAGED_REF, PAGED_SUPPORTS);
-  await grant(COUNT_REF, "count", live, COUNT_CONTEXT, COUNT_VALUE, COUNT_NUMBER, RECEIPT_ID, AUTH_REV);
-  await grant(EXPIRED_REF, "row", expired, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
+  await grant(
+    COUNT_REF,
+    "count",
+    live,
+    COUNT_CONTEXT,
+    COUNT_VALUE,
+    COUNT_NUMBER,
+    RECEIPT_ID,
+    AUTH_REV
+  );
+  await grant(
+    EXPIRED_REF,
+    "row",
+    expired,
+    ROW_CONTEXT,
+    ROW_VALUE,
+    null,
+    null,
+    AUTH_REV
+  );
   await pin(EXPIRED_REF, [SUPPORT_A1]);
-  await grant(STOPPED_REF, "row", live, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
+  await grant(
+    STOPPED_REF,
+    "row",
+    live,
+    ROW_CONTEXT,
+    ROW_VALUE,
+    null,
+    null,
+    AUTH_REV
+  );
   await pin(STOPPED_REF, [SUPPORT_STOPPED]);
-  await grant(UNRESOLVED_REF, "row", live, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV);
+  await grant(
+    UNRESOLVED_REF,
+    "row",
+    live,
+    ROW_CONTEXT,
+    ROW_VALUE,
+    null,
+    null,
+    AUTH_REV
+  );
   await pin(UNRESOLVED_REF, [SUPPORT_UNRESOLVED]);
-  await grant(REVOKED_REF, "row", live, ROW_CONTEXT, ROW_VALUE, null, null, AUTH_REV_MOVED);
+  await grant(
+    REVOKED_REF,
+    "row",
+    live,
+    ROW_CONTEXT,
+    ROW_VALUE,
+    null,
+    null,
+    AUTH_REV_MOVED
+  );
   await pin(REVOKED_REF, [SUPPORT_A1]);
   await client.query("SET LOCAL session_replication_role = replica");
-  await client.query(`DELETE FROM ${Q("assertion_supports")} WHERE support_id = $1`, [
-    SUPPORT_UNRESOLVED,
-  ]);
+  await client.query(
+    `DELETE FROM ${Q("assertion_supports")} WHERE support_id = $1`,
+    [SUPPORT_UNRESOLVED]
+  );
   await client.query("SET LOCAL session_replication_role = origin");
 }
 
@@ -536,11 +648,15 @@ source_versions`
         .split("\n")
         .map((name) => name.trim())
     );
-    expect([...touched].filter((table) => !allowed.has(table)).sort()).toEqual([]);
+    expect([...touched].filter((table) => !allowed.has(table)).sort()).toEqual(
+      []
+    );
     // EXIT: the read did real work. An empty statement list would make the
     // table-set assertion vacuously true, so it is checked for content.
     expect(statements.length).toBeGreaterThan(0);
-    expect(statements.some((text) => text.includes("evidence_grants"))).toBe(true);
+    expect(statements.some((text) => text.includes("evidence_grants"))).toBe(
+      true
+    );
 
     // EXIT: the module graph is checked statically as well, so the claim does
     // not rest on one run's statement list. Only import specifiers are examined,
@@ -596,9 +712,9 @@ source_versions`
       `SELECT expires_at FROM ${Q("evidence_grants")} WHERE evidence_ref = $1`,
       [COUNT_REF]
     );
-    expect(
-      new Date(stored.rows[0].expires_at as string).getTime()
-    ).toBe(new Date(first.expires_at).getTime());
+    expect(new Date(stored.rows[0].expires_at as string).getTime()).toBe(
+      new Date(first.expires_at).getTime()
+    );
 
     await expect(
       readPrivateEvidence(
@@ -649,7 +765,9 @@ source_versions`
       code: EVIDENCE_FAILURE.UNSUPPORTED_SOURCE_BINDING,
       reason: "dependency_unresolved",
     });
-    await expect(read("99999999-9999-4999-8999-999999999999")).rejects.toMatchObject({
+    await expect(
+      read("99999999-9999-4999-8999-999999999999")
+    ).rejects.toMatchObject({
       code: EVIDENCE_FAILURE.UNAVAILABLE,
       reason: "unknown_reference",
     });
@@ -679,9 +797,7 @@ source_versions`
       })
     ).toThrowError(/unresolved binding is refused/);
     expect(() =>
-      readTrustedIdentityBinding(
-        bindingEnv(SCOPE_A, [SOURCE_A1], AUTH_REV)
-      )
+      readTrustedIdentityBinding(bindingEnv(SCOPE_A, [SOURCE_A1], AUTH_REV))
     ).not.toThrow();
   });
 
@@ -752,7 +868,9 @@ source_versions`
     } catch (error) {
       caught = error;
     }
-    expect(caught, "the narrower identity must be refused").toBeInstanceOf(Error);
+    expect(caught, "the narrower identity must be refused").toBeInstanceOf(
+      Error
+    );
     expect(caught).toMatchObject({
       code: EVIDENCE_FAILURE.ACCESS_DENIED,
       reason: EVIDENCE_REFUSAL_REASON.SOURCE_OUTSIDE_AUTHORIZED_SUBSET,
@@ -792,13 +910,14 @@ source_versions`
         }),
         AT
       )
-    // EXIT: the refusal is the seam's own, not this ticket's guard. scopeAuthorityOf
-    // refuses anything it did not mint before the read begins, which is the
-    // stronger statement: a hand-assembled context never reaches the store.
+      // EXIT: the refusal is the seam's own, not this ticket's guard. scopeAuthorityOf
+      // refuses anything it did not mint before the read begins, which is the
+      // stronger statement: a hand-assembled context never reaches the store.
     ).rejects.toMatchObject({
       name: "StructuredScopeError",
       code: "access_denied",
-      message: "the authorized scope context was not minted by trusted composition",
+      message:
+        "the authorized scope context was not minted by trusted composition",
     });
   });
 
@@ -895,7 +1014,9 @@ source_versions`
     // is the seam's own COMMIT. A continuation that leased its own connection
     // would open and close a bracket inside that span, so the fence is observed,
     // not assumed.
-    const grantRead = statements.findIndex((text) => text.includes("FROM evidence_grants"));
+    const grantRead = statements.findIndex((text) =>
+      text.includes("FROM evidence_grants")
+    );
     const extractionRead = statements.findIndex((text) =>
       text.includes("FROM evidence_grant_extractions")
     );
@@ -908,7 +1029,9 @@ source_versions`
     ).toBe(false);
     expect(statements.at(-1)).toBe("COMMIT");
 
-    const second = (await page({ cursor: first.next_cursor })) as EvidenceSupportsResult;
+    const second = (await page({
+      cursor: first.next_cursor,
+    })) as EvidenceSupportsResult;
     expect(second.supports.map((entry) => entry.support_id)).toEqual(
       PAGED_SUPPORTS.slice(8)
     );
@@ -941,14 +1064,20 @@ source_versions`
         await page(patch);
         expect.unreachable();
       } catch (error) {
-        const typed = error as { code: string; reason: string; message: string };
+        const typed = error as {
+          code: string;
+          reason: string;
+          message: string;
+        };
         expect(Object.values(EVIDENCE_FAILURE)).toContain(typed.code);
         expect(Object.values(EVIDENCE_REFUSAL_REASON)).toContain(typed.reason);
         reasons.push(typed.reason);
         if (typed.message.includes("mutually exclusive")) mutual = typed;
       }
     }
-    expect(reasons).not.toContain(EVIDENCE_REFUSAL_REASON.SUPPORTS_CONTINUATION_NOT_READ);
+    expect(reasons).not.toContain(
+      EVIDENCE_REFUSAL_REASON.SUPPORTS_CONTINUATION_NOT_READ
+    );
     expect(mutual?.message).toContain("mutually exclusive");
     expect(mutual?.message).not.toContain(SOURCE_A1);
   });

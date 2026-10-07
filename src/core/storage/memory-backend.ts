@@ -1433,6 +1433,7 @@ export class MemoryBackend
         value: plan.value,
         result_count: plan.count,
         authorization_receipt_id: receipt?.receipt_id ?? null,
+        consumer_id: plan.consumer_id,
       };
       this.grants.set(evidenceRef, grant);
       if (!isCount) this.pinGrantDependencies(evidenceRef, plan);

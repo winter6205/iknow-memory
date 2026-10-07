@@ -66,6 +66,7 @@ import {
 import {
   queryScopeIdentityFromEnv,
   resolveQueryScope,
+  QUERY_SCOPE_ENV_VARS,
   type QueryScopeIdentity,
 } from "./core/storage/structured-query-scope.js";
 import type { StructuredQueryReader } from "./core/structured/result.js";
@@ -302,12 +303,18 @@ export function buildStructuredQueryReader(
           "structured_search_unavailable"
         );
       }
+      // Next to the scope gate, not down at the issuance call: a host that
+      // injected no consumer can never issue a grant, so refusing it before the
+      // read keeps an unprovisioned connection from paying a full page read —
+      // against the corpus — to be told at the end that nothing could be issued.
+      const consumerId = requireConsumerId(identity);
       const plan = await reader.readStructuredQuery(resolved.context, request);
       const issued = await issuePage(
         grants,
         plan.grants,
         plan.issuanceFence,
-        plan.scopeBinding
+        plan.scopeBinding,
+        consumerId
       );
       // The storage layer owns this projection because it owns the issuer-side
       // refusal: a row or a receipt whose reference was never issued is refused
@@ -350,7 +357,8 @@ async function issuePage(
   grants: StructuredGrantStore,
   grantPlans: readonly StructuredQueryGrantPlan[],
   expectedScopeRevisionFence: ScopeRevisionFence,
-  expectedScopeBinding: string
+  expectedScopeBinding: string,
+  consumerId: string
 ): Promise<readonly string[]> {
   if (
     expectedScopeRevisionFence === null ||
@@ -364,7 +372,7 @@ async function issuePage(
       "structured_search_unavailable"
     );
   }
-  const requests = grantPlans.map(grantRequestOf);
+  const requests = grantPlans.map((plan) => grantRequestOf(plan, consumerId));
   try {
     const issued = await grants.issueGrants(
       requests,
@@ -397,6 +405,45 @@ async function issuePage(
 }
 
 /**
+ * The stream this connection's grants belong to, or the SPEC's own refusal.
+ *
+ * `consumerId` is the one grant input the HOST must supply and this seam cannot
+ * derive: a plan is computed from a read that never saw a binding, so a guess
+ * here would be an invented stream whose invalidations then go to a consumer
+ * nobody is. It is therefore read from the same per-connection identity object
+ * the six scope members come from — never from the environment, never from the
+ * request — and its absence is a refusal in the same code an absent reader
+ * produces, so a deployment that injected no consumer reads as unprovisioned
+ * rather than as a grant published to a stream of nobody's choosing.
+ *
+ * Refused HERE rather than inside the store so the message names the variable,
+ * and so a plan that was never issued is never partially written.
+ *
+ * **The two refusals of the same missing variable differ, deliberately.** This
+ * seam answers `structured_search_unavailable`, the SPEC's capability trigger:
+ * a connection the host bound without a consumer is not one that can read, and
+ * it says so in the same code an absent reader produces. The private Evidence
+ * channel reads the SAME variable through `readTrustedIdentityBinding` and
+ * answers `access_denied`, because there the binding as a whole is the
+ * authorization being withheld. Both refuse, neither invents a default, and an
+ * operator reads the same variable name in either message. Aligning the codes
+ * would mean widening `STRUCTURED_SCOPE_FAILURE_CODES` with a member the scope
+ * contracts do not define, so the divergence is recorded here instead.
+ */
+function requireConsumerId(identity: QueryScopeIdentity): string {
+  const consumerId = identity.consumerId;
+  if (consumerId === undefined || consumerId.trim() === "") {
+    throw new StructuredQueryError(
+      "this connection was given no invalidation consumer, so its grants " +
+        "could not be invalidated; inject " +
+        `${QUERY_SCOPE_ENV_VARS.consumerId} alongside the Query identity`,
+      "structured_search_unavailable"
+    );
+  }
+  return consumerId.trim();
+}
+
+/**
  * One grant plan as the grant store's own request.
  *
  * The plan carries both arms on every grant — a row grant's null count and a
@@ -405,7 +452,10 @@ async function issuePage(
  * retain something its kind may not keep. The arm this grant is NOT is
  * therefore dropped here rather than forwarded as a null.
  */
-function grantRequestOf(plan: StructuredQueryGrantPlan): GrantRequest {
+function grantRequestOf(
+  plan: StructuredQueryGrantPlan,
+  consumerId: string
+): GrantRequest {
   const shared = {
     subject: plan.subject,
     operation: plan.operation,
@@ -415,6 +465,7 @@ function grantRequestOf(plan: StructuredQueryGrantPlan): GrantRequest {
     queriedAt: plan.queriedAt,
     context: plan.context,
     value: plan.value,
+    consumerId,
   };
   if (plan.kind === "row") {
     return { ...shared, kind: "row", supports: plan.supports };

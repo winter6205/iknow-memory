@@ -49,6 +49,24 @@ export const MAX_EVIDENCE_BYTES = 32 * 1024;
 /** The finite reference lifetime, measured from `queried_at` and never renewed. */
 export const GRANT_LIFETIME_DAYS = 365;
 
+/**
+ * Longest consumer id a grant may carry.
+ *
+ * Cross-repo contract with fin, which bounds the same label at
+ * `MAX_BINDING_TOKEN_CHARS = 512` in
+ * `src/fin/retrieve/evidence_route.py`. Both sides must agree about ONE string:
+ * a value fin accepts at the transport and stores, and then cannot drain, or a
+ * value it refuses while iknow has already issued grants under it, is a binding
+ * that launches a process and cannot make progress. Neither side may raise the
+ * bound alone.
+ *
+ * It is a bound rather than a prohibition because the value is an
+ * operator-chosen label, not content: what it must not be is unbounded free text
+ * riding into a row that is otherwise six scalars, and into the outbox row its
+ * invalidation is published on.
+ */
+export const MAX_CONSUMER_ID_CHARS = 512;
+
 const MS_PER_DAY = 86_400_000;
 const GRANT_LIFETIME_MS = GRANT_LIFETIME_DAYS * MS_PER_DAY;
 
@@ -85,6 +103,8 @@ export interface NormalizedGrant {
   readonly supports: readonly EvidenceSupportRef[];
   /** The count itself is a receipt field; the matching ids are not retained. */
   readonly count: number | null;
+  /** The stream this grant's invalidation is published on. */
+  readonly consumer_id: string;
 }
 
 /** Everything a replay decision is made from. */
@@ -233,7 +253,52 @@ function normalizeGrantBase(
     queried_at,
     context: input.context,
     value: input.value,
+    // Bounded because a consumer id is an operator-chosen label, not a payload:
+    // an unbounded string here would be the one place a caller's own text could
+    // ride into a row that is otherwise six scalars, and into the outbox row its
+    // invalidation is published on. `assertFilled` is the same non-empty check
+    // every other string field on this request gets, which is what makes an
+    // absent consumer a refusal rather than an invented one — and the length
+    // bound is what makes the word "bounded" above true rather than aspirational,
+    // agreeing with fin on the same string. See MAX_CONSUMER_ID_CHARS.
+    consumer_id: assertBoundedConsumerId(input.consumerId),
   };
+}
+
+/**
+ * The one bounded-token rule for a consumer id, shared with the allocator that
+ * opens a consumer's stream (`allocateInvalidationSeq`). Two enforcement points,
+ * one predicate: a rule written twice is a rule the second copy will forget.
+ *
+ * A blank id is refused rather than trimmed into a stream of its own — `""` and
+ * `"   "` are two different cursors and neither is a consumer anyone drains,
+ * which is the cross-consumer confusion ADR 0097 §2.1's stored `consumer_id`
+ * exists to prevent. Fin applies the same two conditions
+ * (`_is_bounded_token` in `src/fin/retrieve/evidence_route.py`); it additionally
+ * rejects an id carrying SURROUNDING whitespace, which these seams do not,
+ * because both trim before they get here. That remaining divergence is fin's to
+ * close, not a rule to re-invent on this side.
+ */
+export function isBoundedConsumerId(value: string): boolean {
+  return value.trim() !== "" && value.length <= MAX_CONSUMER_ID_CHARS;
+}
+
+/**
+ * A consumer id, or a refusal. An over-long id is a MALFORMED_CONTRACT rather
+ * than an absent one: the host supplied a value, it just cannot be one fin would
+ * ever drain, and reporting it as missing would send an operator to the wrong
+ * variable.
+ */
+function assertBoundedConsumerId(value: unknown): string {
+  const consumerId = assertFilled(value, "grant consumer_id");
+  if (!isBoundedConsumerId(consumerId)) {
+    throw evidenceError(
+      EVIDENCE_FAILURE.MALFORMED_CONTRACT,
+      `grant consumer_id is ${consumerId.length} characters, over the ` +
+        `${MAX_CONSUMER_ID_CHARS} fin accepts for the same label`
+    );
+  }
+  return consumerId;
 }
 
 /**

@@ -132,6 +132,7 @@ function rowGrant(
     context: { coverage: "stored_structured_subjects" },
     value: { entity_id: `${caseId}-result`, name: "某公司" },
     supports,
+    consumerId: `${caseId}-consumer`,
     ...patch,
   } as GrantRequest;
 }
@@ -152,6 +153,7 @@ function countGrant(
     context: { coverage: "stored_structured_subjects" },
     value: { count, operation: "count" },
     count,
+    consumerId: `${caseId}-consumer`,
     ...patch,
   } as GrantRequest;
 }

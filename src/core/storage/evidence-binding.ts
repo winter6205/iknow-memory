@@ -60,6 +60,16 @@ export const TRUSTED_BINDING_ENV_VARS = {
   sourceRefs: "IKNOW_EVIDENCE_SOURCE_REFS",
   authorizationRevision: "IKNOW_EVIDENCE_AUTH_REVISION",
   deadlineAt: "IKNOW_EVIDENCE_DEADLINE_AT",
+  /**
+   * Which per-consumer invalidation stream this identity's grants belong to.
+   *
+   * The eighth member and the only one that is not an identity field: it names
+   * the stream, not the actor, which is why ADR 0097 §2.1 stores it and never
+   * sends it. It is allowlisted here so it arrives with the same trust the other
+   * seven do — from a name the host set deliberately — rather than from a
+   * request field a caller could choose.
+   */
+  consumerId: "IKNOW_EVIDENCE_CONSUMER_ID",
 } as const;
 
 /** Every allowlisted name, for a host that builds an explicit child env. */
@@ -90,6 +100,13 @@ export interface TrustedIdentityBinding {
   readonly sourceRefs: readonly string[];
   readonly authorizationRevision: string;
   readonly deadlineAt: string;
+  /**
+   * Carried to the grant, never compared on the read path and never part of the
+   * context's authority — the same standing as `readerBinding`. It is the stream
+   * the grant's future invalidation is addressed to, and it exists so a drain can
+   * never be told which stream to read from request input.
+   */
+  readonly consumerId: string;
 }
 
 /** The environment subset the resolver is allowed to look at. */
@@ -145,8 +162,18 @@ export function readTrustedIdentityBinding(
     env,
     TRUSTED_BINDING_ENV_VARS.authorizationRevision
   );
-  const deadlineAt = requireBindingField(env, TRUSTED_BINDING_ENV_VARS.deadlineAt);
+  const deadlineAt = requireBindingField(
+    env,
+    TRUSTED_BINDING_ENV_VARS.deadlineAt
+  );
   const rawRefs = requireBindingField(env, TRUSTED_BINDING_ENV_VARS.sourceRefs);
+  // No default, for the same reason the other seven have none: a grant with an
+  // invented consumer would be attached to a stream nobody drains, and its
+  // eventual invalidation would be silent. An absent binding is a refusal.
+  const consumerId = requireBindingField(
+    env,
+    TRUSTED_BINDING_ENV_VARS.consumerId
+  );
 
   const sourceRefs = [
     ...new Set(
@@ -178,6 +205,7 @@ export function readTrustedIdentityBinding(
     sourceRefs,
     authorizationRevision,
     deadlineAt,
+    consumerId,
   };
 }
 

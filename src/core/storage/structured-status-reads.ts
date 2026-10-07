@@ -236,8 +236,16 @@ function authorizedSubset(
   return stableSourceRefs(requested);
 }
 
-/** The authorization grant a read must still carry to describe this scope. */
-async function assertCurrentAuthorization(
+/**
+ * The authorization grant a read must still carry to describe this scope.
+ *
+ * Exported rather than module-private because the fence is a property of every
+ * authorized READ, not of the status reader: `PgEvidenceInvalidationStorage`
+ * re-checks the same fact inside its own read-only unit of work, and a second
+ * copy of these ten lines would be a second rule that could drift from the one
+ * every other read trusts.
+ */
+export async function assertCurrentAuthorization(
   client: ScopeTransactionClient,
   context: AuthorizedScopeContext
 ): Promise<void> {

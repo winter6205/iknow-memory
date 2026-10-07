@@ -298,6 +298,19 @@ export const EVIDENCE_FAILURE = {
   UNSUPPORTED_SOURCE_BINDING: "unsupported_source_binding",
   /** The request violates the stored evidence contract. */
   MALFORMED_CONTRACT: "malformed_evidence_contract",
+  /**
+   * A shape this build recognises at a version it does not implement.
+   *
+   * The eighth token the spec names, and the one that had no home: this set
+   * carries a store or contract fact, which is exactly what an unrecognised
+   * `schema_version` is, so it belongs beside `MALFORMED_CONTRACT` rather than
+   * in the transport set. Register §1b.5a decided the membership against three
+   * authorities (the spec's own failure list, the transport-integration plan,
+   * and ADR 0097 §2.7) after enumerating all eight tokens against all three
+   * closed sets; this is that declaration, not a widening of the vocabulary. A
+   * request at an unknown version is refused with it, never read as version 1.
+   */
+  UNSUPPORTED_CONTRACT: "unsupported_evidence_contract",
   /** The value cannot fit the bounded 32 KiB envelope. */
   TOO_LARGE: "evidence_too_large",
   /** The finite reference lifetime ended. */

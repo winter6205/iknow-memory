@@ -14,6 +14,7 @@ affects: src/core/storage/evidence-pg.ts
 affects: src/core/storage/pgvector-backend.ts
 affects: src/core/storage/memory-backend.ts
 affects: src/index.ts
+affects: tests/storage/evidence-store-contract.ts
 affects: tests/storage/structured-query-memory.test.ts
 affects: tests/acceptance/structured-query-pg.test.ts
 
@@ -26,6 +27,7 @@ affects: tests/acceptance/structured-query-pg.test.ts
 - `src/core/storage/pgvector-backend.ts`
 - `src/core/storage/memory-backend.ts`
 - `src/index.ts`
+- `tests/storage/evidence-store-contract.ts`
 - `tests/storage/structured-query-memory.test.ts`
 - `tests/acceptance/structured-query-pg.test.ts`
 
@@ -51,5 +53,5 @@ minimal-change-verifier: yes — one authorization/purge race repair; no schema,
 
 - RED/GREEN and full live PostgreSQL acceptance: `source /home/winner/projects/fin-wt-p3-closeout/scripts/structured-live-env.sh >/dev/null 2>&1 && STRUCTURED_QUERY_PG=1 ./node_modules/.bin/vitest run tests/acceptance/structured-query-pg.test.ts`.
 - Memory parity: `./node_modules/.bin/vitest run tests/storage/structured-query-memory.test.ts`.
-- Evidence store regression: `./node_modules/.bin/vitest run tests/storage/evidence-store-memory.test.ts tests/storage/evidence-store-pg.test.ts`.
+- Evidence store contract on both backends: `./node_modules/.bin/vitest run tests/storage/evidence-store-memory.test.ts tests/storage/evidence-store-pg.test.ts`.
 - Package typecheck/build: `npm run typecheck` and `npm run build`.

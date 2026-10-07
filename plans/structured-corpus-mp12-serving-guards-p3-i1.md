@@ -27,15 +27,25 @@ needed, and none is built here.
 
 ## The predicate, and why it is this shape
 
-A source is *served* when at least one of its versions still has a payload that
-has not been collected. That single fact covers both halves of the requirement:
+A source is *served* when it has not been withdrawn **and** at least one of its
+versions still has a payload that has not been collected. Those are two
+independent facts, and neither can stand in for the other:
 
-- **Withdrawn** — every version of the source is retired, so none is live.
-- **Sole-purged** — every version's `payload_collected_at` is set.
+- **Withdrawn** — recorded as `structured_publication_sources.active = false`.
+  `withdraw()` writes that column and nothing else: it never retires a version
+  and never stamps a collection, so an un-collected withdrawn source is
+  indistinguishable from a live one to a payload rule alone. Phrased as
+  `NOT EXISTS (withdrawn)`, NOT as `EXISTS (active = true)`: a source that was
+  ingested but never published has no publication row at all, and the `EXISTS`
+  form would fail-close every such source even though nothing withdrew it.
+- **Sole-purged** — every version's `payload_collected_at` is set. Written as a
+  positive test (a version must exist and be un-collected), so a source the
+  store cannot account for fails closed rather than serving on absence.
 - **A current remaining support** — one version with `payload_collected_at IS NULL`
   keeps the whole source visible, which is what the ticket demands and what a
   per-chunk `retired_at` predicate would get wrong by hiding a live version
-  because a sibling version was retired.
+  because a sibling version was retired. Both tests are therefore per-SOURCE
+  aggregates (`bool_or` over versions), not per-chunk predicates.
 
 The check is on **live** source versions, not on the chunk's own validity window:
 `valid_from`/`valid_until` decide whether a *row* is current, and a purged
@@ -85,12 +95,18 @@ minimal-change-verifier: yes — one ticket, one predicate, one guard. The lexic
 
 ## Honest limits of this branch
 
-- The clause is proven against a real PostgreSQL with real lifecycle rows, and
-  against the memory lane, but it is **not** proven through the three-tier
+- The clause is proven against a real PostgreSQL: `SERVING_GUARD_CLAUSE` itself
+  is executed through `buildVectorSearchQuery` against real `chunks`,
+  `source_versions` and `structured_publication_sources` rows, not only through
+  the guard's own fact read. It is **not** proven through the three-tier
   retrieval assembler, because the lexical and graph arms do not yet consult the
   guard. This branch therefore does not yet satisfy M19's three-tier clause, and
   the register must not be flipped to claim otherwise.
-- No tombstone exists (that is MP15/MP16), so the guard keys on the lifecycle
-  stamps. Once MP16 lands, a purged source with no version row at all must be
-  treated as not-served; the SQL's `NOT EXISTS` shape already does this, and this
-  branch tests it.
+- M19's two source-level halves — withdrawn and sole-purged — are both covered on
+  the **vector** arm. They are not covered on the lexical and graph arms (above),
+  and nothing here covers a citation that names a source without going through
+  `chunks`.
+- No tombstone exists (that is MP15/MP16). The payload half already refuses a
+  purged source that has no version row at all, so a tombstone cannot
+  reintroduce that leak; the withdrawal half is unaffected by tombstones either
+  way, because a tombstoned source has no publication row to be withdrawn by.

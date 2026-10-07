@@ -1,15 +1,28 @@
 /**
  * MP12 serving guard (spec 320-323).
  *
- * One question, asked before a derived hit is served: does the source this hit
- * came from still have a live version?
+ * One question, asked before a derived hit is served: may this source be served
+ * at all?
  *
- * "Live" means at least one version whose payload has not been collected. That
- * single fact covers both halves of the requirement — a withdrawn source has no
- * un-retired version, a sole-purged source has no un-collected payload — while a
- * source that still has one current support stays visible. A predicate per chunk
- * would get that last case wrong: it would hide a live version because a sibling
- * version of the same source was retired.
+ * Two independent facts answer it, and they are independent on purpose — the
+ * spec's rule covers a withdrawn OR a sole-purged source, and neither fact can
+ * stand in for the other:
+ *
+ * - **Payload**: at least one version still has an un-collected payload. This
+ *   covers the sole-purged half, and it stays a per-SOURCE fact rather than a
+ *   per-version one so that one live version keeps its collected siblings'
+ *   source visible; a predicate per chunk would get that wrong by hiding a live
+ *   version because a sibling version was purged.
+ * - **Withdrawal**: `structured_publication_sources.active = false`. `withdraw()`
+ *   writes that column and nothing else — it never retires a version and never
+ *   stamps a collection — so a withdrawn-but-uncollected source looks perfectly
+ *   live to the payload rule alone. Reading withdrawal as "every version is
+ *   retired" is the mistake this separation exists to prevent.
+ *
+ * Retirement is deliberately NOT a third rule: `retired_at` is carried so a
+ * caller can see it and so the cross-lane contract has something to aggregate,
+ * but retirement stops a source being collected, not a live sibling version
+ * being served.
  *
  * The decision is pure. It reads no clock, touches no storage, and returns a
  * typed refusal rather than a default answer when the lifecycle facts are absent,
@@ -18,11 +31,22 @@
  */
 import type { StructuredErrorCode } from "./errors.js";
 
-/** One source version's lifecycle state, as read from `source_versions`. */
+/** One source's lifecycle state, as read from the store. */
 export interface SourceLifecycleFact {
   readonly sourceRef: string;
   readonly retiredAt: string | null;
   readonly payloadCollectedAt: string | null;
+  /**
+   * False only when a `structured_publication_sources` row says the source was
+   * withdrawn.
+   *
+   * A source with NO such row is `true`, not unknown: the row is only ever
+   * written by publication, so a source that was ingested and never published
+   * has not been withdrawn and must keep serving. That is why the withdrawal
+   * half of the rule is phrased as "is not withdrawn" rather than "is published
+   * and active".
+   */
+  readonly active: boolean;
 }
 
 /**
@@ -40,7 +64,7 @@ export type ServingGuardVerdict =
       readonly served: false;
       readonly code: Extract<
         StructuredErrorCode,
-        "maintenance_status_unavailable" | "structured_search_unavailable"
+        "maintenance_status_unavailable"
       >;
       readonly detail: string;
     };
@@ -78,23 +102,24 @@ export function decideServingGuard(
     // narrowing is what lets the rule below read as a rule rather than a guard
     // against `undefined`.
     if (fact === undefined) return true;
-    return !hasLiveVersion(fact);
+    return !isServable(fact);
   });
 
   return { served: true, dropped };
 }
 
 /**
- * Whether a source is still servable.
+ * Whether a source may be served: not withdrawn, and one version still
+ * un-collected.
  *
- * `payload_collected_at IS NULL` is the test, and `retired_at` deliberately does
- * not participate: retirement stops a source being *collected*, not a live
- * sibling version being *served*. A source whose current version is still live
- * stays visible, which is the ticket's "a current remaining support stays
- * visible" clause.
+ * `payload_collected_at IS NULL` is the payload test and `retired_at` does not
+ * participate: retirement stops a source being *collected*, not a live sibling
+ * version being *served*. `active` is the withdrawal test, and it is checked
+ * first because it is the one fact whose absence is not a reason to serve —
+ * `active` is `true` only when nothing has withdrawn the source.
  */
-function hasLiveVersion(fact: SourceLifecycleFact): boolean {
-  return fact.payloadCollectedAt === null;
+function isServable(fact: SourceLifecycleFact): boolean {
+  return fact.active && fact.payloadCollectedAt === null;
 }
 
 function unavailable(detail: string): ServingGuardVerdict {

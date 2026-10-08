@@ -134,6 +134,24 @@ export async function upSchemaPublication(client: SchemaClient): Promise<void> {
         REFERENCES structured_publication_sources(scope_binding, source_ref) ON DELETE CASCADE
     )`);
 
+  // MP11: one row per derived generation, keyed by the complete dependency
+  // revision it was built from. The key is what makes a repeat rebuild an
+  // observable no-op rather than a second derived artifact, and `dependencies`
+  // is the FULL vector rather than a count, so MP12's serving guard can check
+  // staleness without re-deriving what was depended on.
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS structured_projection_generations (
+      scope_binding text NOT NULL REFERENCES structured_publication_scopes(scope_binding) ON DELETE CASCADE,
+      dependency_revision text NOT NULL CHECK (dependency_revision ~ '^[0-9a-f]{64}$'),
+      publication_revision bigint NOT NULL CHECK (publication_revision >= 0),
+      dependencies jsonb NOT NULL CHECK (jsonb_typeof(dependencies) = 'array'),
+      subjects jsonb NOT NULL CHECK (jsonb_typeof(subjects) = 'array'),
+      rebuilt_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (scope_binding, dependency_revision)
+    )`);
+  await client.query(`CREATE INDEX IF NOT EXISTS structured_projection_generations_scope_idx
+    ON structured_projection_generations (scope_binding, rebuilt_at)`);
+
   await client.query(`CREATE INDEX IF NOT EXISTS structured_publication_sources_scope_idx
     ON structured_publication_sources (scope_binding, active, source_ref)`);
   await client.query(`CREATE INDEX IF NOT EXISTS structured_publication_membership_read_idx

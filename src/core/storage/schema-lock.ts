@@ -124,6 +124,7 @@ const BOOTSTRAP_TABLES = [
   "structured_publication_display",
   "structured_publication_stages",
   "structured_publication_extraction_bindings",
+
   // The invalidation outbox and its per-consumer cursor: brand-new tables, same
   // rule as index_jobs, so the probe names them or a deployed store would
   // short-circuit before replaying their CREATE statements.
@@ -145,6 +146,9 @@ const BOOTSTRAP_TABLES = [
   // that short-circuits past its CREATE has no row to resume from, and a retry
   // would re-run every phase instead of skipping the ones that committed.
   "structured_collection_deletions",
+  // MP11: a brand-new derived-generation table — same rule as index_jobs, so the
+  // probe names it or it never reaches a deployed store.
+  "structured_projection_generations",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -212,6 +216,7 @@ const BOOTSTRAP_INDEXES = [
   // MP15: the `dependent_supports` phase deletes the grant's extraction pins by
   // support, and that table's PK leads with `evidence_ref`.
   "evidence_grant_extractions_support_id_idx",
+  "structured_projection_generations_scope_idx",
 ] as const;
 
 /**

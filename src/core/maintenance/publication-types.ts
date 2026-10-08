@@ -8,11 +8,13 @@
  */
 import type {
   MaintenanceAttemptGuard,
+  MaintenanceDependency,
   MaintenanceWorkStatus,
 } from "./types.js";
 import type { EntityIdentityInput } from "../structured/identity-store.js";
 import type { RelationAssertionInput } from "../structured/identity.js";
 import type { ProjectionSubject } from "../storage/projection-outbox.js";
+import type { AuthorizedScopeContext } from "../storage/structured-scope-types.js";
 import type {
   NewSourceVersion,
   SourceLocatorBinding,
@@ -119,6 +121,51 @@ export interface PublicationOutboxPort {
   ): Promise<() => void>;
 }
 
+/**
+ * One `projection_rebuild` request.
+ *
+ * The guard is a `projection_rebuild` maintenance attempt, so the rebuild runs
+ * under the same durable-work fences every other capability reuses. It carries
+ * no accepted payload: a rebuild consumes what publication already accepted and
+ * never carries a new interpretation of the source.
+ */
+export interface RebuildProjectionInput {
+  readonly context: AuthorizedScopeContext;
+  readonly guard: MaintenanceAttemptGuard;
+  readonly at: string;
+}
+
+/**
+ * What one rebuild produced.
+ *
+ * `dependencyRevision` is the canonical digest of the COMPLETE dependency vector
+ * and `publicationRevision` is the scope read revision the generation was built
+ * at, so a later consumer can decide staleness without re-deriving either.
+ * `reusedGeneration` is true when a generation already existed at this exact
+ * dependency revision, which is what makes a repeat rebuild a no-op rather than
+ * a second derived artifact.
+ */
+export interface ProjectionRebuildResult {
+  readonly subjects: readonly ProjectionSubject[];
+  readonly dependencyRevision: string;
+  readonly publicationRevision: string;
+  readonly reusedGeneration: boolean;
+  readonly queuedIntents: number;
+}
+
+/**
+ * The persisted record of one derived generation, as a reader sees it.
+ *
+ * This is the boundary MP12's serving guard will read: it carries the complete
+ * dependency vector, not a count, plus the publication revision it was built at.
+ */
+export interface ProjectionGenerationSnapshot {
+  readonly subjects: readonly ProjectionSubject[];
+  readonly dependencies: readonly MaintenanceDependency[];
+  readonly dependencyRevision: string;
+  readonly publicationRevision: string;
+}
+
 export interface StructuredPublicationStorage {
   /** Trusted owner declaration advances a source generation before scheduling. */
   declareDesired(
@@ -138,4 +185,23 @@ export interface StructuredPublicationStorage {
   readSnapshot(input: {
     readonly scopeBinding: string;
   }): Promise<PublicationSnapshot>;
+}
+
+/**
+ * MP11's derived-projection rebuild, as its own surface.
+ *
+ * Deliberately NOT part of `StructuredPublicationStorage`: a rebuild is a
+ * separate work kind under the shared scope unit of work, the same way
+ * structural screening is. Keeping it separate is what makes "rebuild is
+ * distinct from extraction" structural — the publication interface cannot grow a
+ * method that stages a payload, so a rebuild has no path to one.
+ */
+export interface ProjectionRebuildStorage {
+  rebuildProjections(
+    input: RebuildProjectionInput
+  ): Promise<ProjectionRebuildResult>;
+  readProjectionGeneration(
+    context: AuthorizedScopeContext,
+    sourceRefs: readonly string[]
+  ): Promise<ProjectionGenerationSnapshot>;
 }

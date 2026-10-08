@@ -54,7 +54,11 @@ import type {
 } from "../retrieval/types.js";
 import { InMemoryStructuredIdentityStore } from "../structured/identity-store.js";
 import { InMemoryMaintenanceWorkStore } from "./maintenance-work-memory.js";
-import { MemoryStructuredPublicationStorage } from "./publication-memory.js";
+import {
+  MemoryProjectionOutbox,
+  MemoryStructuredPublicationStorage,
+} from "./publication-memory.js";
+import { MemoryProjectionRebuildStorage } from "./projection-rebuild-memory.js";
 import {
   MemoryStructuredScopeTail,
   MemoryStructuredScopeUnitOfWork,
@@ -251,6 +255,10 @@ export class MemoryBackend
   /** The shared write authority the publication and work adapters compose with. */
   readonly structuredScopeUnitOfWork: MemoryStructuredScopeUnitOfWork;
   private readonly publicationUow: MemoryStructuredPublicationStorage;
+  /** MP11: the derived-projection rebuild, on the same scope seam and rows. */
+  readonly projectionRebuild: MemoryProjectionRebuildStorage;
+  /** The one outbox port publication and rebuild both enqueue through. */
+  readonly publicationOutbox: PublicationOutboxPort;
 
   /**
    * The publication adapter typed as the scope authority MP15's memory-lane
@@ -343,9 +351,11 @@ export class MemoryBackend
     this.maintenanceWorkStore = new InMemoryMaintenanceWorkStore(
       this.scopeTail
     );
+    this.publicationOutbox =
+      options.publicationOutbox ?? new MemoryProjectionOutbox();
     this.publicationUow = new MemoryStructuredPublicationStorage(
       this,
-      options.publicationOutbox,
+      this.publicationOutbox,
       this.scopeTail
     );
     this.structuredPublication = this.publicationUow;
@@ -354,6 +364,12 @@ export class MemoryBackend
       this.publicationUow,
       this.maintenanceWorkStore,
       this
+    );
+    this.projectionRebuild = new MemoryProjectionRebuildStorage(
+      this.structuredScopeUnitOfWork,
+      this.maintenanceWorkStore,
+      this.publicationUow,
+      this.publicationOutbox
     );
   }
 

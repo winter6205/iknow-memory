@@ -28,6 +28,7 @@ import { buildStructuredQueryReader } from "../../src/index.js";
 import {
   MemoryStructuredQueryStorage,
   STRUCTURED_QUERY_SUPPORT_ROLE,
+  type MemoryStructuredQueryAuthority,
   type StructuredQueryGrantPlan,
   type StructuredQueryRelationTuple,
   type StructuredQueryReadPlan,
@@ -1677,27 +1678,17 @@ describe("structured query memory twin", () => {
     );
   });
 
-  it("refuses a context not minted by this composition before opening a scope", async () => {
-    const lane = openLane();
-    const seeded = await seed(lane, {
-      sourceRefs: ["s-a"],
-      facts: [
-        {
-          subject: "entity",
-          resultId: ANCHOR,
-          name: "Alpha",
-          entityType: "organization",
-          sourceRef: "s-a",
-        },
-      ],
-    });
-    // Both the reader's own guard and the unit-of-work guard refuse an unminted
-    // context with the SAME code, and the reader's rethrows the unit-of-work's own
-    // message, so neither the code nor the text can say which one refused. What
-    // does separate them is the reader's stated contract — refuse "before any
-    // connection is leased" — so this counts scope openings instead of guessing.
+  // Both the reader's own guard and the unit-of-work guard refuse with the SAME
+  // code, and the reader rethrows the unit-of-work's own error, so neither the
+  // code nor the text can say which one refused. These cases therefore count
+  // scope openings, which is the reader's stated contract: refuse "before any
+  // connection is leased" (structured-query-reads.ts:341).
+  function countingScopeFor(scope: MemoryStructuredQueryAuthority): {
+    scope: MemoryStructuredQueryAuthority;
+    openings: () => number;
+  } {
     let scopesOpened = 0;
-    const countingScope = new Proxy(lane.backend.structuredScopeUnitOfWork, {
+    const authority = new Proxy(scope, {
       get(target, property, receiver) {
         if (property !== "withAuthorizedScope") {
           return Reflect.get(target, property, receiver);
@@ -1713,21 +1704,82 @@ describe("structured query memory twin", () => {
         };
       },
     });
-    const storage = new MemoryStructuredQueryStorage(
-      countingScope,
+    return { scope: authority, openings: () => scopesOpened };
+  }
+
+  function storageOver(
+    scope: MemoryStructuredQueryAuthority,
+    lane: Lane,
+    clock: () => Date
+  ): MemoryStructuredQueryStorage {
+    return new MemoryStructuredQueryStorage(
+      scope,
       tupleReaderOf(lane.backend.structuredIdentityStore),
       supportReaderOf(lane.backend),
       (scopeBinding) => lane.backend.getScopeRevisions(scopeBinding),
       undefined,
       CURSOR_KEY,
-      lane.clock
+      clock
     );
+  }
+
+  it("refuses a never-minted context before opening a scope", async () => {
+    const lane = openLane();
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: [
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+      ],
+    });
+    const counted = countingScopeFor(lane.backend.structuredScopeUnitOfWork);
+    // The minted-context marker is a WeakMap keyed on object identity, so this
+    // spread is unminted even though every field matches the lane's own context.
     const forged = { ...seeded.context } as AuthorizedScopeContext;
     await expectRefusal(
-      () => storage.readStructuredQuery(forged, list()),
+      () =>
+        storageOver(counted.scope, lane, lane.clock).readStructuredQuery(
+          forged,
+          list()
+        ),
       "authorization_denied"
     );
-    expect(scopesOpened).toBe(0);
+    expect(counted.openings()).toBe(0);
+  });
+
+  it("refuses another composition's context before opening a scope", async () => {
+    const lane = openLane();
+    const other = openLane();
+    const seeded = await seed(lane, {
+      sourceRefs: ["s-a"],
+      facts: [
+        {
+          subject: "entity",
+          resultId: ANCHOR,
+          name: "Alpha",
+          entityType: "organization",
+          sourceRef: "s-a",
+        },
+      ],
+    });
+    const counted = countingScopeFor(other.backend.structuredScopeUnitOfWork);
+    // A context minted by a DIFFERENT composition carries every field a
+    // structural comparison would accept, so only the per-composition authority
+    // check can refuse it.
+    await expectRefusal(
+      () =>
+        storageOver(counted.scope, lane, lane.clock).readStructuredQuery(
+          seeded.context,
+          list()
+        ),
+      "authorization_denied"
+    );
+    expect(counted.openings()).toBe(0);
   });
 
   it("names endpoint display supports with their own grant role", async () => {

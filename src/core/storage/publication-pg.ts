@@ -49,6 +49,7 @@ import {
   normalizeLocatorBinding,
   normalizeOccurrence,
   normalizeSourceVersion,
+  supportIdOf,
 } from "./evidence-source.js";
 import type { NewSourceVersion, SupportRecord } from "../types.js";
 import type { PgStructuredScopeUnitOfWork } from "./structured-scope-uow.js";
@@ -488,9 +489,6 @@ export class PgStructuredPublicationStorage implements StructuredPublicationStor
           publishedSources: sources.filter(
             (source) => source.active && source.published !== null
           ).length,
-          desiredIndexBuckets: activeCount,
-          conflictCheckBuckets: activeCount,
-          conflictStatus: "pending",
         };
         return {
           scopeBinding,
@@ -1547,7 +1545,11 @@ async function persistFactEvidence(
   for (const fact of facts) {
     await lockAndVerifyJob(client, guard);
     const occurrence = normalizeOccurrence(fact.fact.occurrence);
-    const result = await recordSupportRow(client, occurrence, randomUUID());
+    const result = await recordSupportRow(
+      client,
+      occurrence,
+      supportIdOf(occurrence)
+    );
     if (
       result.support.result_id !== fact.resultId ||
       result.support.subject !== fact.subject
@@ -1728,9 +1730,6 @@ function emptySnapshot(scopeBinding: string): PublicationSnapshot {
     maintenance: {
       sourcesInScope: 0,
       publishedSources: 0,
-      desiredIndexBuckets: 0,
-      conflictCheckBuckets: 0,
-      conflictStatus: "pending",
     },
   };
 }

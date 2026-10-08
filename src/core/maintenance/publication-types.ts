@@ -65,10 +65,6 @@ export interface PublicationSubjectSnapshot {
 export interface PublicationMaintenanceSummary {
   readonly sourcesInScope: number;
   readonly publishedSources: number;
-  readonly desiredIndexBuckets: number;
-  readonly conflictCheckBuckets: number;
-  /** MP8/MP9 do not yet record structural screening outcomes. */
-  readonly conflictStatus: "pending";
 }
 
 export interface PublicationSnapshot {

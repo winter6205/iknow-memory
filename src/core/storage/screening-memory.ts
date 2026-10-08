@@ -10,6 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 
+import type { MaintenanceScreeningRecord } from "../maintenance/maintenance-status.js";
 import {
   isConflictCheckGuard,
   screenFenceVerdict,
@@ -22,6 +23,7 @@ import {
   SCREENING_RULESET_REVISION,
   type ScreeningAssertion,
   type StructuralCandidate,
+  type StructuralCheckRecord,
   type StructuralScreenOutcome,
 } from "../maintenance/screening-types.js";
 import {
@@ -31,6 +33,7 @@ import {
   type AuthorizedScopeRunOptions,
   type PreparedMemoryScopeWork,
 } from "./structured-scope-types.js";
+import type { MemoryScreeningStatusPort } from "./structured-status-reads.js";
 import type { PersistedCandidate } from "./screening-pg.js";
 
 export interface MemoryStageScreenInput {
@@ -98,16 +101,30 @@ function checkKey(scopeBinding: string, checkId: string): string {
   return `${scopeBinding}|${checkId}`;
 }
 
+/**
+ * One persisted structural check, as this lane holds it.
+ *
+ * The ruleset and coverage are the ones the screen published with, kept beside
+ * the row rather than re-quoted on read: a status that reports the ruleset has
+ * to be able to refuse when a scope holds records which disagree, and it can
+ * only do that from values that were stored, not from a constant re-attached at
+ * read time.
+ */
+export interface MemoryScreeningCheckRecord {
+  readonly checkId: string;
+  readonly sourceRef: string;
+  readonly rulesetRevision: string;
+  readonly coverage: string;
+  readonly candidateCount: number;
+}
+
 /** In-memory structural screening evidence. */
-export class MemoryScreeningStorage {
+export class MemoryScreeningStorage implements MemoryScreeningStatusPort {
   private readonly candidates = new Map<
     string,
     PersistedCandidate & { readonly full: StructuralCandidate }
   >();
-  private readonly checks = new Map<
-    string,
-    { readonly checkId: string; readonly candidateCount: number }
-  >();
+  private readonly checks = new Map<string, MemoryScreeningCheckRecord>();
 
   constructor(private readonly scope: MemoryScreeningAuthority) {}
 
@@ -232,10 +249,27 @@ export class MemoryScreeningStorage {
           })
         );
         const scopeBinding = input.context.ownerScopeBinding;
+        const check: StructuralCheckRecord = {
+          checkId,
+          scopeBinding,
+          jobKey: input.guard.jobKey,
+          sourceRef: input.guard.sourceRef,
+          rulesetRevision: SCREENING_RULESET_REVISION,
+          coverage: SCREENING_COVERAGE,
+          relationCatalogVersion: input.relationCatalogVersion,
+          relationBuckets: input.relationBuckets,
+          inputRevision: input.guard.inputRevision,
+          assertionCount: assertions.length,
+          candidateCount: candidates.length,
+          publishedAt,
+        };
         work.prepare(() => {
           this.checks.set(checkKey(scopeBinding, checkId), {
             checkId,
-            candidateCount: candidates.length,
+            sourceRef: check.sourceRef,
+            rulesetRevision: check.rulesetRevision,
+            coverage: check.coverage,
+            candidateCount: check.candidateCount,
           });
           for (const candidate of candidates) {
             // An identical candidate identity is left as it stands: re-screening
@@ -260,20 +294,7 @@ export class MemoryScreeningStorage {
         });
         work.bumpRevisions({ read: false, maintenance: true });
         return {
-          check: {
-            checkId,
-            scopeBinding,
-            jobKey: input.guard.jobKey,
-            sourceRef: input.guard.sourceRef,
-            rulesetRevision: SCREENING_RULESET_REVISION,
-            coverage: SCREENING_COVERAGE,
-            relationCatalogVersion: input.relationCatalogVersion,
-            relationBuckets: input.relationBuckets,
-            inputRevision: input.guard.inputRevision,
-            assertionCount: assertions.length,
-            candidateCount: candidates.length,
-            publishedAt,
-          },
+          check,
           candidates,
           nonCandidates: selection.nonCandidates,
         };
@@ -300,6 +321,37 @@ export class MemoryScreeningStorage {
       if (key.startsWith(`${scopeBinding}|`)) count += 1;
     }
     return count;
+  }
+
+  /**
+   * The persisted check records the requested sources actually published.
+   *
+   * Every field is read off the stored row. Re-quoting the normative constants
+   * here would make a scope whose records disagree indistinguishable from a
+   * scope holding one ruleset, so a status could never refuse on the very
+   * disagreement this read exists to expose.
+   */
+  readScreeningStatus(
+    scopeBinding: string,
+    sourceRefs: readonly string[]
+  ): readonly MaintenanceScreeningRecord[] {
+    const wanted = new Set(sourceRefs);
+    return [...this.checks.entries()]
+      .filter(([key]) => key.startsWith(`${scopeBinding}|`))
+      .map(([, value]) => value)
+      .filter((value) => wanted.has(value.sourceRef))
+      .map((value) => ({
+        sourceRef: value.sourceRef,
+        rulesetRevision: value.rulesetRevision,
+        coverage: value.coverage,
+        // NAMED GAP: a retirement is recorded as a visibility row owned by the
+        // decision lane, and that lane already composes this store for its own
+        // reads, so this store cannot observe the rows without a dependency
+        // that closes a cycle. Reporting zero here is an absence of
+        // observation, not a measurement: a scope whose decision retired a
+        // support still reads `ready` where the PostgreSQL lane reads `stale`.
+        retiredSupports: 0,
+      }));
   }
 
   /**

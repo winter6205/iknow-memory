@@ -38,11 +38,39 @@ const ASSEMBLY_PATTERNS: ReadonlyArray<RegExp> = [
   /\bbuildHarnessEngine\s*\(/,
 ];
 
+/**
+ * How a test reaches a real database.
+ *
+ * `new pg.Client(` alone missed every lane that obtains its client from a
+ * helper, so the guard reported the suite clean while `test-fast` failed to
+ * load the structured lanes one by one. Those lanes reach PostgreSQL through
+ * one of three entry points — a direct constructor, the strict driver, or the
+ * shared integration harness — so all three are matched here.
+ *
+ * Prose is deliberately NOT a signal. An earlier revision matched "requires"
+ * and pulled in two dozen hermetic tests whose copy happens to use the word;
+ * a match on English is a guess about behaviour, and guessing wrong here
+ * silences coverage rather than merely misfiling it.
+ */
 const PG_PATTERNS: ReadonlyArray<RegExp> = [
   /\bnew pg\.Client\s*\(/,
   /\bnew PgClient\s*\(/,
   /\bdescribePg\b/,
+  /\bopenStrictPgDriver\b/,
+  /\bcreatePgIntegrationHarness\b/,
 ];
+
+/**
+ * Files that legitimately name the helpers above without needing a database.
+ *
+ * The harness's own unit test exercises the module in isolation and passes with
+ * no server, so matching on the helper name alone would exclude a hermetic file
+ * and lose its coverage. A file that both DEFINES the helper and is not itself
+ * a lane is that case.
+ */
+const PG_HELPER_DEFINERS: ReadonlySet<string> = new Set([
+  "tests/pg-test-harness.test.ts",
+]);
 
 const EXCLUDE_RE = /--exclude\s+(['"]?)([^'"\s]+)\1/g;
 
@@ -89,7 +117,7 @@ const assemblyFiles = new Set<string>();
 for (const f of files) {
   const src = readFileSync(join(repoRoot, f), "utf8");
   if (matchesAny(src, ASSEMBLY_PATTERNS)) assemblyFiles.add(f);
-  else if (matchesAny(src, PG_PATTERNS)) pgFiles.add(f);
+  else if (matchesAny(src, PG_PATTERNS) && !PG_HELPER_DEFINERS.has(f)) pgFiles.add(f);
 }
 
 const workflowPath = join(repoRoot, ".github", "workflows", "test.yml");

@@ -66,6 +66,7 @@ jobs:
             --exclude tests/acceptance/projection-rebuild-pg.test.ts \
             --exclude tests/acceptance/structured-invalidation-drain-pg.test.ts \
             --exclude tests/acceptance/structured-purge-completion-pg.test.ts \
+            --exclude tests/acceptance/structured-purge-pg.test.ts \
             --exclude tests/structured/identity-store-pg.test.ts \
             --exclude tests/acceptance/maintenance-m-acceptance-pg.test.ts \
             --exclude tests/acceptance/structured-maintenance-status-pg.test.ts \

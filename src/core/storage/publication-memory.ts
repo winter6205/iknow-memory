@@ -550,6 +550,31 @@ export class MemoryStructuredPublicationStorage implements StructuredPublication
     if (change.maintenance) scope.maintenanceRevision += 1n;
   }
 
+  /**
+   * MP15's `superseded_caches` phase: drop every published extraction binding
+   * of one source version, returning the removed count.
+   *
+   * **Synchronous, and deliberately not behind its own `exclusive`.** The
+   * collection-delete store calls this from inside its `serialization.exclusive`
+   * slice — the one tail this adapter also queues on — so re-entering
+   * `exclusive` here would wait on a slot the caller already holds and deadlock
+   * the only writer. Serialization is the caller's obligation; this method only
+   * mutates the map, exactly like `advanceScopeRevision`.
+   */
+  deleteExtractionBindingsForSourceVersion(sourceVersionId: string): number {
+    let removed = 0;
+    for (const scope of this.scopes.values()) {
+      for (const source of scope.sources.values()) {
+        for (const key of [...source.extractionBindings.keys()]) {
+          if (!key.startsWith(`${sourceVersionId}\u0000`)) continue;
+          source.extractionBindings.delete(key);
+          removed += 1;
+        }
+      }
+    }
+    return removed;
+  }
+
   private requireCurrentSource(
     scopeBinding: string,
     sourceRef: string

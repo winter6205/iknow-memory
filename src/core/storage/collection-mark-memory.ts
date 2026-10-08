@@ -350,6 +350,18 @@ export class InMemoryCollectionMarkStorage {
   }
 
   /**
+   * MP15's terminal step withdraws the mark with the payload it stopped
+   * obligations for, so a collected payload keeps no live mark (plan's terminal
+   * row — the surviving identity record is `payload_collected_at`). The caller
+   * invokes this with the shared tail already held, inside the same serialized
+   * step as the payload's own removal; it is deliberately not part of MP14's own
+   * flows, which cancel but never delete.
+   */
+  deleteCollectionMark(identity: CollectionMarkIdentity): void {
+    this.marks.delete(markKey(identity.payloadClass, identity.payloadRef));
+  }
+
+  /**
    * Recheck a persisted mark against the scope as it stands now.
    *
    * The revision is read inside the same authorized scope as the mark, so `stale`

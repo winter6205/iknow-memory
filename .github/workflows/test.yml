@@ -52,6 +52,20 @@ jobs:
             --exclude tests/storage/pgvector-startup.test.ts \
             --exclude tests/storage/source-documents-pg.test.ts \
             --exclude tests/storage/storage-reads-pg.test.ts \
+            --exclude tests/acceptance/structured-evidence-pg.test.ts \
+            --exclude tests/acceptance/structured-ingest-pg.test.ts \
+            --exclude tests/acceptance/structured-scope-uow-pg.test.ts \
+            --exclude tests/acceptance/structured-screening-pg.test.ts \
+            --exclude tests/acceptance/structured-stage-fence-pg.test.ts \
+            --exclude tests/acceptance/t13-private-evidence-read.test.ts \
+            --exclude tests/structured-snapshot/canonical.test.ts \
+            --exclude tests/acceptance/maintenance-mp12-guards-pg.test.ts \
+            --exclude tests/acceptance/maintenance-mp13-collection-pg.test.ts \
+            --exclude tests/acceptance/maintenance-mp14-mark-pg.test.ts \
+            --exclude tests/acceptance/maintenance-mp15-delete-pg.test.ts \
+            --exclude tests/acceptance/projection-rebuild-pg.test.ts \
+            --exclude tests/acceptance/structured-invalidation-drain-pg.test.ts \
+            --exclude tests/acceptance/structured-purge-completion-pg.test.ts \
             --exclude tests/structured/identity-store-pg.test.ts \
             --exclude tests/acceptance/maintenance-m-acceptance-pg.test.ts \
             --exclude tests/acceptance/structured-maintenance-status-pg.test.ts \
@@ -64,6 +78,29 @@ jobs:
             --exclude tests/acceptance/structured-invalidation-outbox-pg.test.ts \
             --exclude tests/storage/evidence-continuation-pg.test.ts \
             --exclude tests/storage/evidence-store-pg.test.ts
+
+  test-timezone:
+    # The business-query date contract is a per-zone claim, and V8 resolves the
+    # local zone once at process start — so a single runner cannot honestly
+    # assert all three. Each matrix leg launches a process in its own zone.
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        zone: [UTC, Asia/Shanghai, America/Los_Angeles]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Date normalization in ${{ matrix.zone }}
+        run: npx vitest run tests/business-query/sql-query.test.ts
+        env:
+          ZONE_UNDER_TEST: ${{ matrix.zone }}
 
   test-es:
     runs-on: ubuntu-latest

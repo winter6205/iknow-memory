@@ -125,6 +125,12 @@ const BOOTSTRAP_TABLES = [
   // would short-circuit before replaying their CREATE statements.
   "structured_read_leases",
   "structured_purge_tombstones",
+  // The all-owner completion record: one row per purge revision and one per owner,
+  // both brand-new tables under the same rule as index_jobs, so the probe names
+  // them or a deployed store would short-circuit before replaying their CREATE
+  // statements and the purge transaction would fail on a table that is not there.
+  "structured_purge_outcomes",
+  "structured_purge_ack_states",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -181,6 +187,9 @@ const BOOTSTRAP_INDEXES = [
   "evidence_invalidation_outbox_evidence_ref_idx",
   // The purge's active-read scan: (scope, source) narrowed by a live bound.
   "structured_read_leases_active_idx",
+  // The reconciler's all-owner guard joins owner rows by (scope, revision) against
+  // a derived owner list.
+  "structured_purge_ack_states_scope_revision_idx",
 ] as const;
 
 /**

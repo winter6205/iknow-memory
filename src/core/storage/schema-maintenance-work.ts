@@ -9,9 +9,12 @@
  * separable from the legacy index-job ledger, which this capability never
  * touches. `upSchemaBootstrap` still calls it so one bootstrap covers both.
  *
- * Same migration mechanism as the rest of the package — CREATE IF NOT EXISTS
- * only, no version tracking — which is why every column MP4 needs ships now: a
- * column added later would never appear on an already-bootstrapped database.
+ * Same migration mechanism as the rest of the package — no version tracking, and
+ * every statement guarded by IF NOT EXISTS or its own inverse — which is why every
+ * column MP4 needs ships now: a column added later would never appear on an
+ * already-bootstrapped database. A CHECK on such a table is equally unreachable
+ * from the CREATE, so the work-kind constraint is rebuilt in place below rather
+ * than only declared.
  *
  * Statement surface is parameterless, so a Pool, a PoolClient, and the test
  * fakes all satisfy `SchemaClient` without a cast.
@@ -80,6 +83,30 @@ export async function upSchemaMaintenanceWork(
     )`);
   await client.query(`ALTER TABLE maintenance_jobs
     ADD COLUMN IF NOT EXISTS input_dependencies jsonb NOT NULL DEFAULT '[]'::jsonb`);
+  /**
+   * The work-kind CHECK has to be REBUILT, not just rendered: CREATE TABLE IF NOT
+   * EXISTS never reaches a table that already exists, so a store bootstrapped
+   * before MP13 keeps the three-kind CHECK and rejects `collect_payload` at
+   * INSERT — the failure the render-from-vocabulary rule above exists to prevent.
+   *
+   * Both names are dropped because the original CREATE auto-named its inline
+   * CHECK `maintenance_jobs_work_kind_check`, and dropping the closed name first
+   * is what makes the re-add idempotent: a second bootstrap replaces a definition
+   * with an identical one. The closed name is the marker the readiness probe
+   * looks for (schema-lock.ts), because a widened CHECK on a long-lived table has
+   * no column or index the probe could notice instead.
+   */
+  await client.query(
+    `ALTER TABLE maintenance_jobs
+      DROP CONSTRAINT IF EXISTS maintenance_jobs_work_kind_check`
+  );
+  await client.query(
+    `ALTER TABLE maintenance_jobs
+      DROP CONSTRAINT IF EXISTS maintenance_jobs_work_kind_closed_check`
+  );
+  await client.query(`ALTER TABLE maintenance_jobs
+    ADD CONSTRAINT maintenance_jobs_work_kind_closed_check
+    CHECK (work_kind IN (${sqlList(MAINTENANCE_WORK_KINDS)}))`);
   /**
    * Claim scan: oldest pending work whose retry deadline has passed. Partial on
    * `pending` so a running job — which reclaim owns, not claim — can never

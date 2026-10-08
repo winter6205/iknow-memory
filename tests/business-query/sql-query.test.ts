@@ -124,17 +124,17 @@ describe("driver date normalization", () => {
    * on a server east of Greenwich `toISOString()` renders the previous
    * calendar day. That would put a wrong date in a citation, which is the
    * one thing the record_key/fields evidence contract exists to prevent.
+   *
+   * The zone is READ from the environment, never assigned into it: V8 resolves
+   * the local zone once and caches it, so writing `process.env.TZ` after the
+   * first `Date` does not move the process. The run then keeps the zone it
+   * started in and asserts the wrong calendar day — which is why this case
+   * passed on a developer's machine and failed on a UTC runner. `ZONE_UNDER_TEST`
+   * selects the zone at process start, so one file asserts one zone honestly.
    */
-  function inTimeZone<T>(zone: string, run: () => T): T {
-    const previous = process.env.TZ;
-    process.env.TZ = zone;
-    try {
-      return run();
-    } finally {
-      if (previous === undefined) delete process.env.TZ;
-      else process.env.TZ = previous;
-    }
-  }
+  const ZONE_UNDER_TEST = process.env["ZONE_UNDER_TEST"];
+  const ZONES = ["UTC", "Asia/Shanghai", "America/Los_Angeles"] as const;
+  const zones = ZONE_UNDER_TEST === undefined ? ZONES : [ZONE_UNDER_TEST];
 
   /** The Dates a driver hands back for the seeded contract's two dates. */
   function driverDates(): Record<string, Date> {
@@ -144,15 +144,15 @@ describe("driver date normalization", () => {
     };
   }
 
-  for (const zone of ["UTC", "Asia/Shanghai", "America/Los_Angeles"]) {
+  for (const zone of zones) {
     it(`cites the ledger's calendar day, not the UTC day, in ${zone}`, async () => {
-      // The row is built INSIDE the zone, because that is where the driver
-      // would parse it: `pg` reads 2026-03-14 into a Date at local midnight
-      // of whatever zone the server runs in. Building the Date in a
-      // different zone would test the harness, not the executor.
-      const result = await inTimeZone(zone, async () => {
-        const { executor } = executorWith([{ ...C_2291, ...driverDates() }]);
-        return executor.query({ template: "contracts_expiring", params: WINDOW });
+      // The row is built in the process's own zone, because that is where the
+      // driver would parse it: `pg` reads 2026-03-14 into a Date at local
+      // midnight of whatever zone the server runs in.
+      const { executor } = executorWith([{ ...C_2291, ...driverDates() }]);
+      const result = await executor.query({
+        template: "contracts_expiring",
+        params: WINDOW,
       });
       expect(result.rows[0]?.fields.expiry_date).toBe("2026-03-14");
       expect(result.rows[0]?.fields.notice_by).toBe("2026-02-12");

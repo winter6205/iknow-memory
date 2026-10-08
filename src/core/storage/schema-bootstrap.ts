@@ -33,10 +33,12 @@ import { upSchemaProjection } from "./schema-projection.js";
 import { createEvidenceTables } from "./schema-evidence.js";
 import { sqlTextList, sqlTextLiteral } from "./schema-sql.js";
 import type { SchemaBootstrapClient } from "./schema-sql.js";
+import { upSchemaCollectionMark } from "./schema-collection-mark.js";
 import { upSchemaMaintenanceWork } from "./schema-maintenance-work.js";
 import { upSchemaPublication } from "./schema-publication.js";
 import { upSchemaStructuredPurge } from "./schema-structured-purge.js";
 import { upSchemaStructuredCompletion } from "./schema-structured-completion.js";
+import { upSchemaCollectionDelete } from "./schema-collection-delete.js";
 import { acquireSchemaBootstrapLock } from "./schema-lock.js";
 export type { SchemaBootstrapClient } from "./schema-sql.js";
 
@@ -833,6 +835,10 @@ export async function upSchemaBootstrap(
     await upSchemaProjection(client);
     await upSchemaMaintenanceWork(client);
     await upSchemaPublication(client);
+// MP14's collection marks. A brand-new table, so CREATE IF NOT EXISTS alone
+    // never reaches a deployed store — the probe in schema-lock.ts names it, and
+    // this call is what actually creates it. The two must land together.
+    await upSchemaCollectionMark(client);
     // After upSchemaPublication: the tombstone and the read lease both key on a
     // source the publication tables own, and the purge transaction refuses a
     // source it cannot lock there.
@@ -843,6 +849,11 @@ export async function upSchemaBootstrap(
     // already wrote, so the ordering documents the sequence rather than enforcing
     // a dependency.
     await upSchemaStructuredCompletion(client);
+    // After upSchemaStructuredPurge: MP15's progress row records WHICH delete
+    // phase committed last, and its terminal phase writes the completion record's
+    // `collected` state — so this capability is only reachable once the purge
+    // tombstone and the outcome record it reconciles both exist.
+    await upSchemaCollectionDelete(client);
     // ALTER chunks back-pointers must come after `source_documents` exists
     // (FK target) and after `chunks` itself exists (caller's responsibility —
     // `PgvectorBackend.ensureTable` creates it before invoking us).

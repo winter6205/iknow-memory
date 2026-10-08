@@ -34,6 +34,11 @@ const FNV1A_PRIME = 1099511628211n;
  * so the next forward-compat column fails a test instead of shipping.
  */
 const BOOTSTRAP_COLUMNS = [
+  // MP14: the mark's cancellation pair is a forward-compat ADD COLUMN, so a
+  // deployed store that predates MP14 never receives it unless the probe names
+  // both — same rule as source_documents.content_identity below.
+  ["structured_collection_marks", "cancelled_at"],
+  ["structured_collection_marks", "cancelled_reason"],
   ["triples", "superseded_by"],
   ["triples", "evidence_span"],
   ["triples", "extractor"],
@@ -89,6 +94,11 @@ const BOOTSTRAP_TABLES = [
   // corpus-index-job T2: a brand-new table — CREATE IF NOT EXISTS alone never
   // reaches a deployed store once the probe says ready, so the probe names it.
   "index_jobs",
+  // MP14: the collection marks. Brand-new, so the probe names it — a table the
+  // probe does not name never reaches a deployed store, and one it names without
+  // upSchemaCollectionMark creating it would keep the probe answering "not ready"
+  // forever. schema-bootstrap.ts calls both halves in the same transaction.
+  "structured_collection_marks",
   // QP3: the structured-query identity registry, brand-new tables — same rule as
   // index_jobs, so the probe names them or they never reach a deployed store.
   "structured_entity_identities",
@@ -131,6 +141,10 @@ const BOOTSTRAP_TABLES = [
   // statements and the purge transaction would fail on a table that is not there.
   "structured_purge_outcomes",
   "structured_purge_ack_states",
+  // MP15's per-phase deletion progress. Brand-new under the same rule: a store
+  // that short-circuits past its CREATE has no row to resume from, and a retry
+  // would re-run every phase instead of skipping the ones that committed.
+  "structured_collection_deletions",
 ] as const;
 const BOOTSTRAP_INDEXES = [
   "entities_canonical_name_idx",
@@ -190,6 +204,14 @@ const BOOTSTRAP_INDEXES = [
   // The reconciler's all-owner guard joins owner rows by (scope, revision) against
   // a derived owner list.
   "structured_purge_ack_states_scope_revision_idx",
+  // MP15: the shared-object live-reference counts filter on `content_digest` and
+  // on `origin_object_ref`, and neither column carries any index today, so both
+  // counts are seq scans over the corpus's largest table.
+  "source_versions_content_digest_idx",
+  "source_versions_origin_object_ref_idx",
+  // MP15: the `dependent_supports` phase deletes the grant's extraction pins by
+  // support, and that table's PK leads with `evidence_ref`.
+  "evidence_grant_extractions_support_id_idx",
 ] as const;
 
 /**
@@ -307,6 +329,21 @@ async function schemaBootstrapIsReady(
           WHERE n.nspname = current_schema()
             AND t.relname = 'entities'
             AND k.conname = 'entities_type_closed_check'
+       )
+       AND EXISTS (
+         -- MP13: the work-kind CHECK is widened by re-adding it, and no CREATE
+         -- can reach an existing table, so a store still carrying the legacy
+         -- three-kind definition has to answer "not ready" for the rebuild in
+         -- schema-maintenance-work.ts to run. Like the entities CHECK above, the
+         -- renamed constraint's presence is the marker — a CHECK has no column
+         -- or index the other arms of this probe could notice instead.
+         SELECT 1
+           FROM pg_constraint k
+           JOIN pg_class t ON t.oid = k.conrelid
+           JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE n.nspname = current_schema()
+            AND t.relname = 'maintenance_jobs'
+            AND k.conname = 'maintenance_jobs_work_kind_closed_check'
        )
        AND EXISTS (
          SELECT 1

@@ -58,11 +58,20 @@ import { MemoryStructuredPublicationStorage } from "./publication-memory.js";
 import {
   MemoryStructuredScopeTail,
   MemoryStructuredScopeUnitOfWork,
+  type MemoryPublicationScopeAuthority,
 } from "./structured-scope-uow.js";
 import type {
   PublicationOutboxPort,
   StructuredPublicationStorage,
 } from "../maintenance/publication-types.js";
+import type {
+  CollectionDeleteEvidenceSurface,
+  CollectionDeleteFacts,
+  CollectionDeleteFactsInput,
+  CollectionDeleteSharedReferences,
+} from "./collection-delete-evidence.js";
+import { CollectionDeleteEvidenceError } from "./collection-delete-evidence.js";
+import type { CollectionDeletePhase } from "../maintenance/collection-delete.js";
 import {
   EVIDENCE_FAILURE,
   EVIDENCE_GRANT_KIND,
@@ -223,6 +232,7 @@ export class MemoryBackend
     CommunityIndexStateStorage,
     IndexJobStore,
     EvidenceStore,
+    CollectionDeleteEvidenceSurface,
     StorageReadPort
 {
   /** Shared identity registry used by the optional publication UOW. */
@@ -240,6 +250,18 @@ export class MemoryBackend
   /** The shared write authority the publication and work adapters compose with. */
   readonly structuredScopeUnitOfWork: MemoryStructuredScopeUnitOfWork;
   private readonly publicationUow: MemoryStructuredPublicationStorage;
+
+  /**
+   * The publication adapter typed as the scope authority MP15's memory-lane
+   * delete store composes with: serialization (already the caller's obligation
+   * — the store holds this same tail) plus the revision read and advance.
+   * The public `structuredPublication` field is typed as the narrow
+   * `StructuredPublicationStorage` port, which does not declare the revision
+   * members, so this getter is the one published view of the same object.
+   */
+  get structuredPublicationScopeAuthority(): MemoryPublicationScopeAuthority {
+    return this.publicationUow;
+  }
 
   private readonly store = new Map<string, ChunkRecord>();
   /**
@@ -1659,6 +1681,252 @@ export class MemoryBackend
       ...record,
       [stamp]: instantText(at, stamp),
     });
+  }
+
+  /**
+   * MP15's facts read — the in-memory twin of the PG facts statement MP14's
+   * post-grace recheck runs, narrowed to what a payload delete decides from.
+   * Every question below is answered by walking from the version row, never
+   * from caller-supplied intermediates, so the counts and pins here are what
+   * the same walk over the PG tables would return.
+   *
+   * Called inside the delete store's serialization slice; the maps it reads
+   * are the same ones every other structured writer commits to.
+   */
+  async readCollectionDeleteFacts(
+    input: CollectionDeleteFactsInput
+  ): Promise<CollectionDeleteFacts> {
+    const record = this.collectionDeleteVersionRow(input.sourceVersionId);
+    const supportIds = this.collectionDeleteSupportIds(record);
+    const nowMs = input.now.getTime();
+    const liveRowGrants = [...this.grants.values()]
+      .filter(
+        (grant) =>
+          grant.kind === EVIDENCE_GRANT_KIND.ROW &&
+          nowMs < Date.parse(grant.expires_at) &&
+          [...(this.grantSupports.get(grant.evidence_ref)?.keys() ?? [])].some(
+            (supportId) => supportIds.has(supportId)
+          )
+      )
+      .map((grant) => grant.evidence_ref)
+      .sort();
+    return {
+      bindingResolved: true,
+      payloadCollected: record.payload_collected_at !== null,
+      liveRowGrants,
+    };
+  }
+
+  /**
+   * One phase's removal. Each case is the in-memory twin of the phase's PG
+   * DELETE — the WHERE clause is spelled out per case rather than guessed —
+   * and the return value is that statement's row count. The cases run in the
+   * `COLLECTION_DELETE_PHASES` order the store drives them; an unknown phase
+   * is a closed-vocabulary failure, thrown rather than counted as zero.
+   */
+  async deleteCollectionPhase(
+    phase: CollectionDeletePhase,
+    input: { readonly sourceVersionId: string }
+  ): Promise<number> {
+    switch (phase) {
+      case "dependent_supports":
+        return this.deleteDependentSupports(input.sourceVersionId);
+      case "extraction_payloads":
+        return this.deleteExtractionPayloads(input.sourceVersionId);
+      case "assertion_supports":
+        return this.deleteAssertionSupports(input.sourceVersionId);
+      case "frozen_units":
+        return this.deleteFrozenUnits(input.sourceVersionId);
+      case "superseded_caches":
+        return this.deleteSupersededCaches(input.sourceVersionId);
+      default: {
+        throw new CollectionDeleteEvidenceError(
+          "invalid_input",
+          `collection delete: unknown phase ${String(phase)}`
+        );
+      }
+    }
+  }
+
+  /**
+   * evidence_grant_supports + evidence_grant_extractions rows pinned to this
+   * payload's supports, joined from source_version_id in the WHERE.
+   */
+  private deleteDependentSupports(sourceVersionId: string): number {
+    const supportIds = this.collectionDeleteSupportIds(
+      this.collectionDeleteVersionRow(sourceVersionId)
+    );
+    let removed = 0;
+    for (const [evidenceRef, pins] of [...this.grantSupports]) {
+      removed += this.deleteSupportPinsOf(evidenceRef, pins, supportIds);
+      removed += this.deleteExtractionPinsOf(evidenceRef, supportIds);
+    }
+    return removed;
+  }
+
+  /** The grant-support pins one grant holds on this payload's supports. */
+  private deleteSupportPinsOf(
+    evidenceRef: string,
+    pins: Map<string, EvidenceSupportRole>,
+    supportIds: Set<string>
+  ): number {
+    let removed = 0;
+    for (const supportId of [...pins.keys()]) {
+      if (!supportIds.has(supportId)) continue;
+      pins.delete(supportId);
+      if (pins.size === 0) this.grantSupports.delete(evidenceRef);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  /** The grant-extraction pins one grant holds on this payload's supports. */
+  private deleteExtractionPinsOf(
+    evidenceRef: string,
+    supportIds: Set<string>
+  ): number {
+    const extractions = this.grantExtractions.get(evidenceRef);
+    if (extractions === undefined) return 0;
+    let removed = 0;
+    for (const key of [...extractions]) {
+      if (!supportIds.has(key.slice(0, key.indexOf("|")))) continue;
+      extractions.delete(key);
+      removed += 1;
+      if (extractions.size === 0) {
+        this.grantExtractions.delete(evidenceRef);
+      }
+    }
+    return removed;
+  }
+
+  /** support_extractions rows: the links of this payload's supports. */
+  private deleteExtractionPayloads(sourceVersionId: string): number {
+    const supportIds = this.collectionDeleteSupportIds(
+      this.collectionDeleteVersionRow(sourceVersionId)
+    );
+    let removed = 0;
+    for (const supportId of supportIds) {
+      removed += this.supportLinks.get(supportId)?.size ?? 0;
+      this.supportLinks.delete(supportId);
+    }
+    return removed;
+  }
+
+  /**
+   * assertion_supports rows, plus the occurrence-identity index the unique
+   * constraint enforces on the PG side.
+   */
+  private deleteAssertionSupports(sourceVersionId: string): number {
+    const supportIds = this.collectionDeleteSupportIds(
+      this.collectionDeleteVersionRow(sourceVersionId)
+    );
+    let removed = 0;
+    for (const [occurrenceKey, supportId] of this.supportIdsByOccurrence) {
+      if (!supportIds.has(supportId)) continue;
+      this.supportIdsByOccurrence.delete(occurrenceKey);
+      this.supports.delete(supportId);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  /**
+   * source_version_locators rows: the declared bindings of this version.
+   * `locatorKey` is a JSON array whose first element is the uuid, so the
+   * prefix is `["<uuid>",` — JSON.stringify puts no space after the comma.
+   */
+  private deleteFrozenUnits(sourceVersionId: string): number {
+    const prefix = `["${sourceVersionId}",`;
+    let removed = 0;
+    for (const key of [...this.locatorBindings]) {
+      if (!key.startsWith(prefix)) continue;
+      this.locatorBindings.delete(key);
+      removed += 1;
+    }
+    return removed;
+  }
+
+  /**
+   * structured_publication_extraction_bindings rows. Binding keys carry the
+   * version STRING (`source_versions.source_version`, e.g. "v1"), not the
+   * uuid — resolve the row and match on what publish actually keyed, or the
+   * delete would silently count zero against real bindings.
+   */
+  private deleteSupersededCaches(sourceVersionId: string): number {
+    const record = this.collectionDeleteVersionRow(sourceVersionId);
+    return this.publicationUow.deleteExtractionBindingsForSourceVersion(
+      record.source_version
+    );
+  }
+
+  /**
+   * The spec:312 live-reference counts on the "original content" columns,
+   * excluding this version itself — the in-memory twin of the two counted
+   * SELECTs `source_versions_content_digest_idx` and
+   * `source_versions_origin_object_ref_idx` serve. Reported, never gating.
+   */
+  async countSharedVersionReferences(
+    sourceVersionId: string
+  ): Promise<CollectionDeleteSharedReferences> {
+    const record = this.collectionDeleteVersionRow(sourceVersionId);
+    const countBy = (
+      pick: (row: SourceVersionRecord) => string
+    ): number => {
+      let count = 0;
+      for (const row of this.sourceVersions.values()) {
+        if (row.source_version_id === sourceVersionId) continue;
+        if (pick(row) === pick(record)) count += 1;
+      }
+      return count;
+    };
+    return {
+      contentDigestReferences: countBy((row) => row.content_digest),
+      originObjectReferences: countBy((row) => row.origin_object_ref),
+    };
+  }
+
+  /**
+   * The version row's `payload_collected_at` stamp, read from this backend —
+   * never from a store-private copy — so a store that resumes after a crash
+   * sees the stamp a previous instance wrote.
+   */
+  async readPayloadCollectedAt(
+    sourceVersionId: string
+  ): Promise<string | null> {
+    return this.collectionDeleteVersionRow(sourceVersionId)
+      .payload_collected_at;
+  }
+
+  /**
+   * The version row behind one evidence-surface call, failing with the typed
+   * maintenance code when it is gone: between the plan's committed-facts read
+   * and a later call the world can move, and the surface throws rather than
+   * returning a decision the plan already made.
+   */
+  private collectionDeleteVersionRow(sourceVersionId: string): SourceVersionRecord {
+    const record = this.sourceVersions.get(
+      assertUuid(sourceVersionId, "source_version_id")
+    );
+    if (record === undefined) {
+      throw new CollectionDeleteEvidenceError(
+        "unsupported_source_binding",
+        `collection delete: source version ${sourceVersionId} does not resolve to a row`
+      );
+    }
+    return record;
+  }
+
+  /** The support ids one version row owns — the per-phase WHERE's inner join. */
+  private collectionDeleteSupportIds(
+    record: SourceVersionRecord
+  ): Set<string> {
+    const ids = new Set<string>();
+    for (const support of this.supports.values()) {
+      if (support.source_version_id === record.source_version_id) {
+        ids.add(support.support_id);
+      }
+    }
+    return ids;
   }
 
   /**

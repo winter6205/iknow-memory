@@ -33,6 +33,19 @@ export type StructuredPublicationFailureCode =
   | "access_denied"
   | "unsupported_source_binding";
 
+/** Every code `publicationError` is allowed to pass through unchanged. */
+const PUBLICATION_FAILURE_CODES: readonly string[] = [
+  "invalid_input",
+  "backend_unavailable",
+  "lease_lost",
+  "input_stale",
+  "execution_timeout",
+  "resource_exhausted",
+  "maintenance_status_unavailable",
+  "access_denied",
+  "unsupported_source_binding",
+];
+
 export interface NormalizedPublicationFact {
   readonly fact: PublicationFact;
   readonly occurrence: NormalizedSupport;
@@ -367,9 +380,26 @@ function normalizeRelationFact(
 
 export function publicationError(error: unknown): StructuredPublicationError {
   if (error instanceof StructuredPublicationError) return error;
-  const token = failureTokenOf(error);
-  if (token === "unsupported_source_binding" || token === "access_denied") {
-    return new StructuredPublicationError(token, errorMessage(error));
+  // A refusal that already names a code in this vocabulary keeps it. The seam
+  // carries its code on `.code` rather than as a GraphragError failure token,
+  // so it has to be read directly. Masking any of these as
+  // `backend_unavailable` would lose the verdict the caller branches on: the
+  // durable-work fence's `lease_lost` would read as a backend outage, and a
+  // source outside its trusted set as a transient fault.
+  const direct = (error as { readonly code?: unknown }).code;
+  const token =
+    typeof direct === "string" &&
+    (PUBLICATION_FAILURE_CODES as readonly string[]).includes(direct)
+      ? (direct as StructuredPublicationFailureCode)
+      : failureTokenOf(error);
+  if (
+    token !== undefined &&
+    (PUBLICATION_FAILURE_CODES as readonly string[]).includes(token)
+  ) {
+    return new StructuredPublicationError(
+      token as StructuredPublicationFailureCode,
+      errorMessage(error)
+    );
   }
   if (
     error instanceof StructuredIdentityError ||

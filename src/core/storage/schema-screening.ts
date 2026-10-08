@@ -63,6 +63,11 @@ export async function upSchemaScreening(client: SchemaClient): Promise<void> {
  * or deleted by a later decision, so "preserve evidence" is a property of the
  * schema rather than of a code path that remembers to keep history.
  *
+ * One conflict is decided once. `(scope_binding, candidate_id)` is unique, so a
+ * second decision on a resolved conflict cannot be recorded even if every lock
+ * in the writing transaction is gone: the constraint, not a read the decision
+ * made before it wrote, is what two racing decisions collide on.
+ *
  * The conflict table is separate because a decision resolves a conflict by
  * changing which rows are current, and that is state rather than evidence. It
  * carries one row per (candidate, support) with the visibility the decision
@@ -107,5 +112,12 @@ export async function upSchemaScreeningDecisions(
     )`);
   await client.query(`
     CREATE INDEX IF NOT EXISTS structured_screening_decisions_scope_idx
+      ON structured_screening_decisions (scope_binding, candidate_id)`);
+  // The unique index is named apart from the lookup index above on purpose:
+  // `CREATE INDEX IF NOT EXISTS` skips a name that already exists, so reusing it
+  // would leave a bootstrapped database holding the non-unique index forever
+  // while appearing to have applied this one.
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS structured_screening_decisions_conflict_uniq
       ON structured_screening_decisions (scope_binding, candidate_id)`);
 }

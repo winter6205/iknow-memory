@@ -1447,12 +1447,9 @@ function describeContract(
           }),
         ])
       );
-      expect(visibleStatus.maintenance).toMatchObject({
+      expect(visibleStatus.maintenance).toEqual({
         sourcesInScope: 2,
         publishedSources: 1,
-        desiredIndexBuckets: 2,
-        conflictCheckBuckets: 2,
-        conflictStatus: "pending",
       });
       expect(visibleStatus.subjects).toEqual([]);
       expect(currentIds(visibleStatus)).not.toContain(UUIDS[0]);
@@ -1465,12 +1462,9 @@ function describeContract(
         scopeBinding: hiddenScope,
       });
       expect(hiddenSnapshot.subjects).toHaveLength(1);
-      expect(hiddenSnapshot.maintenance).toMatchObject({
+      expect(hiddenSnapshot.maintenance).toEqual({
         sourcesInScope: 1,
         publishedSources: 1,
-        desiredIndexBuckets: 1,
-        conflictCheckBuckets: 1,
-        conflictStatus: "pending",
       });
     });
 

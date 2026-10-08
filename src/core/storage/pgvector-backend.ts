@@ -123,6 +123,7 @@ import {
   normalizeLocatorBinding,
   normalizeOccurrence,
   normalizeSourceVersion,
+  supportIdOf,
   type SourceVersionStamp,
 } from "./evidence-source.js";
 import {
@@ -2099,7 +2100,7 @@ export class PgvectorBackend
     const plan = normalizeOccurrence(occurrence);
     return wrapPgRead("recordSupport", async () => {
       const pool = await this.ensureReady();
-      return recordSupportRow(pool, plan, randomUUID());
+      return recordSupportRow(pool, plan, supportIdOf(plan));
     });
   }
 

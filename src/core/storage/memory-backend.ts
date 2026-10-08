@@ -107,6 +107,7 @@ import {
   normalizeLocatorBinding,
   normalizeOccurrence,
   normalizeSourceVersion,
+  supportIdOf,
   supportOccurrenceKey,
   type NormalizedSourceVersion,
   type SourceVersionStamp,
@@ -1210,7 +1211,7 @@ export class MemoryBackend
       const support: SupportRecord =
         existingId === undefined
           ? {
-              support_id: randomUUID(),
+              support_id: supportIdOf(plan),
               subject: plan.subject,
               result_id: plan.result_id,
               source_ref: plan.source_ref,
@@ -1337,7 +1338,7 @@ export class MemoryBackend
     const support: SupportRecord =
       existingId === undefined
         ? {
-            support_id: randomUUID(),
+            support_id: supportIdOf(plan),
             subject: plan.subject,
             result_id: plan.result_id,
             source_ref: plan.source_ref,

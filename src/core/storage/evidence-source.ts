@@ -316,6 +316,49 @@ export function supportOccurrenceKey(support: NormalizedSupport): string {
   ]);
 }
 
+/**
+ * Frozen RFC 4122 namespace for the occurrence→support-id derivation. It is a
+ * one-way door: `recordSupportRow` conflicts on the occurrence key rather than
+ * on `support_id`, so changing this value re-derives every support id while no
+ * insert fails, and `assertion_supports` would silently split into two disjoint
+ * id spaces that no stored column could tell apart.
+ *
+ * Frozen by ticket T12 (QP10) in
+ * `docs/validation/2026-10-06-t12-qp10-post-ingest-id-freeze-record.md` at IK
+ * `0ad17f2`. Changing it now would not error: `recordSupportRow` conflicts on
+ * the occurrence key, so the new derivation is discarded and the old row
+ * returned.
+ */
+export const SUPPORT_ID_NAMESPACE = "6f6b1c2e-9a4d-5f38-b7c1-0d2e3f4a5b6c";
+
+/**
+ * The support id for an occurrence. Derived rather than minted so that every
+ * path which writes a support names it the same way: an id carried no identity
+ * of its own could only be compared against a row that already existed, and
+ * two paths writing the same occurrence would disagree about it.
+ */
+export function supportIdOf(support: NormalizedSupport): string {
+  return uuidV5(SUPPORT_ID_NAMESPACE, supportOccurrenceKey(support));
+}
+
+function uuidV5(namespace: string, name: string): string {
+  const bytes = createHash("sha1")
+    .update(Buffer.from(namespace.replace(/-/g, ""), "hex"))
+    .update(name, "utf8")
+    .digest()
+    .subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join("-");
+}
+
 /** Validate one extracted occurrence into its stored spelling. */
 export function normalizeOccurrence(
   input: SupportOccurrence

@@ -13,7 +13,12 @@
  *
  * **What this module is NOT.** It deletes no payload (that is MP15) and it records
  * no all-owner completion (that is MP17, gated on the four-state table in the
- * acknowledgement contract). The transaction stops at the outbox emission.
+ * acknowledgement contract). What it DOES carry, since MP17, is the `scheduled`
+ * half of that table: `schedulePurgeCompletion` is called here, inside this
+ * transaction, because ADR 0099 §2.1 makes `scheduled` true only when the
+ * invalidation events are durably queued in the same commit as the tombstone. It
+ * writes no `completed_at` — ADR 0099 §2.4a's writer separation means no statement
+ * in this file could, and a contract test fails if one appears.
  *
  * **The tombstone comes before the deletion, and the deletion is not here.** The
  * tombstone is committed first because it is what makes a retry safe: a retry
@@ -52,6 +57,10 @@ import {
   allocateInvalidationSeq,
   INVALIDATION_REASON,
 } from "./invalidation-outbox.js";
+import {
+  readConfiguredOwners,
+  schedulePurgeCompletion,
+} from "./structured-purge-completion.js";
 import { scopedSafeNumber } from "./structured-scope-reads.js";
 import {
   advanceRevision,
@@ -479,6 +488,18 @@ export class PgStructuredPurgeStore {
     const fencedJobKeys = await this.fenceAffectedWork(client, request);
     const grants = await this.readAffectedGrants(client, request);
     const published = await this.emitInvalidations(client, grants);
+    // ADR 0099 §2.1's `scheduled`, in THIS commit rather than beside it: the state
+    // is true only when the invalidation events are durably queued, so seeding it
+    // after this transaction would leave a window where a tombstone exists with no
+    // record of what it announced. The owner set is read here, inside the purge,
+    // and the owner rows carry the allocation watermark reached AFTER emission —
+    // which is the position an acknowledgement must reach for this revision to read
+    // as scrubbed for that owner.
+    await schedulePurgeCompletion(client, {
+      scopeBinding: request.scopeBinding,
+      purgeRevision: request.purgeRevision,
+      consumerIds: await readConfiguredOwners(client, request.scopeBinding),
+    });
     // The purge changes what a reader may see AND what a worker may report, so
     // both revisions move — once, here, after every fallible step.
     await advanceRevision(client, request.scopeBinding, {

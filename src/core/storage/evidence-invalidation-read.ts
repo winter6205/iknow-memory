@@ -54,6 +54,7 @@ import {
   type InvalidationCheckpointKey,
 } from "./evidence-invalidation-checkpoint.js";
 import {
+  readFirstRetainedSeq,
   readInvalidationCursor,
   type EvidenceInvalidationCursor,
   type InvalidationReason,
@@ -292,22 +293,6 @@ function wholeSecondStamp(value: unknown): string {
   return new Date(Math.floor(raw.getTime() / 1000) * 1000)
     .toISOString()
     .replace(/\.000Z$/, "Z");
-}
-
-/** The lowest `seq` this consumer still holds, or `null` when it holds none. */
-async function readFirstRetainedSeq(
-  client: ScopeTransactionClient,
-  consumerId: string
-): Promise<number | null> {
-  const { rows } = await client.query(
-    `SELECT min(seq) AS first_seq
-       FROM evidence_invalidation_outbox
-      WHERE consumer_id = $1`,
-    [consumerId]
-  );
-  const first = (rows as { first_seq?: unknown }[])[0];
-  if (first === undefined || first.first_seq === null) return null;
-  return scopedSafeNumber(first.first_seq, "invalidation first retained seq");
 }
 
 /** One page of this consumer's stream, ascending by `seq`. */

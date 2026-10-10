@@ -625,7 +625,7 @@ describePg("retrieval-pg: real Postgres graph-arm retrieval (T6)", () => {
   });
 
   it("12. entity_type seed filter: SQL restricts to one type, omit recalls all", async () => {
-    // plans/entity-type-and-filter.md T3: the typed filter lands as a bind
+    // specs/entity-type-and-filter.md: the typed filter lands as a bind
     // parameter on SEED_ENTITIES_SQL; `$n IS NULL OR type = $n` keeps the
     // omitted call byte-for-byte the old behavior.
     const c = client!;

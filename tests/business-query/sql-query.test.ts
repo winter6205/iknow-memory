@@ -1,5 +1,5 @@
 /**
- * Business-query module contract tests (fin:plans/post322-a2-sql-slice.md T4).
+ * Business-query module contract tests.
  *
  * Drivable with a fake pool and no database: the module takes its pool from a
  * factory, so every assertion here is about the module's own behaviour —
@@ -7,8 +7,8 @@
  * it refuses. The live-database run against the synthetic ledger is a
  * separate opt-in suite and is NOT what this file stands in for.
  *
- * Expected values are the literals written in the committed fixture
- * (fin:tests/retrieve/fixtures/ledger/002_seed.sql), not values read back from a
+ * Expected values are the literals written in the committed fixture,
+ * not values read back from a
  * database, so a broken seed cannot make these pass vacuously.
  */
 import { describe, expect, it } from "vitest";

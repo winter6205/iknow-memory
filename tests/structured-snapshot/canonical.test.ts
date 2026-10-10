@@ -8,7 +8,6 @@
  *   1. $FIN_STRUCTURED_SNAPSHOT_WORKSHEET — the supported way to point at a
  *      fin checkout whose path is not the default below.
  *   2. A sibling checkout at ../fin (the normal two-repo dev layout).
- *   3. The default absolute path below.
  * A missing worksheet is a FAILURE, not a skip: a silently skipped
  * cross-language suite is indistinguishable from one that passed.
  */
@@ -30,7 +29,6 @@ function resolveWorksheetPath(): string {
   const candidates = [
     process.env.FIN_STRUCTURED_SNAPSHOT_WORKSHEET,
     resolve(dirname(fileURLToPath(import.meta.url)), "../../../fin", WORKSHEET_RELATIVE),
-    "/home/winner/projects/fin-wt-structured-evidence/" + WORKSHEET_RELATIVE,
   ].filter((value): value is string => typeof value === "string" && value !== "");
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;

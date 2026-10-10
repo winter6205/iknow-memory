@@ -74,7 +74,7 @@ export function stripCDropWindowsFilter(
 
 /**
  * The `filters` key restricting which entity types may seed the graph and
- * entity-embedding arms (plans/entity-type-and-filter.md T3). Same routing
+ * entity-embedding arms (specs/entity-type-and-filter.md). Same routing
  * contract as `search_mode`: exact-match backends must never see it.
  */
 export const ENTITY_TYPE_FILTER_KEY = "entity_type";

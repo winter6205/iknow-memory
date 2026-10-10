@@ -1,5 +1,5 @@
 /**
- * MemoryBackend's BM25 lexical arm (#66).
+ * MemoryBackend's BM25 lexical arm.
  *
  * Same contract as `ElasticsearchPrecisionLayer.searchLexical` — a query
  * string in, ranked `RetrievedChunk[]` out, honouring valid_window /

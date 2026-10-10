@@ -34,11 +34,15 @@ docs/vector-memory-upgrade-archive.html
 .reference/
 
 # Docs local-only (keep on disk). Product SSOT stays tracked:
-# docs/CONTEXT.md, docs/adr/, specs/, active plans/, docs/runbooks/, docs/mcp-config.md
+# docs/CONTEXT.md, docs/adr/, specs/, docs/runbooks/, docs/mcp-config.md
 docs/wayfinder/
 docs/handoff/
 docs/archive/
 docs/visualizations/
+
+# Release scoping: ticket-by-ticket execution plans are maintainer-local working
+# material, so they stay out of this tree. Do not restore them on a source sync.
+/plans/
 
 # Playwright CLI page snapshots / console logs (local debugging scratch)
 .playwright-cli/

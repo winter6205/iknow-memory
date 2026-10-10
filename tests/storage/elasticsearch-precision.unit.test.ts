@@ -401,7 +401,7 @@ describe("ElasticsearchPrecisionLayer", () => {
     );
     expect(JSON.stringify(bulkCalls[0]?.[0])).toContain("����");
   });
-  // plans/entity-type-and-filter.md T3: the entity lexical seed is half of
+  // specs/entity-type-and-filter.md: the entity lexical seed is half of
   // the neo4j arm's seed fusion, so it must honor the typed entity filter
   // too — as a term clause, never as a chunk exact-match filter.
   it("entityType restricts entity search with a term filter", async () => {
@@ -820,7 +820,7 @@ describe("ElasticsearchPrecisionLayer.indexCommunitySummaries", () => {
 });
 
 /**
- * Issue #272: the write path must REPLACE the published generation, not upsert
+ * The write path must REPLACE the published generation, not upsert
  * into it. A community that dropped out of the generation stops being readable,
  * and a write that dies midway must leave readers on the previous COMPLETE
  * generation — never a half-old/half-new mix, which is what a per-community

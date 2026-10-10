@@ -1,8 +1,7 @@
 /**
  * The `seq` allocator for the invalidation outbox, the one place the invalidation
- * vocabulary lives (ADR 0097 §2.6 and §4.2; the register at
- * `plans/structured-corpus-p3-prerequisites.md` §1b.4), and the retention sweep
- * that discharges register §1.6.
+ * vocabulary lives (ADR 0097 §2.6 and §4.2; the register), and the retention
+ * sweep that discharges register §1.6.
  *
  * Sibling of the schema module rather than a second statement inside it: the
  * DDL declares what the stream IS and this module decides how a number reaches

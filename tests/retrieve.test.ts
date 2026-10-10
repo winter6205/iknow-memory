@@ -104,7 +104,7 @@ class RecordingLexicalBackend extends MemoryBackend {
  * the exact-match filters the vector search got — the probe for driving the
  * `filters.entity_type` control through the full
  * handler → arm → seam chain without a live Postgres
- * (plans/entity-type-and-filter.md T3).
+ * (specs/entity-type-and-filter.md).
  */
 class RecordingSeedBackend implements GraphRagStorageBackend {
   seedCalls: Array<{ topK: number; entityType?: string }> = [];
@@ -261,7 +261,7 @@ describe("createRetrieveHandler", () => {
     });
   });
 
-  // plans/search-mode-retrieve.md T1: `filters.search_mode` is a routing
+  // specs/search-mode-retrieve.md: `filters.search_mode` is a routing
   // control, not a chunk-matching filter. Missing → today's graph-priority
   // route; outside the closed word-form set (single letters included) → typed
   // INVALID_INPUT carrying a stable host-mappable reason token (never a
@@ -556,7 +556,7 @@ describe("createRetrieveHandler", () => {
     });
   });
 
-  // plans/entity-type-and-filter.md T3: `filters.entity_type` is a routing
+  // specs/entity-type-and-filter.md: `filters.entity_type` is a routing
   // control like `search_mode`, not a chunk-matching filter. Missing = all
   // types (zero behavior change); the four closed values restrict the
   // graph/entity seeds; anything else is a typed INVALID_INPUT carrying the
@@ -681,7 +681,7 @@ describe("createRetrieveHandler", () => {
     });
   });
 
-  // plans/search-mode-retrieve.md T3 (fin ADR-0070): the `global` report-first
+  // specs/search-mode-retrieve.md (fin ADR-0070): the `global` report-first
   // arm over the community summaries. Handler-level acceptance on the fake
   // fixture: a ready ledger answers with summary rows on the wire, and the
   // `c_drop_windows` routing key never becomes an exact-match filter.
@@ -727,7 +727,7 @@ describe("createRetrieveHandler", () => {
     });
   });
 
-  // plans/search-mode-retrieve.md T2 (ADR-0060): the `lexical` 档 ranks
+  // specs/search-mode-retrieve.md (ADR-0060): the `lexical` 档 ranks
   // in-window children and cites the PARENT 抽图窗 body. Acceptance fixture
   // below: a lexical query that hits the child returns the parent text.
   describe("search_mode=lexical child hit returns parent text (T2)", () => {

@@ -1,8 +1,7 @@
 # Spec: P0 Eval — Extraction Quality Gate (LLM gold)
 
 > **Status:** ACR all-yes (this file). Not implemented on main.
-> **Source tickets:** [#15](https://github.com/winter6205/iknow-memory/issues/15) T-P0-eval; #5 P0e Q1/Q3/Q4 kept; **Q2 superseded** by operator 2026-08-30 (LLM replaces all human gold / audit).
-> **Wayfinder parent:** [#1](https://github.com/winter6205/iknow-memory/issues/1).
+> **Source tickets:** T-P0-eval; P0e Q1/Q3/Q4 kept; **Q2 superseded** by operator 2026-08-30 (LLM replaces all human gold / audit).
 > **Predecessors:** `specs/p0-schema.md`, `specs/p0-extraction.md`, `specs/p0-integration.md`; ADR-0001; retrieve eval is a **different** CLI (`specs/retrieve-p5.md`).
 > **Assumption gate:** operator confirmed the LLM-gold upgrade path (2026-08-30). A1–A16 below are the gate.
 
@@ -35,10 +34,10 @@ Terms used in this contract (eval filter / gold model / audit model are operatio
 
 (operator 2026-08-30: 「人工部分我们直接全部由 LLM 替代」+「OK, 可以写」— treated as confirmed)
 
-1. #5 Q1 stays: score **raw** pre-merge triples only. Merge-layer e2e gate stays out. Retrieve P@5 stays `eval:retrieve`.
-2. #5 Q3 stays: absolute thresholds + drift; any axis fail fails the gate; error types never gate; Bootstrap records until adjacent F1 delta ≤ 0.05; threshold edits = commit + `Why:`.
-3. #5 Q4 stays: PR = drift, no gold/extract LLM; Release = full three axes + **gold model** re-run of gold-build (new ruler if gold identity changes — must not silently reuse the old baseline curve).
-4. **#5 Q2 is replaced:** no human anchor chunks, no human reject-pile auditor, no monthly human calendar. Filter is **not** calibrated by 10–15 human labels.
+1. Q1 stays: score **raw** pre-merge triples only. Merge-layer e2e gate stays out. Retrieve P@5 stays `eval:retrieve`.
+2. Q3 stays: absolute thresholds + drift; any axis fail fails the gate; error types never gate; Bootstrap records until adjacent F1 delta ≤ 0.05; threshold edits = commit + `Why:`.
+3. Q4 stays: PR = drift, no gold/extract LLM; Release = full three axes + **gold model** re-run of gold-build (new ruler if gold identity changes — must not silently reuse the old baseline curve).
+4. **Q2 is replaced:** no human anchor chunks, no human reject-pile auditor, no monthly human calendar. Filter is **not** calibrated by 10–15 human labels.
 5. Gold volume = **gold model** over a **frozen chunk snapshot** in git, then **eval filter**. Snapshot v1 size **10–40** chunks inclusive (rule-sampled or fixture; not live crawl).
 6. **Gold model id ≠ extract model id** (`--gold-build` ConfigError if equal). **Audit model id ≠ extract model id**. Sharing gold and audit models is allowed.
 7. Changing the **extract** model must not rewrite gold. Changing gold model / gold prompt hash / snapshot id is a **new ruler**: new gold files + new Bootstrap, not a continuation of the previous F1 series without a `Why:` commit.
@@ -105,9 +104,9 @@ Binary; each maps to a command or measurable check.
 
 ## Inherits / Changes
 
-**Inherits:** spec-2 extract CLI isolation and 0/1/2 exits; `normalizeRelation` + ALLOWED vocabulary; spec-1 tables (`extraction_records`, triples, chunks) read-only; ADR-0001 (eval does not write Neo4j); #5 Q1/Q3/Q4; Vitest; TS strict ESM; Node ≥20; `ConfigError`; no iknow runtime import.
+**Inherits:** spec-2 extract CLI isolation and 0/1/2 exits; `normalizeRelation` + ALLOWED vocabulary; spec-1 tables (`extraction_records`, triples, chunks) read-only; ADR-0001 (eval does not write Neo4j); Q1/Q3/Q4; Vitest; TS strict ESM; Node ≥20; `ConfigError`; no iknow runtime import.
 
-**Changes:** #5 Q2 human filter-first **replaced** by LLM gold + code filter + LLM audit (ADR-0002). New offline eval CLI, not mixed into `eval-retrieve`. CONTEXT **extraction F1** ground-truth sentence must change (persist).
+**Changes:** Q2 human filter-first **replaced** by LLM gold + code filter + LLM audit (ADR-0002). New offline eval CLI, not mixed into `eval-retrieve`. CONTEXT **extraction F1** ground-truth sentence must change (persist).
 
 ## Testing Strategy (5 boundary classes)
 
@@ -142,5 +141,3 @@ OVERALL: PASS — hand to `writing-plans`.
 ## Hand-off
 
 - Spec: `specs/p0-eval.md`
-- Plan: `plans/p0-eval.md`
-- Parent ticket: [#15](https://github.com/winter6205/iknow-memory/issues/15)

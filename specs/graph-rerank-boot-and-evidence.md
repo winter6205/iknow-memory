@@ -1,6 +1,6 @@
 # Spec: Graph / rerank fail-start, process logs, evidence span persist
 
-> **Status:** ACR PASS 2026-09-05 — see §Architecture Change Reviewer. Persist flushed. Plan: `plans/graph-rerank-boot-and-evidence.md`.
+> **Status:** ACR PASS 2026-09-05 — see §Architecture Change Reviewer. Persist flushed.
 > **Assumption gate:** confirmed 2026-09-05 — grilling closed; decisions live here, not on a wayfinder map.
 > **Slice:** first implementation slice. MCP tool catalog is `specs/mcp-tool-surface.md`.
 
@@ -155,4 +155,3 @@ OVERALL: PASS — hand to `writing-plans`.
 
 - Spec path: `specs/graph-rerank-boot-and-evidence.md`
 - Companion spec: `specs/mcp-tool-surface.md` (not this plan)
-- Plan path: `plans/graph-rerank-boot-and-evidence.md`

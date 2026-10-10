@@ -1,9 +1,9 @@
 /**
  * Pure-function tests for Reciprocal Rank Fusion.
  *
- * `rrfFuse` takes a list of arms rather than a fixed (vector, graph) pair
- * (#64): production fuses vector + BM25, the SQL graph arm is archived off
- * that path (#58), and the algorithm itself is unchanged at k=60. Covers
+ * `rrfFuse` takes a list of arms rather than a fixed (vector, graph) pair:
+ * production fuses vector + BM25, the SQL graph arm is archived off
+ * that path, and the algorithm itself is unchanged at k=60. Covers
  * every fusion branch: single-arm, dual-arm, same-id soft merge, per-arm
  * weighting, empty input, limit truncation, invalid ranks, and the
  * deterministic tie-break (rrfScore desc, then arm order, then chunk id).
@@ -35,7 +35,7 @@ const CFG: RetrieveConfig = {
 };
 
 /**
- * The shipped production weights (#69/#70): vector 0.7 / BM25 0.15 /
+ * The shipped production weights: vector 0.7 / BM25 0.15 /
  * graph 0.15.
  */
 const PROD_CFG: RetrieveConfig = {
@@ -190,7 +190,7 @@ describe("rrfFuse", () => {
   });
 
   it("fuses three arms when an archived graph arm is explicitly supplied", () => {
-    // The graph arm no longer runs by default (#58), but the fusion
+    // The graph arm no longer runs by default, but the fusion
     // function stays N-arm so injected-config tests keep working.
     const out = rrfFuse(
       [

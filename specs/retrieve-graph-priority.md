@@ -3,9 +3,9 @@
 > **Superseded in part (boot):** missing Neo4j URI with `graphEnabled` on is fail-start (`specs/graph-rerank-boot-and-evidence.md`, ADR-0006), not skip/`degraded`. Ranking order in this spec still holds.
 
 > **Status:** draft → ACR gate in this file (§Architecture Change Reviewer).
-> **Source:** wayfinder grilling #89 (CLOSED) — production ranking is graph-priority, not three-arm RRF 0.7/0.15/0.15.
+> **Source:** production ranking is graph-priority, not three-arm RRF 0.7/0.15/0.15.
 > **Predecessor:** `specs/neo4j-graph-arm.md` (seed → PPR → chunks; this spec changes **how** those hits enter Host `chunks[]`).
-> **Assumption gate:** confirmed 2026-08-27 — follow the locked retrieve path; update stale CONTEXT terms; projection GC / graph tombstones / self-loop reject taxonomy / #88 rerank deferred.
+> **Assumption gate:** confirmed 2026-08-27 — follow the locked retrieve path; update stale CONTEXT terms; projection GC / graph tombstones / self-loop reject taxonomy / rerank deferred.
 
 ## Objective
 
@@ -30,7 +30,7 @@ Exact copy from `docs/CONTEXT.md` after the persist flush in this SPECIFY turn (
 3. Non-empty graph hits: no equal-weight RRF vs vector/BM25. Graph-arm order occupies the front of the list; if fewer than `limit`, fill from vector+BM25 RRF, deduped by chunk id (graph-already-present ids skipped). If graph hits ≥ `limit`, no fill.
 4. Query embeds once. Vector / BM25 / graph may still run concurrently for latency; fusion follows 2–3.
 5. Levers unchanged: `entityLinkTopK=8`, `candidateCap=50`, Host `limit` default 10, PPR damping 0.85. `triples.confidence` stays off the ranking path. SQL graph arm stays archived.
-6. Out of this spec: Neo4j tombstones, unresolved-graph DELETE, id-set reconcile, self-loop typed reject, #88 rerank, #15 extraction F1, read-your-writes.
+6. Out of this spec: Neo4j tombstones, unresolved-graph DELETE, id-set reconcile, self-loop typed reject, rerank, extraction F1, read-your-writes.
 7. Tests: existing assembler tests assert the new order; `npm run eval:retrieve` keeps the same gold harness (order changes, not harness shape). **Superseded (C-6, `specs/retrieval-stack.md` §B3):** a missing Neo4j URI still skips the graph, but the run is now `degraded` and is therefore refused before publish by the harness rule in SC8. `npm test` green without live Neo4j.
 8. CONTEXT terms that still describe three-arm RRF 0.7/0.15/0.15 as production ranking are flushed in this SPECIFY persist (domain-modeling). ADR-0001 unchanged.
 
@@ -130,5 +130,4 @@ OVERALL: PASS — hand to `writing-plans`.
 ## Hand-off
 
 - Spec path: `specs/retrieve-graph-priority.md`
-- Plan path: `plans/retrieve-graph-priority.md`
-- Tracker: local `docs/handoff/wayfinder-tickets/retrieve-graph-priority.md`; do not reopen #89 grilling
+- Tracker: local `docs/handoff/wayfinder-tickets/retrieve-graph-priority.md`; do not reopen the grilling

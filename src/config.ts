@@ -130,7 +130,7 @@ export const DEFAULT_ELASTICSEARCH_SUMMARY_INDEX = "iknow-memory-summaries";
 export const DEFAULT_ELASTICSEARCH_REQUEST_TIMEOUT_MS = 5_000;
 
 /**
- * Business ledger DSN (plans/post322-a2-sql-slice.md T7). The name is the
+ * Business ledger DSN. The name is the
  * one specs/search-mode-business-sql-contract.md §9 uses; it reaches the
  * server only through the environment or the operator setting, and the
  * read-only credential inside it is never logged, echoed, or repeated in
@@ -154,7 +154,7 @@ export class ConfigError extends Error {
 }
 
 /**
- * Neo4j sidecar connection settings (#70).
+ * Neo4j sidecar connection settings.
  *
  * Present only when a URI is configured. Since ADR-0006, absence with the
  * graph switch on (the default) refuses process start; only an explicit
@@ -892,7 +892,7 @@ function parseRetrievalConfig(): RetrieveConfig {
   };
 }
 
-// --- Neo4j sidecar config (#70) ---
+// --- Neo4j sidecar config ---
 
 /**
  * Exported because the projection CLI names it in its own "you asked me to

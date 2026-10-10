@@ -1,6 +1,5 @@
 /**
- * 档 C arm — report-first community summaries (plans/search-mode-retrieve.md
- * T3; fin ADR-0070 "C searches community-report text with lexical and
+ * 档 C arm — report-first community summaries (fin ADR-0070 "C searches community-report text with lexical and
  * vectors in parallel"; specs/search-mode-retrieve.md assumption 4, SC4).
  *
  * Shape of the answer:

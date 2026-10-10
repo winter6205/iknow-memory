@@ -7,8 +7,7 @@
 > The production lexical carrier has moved from the Postgres `simple` FTS
 > shape described here to the Elasticsearch **precision layer**. The
 > active contract for that work is now
-> [`specs/es-precision-layer.md`](es-precision-layer.md), with execution
-> tracked in [`plans/es-precision-layer.md`](../plans/es-precision-layer.md).
+> [`specs/es-precision-layer.md`](es-precision-layer.md).
 > The SQL one-hop graph arm referenced in this spec was separately retired
 > by [`docs/runbooks/sql-graph-arm-archived.md`](../docs/runbooks/sql-graph-arm-archived.md).
 >

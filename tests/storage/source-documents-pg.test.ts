@@ -227,7 +227,7 @@ describePg("source_documents ledger (operator-console T1)", () => {
   });
 
   it("parentWindowsByChunkIds resolves 档 A child rows and omits parentless children", async () => {
-    // plans/search-mode-retrieve.md T2 (ADR-0060): the arm's child→parent
+    // specs/search-mode-retrieve.md (ADR-0060): the arm's child→parent
     // seam. Back-pointing children yield the 资料 body; a legacy child
     // without `source_doc_id` yields NO row — the INNER JOIN is what makes
     // "missing parent" a visible degradation instead of a child-only cite.

@@ -41,7 +41,7 @@ import type { RetrievedChunk, SearchOptions } from "../../src/core/types.js";
 const NOW = "2026-08-01T00:00:00.000Z";
 const DIM = 4;
 
-/** Production defaults (#69/#70). */
+/** Production defaults. */
 const CFG: RetrieveConfig = {
   w_vec: 0.7,
   w_bm25: 0.15,

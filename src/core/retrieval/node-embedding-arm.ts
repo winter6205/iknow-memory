@@ -21,7 +21,7 @@ export interface NodeEmbeddingArmDeps {
   config: RetrieveConfig;
   /**
    * Resolved `filters.entity_type` seed restriction
-   * (plans/entity-type-and-filter.md T3); absent = all types.
+   * (specs/entity-type-and-filter.md); absent = all types.
    */
   entityType?: EntityType;
 }

@@ -703,7 +703,7 @@ export class ElasticsearchPrecisionLayer
 
   /**
    * Lexical entity seed search. `entityType` (resolved
-   * `filters.entity_type`, plans/entity-type-and-filter.md T3) adds a term
+   * `filters.entity_type`, specs/entity-type-and-filter.md) adds a term
    * filter on the projected entity `type` so the lexical half of the graph
    * arm's seed fusion cannot smuggle other types into a restricted seed set.
    */

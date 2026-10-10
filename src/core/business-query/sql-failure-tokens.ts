@@ -57,7 +57,7 @@ export const SQL_NO_MATCHING_ROWS = "sql_no_matching_rows" as const;
  *
  * Deferred rename (review M4): the oversized-row surface deserves its own
  * token, but the failure vocabulary is the seven-member cross-repo
- * agreement of fin:specs/search-mode-business-sql-contract.md §7.1, so
+ * agreement of the fin search-mode SQL contract §7.1, so
  * adding a member is gated on a fin-side spec revision, not on this module.
  */
 export const INVALID_BUSINESS_QUERY = "invalid_business_query" as const;

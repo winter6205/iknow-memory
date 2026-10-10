@@ -227,7 +227,7 @@ describe("createServer — registered tool set (T7)", () => {
   });
 
   it("tools/call retrieve search_mode=sql without a provisioned ledger answers a structured error field", async () => {
-    // plans/post322-a2-sql-slice.md T7 / spec §7.1: a SQL failure may not
+    // spec §7.1: a SQL failure may not
     // reach the host as prose. The offline server has no
     // FIN_BUSINESS_LEDGER_URL, so the `sql` 档 exits
     // `real_db_not_wired` (means *not provisioned* after A2, spec §7),
@@ -384,7 +384,7 @@ describe("createServer — registered tool set (T7)", () => {
 });
 
 /**
- * Issue #273 (producer side of the pinned wire contract): a named failure is
+ * Producer side of the pinned wire contract: a named failure is
  * classified from a STRUCTURED field of the isError text block, never from a
  * substring of the human-readable prose. Only a failure that declares one
  * changes shape; every other isError result keeps the plain text it had.
@@ -436,7 +436,7 @@ describe("createServer — named failure on the wire", () => {
 });
 
 /**
- * SQL one-hop graph arm archived off the production path (#58 / #62).
+ * SQL one-hop graph arm archived off the production path.
  *
  * `assembleRetrievalResult` runs the graph arm only when the retrieve tool
  * is handed BOTH a backend exposing `graphArmSeed` (PgvectorBackend does)
@@ -475,7 +475,7 @@ describe("buildRetrieveDeps — SQL graph arm archived (#58/#62)", () => {
 
   // The same config object that used to arrive as `graphConfig` now
   // arrives as `retrieveConfig`, which is what turns the BM25 arm on for
-  // the stock server (#66). Losing this key would silently ship a
+  // the stock server. Losing this key would silently ship a
   // vector-only server that still passes every arm-level unit test.
   it("supplies the loaded retrieval config as retrieveConfig", () => {
     const deps = buildRetrieveDeps({ embedder, storage, retrieval }, false);
@@ -638,7 +638,7 @@ describe("buildRetrieveDeps — structured reader capability gate", () => {
 });
 
 /**
- * Neo4j PPR arm wiring (#70 T4) — the mirror image of the archive above.
+ * Neo4j PPR arm wiring — the mirror image of the archive above.
  *
  * The Neo4j arm IS production, so the ranker travels whenever one was
  * built. Whether one was built is decided by `loadEnv().neo4j`, i.e. by

@@ -1,5 +1,5 @@
 /**
- * Business ledger URL configuration (plans/post322-a2-sql-slice.md T7).
+ * Business ledger URL configuration.
  *
  * `FIN_BUSINESS_LEDGER_URL` is the name the contract spec §9 uses for the
  * ledger DSN; it arrives only through the environment (or the operator

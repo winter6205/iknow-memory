@@ -1,6 +1,6 @@
 /**
  * T8 defensive contract for `extractChunk` — 5 boundary classes per
- * arthurpower:defensive-contract-validator.
+ * defensive contract validation.
  *
  *   empty      → content="" / whitespace → failed EMPTY_CHUNK, no LLM call
  *   negative   → malformed chunk.id (empty/missing) is NOT validated by

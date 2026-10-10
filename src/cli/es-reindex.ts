@@ -1,7 +1,7 @@
 /**
  * es-reindex CLI — wipe the derived ES chunk + entity indexes and re-project
  * them from the authoritative Postgres ledger (specs/es-precision-layer.md,
- * plans/es-precision-layer.md T8, docs/runbooks/es-precision-layer.md).
+ * docs/runbooks/es-precision-layer.md).
  *
  * Postgres stays the only system of record. This CLI never writes PG; it
  * walks the live ledger in keyset-paginated scans and re-bulk-projects the

@@ -11,9 +11,9 @@
  * `filters.search_mode` (检索档 lexical|graph|global|sql,
  * specs/search-mode-graph-global.md) is resolved and dispatched in this
  * handler before the arms run: missing → `graph`, outside the closed set →
- * typed INVALID_INPUT, `lexical` → the lexical child-hit/parent-body arm
- * (plans T2), `global` → the report-first community-summary arm (plans T3),
- * `sql` → the business-SQL arm (plans/post322-a2 T7): with a ledger
+ * typed INVALID_INPUT, `lexical` → the lexical child-hit/parent-body arm,
+ * `global` → the report-first community-summary arm,
+ * `sql` → the business-SQL arm: with a ledger
  * provisioned it answers `{ chunks: [], database_rows }` from one named
  * parameterized template, and without one it exits the tokened
  * `real_db_not_wired` (specs/search-mode-business-sql-contract.md §7).
@@ -25,7 +25,7 @@
  * `invalid_business_query` before a connection exists — there is no
  * defaulted window).
  *
- * `filters.entity_type` (plans/entity-type-and-filter.md T3) is resolved
+ * `filters.entity_type` (specs/entity-type-and-filter.md) is resolved
  * and stripped the same way: missing → all types, one of the closed set →
  * typed seed restriction for the graph/entity-embedding arms, anything
  * else → typed INVALID_INPUT. It is a routing control, never a chunk
@@ -194,11 +194,11 @@ export interface RetrieveDeps {
   retrieveConfig?: RetrieveConfig;
   /**
    * Opt-in config for the ARCHIVED SQL one-hop graph arm. The default
-   * server path never supplies it (#58); only tests that want the arm do.
+   * server path never supplies it; only tests that want the arm do.
    */
   graphConfig?: RetrieveConfig;
   /**
-   * Neo4j PPR ranker for the production graph arm (#70). Wired from
+   * Neo4j PPR ranker for the production graph arm. Wired from
    * `loadEnv().neo4j` at the server assembly layer, and absent when no
    * sidecar URI is configured — which skips the arm without degrading the
    * envelope (spec SC7).
@@ -261,8 +261,8 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
     }
     const stringFilters = stripped.filters;
     // Resolve the 档 before anything else so an invalid value is a typed
-    // refusal, never a degraded or empty answer (plans/search-mode-retrieve
-    // .md T1 acceptance). `search_mode` is routing, not matching: strip it
+    // refusal, never a degraded or empty answer (specs/search-mode-retrieve.md
+    // acceptance). `search_mode` is routing, not matching: strip it
     // from the exact-match filters so arms and backends never see it.
     const searchMode = parseSearchMode(stringFilters);
     if (searchMode.kind === "invalid") {
@@ -284,8 +284,8 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
         deps
       );
     }
-    // Same contract for `filters.entity_type` (plans/entity-type-and-filter
-    // .md T3): resolve before any arm runs; missing = all types, outside
+    // Same contract for `filters.entity_type` (specs/entity-type-and-filter.md):
+    // resolve before any arm runs; missing = all types, outside
     // the closed set = typed refusal, never a silent ignore. The arms see
     // only the value below — the key is stripped from the exact-match map.
     const entityTypeFilter = parseEntityTypeFilter(stringFilters);

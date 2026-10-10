@@ -7,4 +7,4 @@ iknow-memory is a graph-database-first service. The production graph capability 
 
 When a configured Neo4j fails at retrieve time, the arm fail-opens and **vector search** (plus the **precision layer** when that call succeeds) still answers with `degraded=true`. That already-shipped path is the “graph is down, retrieval continues” contract. It is not a reason to implement a ledger graph engine so a process can claim graph-ready without Neo4j.
 
-**Rejected:** treating “either engine satisfies graph” as a product boundary (PR #217 shape).
+**Rejected:** treating “either engine satisfies graph” as a product boundary.

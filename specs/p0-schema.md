@@ -2,7 +2,7 @@
 
 > Spec 1 of 3 for the P0 foundation (spec boundary decision B: schema standalone;
 > extraction+merge combined; integration+evaluation combined).
-> Upstream decisions: winter6205/iknow-memory#3 (D1–D6), #6 (Q1–Q2), #7 (Q1, Q3a, Q3b).
+> Upstream decisions: D1–D6, Q1–Q2, Q1, Q3a, Q3b.
 > Assumption gate: 26 assumptions surfaced 2026-08-05, all confirmed; items A3 / A15 / A21
 > carried into Open Questions below.
 
@@ -12,11 +12,11 @@ Pin down the concrete Postgres DDL — columns, constraints, indexes, and the
 initialization path — for the four P0 tables that carry the entity/triple layer:
 `entities`, `triples`, `entity_aliases`, `extraction_records`.
 
-Why: the shape of these tables was decided in #3 D1–D6 (schema), #6 Q1–Q2
-(entities.embedding + soft-merge columns), and #7 Q3a (extraction_records),
+Why: the shape of these tables was decided in D1–D6 (schema), Q1–Q2
+(entities.embedding + soft-merge columns), and Q3a (extraction_records),
 but the decisions deliberately left column-level detail to "downstream spec".
-Three downstream workstreams — extraction CLI (#4), canonical merge (#6),
-retrieve graph arm (#7) — all read and write these tables; they need one
+Three downstream workstreams — extraction CLI, canonical merge,
+retrieve graph arm — all read and write these tables; they need one
 authoritative DDL contract to build against.
 
 Users: implementers of the extraction+merge spec and the integration+evaluation
@@ -28,23 +28,23 @@ against a real database, and no downstream spec needs to add a column.
 
 - **ADR-0001** (`docs/adr/0001-postgres-authoritative-neo4j-projection.md`):
   Postgres is the sole system of record; Neo4j is a read-only projection;
-  **P0 code does not connect to Neo4j at all** (#3 D1, #7 Q3b).
-- **#3 D2**: entity id is UUID (opaque, merge-stable). UUID version is Open Question 1.
-- **#3 D3**: relation carried twice — `relation_raw` (free text, audit/eval fidelity)
+  **P0 code does not connect to Neo4j at all** (D1, Q3b).
+- **D2**: entity id is UUID (opaque, merge-stable). UUID version is Open Question 1.
+- **D3**: relation carried twice — `relation_raw` (free text, audit/eval fidelity)
   and `relation_norm` (vocabulary term; graph traversal keys on it). The vocabulary
-  is a git-managed code file owned by #4 D7; the DB does NOT enforce vocabulary
-  membership. `relation_norm = 'UNMAPPED'` is a legal sentinel (#4 D5).
-- **#3 D4**: `triples.source_chunk_id` is a hard FK to `chunks.id` with
+  is a git-managed code file owned by D7; the DB does NOT enforce vocabulary
+  membership. `relation_norm = 'UNMAPPED'` is a legal sentinel (D5).
+- **D4**: `triples.source_chunk_id` is a hard FK to `chunks.id` with
   ON DELETE SET NULL — knowledge outlives its source.
-- **#3 D5**: `triples.valid_window` is `tstzrange` with GiST index, filtered by `@>`;
-  chunks keep their stage-1 two-column time model (deliberate asymmetry, #3 D5 rationale).
-- **#3 D6**: Neo4j projection shape is documented here for P1 reference only;
+- **D5**: `triples.valid_window` is `tstzrange` with GiST index, filtered by `@>`;
+  chunks keep their stage-1 two-column time model (deliberate asymmetry, D5 rationale).
+- **D6**: Neo4j projection shape is documented here for P1 reference only;
   no runtime artifact in P0.
-- **#6 Q1–Q2**: `entities.embedding` column (merge input + graph-arm entity linking,
+- **Q1–Q2**: `entities.embedding` column (merge input + graph-arm entity linking,
   one vector two consumers); soft merge via `merged_into` pointer + `retired` flag.
-- **#7 Q3a**: `extraction_records` is chunk-level rows with `batch_id` aggregation key
+- **Q3a**: `extraction_records` is chunk-level rows with `batch_id` aggregation key
   (no separate batch rows — P0d prototype verdict item 7).
-- **#7 Q1**: retrieve graph arm reads Postgres JOINs only in P0; index set below
+- **Q1**: retrieve graph arm reads Postgres JOINs only in P0; index set below
   must serve one-hop triple lookup + `@>` time slice + entity linking.
 
 ## Glossary
@@ -170,12 +170,12 @@ Good output example — a passing FK-behavior test:
 
 | column           | type          | constraint                                                       | rationale                                                              |
 | ---------------- | ------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `id`             | `uuid`        | PK                                                               | #3 D2; version per Open Question 1                                     |
+| `id`             | `uuid`        | PK                                                               | D2; version per Open Question 1                                     |
 | `canonical_name` | `text`        | NOT NULL                                                         | display + L0 merge lookup                                              |
 | `type`           | `text`        | NOT NULL, CHECK IN (`'person'`,`'concept'`,`'system'`,`'event'`) | closed set in P0; extending = Ask-first DDL change                     |
-| `embedding`      | `vector(N)`   | nullable                                                         | N = chunks embedding dim (single embedder, #6 Q1); no HNSW index in P0 |
+| `embedding`      | `vector(N)`   | nullable                                                         | N = chunks embedding dim (single embedder, Q1); no HNSW index in P0 |
 | `metadata`       | `jsonb`       | nullable, default `'{}'`                                         | open-ended attributes                                                  |
-| `merged_into`    | `uuid`        | nullable, FK → entities(id) ON DELETE SET NULL                   | #6 Q2 soft merge; SET NULL preserves rollback when survivor deleted    |
+| `merged_into`    | `uuid`        | nullable, FK → entities(id) ON DELETE SET NULL                   | Q2 soft merge; SET NULL preserves rollback when survivor deleted    |
 | `retired`        | `boolean`     | NOT NULL DEFAULT false                                           | fast liveness filter without chasing merged_into                       |
 | `created_at`     | `timestamptz` | NOT NULL DEFAULT now()                                           | audit                                                                  |
 
@@ -185,13 +185,13 @@ Invariant (enforced in app layer, spec 2): `retired = true` ⇔ `merged_into IS 
 
 | column       | type          | constraint                                                 | rationale                                                   |
 | ------------ | ------------- | ---------------------------------------------------------- | ----------------------------------------------------------- |
-| `id`         | `uuid`        | PK                                                         | row identity for deterministic unmerge (#6 P0c known limit) |
+| `id`         | `uuid`        | PK                                                         | row identity for deterministic unmerge (P0c known limit) |
 | `entity_id`  | `uuid`        | NOT NULL, FK → entities(id) ON DELETE CASCADE              | aliases die with their entity                               |
 | `alias`      | `text`        | NOT NULL                                                   | surface form                                                |
 | `alias_type` | `text`        | NOT NULL, CHECK IN (`'name'`,`'variant'`,`'abbreviation'`) | glossary: alias types                                       |
 | `created_at` | `timestamptz` | NOT NULL DEFAULT now()                                     | audit                                                       |
 
-No `embedding` column — entity-linking vectors live on `entities` only (#6 Q1,
+No `embedding` column — entity-linking vectors live on `entities` only (Q1,
 confirmed A10).
 
 ### triples
@@ -201,16 +201,16 @@ confirmed A10).
 | `id`              | `uuid`        | PK                                             |                                                                        |
 | `head_id`         | `uuid`        | NOT NULL, FK → entities(id) ON DELETE RESTRICT | merge retires, never deletes                                           |
 | `tail_id`         | `uuid`        | NOT NULL, FK → entities(id) ON DELETE RESTRICT | same                                                                   |
-| `relation_raw`    | `text`        | NOT NULL                                       | #3 D3 fidelity (audit/eval)                                            |
-| `relation_norm`   | `text`        | NOT NULL                                       | #3 D3; `'UNMAPPED'` sentinel legal; vocabulary enforced in app (#4 D7) |
+| `relation_raw`    | `text`        | NOT NULL                                       | D3 fidelity (audit/eval)                                            |
+| `relation_norm`   | `text`        | NOT NULL                                       | D3; `'UNMAPPED'` sentinel legal; vocabulary enforced in app (D7) |
 | `confidence`      | `real`        | NOT NULL, CHECK 0..1                           |                                                                        |
-| `source_chunk_id` | `uuid`        | nullable, FK → chunks(id) ON DELETE SET NULL   | #3 D4                                                                  |
-| `valid_window`    | `tstzrange`   | NOT NULL                                       | #3 D5; `[from, until)`, null upper bound = forever                     |
+| `source_chunk_id` | `uuid`        | nullable, FK → chunks(id) ON DELETE SET NULL   | D4                                                                  |
+| `valid_window`    | `tstzrange`   | NOT NULL                                       | D5; `[from, until)`, null upper bound = forever                     |
 | `created_at`      | `timestamptz` | NOT NULL DEFAULT now()                         |                                                                        |
 
 No DB-level dedup key in P0 (see Open Question 2). The semantic dedup key
 `(head_id, relation_norm, tail_id)` + valid_window overlap is enforced at the
-extraction write layer (#4 D6) in spec 2.
+extraction write layer (D6) in spec 2.
 
 ### extraction_records
 
@@ -219,7 +219,7 @@ extraction write layer (#4 D6) in spec 2.
 | `id`             | `uuid`        | PK                                                        |                                                         |
 | `batch_id`       | `uuid`        | NOT NULL                                                  | aggregation key; no separate batch rows (P0d verdict 7) |
 | `chunk_id`       | `uuid`        | nullable, FK → chunks(id) ON DELETE SET NULL              | mirrors D4                                              |
-| `status`         | `text`        | NOT NULL, CHECK IN (`'pending'`,`'succeeded'`,`'failed'`) | #4 D4 failure-queryable                                 |
+| `status`         | `text`        | NOT NULL, CHECK IN (`'pending'`,`'succeeded'`,`'failed'`) | D4 failure-queryable                                 |
 | `error_code`     | `text`        | nullable                                                  |                                                         |
 | `error_msg`      | `text`        | nullable                                                  |                                                         |
 | `triples_count`  | `integer`     | NOT NULL DEFAULT 0                                        |                                                         |
@@ -232,23 +232,23 @@ extraction write layer (#4 D6) in spec 2.
 
 | table                | index                                                        | serves                                                            |
 | -------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------- |
-| `triples`            | GiST (`valid_window`)                                        | `@>` point + overlap queries (#3 D5)                              |
-| `triples`            | btree (`head_id`), btree (`tail_id`)                         | one-hop graph arm JOIN (#7 Q1)                                    |
-| `triples`            | btree (`source_chunk_id`)                                    | provenance back-map, idempotency scans (#4 D6)                    |
-| `triples`            | btree (`relation_norm`)                                      | UNMAPPED review CLI (#4 D7)                                       |
-| `entities`           | btree (`canonical_name`)                                     | L0 merge lookup support (#6)                                      |
+| `triples`            | GiST (`valid_window`)                                        | `@>` point + overlap queries (D5)                              |
+| `triples`            | btree (`head_id`), btree (`tail_id`)                         | one-hop graph arm JOIN (Q1)                                    |
+| `triples`            | btree (`source_chunk_id`)                                    | provenance back-map, idempotency scans (D6)                    |
+| `triples`            | btree (`relation_norm`)                                      | UNMAPPED review CLI (D7)                                       |
+| `entities`           | btree (`canonical_name`)                                     | L0 merge lookup support                                           |
 | `entity_aliases`     | UNIQUE (`entity_id`, `alias`)                                | no duplicate alias per entity                                     |
-| `entity_aliases`     | btree (`alias`)                                              | cross-entity L0 alias lookup (#6 L0)                              |
-| `extraction_records` | btree (`chunk_id`), (`batch_id`), (`status`), (`created_at`) | listFailed / batch aggregate / cleanup (#7 Q3a, P0d verdicts 5–6) |
+| `entity_aliases`     | btree (`alias`)                                              | cross-entity L0 alias lookup                                      |
+| `extraction_records` | btree (`chunk_id`), (`batch_id`), (`status`), (`created_at`) | listFailed / batch aggregate / cleanup (Q3a, P0d verdicts 5–6) |
 
 No HNSW on `entities.embedding` in P0 (data volume; Ask-first to add later).
 
-### P1 reference only — Neo4j projection shape (#3 D6, no runtime in P0)
+### P1 reference only — Neo4j projection shape (D6, no runtime in P0)
 
 Node `(:Entity {id, canonical_name, type})` — no embedding. Edge
 `[:RELATION {relation_norm, confidence, valid_from, valid_until}]`. Chunks do
 not enter the graph. Sync mechanism (leading candidate: outbox) and
-read-your-writes: P1 (#7 Q3b/Q3c).
+read-your-writes: P1 (Q3b/Q3c).
 
 ## Testing Strategy
 
@@ -294,7 +294,7 @@ Binary — each maps to a command + expected output:
 ## Open Questions
 
 All three Open Questions were resolved on 2026-08-06 at the writing-plans
-handoff (T1 of `plans/p0-schema.md`). Recorded here so downstream specs do
+handoff. Recorded here so downstream specs do
 not re-litigate them:
 
 1. **UUID version (A3) — RESOLVED: `uuid v4`.** Node's built-in
@@ -308,7 +308,7 @@ not re-litigate them:
 2. **DB-layer dedup for triples (A15) — RESOLVED: app-level only.** No
    unique index, no exclusion constraint at the DB layer. The semantic
    dedup key `(head_id, relation_norm, tail_id)` + `valid_window` overlap
-   is enforced at the extraction write layer in spec 2 (#4 D6). The P0b
+   is enforced at the extraction write layer in spec 2 (D6). The P0b
    V4 known limitation (deleted chunk → orphan triple absorbs a
    re-extracted duplicate and drops the new chunk's provenance) is
    inherited by spec 2 and is spec 2's responsibility to address.

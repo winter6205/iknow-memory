@@ -275,7 +275,7 @@ policy is documented here only:
 The exact mechanism (DELETE vs archive table vs PG partition) is **out of scope
 for spec-3** and is owned by the spec-2 runbook (see
 `docs/runbooks/extraction-smoke.md`). The full host-harness acceptance gate for
-this path lives in winter6205/iknow#49 (T-007); spec-3 owns the data path +
+this path lives under T-007; spec-3 owns the data path +
 runbook and does not reopen T-007.
 
 ---

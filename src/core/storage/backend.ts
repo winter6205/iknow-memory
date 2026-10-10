@@ -50,9 +50,9 @@ import type {
  * implementations.
  *
  * Two seams, one per graph arm, because they ask the ledger different
- * questions: `graphArmSeed` traverses `triples` in SQL (archived, #58),
+ * questions: `graphArmSeed` traverses `triples` in SQL (archived),
  * while `neo4jArmSeed` only maps entity ids the graph engine already
- * ranked back onto chunks (#70).
+ * ranked back onto chunks.
  */
 export interface StructuredPublicationBackend extends StorageBackend {
   /** Optional atomic accepted-structured-corpus publication capability. */
@@ -182,7 +182,7 @@ export function supportsParentWindows(
 
 /**
  * Runtime narrowing for 档 C's community_index_state readiness seam
- * (plans/search-mode-retrieve.md T3). The C arm FAILS CLOSED without it:
+ * (specs/search-mode-retrieve.md). The C arm FAILS CLOSED without it:
  * missing evidence of readiness is not readiness.
  */
 export function supportsCommunityIndexState(

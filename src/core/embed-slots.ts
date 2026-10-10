@@ -1,6 +1,6 @@
 /**
  * Embedding generation rotate T2 — the dual-write slot embed helper
- * (specs/embedding-generation.md, plans/embedding-generation.md T2).
+ * (specs/embedding-generation.md).
  *
  * While a rotate is OPEN in `dual_write` mode every persisted vector must
  * exist in BOTH generations: each physical slot column holds a vector

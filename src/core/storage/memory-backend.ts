@@ -518,7 +518,7 @@ export class MemoryBackend
   }
 
   /**
-   * 档 A child→parent window lookup (plans/search-mode-retrieve.md T2):
+   * 档 A child→parent window lookup (specs/search-mode-retrieve.md):
    * resolves each child chunk's back-pointer to its 资料 row. A child
    * without `source_doc_id` (legacy row) or whose 资料 row is gone yields
    * NO row — the caller must degrade rather than cite the child alone.
@@ -543,7 +543,7 @@ export class MemoryBackend
   }
 
   /**
-   * 档 C readiness singleton write (plans/search-mode-retrieve.md T3).
+   * 档 C readiness singleton write (specs/search-mode-retrieve.md).
    * Mirrors the CLI's swap: `null` clears the row (no job ever ran).
    */
   async setCommunityIndexState(

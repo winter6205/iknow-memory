@@ -1,5 +1,5 @@
 /**
- * 档 D (sql) arm contract tests — fin:plans/post322-a2-sql-slice.md T7.
+ * 档 D (sql) arm contract tests.
  *
  * The arm is the row's wire home: a provisioned ledger answers
  * `{ chunks: [], database_rows: [...] }` (spec §8.0 — a sibling key, never
@@ -7,8 +7,7 @@
  * `real_db_not_wired` exit (spec §7: after A2 the token means *not
  * provisioned* only). Driven with a fake pool through the real executor,
  * so every assertion is about the arm's own behaviour and no database is
- * required. Expected row values are the literals of the committed fixture
- * `fin:tests/retrieve/fixtures/ledger/002_seed.sql` (contract C-2291).
+ * required. Expected row values are the literals of the committed fixture.
  */
 import { describe, expect, it } from "vitest";
 import { createRetrieveHandler } from "../../src/tools/retrieve.js";

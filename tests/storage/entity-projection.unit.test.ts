@@ -1,6 +1,6 @@
 /**
  * Entity projection — T5 SSOT (specs/es-precision-layer.md §SC-10,
- * plans/es-precision-layer.md T5, docs/runbooks/es-precision-layer.md).
+ * docs/runbooks/es-precision-layer.md).
  *
  * The precision layer's entity index mirrors Postgres, but the canonical
  * name + alias projection is the single read shape both the extract CLI

@@ -1,9 +1,8 @@
 # Spec: iknow-memory dashboard
 
-> **Status:** assumption gate = wayfinder map [#188](https://github.com/winter6205/iknow-memory/issues/188) Decisions so far (2026-09-09). ACR block below.
-> **Map:** [冻结 PR 187，重写 memory 监控看板](https://github.com/winter6205/iknow-memory/issues/188)
-> **Plan:** `plans/iknow-memory-dashboard.md`
-> **Frozen PR (do not merge):** [#187](https://github.com/winter6205/iknow-memory/pull/187) · branch `worktree-memory-dashboard-plan` is read-only对照. T1 shapes are **not** SSOT.
+> **Status:** assumption gate = wayfinder map Decisions so far (2026-09-09). ACR block below.
+> **Map:** 冻结 PR 187，重写 memory 监控看板
+> **Frozen PR (do not merge):** its branch is read-only对照. T1 shapes are **not** SSOT.
 
 ## Objective
 
@@ -19,9 +18,9 @@ Exact copy from `docs/CONTEXT.md` (not redefined here):
 
 - **iknow-memory**, **MCP tool**, **host**, **iknow-memory dashboard**, **chunk**, **entity**, **authoritative source**, **Neo4j sidecar**, **retrieve**, **degraded=true**, **valid_window**
 
-## Confirmed assumptions (gate · wayfinder #188)
+## Confirmed assumptions (gate)
 
-1. Do not merge PR 187. Branch `worktree-memory-dashboard-plan` is对照 only. T1 11-endpoint JSON pins are not inherited.
+1. Do not merge the frozen PR. Its branch is对照 only. T1 11-endpoint JSON pins are not inherited.
 2. One core, two facades: stdio **MCP tool**s and thin HTTP. HTTP does not `tools/call`.
 3. No parallel SQL and no parallel process boot (no second embedder/ES/Neo4j stack copied beside MCP). Missing core read surfaces are added on **core**, not in a dashboard-only query file.
 4. Graph canvas reads the Neo4j **read-only projection**. Entity / **chunk** / timeline read Postgres (**authoritative source**). Retrieve uses `assembleRetrievalResult`.
@@ -71,7 +70,7 @@ Binary; each maps to a command or measurable check.
 7. **Read-only:** no maintenance POST (or equivalent write) registered. Check: router test 404/405.
 8. **Theme:** default 冷墨; control switches 晨纸 (CSS variables). Fonts are Playfair Display, Space Grotesk, Fira Code. Check: CSS tokens present; visual check against `docs/wayfinder/prototypes/iknow-memory-palette-193.html` sections 冷墨 / 晨纸.
 9. **Existing suite:** `npm run typecheck` and `npm test` exit 0 (existing skips unchanged).
-10. **No 187 merge:** this work is a new branch from `main`, not a rebase of `worktree-memory-dashboard-plan` as the implementation trunk.
+10. **No frozen-PR merge:** this work is a new branch from `main`, not a rebase of that frozen branch as the implementation trunk.
 
 ## Open Questions
 
@@ -91,7 +90,7 @@ Binary; each maps to a command or measurable check.
 
 - New operator surface: thin HTTP + `dashboard/` SPA (not a new MCP tool).
 - New core **read** methods only if current `StorageBackend` cannot satisfy list/count/timeline without dashboard-local SQL.
-- 待写入: (none — glossary flushed on #198)
+- 待写入: (none — glossary flushed)
 
 ## ACR (spec gate · 2026-09-09)
 

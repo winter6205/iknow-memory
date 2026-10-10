@@ -1,7 +1,7 @@
 /**
  * Retrieve ablation CLI — score the eight-key capability matrix and write
  * a git-trackable ablation report (specs/es-precision-layer.md SC-7,
- * plans/es-precision-layer.md T6, specs/retrieval-stack.md §B1 ablation
+ * specs/retrieval-stack.md §B1 ablation
  * matrix row).
  *
  * The matrix is fixed and lives entirely in `core/eval/ablation-matrix.ts`

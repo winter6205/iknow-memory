@@ -1,16 +1,15 @@
 # Spec: Neo4j Projection + True Graph Arm
 
 > **Status:** draft → ACR gate in this file (§Architecture Change Reviewer).
-> **Source tickets:** winter6205/iknow-memory#70 (impl), #69 (grilling CLOSED), #57 (route), ADR-0001 / #3 D1·D6 / #7 Q3b.
-> **Wayfinder parent:** winter6205/iknow-memory#1.
+> **Source tickets:** ADR-0001 / D1·D6 / Q3b.
 > **Predecessor:** `specs/bm25-retrieve.md` (production = vector+BM25; SQL graph arm archived).
-> **Assumption gate:** treated as **confirmed by #69 HITL grilling** (2026-08-26) — forks below are not re-opened.
+> **Assumption gate:** treated as **confirmed by HITL grilling** (2026-08-26) — forks below are not re-opened.
 
 ## Objective
 
 Ship the next retrieve stop after BM25: **Postgres → Neo4j read-only projection** (outbox + backfill) and a **true graph recall arm** (entity seed → Neo4j GDS **PPR** → chunks via Postgres `source_chunk_id`) fused into production **RRF** as a third arm.
 
-**Who uses it:** MCP hosts calling `retrieve`; operators running extract + projection CLIs; implementers following `plans/neo4j-graph-arm.md`.
+**Who uses it:** MCP hosts calling `retrieve`; operators running extract + projection CLIs.
 
 **Success looks like:**
 
@@ -23,29 +22,29 @@ Ship the next retrieve stop after BM25: **Postgres → Neo4j read-only projectio
 
 Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here. Spec **Changes** / plan **待写入** will refresh stage lines after ship:
 
-- **Neo4j sidecar** — read-only projection engine; never SoR (ADR-0001 / #3 D1).
+- **Neo4j sidecar** — read-only projection engine; never SoR (ADR-0001 / D1).
 - **PPR (Personalized PageRank)** — query-anchored multi-hop traversal via Neo4j GDS.
 - **hybrid retrieval** / **RRF fusion (k=60)** / **BM25** / **vector search** / **degraded=true** / **RetrieveConfig** — as in CONTEXT (weights and graph defaults change under this contract).
 - **graph arm** — today means the **archived SQL one-hop** path. This spec adds a distinct production arm backed by Neo4j (see Inherits/Changes and 待写入 term **Neo4j graph arm**).
 - **chunk**, **entity**, **triple**, **valid_window** / **valid_at**, **retrieve**, **extract_triples** — as in CONTEXT.
 - **projection outbox** — new term (待写入): transactional intent log for ledger→Neo4j sync.
 
-## Confirmed assumptions (gate · from #69)
+## Confirmed assumptions (gate)
 
-1. Artifacts this PR: `specs/neo4j-graph-arm.md` + `plans/neo4j-graph-arm.md` (+ CONTEXT persist for decided morphology). Implementation follows plan bullets / #70.
+1. Artifacts this PR: `specs/neo4j-graph-arm.md` (+ CONTEXT persist for decided morphology).
 2. Stack: TS strict ESM · Node ≥20 · Vitest · existing `pg.Pool` / `StorageBackend`. **Neo4j JavaScript driver** is an allowed new runtime dependency for projection + PPR clients (not LangGraph, not a second SoR).
-3. Authority: Postgres ledger SoR; Neo4j read-only projection; node `{id,canonical_name,type}` (no embedding); edges carry `relation_norm` + confidence + valid bounds; **chunks do not enter Neo4j** (ADR-0001 / #3 D6).
+3. Authority: Postgres ledger SoR; Neo4j read-only projection; node `{id,canonical_name,type}` (no embedding); edges carry `relation_norm` + confidence + valid bounds; **chunks do not enter Neo4j** (ADR-0001 / D6).
 4. Sync mechanism: **transactional outbox** (+ async/CLI projector) + **full backfill**; phased delivery allowed (**reconcile/backfill CLI first**, then outbox drain) without changing the locked mechanism.
 5. Write touchpoint for outbox emit: offline **extract CLI** per-chunk transaction (not MCP `ingest`).
-6. Consistency: **eventually consistent**; **no read-your-writes** in this spec (#7 Q3c remains deferred).
+6. Consistency: **eventually consistent**; **no read-your-writes** in this spec (Q3c remains deferred).
 7. Retrieve path: embed once → entity **seeds** (reuse archived SQL arm’s linking _idea_; implementation may share helpers without re-enabling SQL JOIN fusion) → Neo4j GDS **PPR** → map ranked entities to chunks via Postgres `source_chunk_id` → RRF third arm. **No LangGraph.**
 8. Defaults: `w_vec=0.7`, `w_bm25=0.15`, `w_graph=0.15`; Neo4j graph arm **enabled by default** when Neo4j is configured; Ask-first to change defaults post-ship.
 9. Failure / absence:
    - Neo4j **URI/config absent** → do **not** attempt the arm. ~~Envelope stays non-degraded for that reason alone.~~ **Superseded (C-6, `specs/retrieval-stack.md` §B3 rule 1):** the arm is on by default, so a missing URI means it could not be attempted → set `degraded=true` and name graph multi-hop in `degraded_reasons`. Other arms still return.
    - Neo4j **configured** but call/projection errors → **fail-open**; set `degraded=true`; vector+BM25 still returned.
 10. Content without entities/triples: graph arm contributes nothing; vector+BM25 remain the path (hybrid, not graph-only).
-11. `triples.confidence` may project onto edges; **must not** become the primary graph ranking algorithm (#57).
-12. Out of this ship: SQL fake-graph product arm (map **Out of scope** #57 — do not restate as ticket non-goal); #15 eval; node-level embedding; Louvain; causal edges; mode bundle; locking GDS hyperparameters as immutable.
+11. `triples.confidence` may project onto edges; **must not** become the primary graph ranking algorithm.
+12. Out of this ship: SQL fake-graph product arm; eval; node-level embedding; Louvain; causal edges; mode bundle; locking GDS hyperparameters as immutable.
 13. Tests: `npm test` green without live Neo4j; MemoryBackend does **not** require Neo4j; ≥1 real Neo4j integration (or documented loud-skip) for backfill/PPR when available; no real LLM required for retrieve tests.
 14. Prior fence `rg -il neo4j dist/` **empty** is **retired** for this feature: Neo4j client code may appear under projector/retrieve surfaces; isolation rules still forbid iknow runtime imports and still keep MemoryBackend/Neo4j-free unit paths green.
 
@@ -56,7 +55,7 @@ Exact copy / stage notes from `docs/CONTEXT.md` (SSOT) — not redefined here. S
   2. Production retrieve third arm: seed → PPR → chunks → RRF with defaults above; `graphEnabled`-class switch; fail-open on configured failure, and `degraded` on a missing URI per the superseded rule above (C-6, `specs/retrieval-stack.md` §B3).
   3. Config + CONTEXT stage refresh for hybrid weights and Neo4j arm morphology.
 - **Confirms with human:** changing default weights after ship; hard-deleting archived SQL `graph-arm.ts`; requiring Neo4j in CI as non-skippable; choosing a specific GDS PPR hyperparameter set as the forever default.
-- **Out of this spec:** map-level Out of scope SQL fake-graph productization; #15; node embedding; Louvain; causal edges; mode bundle; read-your-writes; MCP dual-write to Neo4j; LangGraph orchestration.
+- **Out of this spec:** map-level Out of scope SQL fake-graph productization; node embedding; Louvain; causal edges; mode bundle; read-your-writes; MCP dual-write to Neo4j; LangGraph orchestration.
 
 ## Success Criteria
 
@@ -78,13 +77,13 @@ Binary; each maps to a command or measurable check.
 
 ## Open Questions
 
-(none) for product forks — closed by #69. Implementer headroom (exact outbox DDL, driver package version, GDS procedure names/params, whether projector is long-running worker vs CLI drain, shared seed helper vs new module) stays open under Boundaries → Confirms / headroom.
+(none) for product forks — closed by HITL grilling. Implementer headroom (exact outbox DDL, driver package version, GDS procedure names/params, whether projector is long-running worker vs CLI drain, shared seed helper vs new module) stays open under Boundaries → Confirms / headroom.
 
 ## Inherits / Changes
 
 **Inherits:**
 
-- ADR-0001 Postgres authoritative / Neo4j read-only projection; #72 Neo4j CE+GDS; #3 D6 projection shape; #7 Q3b outbox preselect (confirmed #69).
+- ADR-0001 Postgres authoritative / Neo4j read-only projection; Neo4j CE+GDS; D6 projection shape; Q3b outbox preselect (confirmed by HITL grilling).
 - Production retrieve today: vector ∥ BM25 + RRF (`specs/bm25-retrieve.md`); SQL graph arm archived off default wiring.
 - Stack & commands: TypeScript strict ESM, Node ≥20, Vitest, `npm test` / `npm run build`.
 - Fail-open envelope pattern; `RetrieveConfig` / `rrfFuse` N-arm; extract CLI as sole production ledger writer for entities/triples.
@@ -106,10 +105,10 @@ Binary; each maps to a command or measurable check.
 | Runtime       | Node ≥20                                 | `package.json#engines` |
 | Tests         | Vitest; FakeEmbedder; loud-skip Neo4j/PG | Existing               |
 | Ledger        | Postgres + pgvector                      | SoR                    |
-| Graph         | Neo4j CE + GDS (PPR)                     | #72 / #69              |
-| Sync          | Outbox + backfill/reconcile              | #69 / ADR-0001         |
-| Fusion        | Existing RRF k=60                        | #59/#62                |
-| Orchestration | In-repo retrieve assembler               | No LangGraph (#69)     |
+| Graph         | Neo4j CE + GDS (PPR)                     |                        |
+| Sync          | Outbox + backfill/reconcile              | ADR-0001               |
+| Fusion        | Existing RRF k=60                        |                        |
+| Orchestration | In-repo retrieve assembler               | No LangGraph           |
 
 ## Commands
 
@@ -147,7 +146,7 @@ bounded-context-guardian: yes — stays in capability slices (config, storage/le
 defensive-contract-validator: yes — Testing Strategy covers empty / negative / overflow / concurrent / exception; SC6–SC10 bind config and fail-open/skip observables.
 error-handling-enforcer: yes — missing URI = skip without degraded (EXIT: continue other arms); configured failure = fail-open + `degraded` (EXIT: return hybrid envelope); embed still hard-fail; config invalid → `ConfigError`; no empty-catch prescription.
 complexity-anti-drift: yes — declared split: config defaults, projection (outbox+backfill+drain), PPR arm+orchestrator, suite/docs; avoids one god-module “do all Neo4j” file by sequencing plan bullets.
-minimal-change-verifier: yes — one logical product outcome (#69/#70 Neo4j true graph into production retrieve); allows one new justified runtime dep (Neo4j driver); per-bullet 1-commit sequencing owned by `writing-plans`.
+minimal-change-verifier: yes — one logical product outcome (Neo4j true graph into production retrieve); allows one new justified runtime dep (Neo4j driver); per-bullet 1-commit sequencing owned by `writing-plans`.
 
 OVERALL: PASS — hand to `writing-plans`.
 
@@ -160,5 +159,4 @@ OVERALL: PASS — hand to `writing-plans`.
 ## Hand-off
 
 - Spec path: `specs/neo4j-graph-arm.md`
-- Next: `writing-plans` → `plans/neo4j-graph-arm.md`
-- Tracker parent: [#70](https://github.com/winter6205/iknow-memory/issues/70)
+

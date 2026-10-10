@@ -11,7 +11,7 @@
  *           (memory mode → vector-only → Success Criterion #4)
  *   Case 4  DEBUG=1 spawn of dist/index.js (pgvector, graph data seeded) →
  *           the debug payload shows vector ∥ BM25 ran and the archived SQL
- *           graph arm did not (#58 / #62)
+ *           graph arm did not
  *   Case 5  Concurrent two-CLI runCli-direct (Success Criterion #12):
  *           two distinct batch_ids appear in extraction_records, no duplicate
  *           triples. Uses `runCli` with injected FakeLLMClient + real pg.Pool
@@ -402,7 +402,7 @@ describePg("extract CLI + graph-arm subprocess e2e (T7)", () => {
 
   // ============================================================
   // Case 4: the SQL one-hop graph arm is archived off the default
-  // production path (#58 / #62, Success Criterion 1).
+  // production path (Success Criterion 1).
   //
   // The schema below holds graph data the arm WOULD traverse: three
   // entities carrying embeddings, and three triples hanging chunks off

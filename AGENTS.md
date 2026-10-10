@@ -51,3 +51,4 @@
 - 自动commit。
 - 无用户明确 `push` 授权则不执行 `git push`。
 
+## 按需查阅（SSOT 指针）

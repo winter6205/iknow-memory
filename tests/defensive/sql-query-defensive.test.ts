@@ -1,5 +1,5 @@
 /**
- * Business-query failure matrix (fin:plans/post322-a2-sql-slice.md T5).
+ * Business-query failure matrix.
  *
  * The six classes of .claude/rules/test.md over the business-query seam, all
  * against a fake pool — no live database, and no document-index machinery.

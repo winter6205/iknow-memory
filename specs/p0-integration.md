@@ -1,11 +1,10 @@
 # Spec: P0 Integration — Graph-Arm Retrieve + Extraction CLI End-to-End (spec 3 of 3)
 
 > **Status:** draft, awaiting `architecture-change-reviewer` 5-verdict gate.
-> **Source ticket:** winter6205/iknow-memory#14 T-P0-integration.
-> **Wayfinder parent:** winter6205/iknow-memory#1.
+> **Source ticket:** T-P0-integration.
 > **Predecessor specs:** `specs/p0-schema.md` (spec 1), `specs/p0-extraction.md` (spec 2).
 > **Predecessor ADRs:** `docs/adr/0001-postgres-authoritative-neo4j-projection.md`.
-> **Predecessor decisions:** wayfinder #3 (P0a), #4 (P0b), #6 (P0c), #7 (P0d), #5 (P0e).
+> **Predecessor decisions:** P0a, P0b, P0c, P0d, P0e.
 
 ## Objective
 
@@ -18,7 +17,7 @@ spec-1 or spec-2 boundaries.
 
 **Who uses it**: MCP hosts call `retrieve` and get graph-aware chunks; ops
 runs the extraction CLI out-of-band; the harness eventually runs the
-end-to-end smoke (`winter6205/iknow#49` T-007).
+end-to-end smoke (`docs/runbooks/integration-smoke.md` T-007).
 
 **Success looks like** (binary list in §Success Criteria):
 
@@ -44,9 +43,9 @@ here.
 - `hybrid retrieval` — multi-arm recall fused by RRF; **P0 实现两步：spec-3
   落地 vector + graph 双臂 + RRF (k=60) + 1:1 权重；P1 再加 BM25 / rerank / PPR。**
 - `extract_triples` — spec-2 LLM triple extraction pipeline.
-- `extraction F1` — evaluation metric (#15 ticket).
+- `extraction F1` — evaluation metric.
 - `Neo4j sidecar` — **not connected in P0**; projection sync, outbox, and
-  read-your-writes graduate to P1 per ADR-0001 + #7 Q3b/Q3c.
+  read-your-writes graduate to P1 per ADR-0001 + Q3b/Q3c.
 
 Terms introduced by this spec (graduation to `docs/CONTEXT.md` deferred to a
 domain-modeling pass after spec 3 lands):
@@ -78,7 +77,7 @@ domain-modeling pass after spec 3 lands):
 | Runtime        | Node ≥20                                                        | Matches `package.json#engines.node`.               |
 | Tests          | Vitest + `FakeEmbedder` for unit; real Postgres for integration | Matches spec-2 strategy; no real LLM in CI.        |
 | Storage        | Postgres 16 + pgvector + spec-1 schema (no change)              | ADR-0001; existing `pg.Pool` reused.               |
-| Graph engine   | **None** (no Neo4j connection in P0)                            | #7 Q1 + ADR-0001 + #1 Decisions-so-far #7 P0d Q1.  |
+| Graph engine   | **None** (no Neo4j connection in P0)                            | Q1 + ADR-0001 + Decisions-so-far P0d Q1.           |
 | LLM (CLI only) | `@anthropic-ai/sdk@0.115.0` (already pinned)                    | spec-2 §Tech Stack; CLI uses `AnthropicLLMClient`. |
 | Embedder (CLI) | existing `NineRouterEmbedder` / `FakeEmbedder`                  | No new runtime dep.                                |
 
@@ -121,7 +120,7 @@ node dist/cli/extract.js --list-unmapped
 # Recorded in docs/runbooks/integration-smoke.md (new, see §Boundaries)
 node dist/index.js                  # MCP server; manually drive via host-smoke
 node dist/cli/extract.js --batch-size 1 --since 2026-08-01T00:00:00Z
-# Then: call retrieve via host harness (winter6205/iknow#49 path) and
+# Then: call retrieve via host harness (docs/runbooks/integration-smoke.md path) and
 # assert ≥1 returned chunk has source_ref matching the ingested chunk.
 ```
 
@@ -155,13 +154,13 @@ tests/
   tools/
     retrieve-graph.test.ts           # contract test: shape unchanged, degraded added
   cli/
-    extract-e2e-graph.test.ts        # extends spec-2 #9 harness (subprocess e2e)
+    extract-e2e-graph.test.ts        # extends spec-2 harness (subprocess e2e)
   defensive/
     retrieval-defensive.test.ts      # 5 boundary classes (empty / negative /
                                      # overflow / concurrent / exception)
 docs/
   runbooks/
-    integration-smoke.md             # NEW (analog of spec-2 #10 runbook)
+    integration-smoke.md             # NEW (analog of spec-2 runbook)
 ```
 
 No new files in `src/cli/extract.ts` shape (the CLI gains no new flags; only
@@ -319,19 +318,18 @@ export interface RetrieveOutputEnvelope {
 - Any change to the `extract_triples` pipeline shape (this spec only
   _consumes_ it).
 - Changing `RetrieveConfig` defaults (`wVec`, `wGraph`, `entityLinkTopK`,
-  `candidateCap`, `graphArmFloor`) after Bootstrap (per spec-2 #5 Q3).
+  `candidateCap`, `graphArmFloor`) after Bootstrap (per spec-2 Q3).
 - Replacing the RRF k=60 / weight 1:1 with a different fusion algorithm.
 
 **Never do**:
 
-- Connect to Neo4j in P0 (ADR-0001, #7 Q1).
+- Connect to Neo4j in P0 (ADR-0001, Q1).
 - Add a new MCP tool. The host-side tool surface stays `ingest` + `retrieve`
-  only (#36 D8).
+  only (D8).
 - Open a new `pg.Pool` from `graph-arm.ts`. Reuse the injected storage
   pool.
 - Use cross-arm score calibration (MinMax / z-score / sigmoid). P0 keeps
-  RRF rank-based fusion to avoid the calibration problem (#14 ticket
-  explicitly lists this as a reason).
+  RRF rank-based fusion to avoid the calibration problem.
 - Persist any debug payload to disk; `debug` lives only in the envelope and
   is gated on `DEBUG=1`.
 - Implement multi-hop traversal (PPR), rerank, or BM25. Those are P1+.
@@ -403,13 +401,13 @@ t+1h)` and a query `valid_at = t+1h`, that triple's source chunk is NOT
 
 - ADR-0001: Postgres authoritative, Neo4j read-only projection; P0 does
   not connect to Neo4j at all.
-- #7 Q1: graph arm uses read-only Postgres JOINs (entity embedding →
+- Q1: graph arm uses read-only Postgres JOINs (entity embedding →
   triples → source_chunk_id → chunks). No new tables, no projection
   sync, no outbox, no read-your-writes in P0.
-- #7 Q3b / Q3c: projection sync + read-your-writes + idempotent
+- Q3b / Q3c: projection sync + read-your-writes + idempotent
   consumption are P1 tasks; explicitly out of scope here.
-- #5 Q2: ground-truth evaluation is filter-first; this spec ships the
-  data path, the harness ships in #15 (separate spec).
+- Q2: ground-truth evaluation is filter-first; this spec ships the
+  data path, the harness ships in a separate spec.
 - spec-1 DDL is frozen here; no Ask-first schema edits.
 - spec-2 `LLMClient` interface is frozen here; this spec only consumes
   spec-2 outputs.
@@ -437,7 +435,7 @@ are binding for T2–T8.
   `graphArmFloor`). No new `cli.retrieval.*` env namespace. Startup
   validation rejects invalid values with `ConfigError`; `tests/config.test.ts`
   key-set assertions are extended in the same change (T5).
-- **End-to-end smoke harness integration with `winter6205/iknow#49` T-007.**
+- **End-to-end smoke harness integration (T-007).**
   RESOLVED: spec-3 ships the runbook + the CLI/retrieve data path; T-007
   owns the full host harness gate. The two converge at the runbook level
   (`docs/runbooks/integration-smoke.md`); spec-3 does not reopen T-007.

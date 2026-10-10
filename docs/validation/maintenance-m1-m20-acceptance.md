@@ -2,8 +2,7 @@
 
 Records the driver `MP1` selected and bound, so a reviewer can tell a measured pass
 from a skipped or invented one. Authority: fin
-[plan](../../fin/plans/structured-corpus-maintenance.md) `MP1`, spec
-[Success Criteria](../../fin/specs/structured-corpus-maintenance.md) M1–M20.
+spec [Success Criteria](../../fin/specs/structured-corpus-maintenance.md) M1–M20.
 
 ## Selected driver
 

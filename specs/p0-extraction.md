@@ -1,8 +1,6 @@
 # Spec: P0 Extraction — LLM Triple Extraction + Canonical Entity Merge
 
-> **Spec 2 of 3** for the P0 entity/triple layer. **Blocked by spec 1** (winter6205/iknow-memory#11, `specs/p0-schema.md` / `plans/p0-schema.md` — four-table DDL: entities / triples / entity_aliases / extraction_records).
->
-> **Tracks wayfinder ticket**: winter6205/iknow-memory#13 T-P0-extraction (`wayfinder:task`, blocked by #12).
+> **Spec 2 of 3** for the P0 entity/triple layer. **Blocked by spec 1** (`specs/p0-schema.md` — four-table DDL: entities / triples / entity_aliases / extraction_records).
 
 ## Objective
 
@@ -20,38 +18,38 @@ Implement the **offline LLM triple-extraction pipeline** and the **canonical ent
 
 ## Architectural Constraints
 
-Authoritative prior decisions (refer to the wayfinder map winter6205/iknow-memory#1 `## Decisions so far` for full Resolution comments):
+Authoritative prior decisions:
 
 | Decision ID                                 | Source            | Effect on this spec                                                                                                                                                                                  |
 | ------------------------------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **#3 P0a D1** (storage authority)           | closed 2026-08-01 | Postgres authoritative for entities / triples / entity_aliases / extraction_records. Neo4j is a read-only projection (P1). This spec writes only Postgres.                                           |
-| **#3 D2** (UUID)                            | closed 2026-08-01 | All id columns = UUID v4 (resolved in spec 1 Open Question 1).                                                                                                                                       |
-| **#3 D3** (raw + norm)                      | closed 2026-08-01 | `triples.relation` is split into `relation_raw` (free text, audit) and `relation_norm` (traversal key, vocabulary-enforced in app).                                                                  |
-| **#3 D4** (source_chunk_id)                 | closed 2026-08-01 | Every triple carries `source_chunk_id` (nullable FK → chunks.id, `ON DELETE SET NULL`).                                                                                                              |
-| **#3 D5** (valid_window)                    | closed 2026-08-01 | `triples.valid_window` is `tstzrange` + GiST + `@>` containment.                                                                                                                                     |
-| **#3 D6** (Neo4j projection shape)          | closed 2026-08-01 | Out of scope for this spec — Neo4j nodes/edges not touched.                                                                                                                                          |
-| **#4 D1** (offline CLI)                     | closed 2026-08-02 | Server is unaware of extraction. CLI is an independent process.                                                                                                                                      |
-| **#4 D2** (LLMClient interface)             | closed 2026-08-02 | `LLMClient` interface + per-vendor adapter; default adapter uses `@anthropic-ai/sdk` against MiniMax M3. `FakeLLMClient` test double.                                                                |
-| **#4 D3** (per-chunk granularity)           | closed 2026-08-02 | One LLM call per chunk. Cross-chunk relations deferred to merge.                                                                                                                                     |
-| **#4 D4** (retry classification)            | closed 2026-08-02 | SDK auto-retries 429/529; we classify: 5xx/network → 3 attempts, 4xx → no retry, format → 1 retry. Mark-and-continue: failed chunk gets `extraction_records.status='failed'` and the batch proceeds. |
-| **#4 D5** (relation normalization cascade)  | closed 2026-08-02 | Exact match → synonym table → embedding similarity. `UNMAPPED` is a legal sentinel.                                                                                                                  |
-| **#4 D6** (write-layer dedup)               | closed 2026-08-02 | `(head_id, relation_norm, tail_id) + valid_window overlap` is the dedup key. No DB-layer dedup constraint.                                                                                           |
-| **#4 D7** (vocabulary governance)           | closed 2026-08-02 | Vocabulary = git-managed TS module + human review + CLI helper (e.g. `listUnmapped`). No growth automation in P0.                                                                                    |
-| **#6 Q1** (entity embedding)                | closed 2026-08-02 | `entities.embedding` column, input = `canonical_name + " \| " + description`. Merge-only use, not written to Neo4j.                                                                                  |
-| **#6 Q2** (soft merge + hierarchical gates) | closed 2026-08-02 | `entities.merged_into` column (FK → entities.id, `ON DELETE SET NULL`, roll-backable). Gates L0/L1/L2/L3.                                                                                            |
-| **#6 Q3** (hybrid algorithm)                | closed 2026-08-02 | Rule + embedding hybrid; gray zone (L3 mid band) → reject; LLM cascade deferred to future ticket.                                                                                                    |
-| **#6 Q4** (merge trigger)                   | closed 2026-08-02 | Merge = last step of the extraction pipeline, same execution context.                                                                                                                                |
-| **#6 Q5** (gray-zone logging)               | closed 2026-08-02 | Structured log on every gray-zone rejection.                                                                                                                                                         |
-| **#6 Q6** (no blocking in P0)               | closed 2026-08-02 | Merge compares against all existing entities; blocking subset interface is reserved (signature accepts `"all" \| Entity[]`).                                                                         |
+| **P0a D1** (storage authority)           | closed 2026-08-01 | Postgres authoritative for entities / triples / entity_aliases / extraction_records. Neo4j is a read-only projection (P1). This spec writes only Postgres.                                           |
+| **D2** (UUID)                            | closed 2026-08-01 | All id columns = UUID v4 (resolved in spec 1 Open Question 1).                                                                                                                                       |
+| **D3** (raw + norm)                      | closed 2026-08-01 | `triples.relation` is split into `relation_raw` (free text, audit) and `relation_norm` (traversal key, vocabulary-enforced in app).                                                                  |
+| **D4** (source_chunk_id)                 | closed 2026-08-01 | Every triple carries `source_chunk_id` (nullable FK → chunks.id, `ON DELETE SET NULL`).                                                                                                              |
+| **D5** (valid_window)                    | closed 2026-08-01 | `triples.valid_window` is `tstzrange` + GiST + `@>` containment.                                                                                                                                     |
+| **D6** (Neo4j projection shape)          | closed 2026-08-01 | Out of scope for this spec — Neo4j nodes/edges not touched.                                                                                                                                          |
+| **D1** (offline CLI)                     | closed 2026-08-02 | Server is unaware of extraction. CLI is an independent process.                                                                                                                                      |
+| **D2** (LLMClient interface)             | closed 2026-08-02 | `LLMClient` interface + per-vendor adapter; default adapter uses `@anthropic-ai/sdk` against MiniMax M3. `FakeLLMClient` test double.                                                                |
+| **D3** (per-chunk granularity)           | closed 2026-08-02 | One LLM call per chunk. Cross-chunk relations deferred to merge.                                                                                                                                     |
+| **D4** (retry classification)            | closed 2026-08-02 | SDK auto-retries 429/529; we classify: 5xx/network → 3 attempts, 4xx → no retry, format → 1 retry. Mark-and-continue: failed chunk gets `extraction_records.status='failed'` and the batch proceeds. |
+| **D5** (relation normalization cascade)  | closed 2026-08-02 | Exact match → synonym table → embedding similarity. `UNMAPPED` is a legal sentinel.                                                                                                                  |
+| **D6** (write-layer dedup)               | closed 2026-08-02 | `(head_id, relation_norm, tail_id) + valid_window overlap` is the dedup key. No DB-layer dedup constraint.                                                                                           |
+| **D7** (vocabulary governance)           | closed 2026-08-02 | Vocabulary = git-managed TS module + human review + CLI helper (e.g. `listUnmapped`). No growth automation in P0.                                                                                    |
+| **Q1** (entity embedding)                | closed 2026-08-02 | `entities.embedding` column, input = `canonical_name + " \| " + description`. Merge-only use, not written to Neo4j.                                                                                  |
+| **Q2** (soft merge + hierarchical gates) | closed 2026-08-02 | `entities.merged_into` column (FK → entities.id, `ON DELETE SET NULL`, roll-backable). Gates L0/L1/L2/L3.                                                                                            |
+| **Q3** (hybrid algorithm)                | closed 2026-08-02 | Rule + embedding hybrid; gray zone (L3 mid band) → reject; LLM cascade deferred to future ticket.                                                                                                    |
+| **Q4** (merge trigger)                   | closed 2026-08-02 | Merge = last step of the extraction pipeline, same execution context.                                                                                                                                |
+| **Q5** (gray-zone logging)               | closed 2026-08-02 | Structured log on every gray-zone rejection.                                                                                                                                                         |
+| **Q6** (no blocking in P0)               | closed 2026-08-02 | Merge compares against all existing entities; blocking subset interface is reserved (signature accepts `"all" \| Entity[]`).                                                                         |
 
 ADR references (in `docs/adr/`):
 
-- **ADR-0001** — Storage authority (Postgres authoritative, Neo4j read-only projection). _Currently on PR winter6205/iknow-memory#11 branch; will land on main via PR #11 merge. This spec is blocked by #11 so both land together._
+- **ADR-0001** — Storage authority (Postgres authoritative, Neo4j read-only projection).
 
 Cross-references:
 
 - spec 1 — `specs/p0-schema.md` (binding contract for the four tables this spec populates; see Open Questions A1, A7 below).
-- spec 3 — `specs/p0-integration.md` (planned, see winter6205/iknow-memory#14). This spec exposes a programmatic merge pipeline; spec 3 consumes entities/triples rows produced here.
+- spec 3 — `specs/p0-integration.md`. This spec exposes a programmatic merge pipeline; spec 3 consumes entities/triples rows produced here.
 
 ## Glossary
 
@@ -63,7 +61,7 @@ Terms from `docs/CONTEXT.md` (exact definitions, not redefined here):
 - **alias** — surface-form string that resolves to a canonical entity (name variant, abbreviation, spelling).
 - **canonical entity** — merged, deduplicated entity that multiple aliases and mentions resolve to.
 - **extract_triples** — P0 pipeline: LLM schema-guided triple extraction from chunk text → confidence scoring → canonical entity resolution → store. _(Note: in this spec the CLI is not an MCP tool; the glossary says "TBD" — this spec closes that TBD: CLI is the extraction trigger.)_
-- **extraction F1** — fact-level precision and recall for triple extraction, evaluated against human-annotated ground truth (closed ticket #5; implemented in ticket #15).
+- **extraction F1** — fact-level precision and recall for triple extraction, evaluated against human-annotated ground truth.
 
 Terms introduced in this spec (graduation to `docs/CONTEXT.md` deferred to a domain-modeling pass after spec 2 lands):
 
@@ -73,7 +71,7 @@ Terms introduced in this spec (graduation to `docs/CONTEXT.md` deferred to a dom
 - **merged_into** — soft-merge pointer on `entities` (nullable FK → entities.id). Survives when the merged entity is later deleted.
 - **L0/L1/L2/L3 gate** — hierarchical merge gates: L0 rule-exact, L1 type-reject, L2 description-cosine floor, L3 name+description-cosine mid threshold.
 - **mark-and-continue** — batch policy: a failed chunk does not abort the batch; `extraction_records.status='failed'` is the visible record.
-- **gray zone** — the L3 cosine band where merge-vs-reject is ambiguous. Default behavior: reject + structured log (per #6 Q5).
+- **gray zone** — the L3 cosine band where merge-vs-reject is ambiguous. Default behavior: reject + structured log (per Q5).
 
 ## Tech Stack
 
@@ -81,7 +79,7 @@ Terms introduced in this spec (graduation to `docs/CONTEXT.md` deferred to a dom
 | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | Language          | TypeScript strict ESM                                                                                                                                          | Matches spec 1 + project `tsconfig.json` strict.                                                     |
 | Runtime           | Node ≥20                                                                                                                                                       | Matches `package.json#engines.node`.                                                                 |
-| LLM client        | `@anthropic-ai/sdk` (single new runtime dep)                                                                                                                   | #4 D2 — sole default adapter, pointed at MiniMax M3 via env. SDK owns 429/529 retry + rate limiting. |
+| LLM client        | `@anthropic-ai/sdk` (single new runtime dep)                                                                                                                   | D2 — sole default adapter, pointed at MiniMax M3 via env. SDK owns 429/529 retry + rate limiting. |
 | Embedding         | existing `Embedder` interface (`src/core/embedder.ts`) — `NineRouterEmbedder` in prod, `FakeEmbedder` in tests. Dimension matches spec 1 `entities.embedding`. | Reuse, no new dep.                                                                                   |
 | Storage           | existing `pg` client + spec 1 schema                                                                                                                           | Reuse.                                                                                               |
 | Schema validation | `zod`                                                                                                                                                          | Already a dependency. Used for `ExtractionResponse` shape.                                           |
@@ -147,7 +145,7 @@ src/
       extract.ts             # extractChunk(): chunk → ExtractionResponse (validated, retries)
       normalize.ts           # relation_norm cascade: exact → synonym → embedding → UNMAPPED
       vocabulary.ts          # git-managed: ALLOWED / ALIASES / PROMPT_HINT
-      dedup.ts               # write-layer dedup (A9 + #4 D6): overlap → merge into existing row
+      dedup.ts               # write-layer dedup (A9 + D6): overlap → merge into existing row
       records.ts             # extraction_records status transitions + listFailed
       prompt.ts              # schema-guided prompt builder from vocabulary
       types.ts               # ExtractionResponse, ExtractionOutput, RetryClass, GateLevel, etc.
@@ -183,7 +181,7 @@ tests/
     fake-llm-client.ts       # canned ExtractionResponse
 ```
 
-`docs/CONTEXT.md` and `docs/adr/` are unchanged in this PR (per Assumption A17; updates land via PR #11).
+`docs/CONTEXT.md` and `docs/adr/` are unchanged in this PR (per Assumption A17).
 
 `src/index.ts`, `src/tools/`, `src/core/storage/`, `src/core/chunker.ts`, `src/core/cosine.ts`, `src/core/embedder.ts`, `src/core/errors.ts`, `src/core/types.ts` — unchanged.
 
@@ -203,7 +201,7 @@ export interface ExtractionOutput {
   relationNorm: string; // may equal 'UNMAPPED'
   tail: string;
   tailType: string;
-  description: string; // MANDATORY per #6 Q1(b); LLM client validates non-empty
+  description: string; // MANDATORY per Q1(b); LLM client validates non-empty
   evidenceSpan: string; // verbatim substring of chunk content
   confidence: number; // [0,1]
 }
@@ -257,7 +255,7 @@ Naming conventions (matching `src/core/embedder.ts`):
 - No abbreviations except standard ones (`ctx`, `cfg`, `dim`, `id`).
 - `*Error` suffix for typed error classes; no generic `Error` thrown from this spec.
 
-Comments explain **why** (per project rule), not what. Example: `// #6 Q4: merge is last step of extraction, same execution context`.
+Comments explain **why** (per project rule), not what. Example: `// Q4: merge is last step of extraction, same execution context`.
 
 **Complexity envelope** (binding, mirrors spec 1): no function in this spec's files exceeds **40 lines** (target) / cyclomatic **10** hard cap; no nesting beyond **2** levels; no function takes more than **4** parameters (use a single options object — `mergeEntitiesWithGating(incoming, candidateSet, ctx)` already does); no file exceeds **500 lines** (target) / **1000** hard cap. When a function approaches a cap, decompose it into a named helper — the L0/L1/L2/L3 gates are four sequential branches, not nested ifs.
 
@@ -271,7 +269,7 @@ Framework: **vitest** (existing). Locations above. Levels:
 | Contract           | `LLMClient` interface — `FakeLLMClient` matches real `AnthropicLLMClient` response shape exactly                                                                                                                                                                                                                                 | All `RetryClass` branches covered (5xx, 4xx, format, ok)                                           |
 | Integration        | Real Postgres 16 + spec 1 schema; `extraction_records` status round-trip; soft-merge + chain walk; dedup overlap semantics                                                                                                                                                                                                       | All four tables touched                                                                            |
 | CLI                | subprocess `spawn` of compiled `dist/cli/extract.js`; exit codes (0 success, 1 error, 2 partial); `--dry-run` and `--list-unmapped` paths                                                                                                                                                                                        | At least one full-batch happy + one failure-recovery test                                          |
-| Defensive contract | 5 boundary classes per `arthurpower:defensive-contract-validator`: empty chunk / negative (chunk_id missing, content over max) / overflow (chunk larger than LLM context window → 4xx class) / concurrent (two CLI runs against same chunks, second sees first's records) / exception (LLM SDK throws → classification + status) | All 5 classes covered for the public surface (`extractChunk`, `mergeEntitiesWithGating`, `runCli`) |
+| Defensive contract | 5 boundary classes per defensive contract validation: empty chunk / negative (chunk_id missing, content over max) / overflow (chunk larger than LLM context window → 4xx class) / concurrent (two CLI runs against same chunks, second sees first's records) / exception (LLM SDK throws → classification + status) | All 5 classes covered for the public surface (`extractChunk`, `mergeEntitiesWithGating`, `runCli`) |
 | Isolation          | `src/index.ts` must not import from `src/core/extraction/*` or `src/core/entities/merge` (per Assumption A11). Test parses the module's source AST or grep for `import .* from .*core/(extraction\|entities)`.                                                                                                                   | Single test, fail-fast                                                                             |
 
 CI: `npm test` (no real LLM calls). Real LLM smoke is documented as a manual run; recorded in PR description.
@@ -284,8 +282,8 @@ CI: `npm test` (no real LLM calls). Real LLM smoke is documented as a manual run
 - Follow existing naming (camelCase TS, snake_case SQL, `*Error` suffix).
 - Validate `chunk.content` size and presence before calling `LLMClient.extract`.
 - Use `UNMAPPED` sentinel literal only in code paths that explicitly handle it; never silently coerce.
-- Write extraction_records in the **same transaction** as the triples/entities it describes (per #4 D6 + #5 Q2).
-- Emit a structured gray-zone log entry for every merge rejection at L1/L2/L3 (per #6 Q5).
+- Write extraction_records in the **same transaction** as the triples/entities it describes (per D6 + Q2).
+- Emit a structured gray-zone log entry for every merge rejection at L1/L2/L3 (per Q5).
 - Treat `relation_norm='UNMAPPED'` as a queryable bucket; `--list-unmapped` is a first-class command.
 
 **Ask first** (any of these = new PR + new spec discussion):
@@ -294,12 +292,12 @@ CI: `npm test` (no real LLM calls). Real LLM smoke is documented as a manual run
 - Adding a new runtime dependency beyond `@anthropic-ai/sdk`.
 - Changing the `LLMClient` interface signature or adding new vendor adapters.
 - Modifying `src/index.ts`, `src/tools/*`, `src/core/storage/*`, or `src/core/chunker.ts`.
-- Adding a unique constraint, exclusion constraint, or DB-level dedup (per #4 D6 = "no DB-layer dedup").
+- Adding a unique constraint, exclusion constraint, or DB-level dedup (per D6 = "no DB-layer dedup").
 - Replacing or upgrading `zod`, `pg`, `@modelcontextprotocol/server`, or `@modelcontextprotocol/client`.
 
 **Never do**:
 
-- Import any symbol from `src/core/extraction/*` or `src/core/entities/merge` from `src/index.ts` or any `src/tools/*` file (per #7 Q2 + #36 D8).
+- Import any symbol from `src/core/extraction/*` or `src/core/entities/merge` from `src/index.ts` or any `src/tools/*` file (per Q2 + D8).
 - Make the extraction CLI an MCP tool or expose it via `tools/list`.
 - Write to Neo4j in this spec. Neo4j is a P1 concern.
 - Delete failing tests to make builds pass; lower assertion strength without operator approval (project rule).
@@ -333,28 +331,28 @@ These items are tracked for implementation reference. Items 1–7 were resolved 
 
 ### RESOLVED 2026-08-07 (T1)
 
-1. **[RESOLVED] L3 "middle threshold" — single floor or band?** → **Single floor at `0.5`** (P0c prototype verdict; band mode is the documented alternative via `MergeConfig.l3NameDescHighThreshold` / `l3NameDescLowThreshold` — switchable if #15 Bootstrap data mandates). Default pinned in `MergeConfig`.
+1. **[RESOLVED] L3 "middle threshold" — single floor or band?** → **Single floor at `0.5`** (P0c prototype verdict; band mode is the documented alternative via `MergeConfig.l3NameDescHighThreshold` / `l3NameDescLowThreshold` — switchable if Bootstrap data mandates). Default pinned in `MergeConfig`.
 2. **[RESOLVED] L2 description floor value.** → **`0.30`** (P0c prototype verdict). Default pinned in `MergeConfig.l2DescLowThreshold`.
 3. **[RESOLVED] Description minimum length for L2.** → **`8`** characters. Descriptions shorter than 8 chars skip L2 and proceed straight to L3. Default pinned in `MergeConfig.minDescriptionLength`.
 4. **[RESOLVED] `maxChainDepth` for `resolveCanonicalId`.** → **`16`** (configurable; cycle detection via visited set). Default pinned in `MergeConfig.maxChainDepth`.
-5. **[RESOLVED] L0 fast-path — add description-coherence check?** → **No** description check at L0 (keeps L0 cost=0; documented limitation). L0 fast = name exact + type same, per #6 Q3 hybrid algorithm.
+5. **[RESOLVED] L0 fast-path — add description-coherence check?** → **No** description check at L0 (keeps L0 cost=0; documented limitation). L0 fast = name exact + type same, per Q3 hybrid algorithm.
 6. **[RESOLVED] Vocabulary entry freeze timing.** → **Initial vocabulary lands with this implementation (≤36 entries).** Frozen-on date and frozen-by recorded in `src/core/extraction/vocabulary.ts` header. Growth automation deferred; `--list-unmapped` is the human-review signal.
 7. **[RESOLVED] `@anthropic-ai/sdk` version.** → **`0.115.0`** (latest stable as of 2026-08-07; verified via `npm view @anthropic-ai/sdk version`). Pinned in `package.json#dependencies`. Per Boundaries, any version bump = Ask-first.
 
 ### Still open (out of T1 scope)
 
 8. **CLI `--list-unmapped` scope.** Counts over `triples.relation_norm='UNMAPPED'` (per spec 1 schema, single table). If human-review needs `relation_raw` surface instead of relation-row count, add `--by-raw` flag in a follow-up.
-9. **Spec 1 Open Question alignment.** This spec assumes the three spec-1 Open Questions are resolved as documented in `specs/p0-schema.md` (`uuid v4`, app-level dedup, `CREATE IF NOT EXISTS`). If any of those flip during PR #11 review, this spec's retry classification + dedup key + idempotency probe may need follow-up edits.
+9. **Spec 1 Open Question alignment.** This spec assumes the three spec-1 Open Questions are resolved as documented in `specs/p0-schema.md` (`uuid v4`, app-level dedup, `CREATE IF NOT EXISTS`).
 
 ## Out of scope
 
-- **Retrieval integration** (spec 3 / winter6205/iknow-memory#14). The graph-arm code lives there; this spec only produces the data it consumes.
-- **Evaluation harness implementation** (#15 / #5 Resolution). The eval gate's three-axis + Bootstrap shape is closed; this spec lands the data the eval will measure, not the harness itself.
+- **Retrieval integration** (spec 3). The graph-arm code lives there; this spec only produces the data it consumes.
+- **Evaluation harness implementation**. The eval gate's three-axis + Bootstrap shape is closed; this spec lands the data the eval will measure, not the harness itself.
 - **Neo4j projection sync** (P1). P0 doesn't read Neo4j.
-- **Cross-chunk relation bridging**. Per-chunk granularity (#4 D3) means cross-chunk relations are resolved at the entity merge step, not at extraction. (E.g. "Alice works at Acme" in chunk 1 + "Acme is in NYC" in chunk 2 do not produce a 3-edge triple in P0.)
+- **Cross-chunk relation bridging**. Per-chunk granularity (D3) means cross-chunk relations are resolved at the entity merge step, not at extraction. (E.g. "Alice works at Acme" in chunk 1 + "Acme is in NYC" in chunk 2 do not produce a 3-edge triple in P0.)
 - **Multimodal extraction** (images, tables). Out of scope; LLM input is text only.
 - **Streaming / incremental LLM calls**. Per-chunk granularity uses request/response, not streams.
-- **Auto-promotion of `UNMAPPED` raw forms into the vocabulary**. Per #4 D7: human review + CLI helper only.
+- **Auto-promotion of `UNMAPPED` raw forms into the vocabulary**. Per D7: human review + CLI helper only.
 
 ---
 
@@ -366,7 +364,7 @@ These items are tracked for implementation reference. Items 1–7 were resolved 
 - **defensive-contract-validator — yes**. Testing Strategy enumerates all 5 boundary classes (empty / negative / overflow / concurrent / exception) for the public surface; coverage targets ≥90% line / ≥85% branch; Success Criterion #15 makes 5-class coverage binary.
 - **error-handling-enforcer — yes**. Sealed tagged unions (`ExtractionResponse`, `MergeDecision`); `*Error` suffix mandated; CLI exit codes 0/1/2 documented; input validation before LLM call; `UNMAPPED` is an explicit sentinel, never a silent coerce.
 - **complexity-anti-drift — yes**. Binding envelope pinned (function ≤ 40 lines target / cyclomatic ≤ 10 hard, nesting ≤ 2, params ≤ 4, file ≤ 500 lines target / ≤ 1000 hard); L0/L1/L2/L3 decomposition hint; Project Structure reinforces for the four hot files.
-- **minimal-change-verifier — yes**. Scope tracks ticket #13 with explicit out-of-scope list; sole new runtime dep = `@anthropic-ai/sdk` per #4 D2; spec 1's per-file envelope precedent mirrored.
+- **minimal-change-verifier — yes**. Explicit out-of-scope list; sole new runtime dep = `@anthropic-ai/sdk` per D2; spec 1's per-file envelope precedent mirrored.
 
 Hand to `writing-plans`.
 

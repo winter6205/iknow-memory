@@ -1,6 +1,6 @@
 # Elasticsearch precision layer — deployment & operation
 
-**Status:** ships with `plans/es-precision-layer.md` (T2 / T8).
+**Status:** ships with `specs/es-precision-layer.md` (T2 / T8).
 **Applies to:** production `retrieve` configured with an ES node and
 `src/core/storage/elasticsearch-precision.ts` as the lexical carrier.
 
@@ -354,8 +354,6 @@ restart iknow-es` (or the prod equivalent).
 - `specs/es-precision-layer.md` — the active contract (SC-1..10
   acceptance mapping; IK alignment; spec for `phrase` / `field_boost` /
   BM25 knobs).
-- `plans/es-precision-layer.md` — execution plan (T2 ES stack, T7
-  Postgres 词法臂摘除, T8 docs / reindex tool).
 - `docs/adr/0003-authoritative-source-and-derived-retrieval-indexes.md`
   — derived-index semantics (Postgres authoritative; ES indexes
   deletable and re-buildable).

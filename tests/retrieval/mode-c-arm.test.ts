@@ -1,5 +1,5 @@
 /**
- * 档 C arm unit tests (plans/search-mode-retrieve.md T3, fin ADR-0070,
+ * 档 C arm unit tests (fin ADR-0070,
  * specs/search-mode-retrieve.md assumption 4 + SC4).
  *
  * Contract under test: C is report-first. Community report text ES runs in

@@ -65,14 +65,14 @@ you do not need a separate migration.
 
 ## Port ownership: Compose vs a host that already runs Postgres
 
-Decision (2026-09-14, `plans/local-infra-es-dev-contract` T1): on a dev box,
+Decision (2026-09-14): on a dev box,
 **this Compose stack owns `5432` / `7687` / `9200`.** Stop any non-compose
 listener on those ports before `docker compose up`. One written set of
 addresses and credentials beats a mixed stack, and it keeps local dev on the
 same `pgvector/pgvector:pg16` family as CI.
 
-On this WSL box the system PostgreSQL 16 owns `5432` and also carries other
-local project databases. The operator stops it before
+On this WSL box the system PostgreSQL 16 owns `5432` and the same instance
+also hosts other local projects' databases. The operator stops it before
 the first `docker compose up -d --wait`:
 
 ```bash

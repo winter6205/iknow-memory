@@ -1205,7 +1205,7 @@ describe("community summary ES write leg", () => {
 });
 
 /**
- * Issue #272 through the PRODUCTION writer: the leg runs against a real
+ * Through the PRODUCTION writer: the leg runs against a real
  * `ElasticsearchPrecisionLayer` over an in-memory cluster, so what is asserted
  * is which documents a reader can actually resolve after the run — including
  * after a run whose ES write died before publishing.

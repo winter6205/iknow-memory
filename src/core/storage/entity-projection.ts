@@ -1,6 +1,6 @@
 /**
  * Entity projection — read the authoritative Postgres entity ledger
- * (specs/es-precision-layer.md T5, plans/es-precision-layer.md T5).
+ * (specs/es-precision-layer.md T5).
  *
  * Postgres remains the only system of record; this module owns the read
  * shape that the precision layer mirrors. The SQL joins `entities` to

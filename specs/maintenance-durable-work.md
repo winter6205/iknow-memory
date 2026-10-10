@@ -2,8 +2,8 @@
 
 Status: **Implemented for MP1–MP4 on `feat/maintenance-durable-work`.**
 The authority is the fin repo's
-[structured corpus maintenance spec](../../fin/specs/structured-corpus-maintenance.md)
-and [plan](../../fin/plans/structured-corpus-maintenance.md); this file records how
+[structured corpus maintenance spec](../../fin/specs/structured-corpus-maintenance.md);
+this file records how
 the durable-work slice realizes that contract inside this package.
 
 ## Objective

@@ -11,7 +11,7 @@
  *
  * The graph arm is identified by the RESULT OBJECT the orchestrator hands
  * in, never by the arm name "graph": the archived SQL one-hop arm answers
- * to the same name (#58) and must keep voting at `w_graph` rather than
+ * to the same name and must keep voting at `w_graph` rather than
  * inheriting a lead it was never granted.
  */
 import { resolveRrfK, rrfFuse } from "./rrf.js";

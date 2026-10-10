@@ -1,5 +1,5 @@
 /**
- * es-reindex CLI unit tests (plans/es-precision-layer.md T8).
+ * es-reindex CLI unit tests (specs/es-precision-layer.md).
  *
  * The CLI is a recovery tool: drop + re-create the two derived ES indexes
  * from the live Postgres ledger. Covered here, all without a live PG or

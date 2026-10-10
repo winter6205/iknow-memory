@@ -139,7 +139,7 @@ describe("retrieve node embedding path", () => {
     expect(out.degraded).toBeUndefined();
   });
 
-  // plans/entity-type-and-filter.md T3: the resolved entity type rides the
+  // specs/entity-type-and-filter.md: the resolved entity type rides the
   // assemble args down to the seed seam; absent = all types.
   it("forwards args.entityType to the entity seed seam", async () => {
     const storage = new NodeEmbeddingBackend();

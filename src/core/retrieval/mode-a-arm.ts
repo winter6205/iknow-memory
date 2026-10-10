@@ -1,6 +1,6 @@
 /**
  * 档 A arm — lexical-first on in-window children, parent window is the
- * citable body (plans/search-mode-retrieve.md T2; ADR-0060
+ * citable body (ADR-0060
  * "one window tree"; specs/search-mode-retrieve.md assumption 2, SC3).
  *
  * Shape of the answer:

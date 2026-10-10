@@ -1,6 +1,6 @@
 /**
  * Neo4j graph arm — the production graph recall path (specs/neo4j-graph-arm.md
- * T4; #70).
+ * T4).
  *
  * Three steps, two stores:
  *   1. **seed** — top-K entities nearest the query embedding, from Postgres.
@@ -55,7 +55,7 @@ export interface Neo4jGraphArmDeps {
   entityLexical?: EntityLexicalStorage;
   /**
    * Resolved `filters.entity_type` seed restriction
-   * (plans/entity-type-and-filter.md T3); absent = all types. BOTH the
+   * (specs/entity-type-and-filter.md); absent = all types. BOTH the
    * vector and the lexical seed halves honor it so a filtered seed set
    * stays closed under RRF fusion.
    */

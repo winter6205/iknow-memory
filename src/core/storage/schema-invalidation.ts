@@ -1,7 +1,6 @@
 /**
  * The evidence invalidation outbox and its per-consumer cursor: the durable,
- * content-free stream a consumer drains (ADR 0097 §2.1/§4.1; the register at
- * `plans/structured-corpus-p3-prerequisites.md` §1.1 and §1b.1).
+ * content-free stream a consumer drains (ADR 0097 §2.1/§4.1).
  *
  * Sibling of schema-bootstrap.ts rather than a fifth table inside it: this is a
  * per-consumer event contract with its own allocation semantics, and the four

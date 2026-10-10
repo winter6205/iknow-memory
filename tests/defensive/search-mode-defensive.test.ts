@@ -1,5 +1,5 @@
 /**
- * Search-mode defensive matrix (plans/search-mode-retrieve.md T4).
+ * Search-mode defensive matrix (specs/search-mode-retrieve.md).
  *
  * Five boundary classes over the `filters.search_mode` dispatch seam, all
  * against pure fake seams — no live Postgres/ES/Neo4j. Format follows

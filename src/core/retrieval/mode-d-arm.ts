@@ -1,6 +1,5 @@
 /**
- * 档 D arm — the business-SQL path (fin:plans/post322-a2-sql-slice.md T7;
- * fin:specs/search-mode-business-sql-contract.md §5–§8).
+ * 档 D arm — the business-SQL path.
  *
  * The arm is the row's wire home: a provisioned ledger answers
  * `{ chunks: [], database_rows: {schema, rows, result_count} }` (spec

@@ -1,5 +1,5 @@
 /**
- * #49 host-smoke: a real MCP Host over stdio.
+ * host-smoke: a real MCP Host over stdio.
  *
  * Proves (per wayfinder map #1 / T-007 task #79, stdio Host):
  *   (a) stdio JSON-RPC handshake: initialize / initialized under a real

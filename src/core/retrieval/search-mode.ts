@@ -1,5 +1,5 @@
 /**
- * Search-mode (检索档) wire control for retrieve — plans/search-mode-retrieve.md T1.
+ * Search-mode (检索档) wire control for retrieve — specs/search-mode-retrieve.md.
  *
  * The host (fin) assigns the 档 and passes it as `filters.search_mode`
  * ∈ lexical|graph|global|sql (specs/search-mode-graph-global.md confirmed

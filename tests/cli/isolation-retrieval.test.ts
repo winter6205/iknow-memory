@@ -2,7 +2,7 @@
  * Isolation guard for the spec-3 retrieval bounded context.
  *
  * Mirrors `tests/cli/isolation.test.ts` (spec-2) for the graph-rag retrieval
- * boundary. Per `plans/p0-integration.md` §Isolation guard: only
+ * boundary. Per `specs/p0-integration.md` §Isolation guard: only
  * `src/tools/retrieve.ts` and `src/core/retrieval/index.ts` (internal) are
  * allowed to import from `src/core/retrieval/*`. The MCP server entry
  * (`src/index.ts`), the ingest tool (`src/tools/ingest.ts`), and the offline

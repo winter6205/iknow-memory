@@ -1,9 +1,8 @@
 # Spec: Retrieve and graph quality stack
 
-> **Status:** ACR all-yes; slice 0 (temporary LLM rerank) **on main** (#118). Remaining slices T2–T11 tracked only in `plans/retrieve-graph-quality.md` (no GitHub issues).
+> **Status:** ACR all-yes; slice 0 (temporary LLM rerank) **on main**. Remaining slices T2–T11 (no GitHub issues).
 > **Source:** operator 2026-08-28 — coarse single contract (not one-question tickets); new wayfinder map for this destination; parent map remains local `docs/handoff/wayfinder-tickets/map-1.md`. Slice 8 detail: `specs/retrieve-community.md`.
 > **Predecessors:** `specs/retrieve-graph-priority.md` (Host order, on main), `specs/retrieve-rerank-llm.md` (temporary LLM rerank, on main), `specs/neo4j-graph-arm.md` (PPR arm + outbox, on main).
-> **Tracker (files):** `plans/retrieve-graph-quality.md` is SSOT for implementation slices. Do not use GitHub issues.
 > **Assumption gate:** operator chose one overview spec. Locks below are the gate; object in review or they stand.
 
 ## Objective
@@ -25,10 +24,10 @@ Exact copy from `docs/CONTEXT.md` (not redefined): **iknow-memory**, **MCP tool*
 1. This is **one** contract for the remaining in-scope stack. Implementation is still sequenced (writing-plans tracer bullets), not one commit.
 2. MCP surface stays **ingest + retrieve** (T-005 D8). Presets, evidence width, and wait flags are retrieve input and/or env, not new tools.
 3. Context assembly, JIT, query rewrite, map-reduce final answers, session traces, multi-tenant, Text2Cypher, framework adapters, and SQL graph-arm revival stay **out**.
-4. **#15 extraction F1** stays postponed (own ticket / spec). This spec uses existing **P@5** harness for retrieve order.
+4. **extraction F1** stays postponed (own spec). This spec uses existing **P@5** harness for retrieve order.
 5. Temporary Anthropic rerank is **already** `specs/retrieve-rerank-llm.md`. This spec **inherits** it as slice 0 and does not replace that file.
-6. Neighbor evidence uses **Postgres** chunks on the same `source_ref` (order by ingest sequence / created_at). Chunks **never** enter Neo4j (#3 D6).
-7. Entity embeddings used in retrieve stay on the **Postgres** entity row (already used for merge). Neo4j nodes stay without embedding properties (#3 D6).
+6. Neighbor evidence uses **Postgres** chunks on the same `source_ref` (order by ingest sequence / created_at). Chunks **never** enter Neo4j (D6).
+7. Entity embeddings used in retrieve stay on the **Postgres** entity row (already used for merge). Neo4j nodes stay without embedding properties (D6).
 8. Community detection is **Louvain** via Neo4j GDS (CONTEXT **community**). Summaries are ledger rows (Postgres), optionally projected as nodes; retrieve may return summary text as chunks with a typed metadata flag. Host still generates the user-visible answer.
 9. Causal relations are vocabulary + extract, not a new MCP tool. Fact supersession writes `superseded_by` / `valid_until` on the ledger; operator consolidate is dry-run-first.
 10. Projection stays eventually consistent by default. Optional retrieve wait-for-drain is **default off**; timeout fail-open (pre-wait ranking, `degraded=true`).
@@ -55,7 +54,7 @@ Exact copy from `docs/CONTEXT.md` (not redefined): **iknow-memory**, **MCP tool*
 - **Confirms with human:** none remaining for this contract (coarse lock). Slice order in writing-plans may be retimed without a spec rewrite if dependencies hold (0 before 1; 2 before 10; 4 before 9 apply-path).
 
 - **Out of this spec:**
-  - extraction F1 / #15 / gold-set bootstrap
+  - extraction F1 / gold-set bootstrap
   - multi-granularity chunker
   - putting chunks or entity embeddings on Neo4j nodes
   - new MCP tools, Cypher-for-the-model, Host map-reduce

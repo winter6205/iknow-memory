@@ -1,6 +1,6 @@
 /**
  * Extract-method dispatch — the version spine of T1, fast leg opened by T4
- * (plans/graph-index-standard-fast.md).
+ * (specs/graph-index-standard-fast.md).
  *
  * One 资料 version carries EXACTLY ONE extract method (spec assumption 3):
  * `standard` (LLM extraction) or `fast` (pure NLP co-occurrence).

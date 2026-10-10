@@ -3,7 +3,7 @@
 > **Status:** draft → ACR in this file.
 > **Source:** operator 2026-08-27 — temporary substitute for a dedicated rerank model is the **extract Anthropic main model** (same key/model/base URL), not the Host chat model, not a cross-encoder HTTP sidecar in this slice.
 > **Predecessor ranking:** `specs/retrieve-graph-priority.md` (Host list before rerank). This spec does **not** implement graph-priority; rerank attaches to whatever order `assembleRetrievalResult` already produces.
-> **Tracker:** local markdown (`plans/retrieve-rerank-llm.md`); GitHub issues not assumed readable from remote.
+> **Tracker:** local markdown; GitHub issues not assumed readable from remote.
 
 ## Objective
 
@@ -31,7 +31,7 @@ From `docs/CONTEXT.md`: **retrieve**, **chunk**, **rerank**, **degraded=true**, 
 
 - **Does:** config gate; retrieve-path optional LLM reorder using extract Anthropic credentials; tests for unattempted (missing token) / fail-open / identity when off; CONTEXT `rerank` stage line.
 - **Confirms with human:** ~~default-on~~ — **decided (C-3, `specs/retrieval-stack.md`)**: rerank is default on; sharing extract rate limits vs a separate key remains open.
-- **Out of this spec:** cross-encoder sidecar; Host-model rerank; graph-priority implementation; #15.
+- **Out of this spec:** cross-encoder sidecar; Host-model rerank; graph-priority implementation.
 
 ## Success Criteria
 
@@ -87,4 +87,4 @@ OVERALL: PASS — hand to `writing-plans`.
 ## Hand-off
 
 - Spec: `specs/retrieve-rerank-llm.md`
-- Plan: `plans/retrieve-rerank-llm.md`
+

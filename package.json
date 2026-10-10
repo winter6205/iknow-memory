@@ -2,7 +2,12 @@
   "name": "iknow-memory",
   "version": "0.0.0",
   "private": true,
-  "description": "GraphRAG knowledge memory backend as an MCP server (MVP stage 0 scaffold).",
+  "description": "MCP memory service with hybrid retrieval and temporal validity.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/winter6205/iknow-memory.git"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -26,9 +31,6 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint:s5": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed",
-    "lint:s5:staged": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs --changed --staged",
-    "lint:s5:all": "node $HOME/.claude/plugins/marketplaces/arthurpower-local/plugins/arthurpower/scripts/s5-complexity/check.mjs src",
     "test": "vitest run",
     "check:retrieval-baseline": "tsx scripts/check-retrieval-baseline.ts",
     "dev": "tsx src/index.ts",

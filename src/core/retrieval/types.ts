@@ -13,11 +13,11 @@ import type { DatabaseRow } from "../business-query/sql-query-types.js";
 /**
  * A retrieval arm the fusion layer understands.
  *
- * `vector` + `bm25` + `graph` are the production hybrid (#59/#70). `graph`
+ * `vector` + `bm25` + `graph` are the production hybrid. `graph`
  * names the ARM, not its engine: on production it is the Neo4j PPR arm
  * (`neo4j-graph-arm.ts`), and it is still the name the archived SQL
  * one-hop arm answers to when a caller injects a `graphConfig` explicitly
- * (#58, `docs/runbooks/sql-graph-arm-archived.md`). Only one of the two
+ * (`docs/runbooks/sql-graph-arm-archived.md`). Only one of the two
  * ever runs in a given call, so one name and one `w_graph` weight cover
  * both — the optional node-embedding arm has its own name so debug output
  * can distinguish direct Postgres ranking from Neo4j graph ranking.
@@ -443,7 +443,7 @@ export interface RankedEntity {
   /**
    * Engine relevance (PPR mass). Comparable only within one ranking, and
    * NOT the arm's fusion key: RRF fuses on rank. Carried so an operator
-   * can see why an entity surfaced (#57 — a score may be projected, it
+   * can see why an entity surfaced (a score may be projected, it
    * must not become the ranking algorithm).
    */
   score: number;
@@ -532,8 +532,8 @@ export interface NeighborChunkStorage {
 }
 
 /**
- * One child→parent resolution row for 档 A (plans/search-mode-retrieve.md
- * T2, ADR-0060). The parent body is the citable text; the child id and
+ * One child→parent resolution row for 档 A (specs/search-mode-retrieve.md,
+ * ADR-0060). The parent body is the citable text; the child id and
  * ordinal locate the hit span inside it. A chunk whose back-pointer or
  * 资料 row is missing yields NO row — the arm must then degrade, never
  * cite the child alone.
@@ -568,7 +568,7 @@ export interface ParentWindowStorage {
  *
  * The optional score is the cosine similarity calculated by Postgres. A
  * backend may omit it when it only exposes deterministic seed order.
- * `entityType` (plans/entity-type-and-filter.md T3) restricts the seed to
+ * `entityType` (specs/entity-type-and-filter.md) restricts the seed to
  * one entity type; absent = every type, byte-for-byte the old behavior.
  */
 export interface EntityEmbeddingStorage {
@@ -646,7 +646,7 @@ export interface CommunityIndexStateRow {
 }
 
 /**
- * Read seam for the C-ready state (plans/search-mode-retrieve.md T3).
+ * Read seam for the C-ready state (specs/search-mode-retrieve.md).
  *
  * Retrieve forwards the readiness verdict verbatim: absent row, non-ready
  * status, or a carried failure_code all mean 档 C is NOT ready and the arm

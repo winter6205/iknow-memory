@@ -54,7 +54,7 @@ This spec uses the English term **community** only. Do not introduce a Chinese a
   - new MCP tools, Cypher-for-the-model, community id as a new retrieve field
   - putting **chunk** text or entity embeddings on Neo4j nodes
   - PPR algorithm changes, SQL graph-arm revival
-  - extraction F1 / #15
+  - extraction F1
   - mode-bundle names and lever integers (parent T6), including which presets enable topic retrieve
   - neighbor evidence, dedicated HTTP rerank, projection GC, `merged_into`, causal / supersession, wait-for-drain
   - treating **community** as a human-curated topic taxonomy
@@ -114,4 +114,4 @@ OVERALL: PASS — hand to `writing-plans` for T9 only. Do not implement from thi
 
 - Spec: `specs/retrieve-community.md`
 - Parent slice: `specs/retrieve-graph-quality.md` slice 8
-- Plan: `plans/retrieve-community.md` (T9 internals; parent slot `plans/retrieve-graph-quality.md` T9)
+

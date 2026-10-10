@@ -1,6 +1,5 @@
 /**
- * Eval-stack CLI unit tests (specs/es-precision-layer.md SC-7,
- * plans/es-precision-layer.md T6).
+ * Eval-stack CLI unit tests (specs/es-precision-layer.md SC-7).
  *
  * The CLI surface is tested via `runCli(argv, deps)` with an injected
  * `AblationRunner` so the suite needs no embedder, no storage and no

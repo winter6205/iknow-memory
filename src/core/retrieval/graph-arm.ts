@@ -1,7 +1,7 @@
 /**
  * Graph-arm pure orchestration (spec-3 p0-integration T3).
  *
- * **ARCHIVED off the production path (#58 / #62).** The default server
+ * **ARCHIVED off the production path.** The default server
  * wiring supplies no `graphConfig`, so `assembleRetrievalResult` never
  * reaches this module: nothing here runs for an operator on the stock
  * server. It is kept compiling, and kept reachable from tests that inject
@@ -33,7 +33,7 @@ export interface GraphArmDeps {
   config: RetrieveConfig;
   /**
    * Resolved `filters.entity_type` seed restriction
-   * (plans/entity-type-and-filter.md T3); absent = all types.
+   * (specs/entity-type-and-filter.md); absent = all types.
    */
   entityType?: EntityType;
 }

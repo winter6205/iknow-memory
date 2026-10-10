@@ -101,7 +101,7 @@ function row(id: string): {
 
 describe("runGraphArm", () => {
   it("passes deps.entityType to the seed seam; absent means all types", async () => {
-    // plans/entity-type-and-filter.md T3: the resolved type rides the arm
+    // specs/entity-type-and-filter.md: the resolved type rides the arm
     // deps, never the exact-match filters.
     const typed = new FakeStorage();
     typed.seedEntities = [{ id: "e1", canonical_name: "Alice" }];

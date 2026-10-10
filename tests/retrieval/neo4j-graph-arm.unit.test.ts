@@ -169,7 +169,7 @@ describe("runNeo4jGraphArm — seed → PPR → chunks", () => {
   });
 
   it("narrows BOTH the vector and the lexical entity seed with deps.entityType", async () => {
-    // plans/entity-type-and-filter.md T3: person-only seeds means the
+    // specs/entity-type-and-filter.md: person-only seeds means the
     // lexical half cannot smuggle other types into the fusion.
     const { storage, ranker } = happyPath();
     const lexicalCalls: Array<{ entityType?: string }> = [];
@@ -353,7 +353,7 @@ describe("runNeo4jGraphArm — seed → PPR → chunks", () => {
       NOW
     );
 
-    // Projected for inspection (#57: confidence/score may be shown, must
+    // Projected for inspection (confidence/score may be shown, must
     // not become the ranking algorithm) — RRF still fuses on `rank`.
     expect(result.hits.map((h) => h.score)).toEqual([0.9, 0.5, 0.1]);
   });

@@ -1,7 +1,7 @@
 /**
  * Vitest global setup — guarantees `dist/` is fresh before any test file runs.
  *
- * Why this exists (issue #169):
+ * Why this exists:
  *   `npm test` is just `vitest run` with no build step, but many tests spawn
  *   subprocesses that assert on `dist/index.js`, `dist/cli/extract.js`, etc.
  *   The build → test dependency was previously encoded ONLY in

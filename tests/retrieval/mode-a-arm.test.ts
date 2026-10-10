@@ -1,5 +1,5 @@
 /**
- * 档 A arm unit tests (plans/search-mode-retrieve.md T2, ADR-0060).
+ * 档 A arm unit tests (specs/search-mode-retrieve.md, ADR-0060).
  *
  * Contract under test: A is lexical-first over in-window children, and a
  * child hit contributes the PARENT (抽图窗) body as the citable

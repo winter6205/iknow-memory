@@ -10,14 +10,14 @@
  *   - **vector** always runs; its failure is released only when another
  *     eligible arm succeeds, otherwise the call returns a typed error.
  *   - **BM25** runs when `retrieveConfig.bm25Enabled` is set and the backend
- *     implements the lexical seam. This is the production partner arm (#59).
+ *     implements the lexical seam. This is the production partner arm.
  *   - **graph** runs when `retrieveConfig.graphEnabled` is set, a
  *     `graphRanker` was wired (i.e. a Neo4j sidecar is configured) and the
  *     backend implements the `neo4jArmSeed` seam. That is the production
- *     third arm (#70). The ARCHIVED SQL one-hop arm answers to the same
+ *     third arm. The ARCHIVED SQL one-hop arm answers to the same
  *     name and runs only when a caller passes `graphConfig` explicitly and
  *     the Neo4j arm is not active — the default server wiring passes no
- *     `graphConfig` (#58, `docs/runbooks/sql-graph-arm-archived.md`).
+ *     `graphConfig` (`docs/runbooks/sql-graph-arm-archived.md`).
  *   - **node embedding** optionally seeds and scores entities from the
  *     Postgres ledger, then maps them directly to chunks.
  *
@@ -118,7 +118,7 @@ export interface AssembleArgs {
   filters?: Record<string, string>;
   /**
    * Resolved `filters.entity_type` seed restriction
-   * (plans/entity-type-and-filter.md T3). Like `search_mode` this is a
+   * (specs/entity-type-and-filter.md). Like `search_mode` this is a
    * routing control the handler resolves and strips: arms see only this
    * typed value, never the filter key. Absent → all types.
    */
@@ -146,7 +146,7 @@ export interface AssembleArgs {
  * `retrieveConfig` carries the production hybrid knobs (BM25 weight and
  * enable switch). `graphConfig` is separate and opt-in: supplying it is
  * the only way to run the archived SQL graph arm, which is why the
- * default server wiring omits it (#58).
+ * default server wiring omits it.
  */
 export interface AssembleDeps {
   embedder: EmbeddingClient;

@@ -1,6 +1,6 @@
 # Spec: MCP tool surface and round boundaries
 
-> **Status:** ACR PASS 2026-09-05 (lift patch). Persist flushed. Plan: `plans/mcp-tool-surface.md`.
+> **Status:** ACR PASS 2026-09-05 (lift patch). Persist flushed.
 > **Assumption gate:** boundaries 2026-09-05; catalog 2026-09-05 (operator accepted the 5-tool list).
 > **Depends on:** `specs/graph-rerank-boot-and-evidence.md` (first slice). This spec is the **second slice**.
 > **G4 read-source amendment:** `specs/bounded-source-read.md` replaces this file's historical one-call full-body `read_source` response with bounded, resumable slices. The stored full-body **资料** authority and the named missing/invalidated exits remain.
@@ -222,5 +222,4 @@ OVERALL: PASS — hand to `writing-plans`.
 ## Hand-off
 
 - Spec path: `specs/mcp-tool-surface.md`
-- Plan path: `plans/mcp-tool-surface.md`
 - Do not mix first-slice boot/evidence commits into this plan.

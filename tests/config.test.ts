@@ -88,7 +88,7 @@ const JEV_VARS = [
 ] as const;
 
 /**
- * The GRAPHRAG_MEMORY_NEO4J_* family (#70 T1). Scrubbed wherever the
+ * The GRAPHRAG_MEMORY_NEO4J_* family. Scrubbed wherever the
  * Neo4j block is under assertion so an operator's live sidecar
  * credentials cannot turn a "not configured" case into a configured one.
  */
@@ -927,10 +927,10 @@ describe("loadEnv — embedding API key resolution", () => {
 });
 
 /**
- * Hybrid retrieval knobs (#59 / #64 / #70).
+ * Hybrid retrieval knobs.
  *
  * Production retrieve fuses vector + BM25 + the Neo4j graph arm at
- * 0.7 / 0.15 / 0.15, with both partner arms on by default (#69/#70 —
+ * 0.7 / 0.15 / 0.15, with both partner arms on by default (
  * `w_graph` steers production again). Every invalid value must abort at
  * startup with a `ConfigError` naming the offending var rather than
  * silently falling back to a default — an operator who typo'd a weight
@@ -1480,7 +1480,7 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
 });
 
 /**
- * Neo4j sidecar connection block (#70 T1).
+ * Neo4j sidecar connection block.
  *
  * These tests pin the parse-level contract: everything an operator DID
  * declare must either be usable or refuse to start — a URI with an

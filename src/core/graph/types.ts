@@ -22,7 +22,7 @@ export interface GraphNode {
 /**
  * A projected triple. `validFrom` / `validUntil` are ISO-8601 strings (null
  * upper bound = forever, matching the ledger's tstzrange), `confidence` rides
- * along for inspection but must not become the graph ranking algorithm (#57).
+ * along for inspection but must not become the graph ranking algorithm.
  */
 export interface GraphEdge {
   id: string;

@@ -1,5 +1,5 @@
 /**
- * The business-query executor (fin:specs/search-mode-business-sql-contract.md
+ * The business-query executor (the fin search-mode SQL contract
  * §1.1, §5, §6, §7).
  *
  * iknow owns the credential, runs one named parameterized template, and lets
@@ -138,7 +138,7 @@ function projectRow(
   // A row with no key cannot be cited, so it cannot ship. The drop is
   // defense in depth, not a live branch: `contract_id` is the base table's
   // PRIMARY KEY and the view projects it directly
-  // (fin:tests/retrieve/fixtures/ledger/001_schema.sql), so a real ledger
+  // so a real ledger
   // cannot produce a null key. If the view DDL ever relaxes that, this
   // drop site is where a matched-but-undisplayable row would surface —
   // pinned by the fake-pool tests, not by hope.

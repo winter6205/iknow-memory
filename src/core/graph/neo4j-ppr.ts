@@ -1,6 +1,6 @@
 /**
  * Personalized PageRank over the Neo4j projection, via Neo4j GDS
- * (specs/neo4j-graph-arm.md T4; #70/#72).
+ * (specs/neo4j-graph-arm.md T4).
  *
  * This is the READ half of the sidecar — the mirror of `neo4j-writer.ts`,
  * which owns the only writes. Nothing here touches product data: the arm

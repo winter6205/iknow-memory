@@ -1,5 +1,5 @@
 /**
- * Orchestrator-level hybrid retrieval: vector ∥ BM25 (#66).
+ * Orchestrator-level hybrid retrieval: vector ∥ BM25.
  *
  * Covers the contract `assembleRetrievalResult` owes the retrieve tool:
  *   SC8   BM25 disabled → envelope is EXACTLY `{ chunks: [...] }`; a

@@ -8,8 +8,8 @@
 import type { GraphragFailureToken } from "../errors.js";
 
 /**
- * Rows returned to the caller. Matches `fin:src/fin/retrieve/fake_port.py`
- * `_LIMIT_CAP`, so no 档 ships a 21st row — a SQL answer that outgrew the
+ * Rows returned to the caller. Matches the fin side's row-limit cap, so no
+ * 档 ships a 21st row — a SQL answer that outgrew the
  * corpus answer's cap would be a silent inconsistency between two 档 of the
  * same entry point.
  */

@@ -1,5 +1,5 @@
 /**
- * search-mode unit tests (plans/search-mode-retrieve.md T1).
+ * search-mode unit tests (specs/search-mode-retrieve.md).
  *
  * Pins the three contracts the seam owns:
  *   1. the closed set lexical|graph|global|sql — word-form tokens matched

@@ -117,7 +117,7 @@ export function hasOptionalArms(arms: OptionalArmSet): boolean {
 /**
  * Attach the per-request seed type to an arm's deps without touching the
  * resolved arm set: `entityType` is request state, so it rides a shallow
- * copy made at start time (plans/entity-type-and-filter.md T3). Absent =
+ * copy made at start time (specs/entity-type-and-filter.md). Absent =
  * all types, and the deps object is returned untouched.
  */
 function withSeedEntityType<T extends { entityType?: EntityType }>(
@@ -290,7 +290,7 @@ function getCommunitySummaries(
 
 /**
  * Project one ledger summary row into an arm hit. Shared by B's optional
- * community arm and 档 C's report arms (plans T3) so the summary-row wire
+ * community arm and 档 C's report arms so the summary-row wire
  * shape — `community/<id>` source ref, epoch validity, community-summary
  * metadata — has exactly one definition.
  */

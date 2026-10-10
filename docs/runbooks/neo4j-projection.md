@@ -1,6 +1,6 @@
 # Neo4j projection — backfill, drain, verify
 
-**Status:** shipped on the #70 implementation branch (T2–T5).
+**Status:** shipped on the implementation branch (T2–T5).
 **Applies to:** the `graph:backfill` / `graph:drain` operator CLIs, the
 `index:worker` durable job runner, and the Neo4j graph arm on `retrieve`.
 

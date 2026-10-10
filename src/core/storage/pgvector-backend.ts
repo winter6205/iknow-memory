@@ -244,7 +244,7 @@ function toVectorLiteral(embedding: number[]): string {
  * Soft-merge survivor-only seed query (T3 contract):
  * `merged_into IS NULL AND retired = false`, ordered by cosine distance.
  * `$3` is the optional `filters.entity_type` seed restriction
- * (plans/entity-type-and-filter.md T3): NULL keeps every type — the exact
+ * (specs/entity-type-and-filter.md): NULL keeps every type — the exact
  * pre-filter plan shape — and a type value narrows the seed set.
  *
  * T3 read binding: the slot column comes from `activeSlotForRead` — one
@@ -275,7 +275,7 @@ const ONE_HOP_CHUNKS_SQL =
   "LIMIT $3";
 
 /**
- * Chunks behind a set of ranked entities (Neo4j graph arm, #70 T4).
+ * Chunks behind a set of ranked entities (Neo4j graph arm).
  *
  * The graph engine ranks ENTITIES; chunks never enter Neo4j (ADR-0001), so
  * this is the hop back. `triples.source_chunk_id` is the provenance link
@@ -493,7 +493,7 @@ SELECT DISTINCT n.id, n.content, n.source_ref, n.valid_from,
  ORDER BY n.source_ref, n.created_at, n.id`;
 
 /**
- * 档 A child→parent window rows (plans/search-mode-retrieve.md T2,
+ * 档 A child→parent window rows (specs/search-mode-retrieve.md,
  * ADR-0060). One round trip over the child ids the lexical arm ranked.
  *
  * The INNER JOIN is the whole contract: a legacy chunk with a NULL
@@ -1579,7 +1579,7 @@ export class PgvectorBackend
   }
 
   /**
-   * Read the 档 C readiness singleton (plans/search-mode-retrieve.md T3).
+   * Read the 档 C readiness singleton (specs/search-mode-retrieve.md).
    * `undefined` = no row = the community job never ran; the C arm turns
    * that and every non-ready spelling into the typed
    * `community_summary_index_failure` exit. A read failure throws — it
@@ -2381,7 +2381,7 @@ export class PgvectorBackend
   };
 
   /**
-   * Neo4j graph-arm storage seam (#70 T4) — the Postgres half of the PPR
+   * Neo4j graph-arm storage seam — the Postgres half of the PPR
    * arm. Seeding is the same survivor-only embedding query the archived arm
    * uses (spec A7 keeps the entity-linking idea); the traversal is NOT, it
    * now happens in the graph engine, and this seam only maps the entities

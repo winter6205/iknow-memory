@@ -7,7 +7,7 @@
  * (`submit_index_job` / `poll_index_job`) that hands graph re-indexing to a
  * worker without changing what `push` means.
  *
- * Decoupling contract (per map #33 / ticket #35):
+ * Decoupling contract:
  *   - No import from iknow (`src/shared/schema.ts`, `src/config/`, etc.).
  *   - Provider key env-var names are looked up by NAME, never stored
  *     in code.
@@ -501,10 +501,10 @@ function supportsStructuredQueryScope(
  * Assemble the retrieve tool's dependencies for the default server path.
  *
  * The loaded retrieval config travels as `retrieveConfig`, which is what
- * arms BM25 alongside the vector arm on the stock server (#59 / #66).
+ * arms BM25 alongside the vector arm on the stock server.
  *
  * It deliberately does NOT travel as `graphConfig`: the SQL one-hop graph
- * arm is **archived off production** (#58 / #62), and
+ * arm is **archived off production**, and
  * `assembleRetrievalResult` gates that arm on receiving a `graphConfig`,
  * so the archive is expressed here as an absence — this function never
  * builds the key. PgvectorBackend still exposes `graphArmSeed` and
@@ -513,7 +513,7 @@ function supportsStructuredQueryScope(
  * from the stock server. A real graph arm belongs on a native graph
  * engine; see `docs/runbooks/sql-graph-arm-archived.md`.
  *
- * The Neo4j PPR arm (#70) is wired the opposite way round: it IS the
+ * The Neo4j PPR arm is wired the opposite way round: it IS the
  * production third arm, so the ranker travels whenever one was built —
  * that is, whenever the operator configured a sidecar URI. No URI means no
  * ranker, which lets `assembleRetrievalResult` report the default-on

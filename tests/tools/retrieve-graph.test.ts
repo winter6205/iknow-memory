@@ -430,7 +430,7 @@ describe("retrieve config boundary validation (T5)", () => {
     withRetrievalEnv({}, () => {
       const env = loadEnv();
       expect(env.retrieval).toEqual({
-        // Production hybrid (#69/#70): vector 0.7 / BM25 0.15 / graph
+        // Production hybrid: vector 0.7 / BM25 0.15 / graph
         // 0.15, both partner arms on. The per-knob assertions live in
         // tests/config.test.ts; this case pins the exact field SET so a
         // new knob cannot appear without the graph-arm suite noticing.

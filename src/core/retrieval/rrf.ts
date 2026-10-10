@@ -7,8 +7,8 @@
  * cross-arm agreement is signal, so the double-count is intentional.
  *
  * The function takes a LIST of arms rather than a fixed pair: production
- * fuses vector + BM25 (#59/#64), and the SQL graph arm is archived off
- * that path (#58) yet still fusable when a caller injects it. Adding an
+ * fuses vector + BM25, and the SQL graph arm is archived off
+ * that path yet still fusable when a caller injects it. Adding an
  * arm is a new `ArmName` plus a weight, not a signature change.
  *
  * Ordering is fully deterministic regardless of arm or hit input order:

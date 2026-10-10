@@ -1,6 +1,6 @@
 # SQL graph arm — archived off production retrieve
 
-**Status:** archived 2026-08-26 (issues #57 route reset, #58 cleanup, #62 BM25).
+**Status:** archived 2026-08-26 (route reset, cleanup, BM25).
 **Applies to:** `retrieve` on the default `createServer` path.
 
 ## What changed
@@ -8,7 +8,7 @@
 Production `retrieve` no longer runs the Postgres one-hop graph arm. The
 default server wiring hands the retrieve tool no `graphConfig`, and
 `assembleRetrievalResult` gates the arm on that key, so the stock server
-takes the vector path (vector + BM25 once #64–#66 land) and returns the
+takes the vector path (vector + BM25) and returns the
 plain `{ chunks: [...] }` envelope.
 
 Nothing was deleted. `src/core/retrieval/graph-arm.ts` still compiles,
@@ -31,7 +31,7 @@ Real graph retrieval is a Neo4j projection concern (ADR: Postgres
 authoritative, Neo4j read-only projection). Keeping the SQL arm wired
 would have made that migration look like a regression rather than the
 first real implementation. Lexical BM25 is the near-term recall partner
-for vector search instead (#59).
+for vector search instead.
 
 ## What is retained
 

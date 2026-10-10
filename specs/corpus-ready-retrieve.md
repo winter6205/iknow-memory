@@ -3,7 +3,6 @@
 > **Status:** assumption gate = fin 图 2 G-arrive 2026-09-16 + live MCP `retrieve` probe (empty `chunks`, no `degraded`).
 > **Sibling spec (fin):** [`../../fin/specs/first-closed-loop.md`](../../fin/specs/first-closed-loop.md)
 > **Landing list (fin tree):** [`../../fin/docs/wayfinder/闭环与分档-落计划-2026-09-16.md`](../../fin/docs/wayfinder/闭环与分档-落计划-2026-09-16.md)
-> **Plan:** `plans/corpus-ready-retrieve.md`
 
 ## Objective
 

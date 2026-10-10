@@ -46,6 +46,13 @@ docs/visualizations/
 # material, so they stay out of this tree. Do not restore them on a source sync.
 /plans/
 
+# Private evaluation datasets and recorded results stay in the private source
+# checkout. Do not force-add new copies. Ignore rules do not untrack files
+# already in history: eval/ and gold-set/snapshot.json stay because the
+# default test suite loads them.
+/eval/
+/docs/validation/
+
 # Playwright CLI page snapshots / console logs (local debugging scratch)
 .playwright-cli/
 .qoder

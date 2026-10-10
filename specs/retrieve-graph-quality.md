@@ -1,7 +1,7 @@
 # Spec: Retrieve and graph quality stack
 
 > **Status:** ACR all-yes; slice 0 (temporary LLM rerank) **on main**. Remaining slices T2–T11 (no GitHub issues).
-> **Source:** operator 2026-08-28 — coarse single contract (not one-question tickets); new wayfinder map for this destination; parent map remains local `docs/handoff/wayfinder-tickets/map-1.md`. Slice 8 detail: `specs/retrieve-community.md`.
+> **Source:** operator 2026-08-28 — coarse single contract (not one-question tickets); new wayfinder map for this destination. The parent wayfinder map is not in this tree. Slice 8 detail: `specs/retrieve-community.md`.
 > **Predecessors:** `specs/retrieve-graph-priority.md` (Host order, on main), `specs/retrieve-rerank-llm.md` (temporary LLM rerank, on main), `specs/neo4j-graph-arm.md` (PPR arm + outbox, on main).
 > **Assumption gate:** operator chose one overview spec. Locks below are the gate; object in review or they stand.
 

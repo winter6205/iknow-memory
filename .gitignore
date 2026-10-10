@@ -19,6 +19,8 @@ docs/vector-memory-upgrade-archive.html
 
 # Claude Code 运行时产物（post-push 钩子日志等）
 .claude/scratchpad/
+# Machine-local Claude permission grants. Keep .claude/settings.json.
+.claude/settings.local.json
 
 # Serena MCP 本地索引 / 缓存 / memories（机器本地，非产品源）
 .serena/

@@ -18,8 +18,7 @@ import { ConfigError, loadEnv, setSettingHomeForTests } from "../src/config.ts";
  * choice is hard-coded to stdio at the call site.
  *
  * What is NOT covered here (deferred to #36 alongside typed errors and
- * IO-throwing handlers per
- * `docs/handoff/2026-07-29-graphrag-mcp-host-acceptance.md`):
+ * IO-throwing handlers):
  *   - concurrent `loadEnv()` under env mutation (no shared cache, but
  *     also no current use case)
  *   - parseEnvFile read-throw paths (.env.local fallback; stage 0 has

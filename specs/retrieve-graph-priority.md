@@ -130,4 +130,4 @@ OVERALL: PASS — hand to `writing-plans`.
 ## Hand-off
 
 - Spec path: `specs/retrieve-graph-priority.md`
-- Tracker: local `docs/handoff/wayfinder-tickets/retrieve-graph-priority.md`; do not reopen the grilling
+- The wayfinder ticket is not in this tree. Do not reopen the grilling.

@@ -131,8 +131,7 @@ const SERVER_VERSION = "0.0.0";
  * BAD_CONFIG returned in T7 alongside the first real config-rejection
  * surface (unknown storage mode / pgvector without a DB URL). It had been
  * removed in stage 0 when the transport knob went away — see
- * `tests/config.test.ts` and
- * `docs/handoff/2026-07-29-graphrag-mcp-host-acceptance.md`.
+ * `tests/config.test.ts`.
  */
 const EXIT_CODES = {
   FATAL_RUNTIME: 1,

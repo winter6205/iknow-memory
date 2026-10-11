@@ -30,6 +30,12 @@ import {
 } from "./core/storage/evidence-dispatch.js";
 
 import { ConfigError, loadEnv, type GraphragEnv } from "./config.js";
+import { resolveMemoryHome } from "./config/memory-home.js";
+import {
+  fingerprintsFromEnv,
+  publishProcessReport,
+  readHttpRerankModel,
+} from "./config/process-fingerprint.js";
 import { createLogger, redactDiagnostic, writeStderr } from "./logging.js";
 import { failureTokenOf } from "./core/errors.js";
 import {
@@ -743,6 +749,7 @@ async function buildDeps(env: GraphragEnv): Promise<ServerDeps> {
     }
     const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions, {
       embedModel: env.embedModel,
+      embedBaseUrl: env.embedBaseUrl,
     });
     // Fail before the stdio transport opens: dimension, ANN-index, and
     // embedding-generation boot-guard errors are server-startup failures,
@@ -878,10 +885,8 @@ export function buildIndexJobSeams(
  * per-call pool to leak (extract runs inside the caller's await, not in a
  * detached task).
  *
- * LLM credentials ride the parsed ANTHROPIC block (`env.rerank` — the same
- * ANTHROPIC_AUTH_TOKEN / GRAPHRAG_MEMORY_ANTHROPIC_* family the extract CLI
- * reads raw from process.env, here already trimmed and defaulted by
- * loadEnv). Embedding credentials come straight from the embed block.
+ * LLM credentials ride `env.llm.extract` from `loadEnv`. Embedding
+ * credentials come straight from the embed block.
  * Missing credentials do NOT fail the build: extract reports a typed
  * per-call error instead (SC9 — never a fake client), which keeps the
  * offline server booting for the other tools.
@@ -900,17 +905,12 @@ export function buildExtractDeps(
   logger: ReturnType<typeof createLogger>,
   precision?: PrecisionIndexer
 ): ExtractDeps {
-  // The extraction LLM credentials ride the parsed ANTHROPIC block: despite
-  // its historical name, `env.rerank` IS the ANTHROPIC_AUTH_TOKEN /
-  // GRAPHRAG_MEMORY_ANTHROPIC_* family the extract CLI reads raw from
-  // process.env. The config field name and env vars are frozen; the local
-  // alias keeps the dual role readable at the use site.
-  const anthropicLlmCreds = env.rerank;
+  const extractLlm = env.llm.extract;
   return {
     llmEnv: {
-      authToken: anthropicLlmCreds?.apiKey,
-      baseUrl: anthropicLlmCreds?.baseUrl,
-      model: anthropicLlmCreds?.model,
+      authToken: extractLlm.apiKey,
+      baseUrl: extractLlm.baseUrl,
+      model: extractLlm.model,
     },
     embedderEnv: {
       apiKey: env.embedApiKey,
@@ -954,6 +954,11 @@ export async function createServer(): Promise<McpServer> {
   // Debug gate: DEBUG=1 surfaces the retrieve envelope's `debug` payload.
   // Absent → no debug key.
   const debug = process.env.DEBUG === "1";
+  const rerankModel =
+    env.rerankUrl !== undefined
+      ? await readHttpRerankModel(env.rerankUrl)
+      : env.llm.rerank.model;
+  const fingerprints = fingerprintsFromEnv(env, rerankModel);
   const registry = buildRegistry([
     ingestTool({ ...deps, logger }),
     invalidationTool(deps),
@@ -961,7 +966,14 @@ export async function createServer(): Promise<McpServer> {
     // buildDeps' single ES precision layer is threaded through so extract
     // shares it instead of constructing a second ES client from env.
     extractTool(buildExtractDeps(env, logger, deps.precision)),
-    retrieveTool(buildRetrieveDeps(deps, debug)),
+    retrieveTool({
+      ...buildRetrieveDeps(deps, debug),
+      retrievalIdentity: {
+        retrievalFingerprint: fingerprints.retrieval,
+        generationId: fingerprints.generationId,
+        epoch: fingerprints.epoch,
+      },
+    }),
     // Operator-console T4: pure read tool over the same deps — the
     // StorageReadPort is implemented by both production backends.
     readSourceTool(deps),
@@ -1115,6 +1127,15 @@ export async function main(argv?: readonly string[]): Promise<void> {
     }
     throw err;
   }
+
+  await publishProcessReport(
+    "mcp",
+    env,
+    resolveMemoryHome({
+      iknowMemoryHome: process.env.IKNOW_MEMORY_HOME,
+      osHome: process.env.HOME,
+    })
+  );
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

@@ -592,7 +592,8 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     );
     return err.exitCode;
   }
-  if (env.rerank === undefined || env.embedApiKey === undefined) {
+  const summaryLlm = env.llm.summary;
+  if (summaryLlm.apiKey === undefined || env.embedApiKey === undefined) {
     writeStderr(
       "community-summary config error: Anthropic and embedding credentials are required\n"
     );
@@ -614,9 +615,9 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     pool: pool as unknown as CommunitySummaryPool,
     detector: createNeo4jCommunityDetector(neo4j),
     summarizer: new AnthropicCommunitySummaryClient({
-      apiKey: env.rerank.apiKey,
-      model: env.rerank.model,
-      baseUrl: env.rerank.baseUrl,
+      apiKey: summaryLlm.apiKey,
+      model: summaryLlm.model,
+      baseUrl: summaryLlm.baseUrl,
     }),
     embedder,
     dimensions: env.embedDimensions,

@@ -47,7 +47,7 @@ export {
 } from "./baseline.js";
 export { seedCorpus } from "./seed.js";
 export {
-  DEFAULT_BASELINE_PATH,
+  defaultBaselinePath,
   DEFAULT_CORPUS_PATH,
   DEFAULT_GOLD_PATH,
   REPO_ROOT,

@@ -32,6 +32,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { defaultEvalOutputDir } from "../../config/memory-home.js";
 
 /** Default path (relative to the directory the caller passes). */
 export const DEFAULT_BASELINE_FILENAME = "baseline.json";
@@ -110,8 +111,11 @@ export function thresholdsFilePath(dir?: string): string {
 }
 
 function resolveGoldSetDir(dir?: string): string {
-  const supplied = (dir ?? process.env[ENV_GOLD_SET_DIR] ?? "gold-set").trim();
-  return supplied === "" ? "gold-set" : supplied;
+  const explicit = dir?.trim() ?? "";
+  if (explicit !== "") return explicit;
+  const fromEnv = process.env[ENV_GOLD_SET_DIR]?.trim() ?? "";
+  if (fromEnv !== "") return fromEnv;
+  return defaultEvalOutputDir();
 }
 
 /* ------------------------------------------------------------------------ */

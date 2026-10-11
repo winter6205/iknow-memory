@@ -31,6 +31,7 @@ interface FakeGenerationRow {
   rollback_slot?: string | null;
   rollback_model?: string | null;
   rollback_dimensions?: number | null;
+  embed_host_hash?: string | null;
   updated_at: Date;
 }
 
@@ -59,6 +60,9 @@ function makeFakeDb(options: FakeDbOptions = {}) {
             string | null,
             number,
           ];
+          const hostHash = /embed_host_hash/i.test(sql)
+            ? ((values?.[3] as string | null) ?? null)
+            : null;
           singleton = {
             active_slot: slot,
             active_model: model,
@@ -67,7 +71,23 @@ function makeFakeDb(options: FakeDbOptions = {}) {
             incoming_model: null,
             incoming_dimensions: null,
             rotate_mode: null,
+            embed_host_hash: hostHash,
             updated_at: new Date("2026-01-01T00:00:00Z"),
+          };
+        }
+        return { rows: [] };
+      }
+      if (
+        /UPDATE embedding_generation/i.test(sql) &&
+        /embed_host_hash/i.test(sql)
+      ) {
+        if (
+          singleton !== null &&
+          (singleton.embed_host_hash ?? null) === null
+        ) {
+          singleton = {
+            ...singleton,
+            embed_host_hash: (values?.[0] as string | null) ?? null,
           };
         }
         return { rows: [] };
@@ -149,7 +169,7 @@ describe("guardEmbeddingBoot (generation pointer seed + boot refuse)", () => {
     const insert = queries.find(({ sql }) =>
       /INSERT INTO embedding_generation/i.test(sql)
     );
-    expect(insert?.values).toEqual(["embedding", "m1", 8]);
+    expect(insert?.values).toEqual(["embedding", "m1", 8, null]);
     expect(transcript(queries)).not.toMatch(/DROP\s+(COLUMN|INDEX|TABLE)/i);
     expect(getSingleton()).not.toBeNull();
   });
@@ -169,7 +189,7 @@ describe("guardEmbeddingBoot (generation pointer seed + boot refuse)", () => {
     const insert = queries.find(({ sql }) =>
       /INSERT INTO embedding_generation/i.test(sql)
     );
-    expect(insert?.values).toEqual(["embedding", "m2", 8]);
+    expect(insert?.values).toEqual(["embedding", "m2", 8, null]);
     expect(getSingleton()?.active_dimensions).toBe(8);
     // The refusal must not touch the live column.
     expect(transcript(queries)).not.toMatch(/DROP\s+(COLUMN|INDEX|TABLE)/i);
@@ -223,6 +243,59 @@ describe("guardEmbeddingBoot (generation pointer seed + boot refuse)", () => {
     await expect(
       guardEmbeddingBoot(client, { model: "m2", dimensions: 8 })
     ).rejects.toBeInstanceOf(ConfigError);
+  });
+
+  it("same embed host with a different path does not trip the guard, a different host does", async () => {
+    const { client, queries, getSingleton } = makeFakeDb({
+      chunkEmbeddingType: "vector(8)",
+    });
+    const desired = { model: "m1", dimensions: 8 };
+
+    await guardEmbeddingBoot(client, {
+      ...desired,
+      embedBaseUrl: "https://Embed.Example/v1/embeddings",
+    });
+    await expect(
+      guardEmbeddingBoot(client, {
+        ...desired,
+        embedBaseUrl: "https://embed.example/other/path",
+      })
+    ).resolves.toMatchObject({ active: { model: "m1", dimensions: 8 } });
+
+    const storedHash = getSingleton()?.embed_host_hash;
+    const error = await guardEmbeddingBoot(client, {
+      ...desired,
+      embedBaseUrl: "https://other.example/v1/embeddings",
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ConfigError);
+    expect((error as Error).message).toContain(
+      "embedding host mismatch: effective embed host differs from the generation singleton and no rotate is open"
+    );
+    expect((error as Error).message).not.toContain("other.example");
+    expect((error as Error).message).not.toContain("embed.example");
+    expect((error as Error).message).not.toContain("Embed.Example");
+    expect(getSingleton()?.embed_host_hash).toBe(storedHash);
+    expect(transcript(queries)).not.toMatch(/INSERT\s+INTO\s+chunks/i);
+  });
+
+  it("rejects an unparseable embed base URL without the host-mismatch sentence", async () => {
+    const { client } = makeFakeDb({
+      singleton: activeRow({ embed_host_hash: "stored-hash" }),
+    });
+
+    const error = await guardEmbeddingBoot(client, {
+      model: "m1",
+      dimensions: 8,
+      embedBaseUrl: "https://bad host.example/v1",
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ConfigError);
+    const message = (error as Error).message;
+    expect(message).toContain("embedBaseUrl");
+    expect(message).not.toContain("embedding host mismatch");
+    expect(message).not.toContain("no rotate is open");
+    expect(message).not.toContain("bad host.example");
   });
 
   it("treats an absent configured model as the NULL active model (no key = no rotate)", async () => {

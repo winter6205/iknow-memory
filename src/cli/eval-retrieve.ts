@@ -78,7 +78,7 @@ import {
   seedCorpus,
   summarizeScores,
   writeBaselineAtomic,
-  DEFAULT_BASELINE_PATH,
+  defaultBaselinePath,
   DEFAULT_CORPUS_PATH,
   DEFAULT_GOLD_PATH,
   EvalRunError,
@@ -139,7 +139,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const flags: EvalFlags = {
     goldPath: DEFAULT_GOLD_PATH,
     corpusPath: DEFAULT_CORPUS_PATH,
-    outPath: DEFAULT_BASELINE_PATH,
+    outPath: defaultBaselinePath(),
     limit: DEFAULT_LIMIT,
     validAt: new Date().toISOString(),
   };

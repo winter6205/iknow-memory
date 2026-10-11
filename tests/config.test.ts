@@ -183,6 +183,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "extractWriteTimeSupersede",
       "ingestBatchLimit",
       "jev",
+      "llm",
       "logLevel",
       "neo4j",
       "pgvectorAnnMaxDimensions",
@@ -1016,8 +1017,13 @@ describe("loadEnv — hybrid retrieval weights + arm switches", () => {
     });
   });
 
+  it("treats a blank RRF k as unset and uses the default", () => {
+    withRetrievalEnv({ GRAPHRAG_MEMORY_RETRIEVAL_RRF_K: "" }, () => {
+      expect(loadEnv().retrieval.rrfK).toBe(60);
+    });
+  });
+
   for (const [label, value] of [
-    ["empty", ""],
     ["zero", "0"],
     ["negative", "-1"],
     ["non-numeric", "not-a-number"],

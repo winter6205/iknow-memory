@@ -11,6 +11,8 @@
  * request bodies without a running cluster. Production construction happens
  * only when the operator configured an Elasticsearch node.
  */
+import { createHash } from "node:crypto";
+
 import { Client } from "@elastic/elasticsearch";
 
 import type { ElasticsearchConfig, GraphragEnv } from "../../config.js";
@@ -303,9 +305,7 @@ function hasCjk(text: string): boolean {
 }
 
 /** Query analyzer chosen by the CJK-segmentation switch. */
-function precisionQueryAnalyzer(
-  precision: PrecisionSearchOptions
-): string {
+function precisionQueryAnalyzer(precision: PrecisionSearchOptions): string {
   return precision.cjkSegmentation === false ? "standard" : IK_QUERY_ANALYZER;
 }
 
@@ -333,10 +333,13 @@ function entityLexicalShould(
   precision: PrecisionSearchOptions
 ): Record<string, unknown>[] {
   const analyzer = precisionQueryAnalyzer(precision);
-  const fields = lexicalFields(precision.fieldBoost ?? true, precision.fieldBoosts ?? {
-    canonical_name: 2,
-    aliases: 1.5,
-  });
+  const fields = lexicalFields(
+    precision.fieldBoost ?? true,
+    precision.fieldBoosts ?? {
+      canonical_name: 2,
+      aliases: 1.5,
+    }
+  );
   const should: Record<string, unknown>[] = [
     {
       multi_match: {
@@ -493,9 +496,7 @@ export class ElasticsearchPrecisionLayer
     return (await this.summaryAliasTarget(alias)) ?? alias;
   }
 
-  private async summaryAliasTarget(
-    alias: string
-  ): Promise<string | undefined> {
+  private async summaryAliasTarget(alias: string): Promise<string | undefined> {
     try {
       const response = await this.client.indices.getAlias({ name: alias });
       return Object.keys(responseBody<Record<string, unknown>>(response))[0];
@@ -934,7 +935,9 @@ function toEntitySeedHit(hit: SearchHit): EntitySeedHit | undefined {
 }
 
 /** Project one report hit into a `CommunitySummaryRow` (id keeps ledger identity). */
-function toCommunitySummaryRow(hit: SearchHit): CommunitySummaryRow | undefined {
+function toCommunitySummaryRow(
+  hit: SearchHit
+): CommunitySummaryRow | undefined {
   const source = sourceRecord(hit._source);
   const id = stringValue(source.id) ?? hit._id;
   const communityId = stringValue(source.community_id);
@@ -992,21 +995,42 @@ function validateBm25Parameter(name: string, value: number): number {
   return value;
 }
 
+function precisionAnalyzers(): Record<string, unknown> {
+  return {
+    [IK_INDEX_ANALYZER]: {
+      type: "custom",
+      tokenizer: "ik_max_word",
+    },
+    [IK_QUERY_ANALYZER]: {
+      type: "custom",
+      tokenizer: "ik_smart",
+    },
+  };
+}
+
+/** Hash of the analyzer and mapping contract. This hash is the lexical epoch. */
+export function lexicalContractHash(): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        analyzers: precisionAnalyzers(),
+        mappings: {
+          chunk: chunkMappings(),
+          entity: entityMappings(),
+          summary: summaryMappings(),
+        },
+      }),
+      "utf8"
+    )
+    .digest("hex");
+}
+
 function precisionSettings(k1: number, b: number): Record<string, unknown> {
   return {
     number_of_shards: 1,
     number_of_replicas: 0,
     analysis: {
-      analyzer: {
-        [IK_INDEX_ANALYZER]: {
-          type: "custom",
-          tokenizer: "ik_max_word",
-        },
-        [IK_QUERY_ANALYZER]: {
-          type: "custom",
-          tokenizer: "ik_smart",
-        },
-      },
+      analyzer: precisionAnalyzers(),
     },
     similarity: {
       [BM25_SIMILARITY]: {

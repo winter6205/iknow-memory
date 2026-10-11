@@ -170,7 +170,10 @@ type ParsedArgs = { ok: true; flags: CliFlags } | { ok: false; error: string };
  */
 type FlagSpec =
   | { kind: "boolean"; set: (flags: CliFlags) => void }
-  | { kind: "value"; parse: (flags: CliFlags, raw: string | undefined) => string | null };
+  | {
+      kind: "value";
+      parse: (flags: CliFlags, raw: string | undefined) => string | null;
+    };
 
 /**
  * Declarative flag → handler mapping: the table is the single list of
@@ -417,9 +420,7 @@ function flagConflict(flags: CliFlags): string | null {
     ["--backfill-embeddings", flags.backfillEmbeddings],
   ];
   const selected = modes.filter(([, on]) => on).map(([name]) => name);
-  const conflict = EXCLUSION_RULES.find((rule) =>
-    rule.when(flags, selected)
-  );
+  const conflict = EXCLUSION_RULES.find((rule) => rule.when(flags, selected));
   return conflict === undefined ? null : conflict.message(flags, selected);
 }
 
@@ -801,11 +802,12 @@ function buildCliDeps(
   };
   // LLM first, embedder second: the credential guards must surface in the
   // pre-T2 order (a keyless real extraction reports the LLM refusal).
+  const extractLlm = env.llm.extract;
   const llm = buildLlmClient(
     {
-      authToken: process.env.ANTHROPIC_AUTH_TOKEN,
-      baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
-      model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
+      authToken: extractLlm.apiKey,
+      baseUrl: extractLlm.baseUrl,
+      model: extractLlm.model,
     },
     { extraction: isRealExtraction(flags) }
   );

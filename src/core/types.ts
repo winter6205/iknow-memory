@@ -86,6 +86,11 @@ export interface SourceDocRecord {
    * backfills it.
    */
   content_identity?: string | null;
+  /**
+   * Extraction fingerprint of the ingest that first wrote this 资料.
+   * Null on rows that predate the column. A later ingest does not replace it.
+   */
+  extraction_fingerprint?: string | null;
 }
 
 /**
@@ -197,6 +202,11 @@ export interface IndexJobRecord {
   finished_at: string | null;
   /** Typed stage failure; set when status is failed. */
   failure_code: string | null;
+  /**
+   * Extraction fingerprint stored when the worker first indexes the job.
+   * Null on rows that predate the column. A later model does not replace it.
+   */
+  extraction_fingerprint?: string | null;
 }
 
 /**
@@ -283,6 +293,15 @@ export interface IndexJobStore {
     jobId: string,
     outcome: IndexJobTerminalOutcome
   ): Promise<IndexJobRecord | null>;
+  /**
+   * Write the extraction fingerprint onto a new index-job row and the 资料
+   * version that job indexes. A fingerprint already stored on either row stays.
+   */
+  stampExtractionFingerprint(input: {
+    jobId: string;
+    sourceRef: string;
+    fingerprint: string;
+  }): Promise<void>;
 }
 
 /**
@@ -751,6 +770,8 @@ export interface EmbeddingGenerationState {
   rollbackSlot: string | null;
   /** Displaced pair; undefined together with `rollbackSlot`. */
   rollback: EmbeddingGenerationPair | null;
+  /** Hash of the normalized embed hostname, or null when none is recorded. */
+  embedHostHash: string | null;
   updatedAt: Date;
 }
 

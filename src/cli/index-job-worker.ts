@@ -32,6 +32,8 @@ import {
   readIngestBatchLimit,
   type GraphragEnv,
 } from "../config.js";
+import { resolveMemoryHome } from "../config/memory-home.js";
+import { publishProcessReport } from "../config/process-fingerprint.js";
 import {
   createLogger,
   redactDiagnostic,
@@ -63,6 +65,7 @@ import {
   COMMUNITY_SUMMARY_INDEX_FAILURE,
   type ExtractMethod,
   type IndexJobRecord,
+  type IndexJobStore,
 } from "../core/types.js";
 import { AnthropicCommunitySummaryClient } from "../core/graph/community-summary-llm.js";
 import { createNeo4jCommunityDetector } from "../core/graph/neo4j-community.js";
@@ -161,6 +164,7 @@ export interface IndexJobLock {
 
 export interface IndexJobWorkerDeps extends IndexJobRunnerDeps {
   lock: IndexJobLock;
+  extractionFingerprint?: string;
 }
 
 interface WorkerOptions {
@@ -237,6 +241,45 @@ export async function runCli(
   return 0;
 }
 
+export class ExtractionFingerprintStampError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = new.target.name;
+  }
+}
+
+export class MissingExtractionFingerprintError extends ExtractionFingerprintStampError {
+  constructor() {
+    super("missing extraction fingerprint");
+  }
+}
+
+export class IndexJobStampUnavailableError extends ExtractionFingerprintStampError {
+  constructor() {
+    super("index job store cannot stamp extraction fingerprint");
+  }
+}
+
+async function stampClaimedExtraction(
+  deps: IndexJobWorkerDeps,
+  job: IndexJobRecord
+): Promise<void> {
+  const fingerprint = deps.extractionFingerprint;
+  if (fingerprint === undefined || fingerprint === "") {
+    throw new MissingExtractionFingerprintError();
+  }
+  const store: Partial<Pick<IndexJobStore, "stampExtractionFingerprint">> =
+    deps.store;
+  if (store.stampExtractionFingerprint === undefined) {
+    throw new IndexJobStampUnavailableError();
+  }
+  await store.stampExtractionFingerprint({
+    jobId: job.job_id,
+    sourceRef: job.source_ref,
+    fingerprint,
+  });
+}
+
 async function claimNext(
   deps: IndexJobWorkerDeps,
   options: WorkerOptions
@@ -258,9 +301,11 @@ async function runClaimedJob(
 ): Promise<boolean> {
   const handle = await deps.lock.acquire(JOB_SERIALIZATION_KEY);
   try {
+    await stampClaimedExtraction(deps, job);
     await runIndexJob(deps, job);
     return true;
   } catch (err) {
+    if (err instanceof ExtractionFingerprintStampError) throw err;
     // EXIT: an untyped stage fault writes no terminal state on purpose, so the
     // stalled-lease arm re-claims the row; one bad job never ends the run for
     // the rest of the queue.
@@ -507,13 +552,18 @@ function buildWorkerDeps(parts: WorkerParts): IndexJobWorkerDeps {
     writeTimeSupersede: env.extractWriteTimeSupersede,
     ...(precision === undefined ? {} : { precision }),
   };
+  const summaryLlm = env.llm.summary;
   const summaryDeps: CommunitySummaryDeps | undefined =
-    env.neo4j === undefined || env.rerank === undefined
+    env.neo4j === undefined || summaryLlm.apiKey === undefined
       ? undefined
       : {
           pool: pool as unknown as CommunitySummaryPool,
           detector: createNeo4jCommunityDetector(env.neo4j),
-          summarizer: new AnthropicCommunitySummaryClient(env.rerank),
+          summarizer: new AnthropicCommunitySummaryClient({
+            apiKey: summaryLlm.apiKey,
+            model: summaryLlm.model,
+            baseUrl: summaryLlm.baseUrl,
+          }),
           embedder,
           dimensions: env.embedDimensions,
           logger,
@@ -573,6 +623,7 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
   const pool = new Pool({ connectionString: env.dbUrl });
   const store = new PgvectorBackend(env.dbUrl, env.embedDimensions, {
     embedModel: env.embedModel,
+    embedBaseUrl: env.embedBaseUrl,
   });
   const precision = createPrecisionLayer(env);
   try {
@@ -580,7 +631,18 @@ export async function runCliFromEnv(argv: string[]): Promise<number> {
     // keyless worker reports its config fault without dialling Postgres.
     const deps = buildWorkerDeps({ env, pool, store, precision, logger });
     await store.initialize();
-    return await runCli(argv, deps);
+    const fingerprints = await publishProcessReport(
+      "index-worker",
+      env,
+      resolveMemoryHome({
+        iknowMemoryHome: process.env.IKNOW_MEMORY_HOME,
+        osHome: process.env.HOME,
+      })
+    );
+    return await runCli(argv, {
+      ...deps,
+      extractionFingerprint: fingerprints.extraction,
+    });
   } catch (err) {
     return reportConfigError(err);
   } finally {

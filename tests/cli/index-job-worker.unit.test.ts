@@ -153,6 +153,8 @@ function ledger() {
       publishes.push(outcome);
       return await backend.publishJobOutcome(jobId, outcome);
     },
+    stampExtractionFingerprint: (input) =>
+      backend.stampExtractionFingerprint(input),
   };
   return { backend, store, publishes, claims };
 }
@@ -250,15 +252,21 @@ function workerDeps(
     logger?: RecordingLogger;
     lock?: FakeLock;
     clockMs?: number;
+    extractionFingerprint?: string | null;
   } = {}
 ): IndexJobWorkerDeps {
-  return {
+  const deps: IndexJobWorkerDeps = {
     store,
     ports,
     logger: options.logger ?? new RecordingLogger(),
     lock: options.lock ?? new FakeLock(),
     clock: () => new Date(options.clockMs ?? T0),
   };
+  if (options.extractionFingerprint !== null) {
+    deps.extractionFingerprint =
+      options.extractionFingerprint ?? "fp-extract-test";
+  }
+  return deps;
 }
 
 function captureStderr(): { text: () => string; restore: () => void } {
@@ -481,6 +489,7 @@ describe("index job worker claim loop", () => {
       supersedeReadyJobs: async () => 0,
       claimNextJob: async () => (grants-- > 0 ? job : null),
       publishJobOutcome: async () => null,
+      stampExtractionFingerprint: async () => {},
     };
     const ports = new FakePorts();
     const lock = new FakeLock();
@@ -573,6 +582,40 @@ describe("index job worker claim loop", () => {
     expect((await backend.getJob("job-1"))?.started_at).toBe(
       new Date(T0).toISOString()
     );
+    stderr.restore();
+  });
+
+  it("does not count a claim without an extraction fingerprint as a successful stamp", async () => {
+    const stderr = captureStderr();
+    const { backend, store, publishes } = ledger();
+    await store.insertJobOrJoin(queuedJob({}));
+    const ports = new FakePorts();
+    const logger = new RecordingLogger();
+    let stamps = 0;
+    store.stampExtractionFingerprint = async () => {
+      stamps += 1;
+    };
+
+    const code = await runCli(
+      ["--once"],
+      workerDeps(store, ports, { logger, extractionFingerprint: null })
+    );
+
+    expect(code).toBe(1);
+    expect(stamps).toBe(0);
+    expect(ports.calls.some((call) => call.startsWith("runExtract"))).toBe(
+      false
+    );
+    expect(publishes).toEqual([]);
+    expect(
+      (await backend.getJob("job-1"))?.extraction_fingerprint ?? null
+    ).toBeNull();
+    expect(stderr.text()).toContain("missing extraction fingerprint");
+    expect(logger.logs).toContainEqual({
+      level: "error",
+      msg: "index-job-worker-fatal",
+      fields: { error: "missing extraction fingerprint" },
+    });
     stderr.restore();
   });
 });

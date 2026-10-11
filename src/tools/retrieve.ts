@@ -92,6 +92,7 @@ import {
   stripCommunityLevelFilter,
   stripEntityTypeFilter,
 } from "../core/retrieval/wire-filters.js";
+import { retrievalEnvelopeFields } from "../config/process-fingerprint.js";
 import { GraphragError } from "../core/errors.js";
 import { StructuredQueryError } from "../core/structured/errors.js";
 import { validateStructuredQueryRequest } from "../core/structured/request.js";
@@ -213,6 +214,15 @@ export interface RetrieveDeps {
   debug?: boolean;
   /** Internal seam for injected capability observations. */
   capabilityObservations?: readonly CapabilityObservation[];
+  /**
+   * Retrieval fingerprint, generation id, and lexical epoch for this process.
+   * Absent keeps the envelope at its previous keys.
+   */
+  retrievalIdentity?: {
+    retrievalFingerprint: string;
+    generationId: string;
+    epoch: string;
+  };
   /** Injectable counter for rejected empty or whitespace-only queries. */
   inputValidationFailureCounter?: InputValidationFailureCounter;
   /** Optional read-only projection outbox wait seam. */
@@ -370,7 +380,18 @@ export function createRetrieveHandler(deps: RetrieveDeps) {
       control
     );
 
-    return textResult(JSON.stringify(envelope));
+    return textResult(JSON.stringify(stampRetrieveEnvelope(envelope, deps)));
+  };
+}
+
+function stampRetrieveEnvelope<T extends object>(
+  envelope: T,
+  deps: RetrieveDeps
+): T {
+  if (deps.retrievalIdentity === undefined) return envelope;
+  return {
+    ...envelope,
+    ...retrievalEnvelopeFields(deps.retrievalIdentity),
   };
 }
 
@@ -405,10 +426,15 @@ async function runStructuredRequest(
   // body key beside it — not a second content block — because every tool
   // result in this server goes through the single-block `textResult`.
   return textResult(
-    JSON.stringify({
-      chunks: [],
-      [STRUCTURED_RESULT_KEY]: buildStructuredResult(validated, outcome),
-    })
+    JSON.stringify(
+      stampRetrieveEnvelope(
+        {
+          chunks: [],
+          [STRUCTURED_RESULT_KEY]: buildStructuredResult(validated, outcome),
+        },
+        deps
+      )
+    )
   );
 }
 

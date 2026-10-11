@@ -1,8 +1,8 @@
 /**
  * Runtime config for iknow-memory MCP server.
  *
- * Loads from process.env with `.env.local` (cwd) as fallback.
- * Precedence: process.env > `.env.local`.
+ * Loads from process.env, then `setting.json`, then `.env.local` under
+ * the memory home. `cwd/.env.local` is not applied.
  *
  * LLM authentication uses ANTHROPIC_AUTH_TOKEN. Vector/embedding
  * authentication uses the dedicated embedding key or vector aliases below;
@@ -10,6 +10,17 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { z } from "zod";
+import { parseEnvFile } from "./config/env-file.js";
+import {
+  memoryHomeDirectory,
+  MemoryHomeMissingError,
+} from "./config/memory-home.js";
+import { resolveLayeredValue } from "./config/layered-value.js";
+import {
+  describeEffectiveConfig,
+  type EffectiveConfigReport,
+} from "./config/effective-config.js";
 import {
   DEFAULT_RETRIEVE_PRESET,
   RETRIEVE_PRESET_BUNDLES,
@@ -171,6 +182,14 @@ export interface Neo4jConfig {
   password: string | undefined;
 }
 
+/** One purpose LLM: protocol, model, base URL, and the resolved API key. */
+export interface LlmPurpose {
+  protocol: "anthropic";
+  model: string;
+  baseUrl: string;
+  apiKey: string | undefined;
+}
+
 export interface GraphragEnv {
   logLevel: LogLevel;
   /** Which StorageBackend to construct. */
@@ -263,6 +282,17 @@ export interface GraphragEnv {
    * backfill / dry-run path, not the daily master switch.
    */
   extractWriteTimeSupersede: boolean;
+  /**
+   * Purpose LLM blocks. A purpose's own model, base URL, or API-key pointer
+   * wins when set. Extract otherwise uses the Anthropic block, then JEV.
+   * Summary otherwise copies extract. Rerank otherwise uses the Anthropic
+   * rerank block; the HTTP rerank URL stays on `rerankUrl`.
+   */
+  llm: {
+    extract: LlmPurpose;
+    summary: LlmPurpose;
+    rerank: LlmPurpose;
+  };
 }
 
 /**
@@ -316,27 +346,6 @@ export interface ElasticsearchConfig {
   requestTimeoutMs: number;
 }
 
-function parseEnvFile(path: string): Record<string, string> {
-  if (!existsSync(path)) return {};
-  const out: Record<string, string> = {};
-  for (const raw of readFileSync(path, "utf8").split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#") || !line.includes("=")) continue;
-    const i = line.indexOf("=");
-    const k = line.slice(0, i).trim();
-    let v = line.slice(i + 1).trim();
-    if (
-      (v.startsWith('"') && v.endsWith('"')) ||
-      (v.startsWith("'") && v.endsWith("'"))
-    ) {
-      v = v.slice(1, -1);
-    }
-    if (v.startsWith("<") && v.endsWith(">")) continue; // unfilled placeholder
-    out[k] = v;
-  }
-  return out;
-}
-
 /**
  * Lazily-built, mutable home override for the operator-setting store.
  *
@@ -375,23 +384,56 @@ export function setSettingHomeForTests(home: string | null): void {
   cachedSettingMap = undefined;
 }
 
-function readEnv(key: string): string | undefined {
-  // Precedence (T2): process.env wins when present and non-blank;
-  // operator setting.json is the next fallback; `.env.local` is the
-  // legacy dev-time fallback. A *present but blank* process.env value
-  // collapses to "absent" — a stray `export FOO=` must not shadow a
-  // real operator setting.
-  if (Object.prototype.hasOwnProperty.call(process.env, key)) {
-    const fromProcess = process.env[key];
-    if (fromProcess !== undefined) {
-      const trimmed = fromProcess.trim();
-      if (trimmed !== "") return fromProcess;
-    }
+function rethrowMissingHome(err: unknown): never {
+  if (err instanceof MemoryHomeMissingError) {
+    throw new ConfigError(err.message);
   }
-  const fromSetting = readEnvFromSettingSync(key);
-  if (fromSetting !== undefined) return fromSetting;
-  const file = parseEnvFile(join(process.cwd(), ".env.local"));
-  return file[key];
+  throw err;
+}
+
+function settingMap(): Record<string, string> {
+  try {
+    if (cachedSettingMap === null || cachedSettingMap === undefined) {
+      readEnvFromSettingSync("GRAPHRAG_MEMORY_LOG_LEVEL");
+    }
+  } catch (err) {
+    rethrowMissingHome(err);
+  }
+  if (cachedSettingMap === null || cachedSettingMap === undefined) return {};
+  return cachedSettingMap;
+}
+
+function configMemoryHome(): string {
+  try {
+    return memoryHomeDirectory(settingHomeOverride);
+  } catch (err) {
+    rethrowMissingHome(err);
+  }
+}
+
+function layerSources() {
+  return {
+    env: process.env,
+    setting: settingMap(),
+    homeEnv: parseEnvFile(join(configMemoryHome(), ".env.local")),
+  };
+}
+
+function readEnv(key: string): string | undefined {
+  return resolveLayeredValue(key, layerSources()).value;
+}
+
+export function readLayeredEnv(key: string): string | undefined {
+  return readEnv(key);
+}
+
+export function describeRuntimeEffectiveConfig(
+  cwd = process.cwd()
+): EffectiveConfigReport {
+  return describeEffectiveConfig({
+    ...layerSources(),
+    cwdEnvLocalPresent: existsSync(join(cwd, ".env.local")),
+  });
 }
 
 /**
@@ -476,13 +518,7 @@ function readEnvFromSettingSync(key: string): string | undefined {
  * default.
  */
 function readRawEnv(key: string): string | undefined {
-  if (Object.prototype.hasOwnProperty.call(process.env, key)) {
-    return process.env[key];
-  }
-  const fromSetting = readEnvFromSettingSync(key);
-  if (fromSetting !== undefined) return fromSetting;
-  const file = parseEnvFile(join(process.cwd(), ".env.local"));
-  return file[key];
+  return readEnv(key);
 }
 
 /**
@@ -640,6 +676,33 @@ const DEFAULT_JEV_MODEL = "jev-latest";
 const DEFAULT_JEV_BASE_URL = "https://api.typesafe.ai";
 const ANTHROPIC_MODEL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_MODEL";
 const ANTHROPIC_BASE_URL_VAR = "GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL";
+const llmProtocolSchema = z.enum(["anthropic"]);
+
+interface LlmPurposeVars {
+  protocol: string;
+  model: string;
+  baseUrl: string;
+  apiKeyEnv: string;
+}
+
+const EXTRACT_LLM: LlmPurposeVars = {
+  protocol: "GRAPHRAG_MEMORY_LLM_EXTRACT_PROTOCOL",
+  model: "GRAPHRAG_MEMORY_LLM_EXTRACT_MODEL",
+  baseUrl: "GRAPHRAG_MEMORY_LLM_EXTRACT_BASE_URL",
+  apiKeyEnv: "GRAPHRAG_MEMORY_LLM_EXTRACT_API_KEY_ENV",
+};
+const SUMMARY_LLM: LlmPurposeVars = {
+  protocol: "GRAPHRAG_MEMORY_LLM_SUMMARY_PROTOCOL",
+  model: "GRAPHRAG_MEMORY_LLM_SUMMARY_MODEL",
+  baseUrl: "GRAPHRAG_MEMORY_LLM_SUMMARY_BASE_URL",
+  apiKeyEnv: "GRAPHRAG_MEMORY_LLM_SUMMARY_API_KEY_ENV",
+};
+const RERANK_LLM: LlmPurposeVars = {
+  protocol: "GRAPHRAG_MEMORY_LLM_RERANK_PROTOCOL",
+  model: "GRAPHRAG_MEMORY_LLM_RERANK_MODEL",
+  baseUrl: "GRAPHRAG_MEMORY_LLM_RERANK_BASE_URL",
+  apiKeyEnv: "GRAPHRAG_MEMORY_LLM_RERANK_API_KEY_ENV",
+};
 /** China MiniMax Anthropic-compatible SDK base (not api.minimax.io). */
 export const DEFAULT_LLM_BASE_URL = "https://api.minimaxi.com/anthropic";
 /** China MiniMax M3 model id. */
@@ -1009,14 +1072,92 @@ function resolveRerankApiKey(): string | undefined {
   return readTrimmed(LLM_AUTH_TOKEN_VAR);
 }
 
-function parseRerankConfig(): RerankConfig | undefined {
-  const apiKey = resolveRerankApiKey();
-  if (apiKey === undefined) return undefined;
-  const model = readTrimmed(ANTHROPIC_MODEL_VAR) ?? DEFAULT_LLM_MODEL;
-  const baseUrl = (
-    readTrimmed(ANTHROPIC_BASE_URL_VAR) ?? DEFAULT_LLM_BASE_URL
-  ).replace(/\/$/, "");
-  return { apiKey, model, baseUrl };
+function stripBaseUrl(url: string): string {
+  return url.replace(/\/$/, "");
+}
+
+function anthropicPurpose(): LlmPurpose {
+  return {
+    protocol: "anthropic",
+    model: readTrimmed(ANTHROPIC_MODEL_VAR) ?? DEFAULT_LLM_MODEL,
+    baseUrl: stripBaseUrl(
+      readTrimmed(ANTHROPIC_BASE_URL_VAR) ?? DEFAULT_LLM_BASE_URL
+    ),
+    apiKey: readTrimmed(LLM_AUTH_TOKEN_VAR),
+  };
+}
+
+function fallbackExtract(jev: JevConfig | undefined): LlmPurpose {
+  const anthropic = anthropicPurpose();
+  const anthropicSet =
+    anthropic.apiKey !== undefined ||
+    readTrimmed(ANTHROPIC_MODEL_VAR) !== undefined ||
+    readTrimmed(ANTHROPIC_BASE_URL_VAR) !== undefined;
+  if (anthropicSet || jev === undefined) return anthropic;
+  return {
+    protocol: "anthropic",
+    model: jev.model,
+    baseUrl: jev.baseUrl,
+    apiKey: jev.apiKey,
+  };
+}
+
+function fallbackRerank(): LlmPurpose {
+  return { ...anthropicPurpose(), apiKey: resolveRerankApiKey() };
+}
+
+function readLlmProtocol(varName: string): "anthropic" {
+  const raw = readTrimmed(varName);
+  if (raw === undefined) return "anthropic";
+  const parsed = llmProtocolSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw new ConfigError(`${varName} must be anthropic, got "${raw}"`);
+  }
+  return parsed.data;
+}
+
+function purposeKeySet(vars: LlmPurposeVars): boolean {
+  return (
+    readTrimmed(vars.model) !== undefined ||
+    readTrimmed(vars.baseUrl) !== undefined ||
+    readTrimmed(vars.apiKeyEnv) !== undefined
+  );
+}
+
+function resolvePurpose(
+  vars: LlmPurposeVars,
+  fallback: LlmPurpose
+): LlmPurpose {
+  const protocol = readLlmProtocol(vars.protocol);
+  if (!purposeKeySet(vars)) return { ...fallback, protocol };
+  const pointer = readTrimmed(vars.apiKeyEnv);
+  const baseRaw = readTrimmed(vars.baseUrl);
+  return {
+    protocol,
+    model: readTrimmed(vars.model) ?? fallback.model,
+    baseUrl: stripBaseUrl(baseRaw ?? fallback.baseUrl),
+    apiKey: pointer === undefined ? fallback.apiKey : readTrimmed(pointer),
+  };
+}
+
+function resolveLlmPurposes(jev: JevConfig | undefined): GraphragEnv["llm"] {
+  const extract = resolvePurpose(EXTRACT_LLM, fallbackExtract(jev));
+  return {
+    extract,
+    summary: resolvePurpose(SUMMARY_LLM, extract),
+    rerank: resolvePurpose(RERANK_LLM, fallbackRerank()),
+  };
+}
+
+function rerankConfigFromPurpose(
+  purpose: LlmPurpose
+): RerankConfig | undefined {
+  if (purpose.apiKey === undefined) return undefined;
+  return {
+    apiKey: purpose.apiKey,
+    model: purpose.model,
+    baseUrl: purpose.baseUrl,
+  };
 }
 
 function resolveJevApiKey(): string | undefined {
@@ -1241,9 +1382,10 @@ export function loadEnv(): GraphragEnv {
   const businessLedgerUrl = parseBusinessLedgerUrl();
   const neo4j = parseNeo4jConfig();
   const elasticsearch = parseElasticsearchConfig();
-  const rerank = parseRerankConfig();
-  const rerankUrl = readTrimmed(RETRIEVAL_RERANK_URL_VAR);
   const jev = parseJevConfig();
+  const llm = resolveLlmPurposes(jev);
+  const rerank = rerankConfigFromPurpose(llm.rerank);
+  const rerankUrl = readTrimmed(RETRIEVAL_RERANK_URL_VAR);
   // Extract write-time supersede switch (T4). ADR-0009: defaults to ON —
   // resolving contradictions at write time is ledger infrastructure, and
   // the explicit off is the test/escape hatch (graphEnabled-shaped).
@@ -1280,6 +1422,7 @@ export function loadEnv(): GraphragEnv {
     rerankUrl,
     jev,
     extractWriteTimeSupersede,
+    llm,
   };
 }
 

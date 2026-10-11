@@ -5,7 +5,7 @@
  * process shares the MCP boot parse. Bind is loopback-only (spec SC1).
  * SPA owns 18868; the API default is 4174.
  */
-import { ConfigError } from "../config.js";
+import { ConfigError, readLayeredEnv } from "../config.js";
 const DASHBOARD_HOST_VAR = "GRAPHRAG_MEMORY_DASHBOARD_HOST";
 const DASHBOARD_PORT_VAR = "GRAPHRAG_MEMORY_DASHBOARD_PORT";
 
@@ -19,7 +19,7 @@ export interface DashboardConfig {
 }
 
 function readTrimmed(key: string): string | undefined {
-  const raw = process.env[key];
+  const raw = readLayeredEnv(key);
   if (raw === undefined) return undefined;
   const trimmed = raw.trim();
   return trimmed === "" ? undefined : trimmed;

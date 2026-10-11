@@ -3,14 +3,9 @@
  *
  * Lifted from `src/cli/extract.ts` (buildLlm / buildEmbedder) so the CLI and
  * the MCP extract tool share ONE guard implementation. The environment is a
- * parameter, not a `process.env` read: the caller resolves its own env block
- * (CLI: `loadEnv()` + raw env vars; MCP: the server's config) and states its
- * intent, and this module refuses unsafe keyless runs. The boundary rule that
- * goes with it: the pure builders below never resolve an env block, and
- * `buildPersistingExtractionClients` is the one place at the process boundary
- * that does — for the extract LLM's own three variables, because `GraphragEnv`
- * carries no extract-LLM block (its `rerank` field is the retrieve-rerank role,
- * resolved through a different precedence).
+ * parameter, not a `process.env` read: the caller passes the block `loadEnv`
+ * resolved on `env.llm.extract` and states its intent, and this module refuses
+ * unsafe keyless runs. The pure builders below never resolve an env block.
  *
  * The SC rule (specs/mcp-tool-surface.md SC9, inherited from the CLI's
  * CR High #1 / #3 fixes): a run whose output is PERSISTED must never fall
@@ -187,11 +182,12 @@ export interface PersistingExtractionClients {
 export function buildPersistingExtractionClients(
   env: GraphragEnv
 ): PersistingExtractionClients {
+  const extractLlm = env.llm.extract;
   const llm = buildLlmClient(
     {
-      authToken: process.env.ANTHROPIC_AUTH_TOKEN,
-      baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
-      model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
+      authToken: extractLlm.apiKey,
+      baseUrl: extractLlm.baseUrl,
+      model: extractLlm.model,
     },
     { extraction: true }
   );

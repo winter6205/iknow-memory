@@ -1,11 +1,14 @@
 /**
  * dashboard-api server — bind + health + stats + envelope (T2).
  */
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
 import { GraphragError } from "../../src/core/errors.js";
-import { ConfigError } from "../../src/config.js";
+import { ConfigError, setSettingHomeForTests } from "../../src/config.js";
 
 import { boot, fetchJson, memoryDeps, stubReadPort, track } from "./helpers.js";
 import {
@@ -169,8 +172,10 @@ describe("dashboard-api binding", () => {
   it("defaults API host to loopback and port away from the SPA 18868", () => {
     const savedHost = process.env.GRAPHRAG_MEMORY_DASHBOARD_HOST;
     const savedPort = process.env.GRAPHRAG_MEMORY_DASHBOARD_PORT;
+    const home = mkdtempSync(join(tmpdir(), "iknow-dashboard-default-"));
     delete process.env.GRAPHRAG_MEMORY_DASHBOARD_HOST;
     delete process.env.GRAPHRAG_MEMORY_DASHBOARD_PORT;
+    setSettingHomeForTests(home);
     try {
       const cfg = readDashboardConfig();
       expect(cfg.host).toBe("127.0.0.1");
@@ -178,6 +183,8 @@ describe("dashboard-api binding", () => {
       expect(cfg.port).toBe(DEFAULT_DASHBOARD_PORT);
       expect(cfg.port).not.toBe(18868);
     } finally {
+      setSettingHomeForTests(null);
+      rmSync(home, { recursive: true, force: true });
       if (savedHost === undefined)
         delete process.env.GRAPHRAG_MEMORY_DASHBOARD_HOST;
       else process.env.GRAPHRAG_MEMORY_DASHBOARD_HOST = savedHost;

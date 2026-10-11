@@ -36,6 +36,7 @@ import {
   createSettingStore,
   type SettingStore,
 } from "./config/setting-store.js";
+import { ConfigError, projectSettingText } from "./config/operator-setting.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -160,12 +161,7 @@ export const BUSINESS_LEDGER_URL_VAR = "FIN_BUSINESS_LEDGER_URL";
  * which covers per-request tool failures: a ConfigError is unrecoverable and
  * aborts the process with EXIT_CODES.BAD_CONFIG before any transport opens.
  */
-export class ConfigError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ConfigError";
-  }
-}
+export { ConfigError };
 
 /**
  * Neo4j sidecar connection settings (#70).
@@ -454,64 +450,29 @@ function readEnvFromSettingSync(key: string): string | undefined {
   // legacy sentinel from before `setSettingHomeForTests` reset to
   // `undefined`. Treat both as needing a (re)load.
   if (cachedSettingMap === null || cachedSettingMap === undefined) {
-    // First read in this process; populate from the store.
-    try {
-      const store = getSettingStore();
-      if (!existsSync(store.path)) {
-        cachedSettingMap = {};
-      } else {
-        const raw = readFileSync(store.path, "utf8");
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(raw);
-        } catch {
-          throw new ConfigError(
-            `${store.path}: not valid JSON (setting.json must be a JSON object of GRAPHRAG_MEMORY_* keys)`
-          );
-        }
-        if (
-          typeof parsed !== "object" ||
-          parsed === null ||
-          Array.isArray(parsed)
-        ) {
-          throw new ConfigError(
-            `${store.path}: root must be a JSON object of GRAPHRAG_MEMORY_* keys`
-          );
-        }
-        const out: Record<string, string> = {};
-        for (const [k, v] of Object.entries(parsed)) {
-          if (k === "") {
-            throw new ConfigError(
-              `${store.path}: setting keys must be non-empty`
-            );
-          }
-          if (typeof v !== "string") {
-            throw new ConfigError(
-              `${store.path}: value for "${k}" must be a string, got ${typeof v}`
-            );
-          }
-          out[k] = v;
-        }
-        cachedSettingMap = out;
-      }
-    } catch (err) {
-      if (err instanceof ConfigError) throw err;
-      // ENOENT race: collapse to empty.
-      if (
-        err instanceof Error &&
-        "code" in err &&
-        (err as NodeJS.ErrnoException).code === "ENOENT"
-      ) {
-        cachedSettingMap = {};
-      } else {
-        throw err;
-      }
-    }
-  }
-  if (cachedSettingMap === undefined || cachedSettingMap === null) {
-    return undefined;
+    cachedSettingMap = loadRuntimeSettingMap();
   }
   return cachedSettingMap[key];
+}
+
+function loadRuntimeSettingMap(): Record<string, string> {
+  try {
+    const store = getSettingStore();
+    if (!existsSync(store.path)) return {};
+    return projectSettingText(readFileSync(store.path, "utf8"), store.path).runtime;
+  } catch (err) {
+    if (err instanceof ConfigError) throw err;
+    if (isSettingEnoent(err)) return {};
+    throw err;
+  }
+}
+
+function isSettingEnoent(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    "code" in err &&
+    (err as NodeJS.ErrnoException).code === "ENOENT"
+  );
 }
 
 /**

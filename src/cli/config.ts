@@ -31,9 +31,9 @@ import pg from "pg";
 import { loadEnv, type GraphragEnv } from "../config.js";
 import {
   createSettingStore,
-  type SettingMap,
   type SettingStore,
 } from "../config/setting-store.js";
+import { wholePlaceholderName } from "../config/operator-setting.js";
 import { parseEnvFile } from "../config/env-file.js";
 import { isSecretKey } from "../config/key-registry.js";
 import {
@@ -163,7 +163,11 @@ export const EMBED_GENERATION_NOT_READ = "embed generation not read";
  * stdout/stderr.
  */
 function maskStoredValue(key: string, value: string): string {
-  if (isSecretKey(key)) return value.trim() === "" ? "unset" : "configured";
+  if (isSecretKey(key)) {
+    const name = wholePlaceholderName(value);
+    if (name !== undefined) return name;
+    return value.trim() === "" ? "unset" : "configured";
+  }
   if (key === "GRAPHRAG_MEMORY_DB_URL") return redactDatabaseUrlUserinfo(value);
   return value;
 }
@@ -250,19 +254,12 @@ export async function runConfigCli(
       return { code: 0, stdout: "", stderr: "" };
     }
     case "set": {
-      const prev = await deps.store.read();
-      const next: SettingMap = { ...prev, [command.key]: command.value };
-      await deps.store.write(next);
+      await deps.store.setKey(command.key, command.value);
       return { code: 0, stdout: "", stderr: "" };
     }
     case "unset": {
       // Idempotent — `unset` on an absent key is a no-op, exit 0.
-      const prev = await deps.store.read();
-      if (command.key in prev) {
-        const next: Record<string, string> = { ...prev };
-        delete next[command.key];
-        await deps.store.write(next);
-      }
+      await deps.store.unsetKey(command.key);
       return { code: 0, stdout: "", stderr: "" };
     }
   }

@@ -1,27 +1,18 @@
 /**
- * Operator-setting file store — read/write of `~/.iknow-memory/setting.json`.
- *
- * Shape: a flat object whose keys are the existing `GRAPHRAG_MEMORY_*` env
- * var names and whose values are strings. The mapping is 1:1 with the
- * env-vars the rest of `config.ts` already understands, so the resolver
- * (src/config/setting-resolver.ts) can fall back to a key lookup with no
- * new naming scheme.
- *
- * Why a custom shape: the spec is explicit — keys stay
- * `GRAPHRAG_MEMORY_*` (no migration to a friendlier namespace this wave).
- * A nested object would force every consumer to re-derive the env name,
- * defeating the purpose. Numeric / array / nested values are rejected
- * with a typed error so a hand-edit typo (`{"GRAPHRAG_MEMORY_DB_URL": 42}`)
- * cannot become "loaded with `undefined`" or "loaded with
- * `[object Object]`" downstream.
- *
- * No new runtime dependency: this module only uses `node:fs` /
- * `node:path`. The package's lockfile is not touched by T2.
+ * Operator-setting file at `~/.iknow-memory/setting.json`.
+ * A nested operator document projects onto registry names; a flat string map is stored as written.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { memoryHomeDirectory } from "./memory-home.js";
+import {
+  applyNestedSet,
+  applyNestedUnset,
+  classifySettingDocument,
+  parseSettingJson,
+  projectSettingText,
+} from "./operator-setting.js";
 
 /** A flat map of `GRAPHRAG_MEMORY_*` → string. */
 export type SettingMap = Readonly<Record<string, string>>;
@@ -32,13 +23,15 @@ export interface SettingStore {
   readonly path: string;
   /**
    * Read the current map. An absent file (or absent parent directory) is
-   * `{}` — never an error, never a block on start. A malformed file or a
-   * non-flat value is a typed error so an operator typo surfaces at the
-   * boot boundary, not as a confusing empty-string at the use site.
+   * `{}` — never an error, never a block on start. A malformed or invalid
+   * document is a typed error so an operator typo surfaces at the boot
+   * boundary, not as a confusing empty-string at the use site.
    */
   read(): Promise<SettingMap>;
   /** Replace the on-disk map with `next`. */
   write(next: SettingMap): Promise<void>;
+  setKey(key: string, value: string): Promise<void>;
+  unsetKey(key: string): Promise<void>;
 }
 
 export interface CreateSettingStoreOptions {
@@ -59,47 +52,99 @@ function storeDirectory(options: CreateSettingStoreOptions): string {
   return memoryHomeDirectory(null);
 }
 
-/**
- * Walk every value in `parsed` and confirm it's a non-empty-key string.
- * Throws a typed error naming the offending key. Returning the validated
- * map keeps the read path small — no second pass.
- */
-function assertFlatStringMap(parsed: unknown): Record<string, string> {
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error(
-      `${FILE_NAME}: root must be a JSON object of GRAPHRAG_MEMORY_* keys, got ${typeof parsed}`
-    );
-  }
+/** Validate an in-memory map the CLI is about to persist. */
+function assertWriteableMap(next: SettingMap): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(parsed)) {
-    if (k === "") {
+  for (const [key, value] of Object.entries(next)) {
+    if (key === "") {
       throw new Error(`${FILE_NAME}: setting keys must be non-empty`);
     }
-    if (typeof v !== "string") {
+    if (typeof value !== "string") {
       throw new Error(
-        `${FILE_NAME}: value for "${k}" must be a string, got ${typeof v}`
+        `${FILE_NAME}: value for "${key}" must be a string, got ${typeof value}`
       );
     }
-    out[k] = v;
+    out[key] = value;
   }
   return out;
 }
 
-/** Validate an in-memory map the CLI is about to persist. */
-function assertWriteableMap(next: SettingMap): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(next)) {
-    if (k === "") {
-      throw new Error(`${FILE_NAME}: setting keys must be non-empty`);
-    }
-    if (typeof v !== "string") {
-      throw new Error(
-        `${FILE_NAME}: value for "${k}" must be a string, got ${typeof v}`
-      );
-    }
-    out[k] = v;
+function isEnoent(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    "code" in err &&
+    (err as NodeJS.ErrnoException).code === "ENOENT"
+  );
+}
+
+async function readSettingText(path: string): Promise<string | undefined> {
+  if (!existsSync(path)) return undefined;
+  try {
+    return await readFile(path, "utf8");
+  } catch (err) {
+    if (isEnoent(err)) return undefined;
+    throw new Error(`${path}: failed to read (${(err as Error).message})`);
   }
-  return out;
+}
+
+async function writeJson(path: string, value: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function readSetting(path: string): Promise<SettingMap> {
+  const raw = await readSettingText(path);
+  if (raw === undefined) return {};
+  return projectSettingText(raw, path).display;
+}
+
+async function writeSetting(path: string, next: SettingMap): Promise<void> {
+  await writeJson(path, assertWriteableMap(next));
+}
+
+async function readParsedSetting(path: string): Promise<unknown | undefined> {
+  const raw = await readSettingText(path);
+  if (raw === undefined) return undefined;
+  return parseSettingJson(raw, path);
+}
+
+async function setSettingKey(
+  path: string,
+  key: string,
+  value: string
+): Promise<void> {
+  const parsed = await readParsedSetting(path);
+  const kind = classifySettingDocument(parsed, path);
+  if (kind === "nested") {
+    await writeJson(path, applyNestedSet(parsed, path, key, value));
+    return;
+  }
+  const current = kind === "flat" ? (parsed as Record<string, string>) : {};
+  await writeSetting(path, { ...current, [key]: value });
+}
+
+async function unsetSettingKey(path: string, key: string): Promise<void> {
+  const parsed = await readParsedSetting(path);
+  if (parsed === undefined) return;
+  const kind = classifySettingDocument(parsed, path);
+  if (kind !== "nested") {
+    await unsetFlat(path, parsed as Record<string, string>, key);
+    return;
+  }
+  const next = applyNestedUnset(parsed, key);
+  if (JSON.stringify(next) === JSON.stringify(parsed)) return;
+  await writeJson(path, next);
+}
+
+async function unsetFlat(
+  path: string,
+  current: Record<string, string>,
+  key: string
+): Promise<void> {
+  if (!Object.prototype.hasOwnProperty.call(current, key)) return;
+  const next = { ...current };
+  delete next[key];
+  await writeSetting(path, next);
 }
 
 /**
@@ -112,31 +157,9 @@ export function createSettingStore(
   const path = join(storeDirectory(options), FILE_NAME);
   return {
     path,
-    async read(): Promise<SettingMap> {
-      if (!existsSync(path)) return {};
-      let raw: string;
-      try {
-        raw = await readFile(path, "utf8");
-      } catch (err) {
-        // ENOENT can race with `existsSync` (deleted between check and
-        // read); collapse to "absent" so the no-block contract holds.
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
-        throw new Error(`${path}: failed to read (${(err as Error).message})`);
-      }
-      let json: unknown;
-      try {
-        json = JSON.parse(raw);
-      } catch {
-        throw new Error(
-          `${path}: not valid JSON (${FILE_NAME} must be a JSON object of GRAPHRAG_MEMORY_* keys)`
-        );
-      }
-      return assertFlatStringMap(json);
-    },
-    async write(next: SettingMap): Promise<void> {
-      const validated = assertWriteableMap(next);
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, JSON.stringify(validated, null, 2) + "\n", "utf8");
-    },
+    read: () => readSetting(path),
+    write: (next) => writeSetting(path, next),
+    setKey: (key, value) => setSettingKey(path, key, value),
+    unsetKey: (key) => unsetSettingKey(path, key),
   };
 }

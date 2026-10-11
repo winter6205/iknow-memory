@@ -1,4 +1,5 @@
 import { KEY_REGISTRY, isKnownKey, type KeySpec } from "./key-registry.js";
+import { wholePlaceholderName } from "./operator-setting.js";
 import {
   resolveLayeredValue,
   type EnvBag,
@@ -49,12 +50,17 @@ function sourcesOf(input: EffectiveConfigInput): LayerSources {
   return { env: input.env, setting: input.setting, homeEnv: input.homeEnv };
 }
 
+function secretReportValue(value: string | undefined): string {
+  if (value === undefined || value.trim() === "") return "unset";
+  return wholePlaceholderName(value) ?? "configured";
+}
+
 function reportKey(spec: KeySpec, sources: LayerSources): EffectiveKeyReport {
   const resolved = resolveLayeredValue(spec.env, sources);
   if (spec.secret) {
     return {
       key: spec.env,
-      value: resolved.value === undefined ? "unset" : "configured",
+      value: secretReportValue(resolved.value),
       layer: resolved.layer,
       effect: spec.effect,
     };

@@ -31,7 +31,7 @@ _Avoid_: wiki page; "document" alone (too generic); assembling the body by conca
 **ledger schema**: the authoritative-source table contract: **资料**, chunks, entities, triples, entity_aliases, extraction_records, projection_outbox. Not a phase label.
 _Avoid_: P0 schema
 
-**operator setting**: the home-directory file `~/.iknow-memory/setting.json` that holds identity and everyday secrets (storage mode, dedicated database URL, embedding model and dimensions, Neo4j URI, API keys). Process env overrides a key when set; missing env does not refuse boot if the file has the key. The dashboard and MCP server both read this file. The CLI is a separate bin `iknow-memory-config` — not a subcommand of the `iknow-memory` stdio entry.
+**operator setting**: the home file `setting.json` (`IKNOW_MEMORY_HOME`, otherwise `~/.iknow-memory`) may be the nested document in `specs/readable-operator-setting.md`, and a flat `GRAPHRAG_MEMORY_*` string map still loads. `loadEnv` remains the only loader; process env overrides a file key; the CLI is `iknow-memory-config`, not a subcommand of `iknow-memory`.
 _Avoid_: `config.json`; `iknow-memory config`; copying DSN and keys into host MCP JSON as a second store; requiring exported shell env for keys to work
 
 **资料集合**: the operator-visible set of pushed **资料** (documents) and their successful **chunk** counts on the existing 资料/dashboard page. Ready means status ready and chunk count ≥ 1. Empty store is legal empty **retrieve**, not `degraded`.

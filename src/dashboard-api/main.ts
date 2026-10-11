@@ -4,6 +4,8 @@
 import { Pool } from "pg";
 
 import { ConfigError, loadEnv, type GraphragEnv } from "../config.js";
+import { resolveMemoryHome } from "../config/memory-home.js";
+import { publishProcessReport } from "../config/process-fingerprint.js";
 import { createLogger, writeStderr } from "../logging.js";
 import { buildRetrieveDeps, buildRetrieveReranker } from "../index.js";
 import { NineRouterEmbedder, UnavailableEmbedder } from "../core/embedder.js";
@@ -48,6 +50,7 @@ async function buildStorage(
   }
   const backend = new mod.PgvectorBackend(env.dbUrl, env.embedDimensions, {
     embedModel: env.embedModel,
+    embedBaseUrl: env.embedBaseUrl,
   });
   // The generation boot guard inside initialize() replaces the retired
   // drop-and-add dim align: desired ≠ active without an open rotate is a
@@ -87,6 +90,14 @@ export async function main(): Promise<void> {
   }
   const logger = createLogger(env.logLevel);
   const storage = await buildStorage(env);
+  const fingerprints = await publishProcessReport(
+    "dashboard",
+    env,
+    resolveMemoryHome({
+      iknowMemoryHome: process.env.IKNOW_MEMORY_HOME,
+      osHome: process.env.HOME,
+    })
+  );
   const embedder = buildEmbedder(env);
   const slotEmbedding = createSlotSourceFromGraphragEnv(env, embedder);
   const precision = createPrecisionLayer(env);
@@ -142,9 +153,9 @@ export async function main(): Promise<void> {
       ? {
           extract: {
             llmEnv: {
-              authToken: process.env.ANTHROPIC_AUTH_TOKEN,
-              baseUrl: process.env.GRAPHRAG_MEMORY_ANTHROPIC_BASE_URL,
-              model: process.env.GRAPHRAG_MEMORY_ANTHROPIC_MODEL,
+              authToken: env.llm.extract.apiKey,
+              baseUrl: env.llm.extract.baseUrl,
+              model: env.llm.extract.model,
             },
             embedderEnv: {
               apiKey: env.embedApiKey,
@@ -195,6 +206,11 @@ export async function main(): Promise<void> {
       : {}),
     ...(graphRanker !== undefined ? { graphRanker } : {}),
     ...(reranker !== undefined ? { reranker } : {}),
+    retrievalIdentity: {
+      retrievalFingerprint: fingerprints.retrieval,
+      generationId: fingerprints.generationId,
+      epoch: fingerprints.epoch,
+    },
     ...(openGraphSession !== undefined ? { openGraphSession } : {}),
     writes,
     storageMode: env.storage,

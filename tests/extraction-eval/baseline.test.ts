@@ -95,10 +95,22 @@ async function captureAppend(fn: () => Promise<unknown>): Promise<unknown> {
 }
 
 describe("baseline — file path resolution (A10)", () => {
-  it("defaults to gold-set/baseline.json when no dir is given", () => {
-    expect(baselineFilePath("")).toBe(
-      join("gold-set", DEFAULT_BASELINE_FILENAME)
-    );
+  it("defaults to the memory home gold-set when no dir is given", () => {
+    const previousHome = process.env.IKNOW_MEMORY_HOME;
+    const previousGold = process.env.GOLD_SET_DIR;
+    const home = freshDir();
+    delete process.env.GOLD_SET_DIR;
+    process.env.IKNOW_MEMORY_HOME = home;
+    try {
+      expect(baselineFilePath("")).toBe(
+        join(home, "gold-set", DEFAULT_BASELINE_FILENAME)
+      );
+    } finally {
+      if (previousHome === undefined) delete process.env.IKNOW_MEMORY_HOME;
+      else process.env.IKNOW_MEMORY_HOME = previousHome;
+      if (previousGold === undefined) delete process.env.GOLD_SET_DIR;
+      else process.env.GOLD_SET_DIR = previousGold;
+    }
   });
 
   it("joins an explicit dir with the default filename", () => {

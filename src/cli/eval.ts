@@ -59,6 +59,11 @@ import {
 import { driftGate as defaultDriftGate } from "../core/extraction-eval/gate.js";
 import { releaseGate as defaultReleaseGate } from "../core/extraction-eval/gate.js";
 import type { LLMClient } from "../core/extraction/llm-client.js";
+import { join } from "node:path";
+import {
+  defaultEvalOutputDir,
+  MemoryHomeMissingError,
+} from "../config/memory-home.js";
 
 /** Eval-side ConfigError. Distinct from `core/config.ts`'s ConfigError
  * so the offline operator tool's exit-1 surface does not depend on the
@@ -167,25 +172,37 @@ const USAGE = `usage: eval (--gold-build|--audit-rejects|--bootstrap|--gate pr|-
                   [--gold-model ID] [--audit-model ID] [--extract-model ID]
                   [--drift-tolerance N]`;
 
-const DEFAULT_FLAGS: EvalFlags = {
-  subcommand: null,
-  snapshotPath: "gold-set/snapshot.json",
-  goldPath: "gold-set/gold.json",
-  auditPath: "gold-set/audit.json",
-  baselineDir: "",
-  goldModel: "",
-  auditModel: "",
-  extractModelId: "",
-  driftTolerance: 0.05,
-  promptText: "",
-};
+function evalOutputDir(): string {
+  try {
+    return defaultEvalOutputDir();
+  } catch (err) {
+    if (err instanceof MemoryHomeMissingError) return "gold-set";
+    throw err;
+  }
+}
+
+function defaultEvalFlags(): EvalFlags {
+  const outputDir = evalOutputDir();
+  return {
+    subcommand: null,
+    snapshotPath: "gold-set/snapshot.json",
+    goldPath: join(outputDir, "gold.json"),
+    auditPath: join(outputDir, "audit.json"),
+    baselineDir: "",
+    goldModel: "",
+    auditModel: "",
+    extractModelId: "",
+    driftTolerance: 0.05,
+    promptText: "",
+  };
+}
 
 /**
  * Parse argv into typed flags. Unknown / malformed flags → `{ ok: false }`
  * so the caller can map to a usage error (exit 2).
  */
 export function parseArgs(argv: string[]): ParsedArgs {
-  const flags: EvalFlags = { ...DEFAULT_FLAGS };
+  const flags: EvalFlags = { ...defaultEvalFlags() };
   let i = 0;
   while (i < argv.length) {
     const arg = argv[i]!;
@@ -383,7 +400,7 @@ async function runGoldBuild(
   assertCrossFamily(flags.goldModel, deps.extractModelId, "gold");
   const snapshot = deps.loadSnapshot(flags.snapshotPath);
   const outPath =
-    flags.goldPath !== DEFAULT_FLAGS.goldPath
+    flags.goldPath !== defaultEvalFlags().goldPath
       ? flags.goldPath
       : flags.auditPath;
   const promptHash = deps.hashPrompt(flags.promptText);
@@ -888,7 +905,7 @@ function baselineDirFromEnv(): string {
   const override = process.env["GOLD_SET_DIR"];
   return override !== undefined && override.trim() !== ""
     ? override
-    : "gold-set";
+    : evalOutputDir();
 }
 
 function buildLlmFromEnv(envVar: string): LLMClient {

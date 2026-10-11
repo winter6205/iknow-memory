@@ -127,21 +127,21 @@ jobs:
         # published path works. scripts/wait-for-es.sh polls until the port
         # answers. See its header for the failures that motivated it.
         env:
-          ES_URL: http://127.0.0.1:9200
+          ES_URL: http://127.0.0.1:9201
         run: bash scripts/wait-for-es.sh
       - name: ES reachability diagnostics
         if: failure()
         run: |
           echo "::group::ES host reachability diagnostics"
           docker compose ps
-          ss -ltn | grep -E '9200|9300' || echo "(no host listener on 9200/9300)"
-          docker inspect iknow-memory-es \
+          ss -ltn | grep -E '9201|9300' || echo "(no host listener on 9201/9300)"
+          docker inspect iknow-memory-dev-es \
             --format '{{json .NetworkSettings.Ports}}' || true
-          docker logs --tail 60 iknow-memory-es || true
+          docker logs --tail 60 iknow-memory-dev-es || true
           echo "::endgroup::"
       - name: Live precision-layer suite
         env:
-          GRAPHRAG_MEMORY_ES_URL: http://127.0.0.1:9200
+          GRAPHRAG_MEMORY_ES_URL: http://127.0.0.1:9201
         run: npx vitest run --retry 1 tests/integration/bm25-pg.test.ts
 
   test-full:
@@ -169,7 +169,7 @@ jobs:
       # side should not depend on where getaddrinfo puts ::1 vs 127.0.0.1.
       # (Not the cause of the first test-es failure — that was a transient
       # connection reset from the published port; see wait-for-es.sh.)
-      GRAPHRAG_MEMORY_ES_URL: http://127.0.0.1:9200
+      GRAPHRAG_MEMORY_ES_URL: http://127.0.0.1:9201
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -193,17 +193,17 @@ jobs:
         # #226 closes (the nightly reported `fetch failed` + 4 skipped for
         # weeks without ever going red).
         env:
-          ES_URL: http://127.0.0.1:9200
+          ES_URL: http://127.0.0.1:9201
         run: bash scripts/wait-for-es.sh
       - name: ES reachability diagnostics
         if: failure()
         run: |
           echo "::group::ES host reachability diagnostics"
           docker compose ps
-          ss -ltn | grep -E '9200|9300' || echo "(no host listener on 9200/9300)"
-          docker inspect iknow-memory-es \
+          ss -ltn | grep -E '9201|9300' || echo "(no host listener on 9201/9300)"
+          docker inspect iknow-memory-dev-es \
             --format '{{json .NetworkSettings.Ports}}' || true
-          docker logs --tail 60 iknow-memory-es || true
+          docker logs --tail 60 iknow-memory-dev-es || true
           echo "::endgroup::"
       - name: Vitest full suite (retry-1)
         run: npx vitest run --retry 1

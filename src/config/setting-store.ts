@@ -21,6 +21,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { memoryHomeDirectory } from "./memory-home.js";
 
 /** A flat map of `GRAPHRAG_MEMORY_*` → string. */
 export type SettingMap = Readonly<Record<string, string>>;
@@ -51,11 +52,11 @@ export interface CreateSettingStoreOptions {
 }
 
 const FILE_NAME = "setting.json";
-const DIR_NAME = ".iknow-memory";
 
-/** Resolve `home/.iknow-memory/setting.json`. */
-function defaultPath(home: string): string {
-  return join(home, DIR_NAME, FILE_NAME);
+/** Resolve the directory that holds `setting.json`. */
+function storeDirectory(options: CreateSettingStoreOptions): string {
+  if (options.home !== undefined) return memoryHomeDirectory(options.home);
+  return memoryHomeDirectory(null);
 }
 
 /**
@@ -108,8 +109,7 @@ function assertWriteableMap(next: SettingMap): Record<string, string> {
 export function createSettingStore(
   options: CreateSettingStoreOptions = {}
 ): SettingStore {
-  const home = options.home ?? process.env.HOME ?? "";
-  const path = defaultPath(home);
+  const path = join(storeDirectory(options), FILE_NAME);
   return {
     path,
     async read(): Promise<SettingMap> {

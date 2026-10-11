@@ -483,6 +483,9 @@ async function createEmbeddingGeneration(
   await client.query(
     "ALTER TABLE embedding_generation ADD COLUMN IF NOT EXISTS rollback_dimensions integer NULL"
   );
+  await client.query(
+    "ALTER TABLE embedding_generation ADD COLUMN IF NOT EXISTS embed_host_hash text NULL"
+  );
 }
 
 /**
@@ -565,6 +568,9 @@ async function createSourceDocuments(
   await client.query(`
     ALTER TABLE source_documents
       ADD COLUMN IF NOT EXISTS content_identity text NULL`);
+  await client.query(`
+    ALTER TABLE source_documents
+      ADD COLUMN IF NOT EXISTS extraction_fingerprint text NULL`);
   // The pair is the index-job submission key. `source_ref` is already UNIQUE
   // so this composite cannot admit a duplicate today, but naming the pair as
   // a constraint is the storage-boundary record of the idempotency contract.
@@ -596,6 +602,9 @@ async function createIndexJobs(client: SchemaBootstrapClient): Promise<void> {
       started_at       timestamptz NULL,
       finished_at      timestamptz NULL
     )`);
+  await client.query(`
+    ALTER TABLE index_jobs
+      ADD COLUMN IF NOT EXISTS extraction_fingerprint text NULL`);
   await client.query(`
     DO $$
     BEGIN
@@ -835,7 +844,7 @@ export async function upSchemaBootstrap(
     await upSchemaProjection(client);
     await upSchemaMaintenanceWork(client);
     await upSchemaPublication(client);
-// MP14's collection marks. A brand-new table, so CREATE IF NOT EXISTS alone
+    // MP14's collection marks. A brand-new table, so CREATE IF NOT EXISTS alone
     // never reaches a deployed store — the probe in schema-lock.ts names it, and
     // this call is what actually creates it. The two must land together.
     await upSchemaCollectionMark(client);

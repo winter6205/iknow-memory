@@ -2403,6 +2403,26 @@ describe("runCliFromEnv precision wiring (production entry point)", () => {
       rerank: undefined,
       rerankUrl: undefined,
       jev: undefined,
+      llm: {
+        extract: {
+          protocol: "anthropic",
+          model: "extract-model",
+          baseUrl: "https://llm.example",
+          apiKey: undefined,
+        },
+        summary: {
+          protocol: "anthropic",
+          model: "summary-model",
+          baseUrl: "https://llm.example",
+          apiKey: undefined,
+        },
+        rerank: {
+          protocol: "anthropic",
+          model: "rerank-model",
+          baseUrl: "https://llm.example",
+          apiKey: undefined,
+        },
+      },
       // Required on GraphragEnv since the ADR-0009 default flip; this
       // suite pins the precision wiring, not the supersede switch.
       extractWriteTimeSupersede: true,

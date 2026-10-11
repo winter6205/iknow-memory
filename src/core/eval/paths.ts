@@ -1,18 +1,17 @@
 /**
  * Default on-disk locations for the evaluation capability's artifacts.
  *
- * Spelled once here so the CLI, the loaders and the tests cannot drift
- * apart. All three live under `eval/` at the repo root — git-tracked, as
- * SC6 requires of the baseline, and outside `src/` so `tsc --outDir dist`
- * never copies or shadows them.
+ * Gold and corpus stay under `eval/` at the repo root. The baseline
+ * file is a write; its default path is under the memory home.
  *
- * Resolution is relative to this module rather than `process.cwd()`, so
- * `npm run eval:retrieve` behaves the same from a subdirectory. The
- * three-level climb is identical for both layouts the module ships in:
- * `src/core/eval/` and `dist/core/eval/`.
+ * Resolution of the fixture paths is relative to this module rather than
+ * `process.cwd()`, so `npm run eval:retrieve` finds the same gold and
+ * corpus from a subdirectory. The three-level climb is identical for
+ * both layouts the module ships in: `src/core/eval/` and `dist/core/eval/`.
  */
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { memoryHomeDirectory } from "../../config/memory-home.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -35,10 +34,12 @@ export const DEFAULT_CORPUS_PATH = join(
   "retrieve-v1.json"
 );
 
-/** Git-tracked baseline the runner writes (SC6). */
-export const DEFAULT_BASELINE_PATH = join(
-  REPO_ROOT,
-  "eval",
-  "baseline",
-  "retrieve-p5.json"
-);
+/** Default write path for the retrieve-eval baseline. */
+export function defaultBaselinePath(): string {
+  return join(
+    memoryHomeDirectory(null),
+    "eval",
+    "baseline",
+    "retrieve-p5.json"
+  );
+}

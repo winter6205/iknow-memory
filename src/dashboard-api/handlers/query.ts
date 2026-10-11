@@ -26,6 +26,7 @@ import {
   RETRIEVE_PRESETS,
   RETRIEVE_PRESET_BUNDLES,
 } from "../../core/retrieval/types.js";
+import { retrievalEnvelopeFields } from "../../config/process-fingerprint.js";
 import type { EmbeddingClient } from "../../core/embedder.js";
 import type { StorageBackend } from "../../core/types.js";
 
@@ -40,6 +41,11 @@ export interface QueryDeps {
   retrieval: RetrieveConfig;
   graphRanker?: GraphRanker;
   reranker?: ChunkReranker;
+  retrievalIdentity?: {
+    retrievalFingerprint: string;
+    generationId: string;
+    epoch: string;
+  };
 }
 
 export function queryHandler(deps: QueryDeps): RouteHandler {
@@ -69,7 +75,11 @@ export function queryHandler(deps: QueryDeps): RouteHandler {
           ...(deps.reranker !== undefined ? { reranker: deps.reranker } : {}),
         } satisfies AssembleDeps
       );
-      return { status: 200, body: envelope };
+      const body =
+        deps.retrievalIdentity === undefined
+          ? envelope
+          : { ...envelope, ...retrievalEnvelopeFields(deps.retrievalIdentity) };
+      return { status: 200, body };
     } catch (err) {
       const { status, code } = retrievalErrorStatus(err);
       return { status, body: errorEnvelope(code, err) };

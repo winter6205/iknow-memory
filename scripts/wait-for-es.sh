@@ -17,13 +17,13 @@
 # localizes the failure to the suite, not to reachability.
 #
 # Usage:
-#   ES_URL=http://127.0.0.1:9200 bash scripts/wait-for-es.sh
+#   ES_URL=http://127.0.0.1:9201 bash scripts/wait-for-es.sh
 #
 # Exit 0 once ES answers; exit 1 after ES_WAIT_TIMEOUT_S (default 120s),
 # printing one verbose curl so the workflow log carries its own cause.
 set -uo pipefail
 
-base="${ES_URL:-http://127.0.0.1:9200}"
+base="${ES_URL:-http://127.0.0.1:9201}"
 url="${base%/}/_cluster/health"
 deadline_s="${ES_WAIT_TIMEOUT_S:-120}"
 

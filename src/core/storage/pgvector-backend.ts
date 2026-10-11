@@ -113,7 +113,10 @@ import {
   slotWriteWidths,
 } from "../embed-slots.js";
 import { waitForProjectionDrain } from "./projection-outbox.js";
-import { SERVING_GUARD_CLAUSE, servingGuardClause } from "./serving-guard-pg.js";
+import {
+  SERVING_GUARD_CLAUSE,
+  servingGuardClause,
+} from "./serving-guard-pg.js";
 import { randomUUID } from "node:crypto";
 import {
   assertFilled,
@@ -233,6 +236,8 @@ export interface PgvectorBackendOptions {
    * the generation boot guard compares the (model, dimensions) pair.
    */
   embedModel?: string;
+  /** Effective embed base URL. The boot guard compares its hostname hash. */
+  embedBaseUrl?: string;
 }
 
 /** Serialized pgvector literal: `[0.1,0.2,...]` with no spaces. */
@@ -377,7 +382,7 @@ const COMMUNITY_INDEX_STATE_SQL = `SELECT status, failure_code
  * record the caller wrote is exactly the record it reads back.
  */
 const INDEX_JOB_COLUMNS = `job_id, source_ref, content_identity, status,
-       failure_code, created_at, started_at, finished_at`;
+       failure_code, created_at, started_at, finished_at, extraction_fingerprint`;
 
 /** The one-active-job-per-source read: `in_progress` is the only active word. */
 const ACTIVE_JOB_FOR_SOURCE_SQL = `WHERE source_ref = $1 AND status = $2::text LIMIT 1`;
@@ -412,6 +417,7 @@ interface IndexJobRow {
   created_at: Date | string;
   started_at: Date | string | null;
   finished_at: Date | string | null;
+  extraction_fingerprint?: string | null;
 }
 
 /** Map a row to the record, serializing timestamps as ISO strings. */
@@ -426,6 +432,7 @@ function toIndexJobRecord(row: IndexJobRow): IndexJobRecord {
     finished_at:
       row.finished_at === null ? null : asIsoTimestamp(row.finished_at),
     failure_code: row.failure_code,
+    extraction_fingerprint: row.extraction_fingerprint ?? null,
   };
 }
 
@@ -440,6 +447,7 @@ interface SourceDocUpsertRow {
   status: string | null;
   failure_code: string | null;
   content_identity: string | null;
+  extraction_fingerprint?: string | null;
 }
 
 /** Project the upsert's RETURNING row back onto the record contract. */
@@ -457,6 +465,9 @@ function toSourceDocUpsertRecord(row: SourceDocUpsertRow): SourceDocRecord {
       : { status: normalizeSourceDocStatus(row.status) }),
     failure_code: row.failure_code,
     content_identity: row.content_identity,
+    ...(row.extraction_fingerprint
+      ? { extraction_fingerprint: row.extraction_fingerprint }
+      : {}),
   };
 }
 
@@ -716,6 +727,7 @@ export class PgvectorBackend
   private readonly poolConfig: PgvectorPoolConfig;
   private readonly annMaxDimensions: number | undefined;
   private readonly embedModel: string | undefined;
+  private readonly embedBaseUrl: string | undefined;
   private generation: EmbeddingGenerationState | undefined;
   private observedConcurrentConnections = 0;
   private peakConcurrentConnections = 0;
@@ -745,6 +757,7 @@ export class PgvectorBackend
     );
     this.annMaxDimensions = options.annMaxDimensions;
     this.embedModel = options.embedModel;
+    this.embedBaseUrl = options.embedBaseUrl;
     const defaults = readPgvectorPoolConfig();
     const poolOptions = options.poolOptions ?? {};
     this.poolConfig = {
@@ -802,6 +815,7 @@ export class PgvectorBackend
     const state = await guardEmbeddingBoot(this.pool!, {
       model: this.embedModel,
       dimensions: this.dimensions,
+      embedBaseUrl: this.embedBaseUrl,
     });
     this.generation = state;
     return state;
@@ -1338,9 +1352,9 @@ export class PgvectorBackend
       const result = await pool.query(
         `INSERT INTO source_documents
            (id, source_ref, title, content, created_at, valid_until,
-            status, failure_code, content_identity)
+            status, failure_code, content_identity, extraction_fingerprint)
            VALUES ($1, $2, $3, $4, $5, NULL,
-                   $8::text, $7::text, $9::text)
+                   $8::text, $7::text, $9::text, $10::text)
            ON CONFLICT (source_ref) DO UPDATE SET
              title = EXCLUDED.title,
              content = EXCLUDED.content,
@@ -1350,13 +1364,18 @@ export class PgvectorBackend
                ELSE $7::text
              END,
              content_identity = EXCLUDED.content_identity,
+             extraction_fingerprint = COALESCE(
+               source_documents.extraction_fingerprint,
+               EXCLUDED.extraction_fingerprint
+             ),
              valid_until = CASE
                WHEN source_documents.content = EXCLUDED.content
                  THEN source_documents.valid_until
                ELSE NULL
              END
            RETURNING id, source_ref, title, content, created_at, valid_until,
-                     status, failure_code, content_identity`,
+                     status, failure_code, content_identity,
+                     extraction_fingerprint`,
         [
           doc.id,
           doc.source_ref,
@@ -1367,6 +1386,7 @@ export class PgvectorBackend
           doc.failure_code ?? null,
           insertStatus,
           doc.content_identity ?? null,
+          doc.extraction_fingerprint ?? null,
         ]
       );
       return toSourceDocUpsertRecord(result.rows[0] as SourceDocUpsertRow);
@@ -1683,6 +1703,34 @@ export class PgvectorBackend
         );
       }
       return { record: joined, inserted: false };
+    });
+  }
+
+  /**
+   * Record the extraction fingerprint on a new job and the 资料 it indexes.
+   * A fingerprint already stored on either row is left unchanged.
+   */
+  async stampExtractionFingerprint(input: {
+    jobId: string;
+    sourceRef: string;
+    fingerprint: string;
+  }): Promise<void> {
+    return wrapPgRead("stampExtractionFingerprint", async () => {
+      const pool = await this.ensureReady();
+      await pool.query(
+        `UPDATE index_jobs
+            SET extraction_fingerprint = $2
+          WHERE job_id = $1
+            AND extraction_fingerprint IS NULL`,
+        [input.jobId, input.fingerprint]
+      );
+      await pool.query(
+        `UPDATE source_documents
+            SET extraction_fingerprint = $2
+          WHERE source_ref = $1
+            AND extraction_fingerprint IS NULL`,
+        [input.sourceRef, input.fingerprint]
+      );
     });
   }
 
@@ -2397,7 +2445,11 @@ export class PgvectorBackend
       if (entityIds.length === 0) return [];
       try {
         const pool = await this.ensureReady();
-        const { sql, params } = buildEntityChunksQuery(entityIds, validAt, limit);
+        const { sql, params } = buildEntityChunksQuery(
+          entityIds,
+          validAt,
+          limit
+        );
         const result = await pool.query(sql, params);
         return result.rows.map((r) => {
           const row = r as {

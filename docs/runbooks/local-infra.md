@@ -13,12 +13,14 @@ on (the defaults) refuses to boot without the matching URI / secret / ES
 address (ADR-0006 / ADR-0007).
 
 CI: `.github/workflows/test.yml` job `test-es` builds only the
-`elasticsearch` compose service (`--no-deps`) and runs
-`tests/integration/bm25-pg.test.ts` so the precision layer cannot
-loud-skip on PR/main (`CI=true` turns an unreachable probe into a
-failed job, not `describe.skip`). Nightly `test-full` starts the same ES
-service alongside the Postgres workflow service (not the compose
-Postgres, to avoid binding `:5432` twice).
+`elasticsearch` compose service (`--no-deps`) from this repository
+compose file and runs `tests/integration/bm25-pg.test.ts` so the
+precision layer cannot loud-skip on PR/main (`CI=true` turns an
+unreachable probe into a failed job, not `describe.skip`). That job
+reaches Elasticsearch at `http://127.0.0.1:9201`. Nightly `test-full`
+starts the same ES service on host port `9201` alongside the Postgres
+workflow service on `5432` (the workflow service, not this compose
+Postgres).
 
 ## Start
 
@@ -56,38 +58,39 @@ shared or production host. No API keys live in the compose file or images.
 
 | Service                         | Image / build                                    | Port(s)                      | Dev credential                                  |
 | ------------------------------- | ------------------------------------------------ | ---------------------------- | ----------------------------------------------- |
-| Postgres + pgvector             | `pgvector/pgvector:pg16` (same family as CI)     | `5432`                       | user/db `iknow_memory`, password `iknow_memory` |
-| Neo4j + GDS                     | `docker/neo4j` → `5.26.0` + baked GDS `2.13.2`   | `7687` (Bolt), `7474` (HTTP) | user `neo4j`, password `iknow-memory-dev`       |
-| Elasticsearch 8.x + analysis-ik | `docker/elasticsearch` → `8.19.20` + matching IK | `9200`                       | security off (no user / API key)                |
+| Postgres + pgvector             | `pgvector/pgvector:pg16` (same family as CI)     | `5433`                       | user/db `iknow_memory`, password `iknow_memory` |
+| Neo4j + GDS                     | `docker/neo4j` → `5.26.0` + baked GDS `2.13.2`   | `7688` (Bolt), `7475` (HTTP) | user `neo4j`, password `iknow-memory-dev`       |
+| Elasticsearch 8.x + analysis-ik | `docker/elasticsearch` → `8.19.20` + matching IK | `9201`                       | security off (no user / API key)                |
 
 `CREATE EXTENSION vector` is created by the host app on first schema bootstrap;
 you do not need a separate migration.
 
-## Port ownership: Compose vs a host that already runs Postgres
+## Dev stack and the production template
 
-Decision (2026-09-14, `plans/local-infra-es-dev-contract` T1): on a dev box,
-**this Compose stack owns `5432` / `7687` / `9200`.** Stop any non-compose
-listener on those ports before `docker compose up`. One written set of
-addresses and credentials beats a mixed stack, and it keeps local dev on the
-same `pgvector/pgvector:pg16` family as CI.
+`docker-compose.yml` is the dev stack. Compose project name
+`iknow-memory-dev`. Container names `iknow-memory-dev-postgres`,
+`iknow-memory-dev-neo4j`, and `iknow-memory-dev-es`. Host ports `5433`
+(Postgres), `7475` (Neo4j HTTP), `7688` (Neo4j Bolt), and `9201`
+(Elasticsearch). Its volumes are not external and are not named
+`iknow-memory-pg`, `iknow-memory-es`, or `iknow-memory-neo4j`.
 
-On this WSL box the system PostgreSQL 16 owns `5432` and also carries other
-projects' databases (`fin`, `gbrain`, `rag_cs`). The operator stops it before
-the first `docker compose up -d --wait`:
+`docker-compose.production.yml` is the production template. Compose project
+name `iknow-memory`. Container names stay `iknow-memory-postgres`,
+`iknow-memory-neo4j`, and `iknow-memory-es`. Host ports stay `5432`,
+`7474`, `7687`, and `9200`. Volumes are `external: true` with names
+`iknow-memory-pg`, `iknow-memory-es`, and `iknow-memory-neo4j`.
 
-```bash
-sudo systemctl stop postgresql
-# If Compose should own 5432 across reboots too: `sudo systemctl disable postgresql`
-# — at the cost of those other databases not coming back at boot.
-```
+An operator copies `docker-compose.production.yml` to
+`~/.iknow-memory/compose/`. This change does not apply that file: it does
+not copy it into the home directory and it does not start, stop, or
+recreate containers.
 
-`7687` and `9200` have no non-compose listener here, so Neo4j and
-Elasticsearch follow the Compose paths above by default. `scripts/neo4j.sh`
-remains the no-Docker path and must not run at the same time.
+The dev stack publishes different host ports from the production containers,
+so both can be running. `scripts/neo4j.sh` remains the no-Docker path and
+listens on `7687`; the dev compose Bolt port is `7688`.
 
-The Compose volumes start empty. Re-populate the ledger with `ingest` /
-`push`; migrating rows off the stopped system instance (`pg_dump`) is a
-manual step and out of scope for this runbook.
+Dev compose volumes start empty. Re-populate the ledger with `ingest` /
+`push`.
 
 ## Host MCP / `.env.local` pointing at compose
 
@@ -100,11 +103,11 @@ pin does not fall through to the file).
 
 ```bash
 GRAPHRAG_MEMORY_STORAGE=pgvector
-GRAPHRAG_MEMORY_DB_URL=postgresql://iknow_memory:iknow_memory@localhost:5432/iknow_memory
-GRAPHRAG_MEMORY_NEO4J_URI=bolt://localhost:7687
+GRAPHRAG_MEMORY_DB_URL=postgresql://iknow_memory:iknow_memory@localhost:5433/iknow_memory
+GRAPHRAG_MEMORY_NEO4J_URI=bolt://localhost:7688
 GRAPHRAG_MEMORY_NEO4J_USER=neo4j
 GRAPHRAG_MEMORY_NEO4J_PASSWORD=iknow-memory-dev
-GRAPHRAG_MEMORY_ES_URL=http://localhost:9200
+GRAPHRAG_MEMORY_ES_URL=http://localhost:9201
 ```
 
 Then on the **host** (not in a container):
@@ -133,7 +136,7 @@ npm run graph:drain
 | `docker compose up` (this runbook)                             | Docker is available; common local/dev case                                   | `neo4j` / `iknow-memory-dev` — set URI **and** USER/PASSWORD together                               |
 | `bash scripts/neo4j.sh install && bash scripts/neo4j.sh start` | No Docker, or Cloud Agent snapshot (`cursor-install.sh` / `cursor-start.sh`) | Auth **disabled**, listener on `127.0.0.1` — `eval "$(bash scripts/neo4j.sh env)"` exports URI only |
 
-Do not run both against port `7687` at once. Both ship GDS so
+Dev compose publishes Bolt on `7688`. `scripts/neo4j.sh` listens on `7687`. Do not bind both to the same host port. Both ship GDS so
 `gds.pageRank.stream` works. Version pin: Neo4j `5.26.0`, GDS `2.13.2`
 (compose bakes the jar; `scripts/neo4j.sh` unpacks the same zip).
 
@@ -148,9 +151,9 @@ The precision-layer runbook still documents a one-off `docker run` plus
 Sanity check after `--wait`:
 
 ```bash
-curl -fsS http://localhost:9200
+curl -fsS http://localhost:9201
 docker compose exec elasticsearch bin/elasticsearch-plugin list | grep -i analysis-ik
-curl -fsS -X POST "http://localhost:9200/_analyze" \
+curl -fsS -X POST "http://localhost:9201/_analyze" \
   -H "Content-Type: application/json" \
   -d '{"analyzer":"ik_smart","text":"中华人民共和国国歌"}'
 ```

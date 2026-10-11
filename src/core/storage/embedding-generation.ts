@@ -17,10 +17,7 @@
  * runs DDL inside one transaction, so its caller must pass a DEDICATED
  * client (a leased PoolClient / pg.Client), not a shared Pool.
  */
-import {
-  ConfigError,
-  readPgvectorAnnMaxDimensions,
-} from "../../config.js";
+import { ConfigError, readPgvectorAnnMaxDimensions } from "../../config.js";
 import { GraphragError } from "../errors.js";
 import {
   isEmbedRotateMode,
@@ -28,6 +25,7 @@ import {
   type EmbeddingGenerationState,
   type EmbedRotateMode,
 } from "../types.js";
+import { hostnameHash } from "../../config/host-hash.js";
 import {
   assertPgvectorAnnDimensions,
   type SchemaBootstrapClient,
@@ -52,6 +50,8 @@ export type RotationTable = (typeof ROTATION_TABLES)[number];
 export interface DesiredEmbeddingGeneration {
   model: string | undefined;
   dimensions: number;
+  /** Effective embed base URL. Only its normalized hostname is compared. */
+  embedBaseUrl?: string;
 }
 
 function toPair(desired: DesiredEmbeddingGeneration): EmbeddingGenerationPair {
@@ -63,7 +63,9 @@ export function sameGenerationPair(
   a: EmbeddingGenerationPair,
   b: EmbeddingGenerationPair
 ): boolean {
-  return (a.model ?? null) === (b.model ?? null) && a.dimensions === b.dimensions;
+  return (
+    (a.model ?? null) === (b.model ?? null) && a.dimensions === b.dimensions
+  );
 }
 
 function pairLabel(pair: EmbeddingGenerationPair): string {
@@ -124,6 +126,7 @@ interface GenerationRow {
   rollback_slot?: string | null;
   rollback_model?: string | null;
   rollback_dimensions?: number | null;
+  embed_host_hash?: string | null;
   updated_at: Date;
 }
 
@@ -139,7 +142,11 @@ interface GenerationRow {
 export function assertVectorReadsAllowed(
   state: EmbeddingGenerationState | null | undefined
 ): void {
-  if (state != null && state.incomingSlot !== null && state.rotateMode === "downtime") {
+  if (
+    state != null &&
+    state.incomingSlot !== null &&
+    state.rotateMode === "downtime"
+  ) {
     throw new GraphragError(
       "embedding rotate downtime: vector retrieve refused until cutover",
       "STORAGE_ERROR"
@@ -148,15 +155,9 @@ export function assertVectorReadsAllowed(
   }
 }
 
-/** The typed read of the singleton; null = no row yet (fresh or pre-ledger store). */
-export async function readGenerationState(
-  client: SchemaBootstrapClient
-): Promise<EmbeddingGenerationState | null> {
-  const result = await client.query(
-    "SELECT active_slot, active_model, active_dimensions, incoming_slot, incoming_model, incoming_dimensions, rotate_mode, rollback_slot, rollback_model, rollback_dimensions, updated_at FROM embedding_generation WHERE id = 1"
-  );
-  const row = result.rows[0] as GenerationRow | undefined;
-  if (row === undefined) return null;
+function assertReadableGenerationRow(
+  row: GenerationRow
+): asserts row is GenerationRow & { rotate_mode: EmbedRotateMode | null } {
   if (row.rotate_mode !== null && !isEmbedRotateMode(row.rotate_mode)) {
     throw new GraphragError(
       `embedding_generation: persisted rotate_mode "${row.rotate_mode}" is outside the vocabulary`,
@@ -180,6 +181,19 @@ export async function readGenerationState(
     );
     // EXIT: half a displaced generation cannot be rolled back or dropped safely.
   }
+}
+
+/** The typed read of the singleton; null = no row yet (fresh or pre-ledger store). */
+export async function readGenerationState(
+  client: SchemaBootstrapClient
+): Promise<EmbeddingGenerationState | null> {
+  const result = await client.query(
+    "SELECT active_slot, active_model, active_dimensions, incoming_slot, incoming_model, incoming_dimensions, rotate_mode, rollback_slot, rollback_model, rollback_dimensions, embed_host_hash, updated_at FROM embedding_generation WHERE id = 1"
+  );
+  const row = result.rows[0] as GenerationRow | undefined;
+  if (row === undefined) return null;
+  assertReadableGenerationRow(row);
+  const rollbackSlot = row.rollback_slot ?? null;
   return {
     activeSlot: row.active_slot,
     active: {
@@ -203,6 +217,7 @@ export async function readGenerationState(
             model: row.rollback_model ?? null,
             dimensions: row.rollback_dimensions as number,
           },
+    embedHostHash: row.embed_host_hash ?? null,
     updatedAt: row.updated_at,
   };
 }
@@ -244,6 +259,41 @@ async function readSlotWidth(
  * 4. Otherwise: typed ConfigError naming BOTH pairs. Never a DROP of the
  *    live column — the retired drop-and-add align must not return.
  */
+function embedHostHashOf(embedBaseUrl: string | undefined): string | null {
+  if (embedBaseUrl === undefined || embedBaseUrl.trim() === "") return null;
+  try {
+    return hostnameHash(embedBaseUrl);
+  } catch (err) {
+    if (!(err instanceof TypeError)) throw err;
+    throw new ConfigError("embedBaseUrl is unparseable");
+  }
+}
+
+async function applyEmbedHostGuard(
+  client: SchemaBootstrapClient,
+  state: EmbeddingGenerationState,
+  desired: DesiredEmbeddingGeneration
+): Promise<EmbeddingGenerationState> {
+  const desiredHash = embedHostHashOf(desired.embedBaseUrl);
+  if (desiredHash === null) return state;
+  const stored = state.embedHostHash;
+  if (stored === null) {
+    await client.query(
+      `UPDATE embedding_generation
+          SET embed_host_hash = $1
+        WHERE id = 1 AND embed_host_hash IS NULL`,
+      [desiredHash]
+    );
+    return { ...state, embedHostHash: desiredHash };
+  }
+  if (stored !== desiredHash && state.incomingSlot === null) {
+    throw new ConfigError(
+      "embedding host mismatch: effective embed host differs from the generation singleton and no rotate is open"
+    );
+  }
+  return state;
+}
+
 export async function guardEmbeddingBoot(
   client: SchemaBootstrapClient,
   desired: DesiredEmbeddingGeneration
@@ -266,10 +316,15 @@ export async function guardEmbeddingBoot(
     // loser reads back the winner's row and re-runs the same comparison.
     await client.query(
       `INSERT INTO embedding_generation
-         (id, active_slot, active_model, active_dimensions, updated_at)
-       VALUES (1, $1, $2, $3, now())
+         (id, active_slot, active_model, active_dimensions, embed_host_hash, updated_at)
+       VALUES (1, $1, $2, $3, $4, now())
        ON CONFLICT (id) DO NOTHING`,
-      [EMBEDDING_SLOT_BASE, desired.model ?? null, catalogWidth]
+      [
+        EMBEDDING_SLOT_BASE,
+        desired.model ?? null,
+        catalogWidth,
+        embedHostHashOf(desired.embedBaseUrl),
+      ]
     );
     state = await readGenerationState(client);
     if (state === null) {
@@ -282,9 +337,14 @@ export async function guardEmbeddingBoot(
     }
   }
   const desiredPair = toPair(desired);
-  if (sameGenerationPair(desiredPair, state.active)) return state;
-  if (state.incoming !== null && sameGenerationPair(desiredPair, state.incoming)) {
-    return state;
+  if (sameGenerationPair(desiredPair, state.active)) {
+    return applyEmbedHostGuard(client, state, desired);
+  }
+  if (
+    state.incoming !== null &&
+    sameGenerationPair(desiredPair, state.incoming)
+  ) {
+    return applyEmbedHostGuard(client, state, desired);
   }
   throw new ConfigError(
     `embedding generation mismatch: desired ${pairLabel(desiredPair)} but ` +

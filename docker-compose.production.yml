@@ -1,0 +1,107 @@
+# Production compose template — Postgres (pgvector), Neo4j (+ GDS), Elasticsearch 8.x (+ analysis-ik).
+# The TypeScript MCP server stays on the host: npm install && npm start (stdio).
+# Do not add an iknow-memory / Node service here.
+#
+# An operator copies this file to ~/.iknow-memory/compose/.
+# This change does not apply it: it does not copy the file into the home
+# directory and it does not start, stop, or recreate containers.
+#
+# Published host ports: 5432 (Postgres), 7474 (Neo4j HTTP), 7687 (Neo4j Bolt),
+# 9200 (Elasticsearch). Credentials below match those containers.
+# Do not put API keys in this file.
+name: iknow-memory
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: iknow-memory-postgres
+    environment:
+      POSTGRES_USER: iknow_memory
+      POSTGRES_PASSWORD: iknow_memory
+      POSTGRES_DB: iknow_memory
+    ports:
+      - "5432:5432"
+    volumes:
+      - iknow-memory-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iknow_memory -d iknow_memory"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  neo4j:
+    # 5.26 is the LTS pin in scripts/neo4j.sh. GDS 2.13.2 is baked in
+    # docker/neo4j (same zip as neo4j.sh) so Bolt is not blocked on a
+    # first-start download. PPR calls gds.graph.project / gds.pageRank.stream.
+    image: iknow-memory-neo4j:5.26.0-gds-2.13.2
+    container_name: iknow-memory-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/iknow-memory-dev
+      NEO4J_dbms_security_procedures_unrestricted: gds.*
+      NEO4J_dbms_security_procedures_allowlist: gds.*
+      NEO4J_server_memory_heap_initial__size: 1G
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512m
+    ports:
+      - "7687:7687"
+      - "7474:7474"
+    volumes:
+      - iknow-memory-neo4j:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "cypher-shell -u neo4j -p iknow-memory-dev 'RETURN 1' || exit 1",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+  elasticsearch:
+    # Official 8.x plus analysis-ik at the same patch (see Dockerfile).
+    # Hosts that lack vm.max_map_count=262144 should set it before first start
+    # (documented in docs/runbooks/local-infra.md).
+    image: iknow-memory-elasticsearch:8.19.20
+    container_name: iknow-memory-es
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.security.transport.ssl.enabled: "false"
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      ingest.geoip.downloader.enabled: "false"
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - iknow-memory-es:/usr/share/elasticsearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s >/dev/null",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 90s
+
+volumes:
+  iknow-memory-pg:
+    external: true
+    name: iknow-memory-pg
+  iknow-memory-es:
+    external: true
+    name: iknow-memory-es
+  iknow-memory-neo4j:
+    external: true
+    name: iknow-memory-neo4j

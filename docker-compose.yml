@@ -2,25 +2,26 @@
 # The TypeScript MCP server stays on the host: npm install && npm start (stdio).
 # Do not add an iknow-memory / Node service here.
 #
+# Dev stack. Project name iknow-memory-dev. Host ports 5433, 7475, 7688, 9201.
 #   docker compose up -d --wait
 #
 # Host env that talks to these published ports: see .env.example and
 # docs/runbooks/local-infra.md. Dev-only credentials below are intentional
 # and documented; do not put API keys in this file.
-name: iknow-memory-infra
+name: iknow-memory-dev
 
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: iknow-memory-postgres
+    container_name: iknow-memory-dev-postgres
     environment:
       POSTGRES_USER: iknow_memory
       POSTGRES_PASSWORD: iknow_memory
       POSTGRES_DB: iknow_memory
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
-      - iknow-memory-pg:/var/lib/postgresql/data
+      - iknow-memory-dev-pg:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U iknow_memory -d iknow_memory"]
       interval: 5s
@@ -39,7 +40,7 @@ services:
         GDS_VERSION: "2.13.2"
     image: iknow-memory-neo4j:5.26.0-gds-2.13.2
     pull_policy: build
-    container_name: iknow-memory-neo4j
+    container_name: iknow-memory-dev-neo4j
     environment:
       NEO4J_AUTH: neo4j/iknow-memory-dev
       NEO4J_dbms_security_procedures_unrestricted: gds.*
@@ -48,10 +49,10 @@ services:
       NEO4J_server_memory_heap_max__size: 1G
       NEO4J_server_memory_pagecache_size: 512m
     ports:
-      - "7687:7687"
-      - "7474:7474"
+      - "7688:7687"
+      - "7475:7474"
     volumes:
-      - iknow-memory-neo4j:/data
+      - iknow-memory-dev-neo4j:/data
     healthcheck:
       test:
         [
@@ -73,7 +74,7 @@ services:
         ES_VERSION: "8.19.20"
     image: iknow-memory-elasticsearch:8.19.20
     pull_policy: build
-    container_name: iknow-memory-es
+    container_name: iknow-memory-dev-es
     environment:
       discovery.type: single-node
       xpack.security.enabled: "false"
@@ -83,9 +84,9 @@ services:
       ingest.geoip.downloader.enabled: "false"
       ES_JAVA_OPTS: "-Xms512m -Xmx512m"
     ports:
-      - "9200:9200"
+      - "9201:9200"
     volumes:
-      - iknow-memory-es:/usr/share/elasticsearch/data
+      - iknow-memory-dev-es:/usr/share/elasticsearch/data
     ulimits:
       memlock:
         soft: -1
@@ -105,6 +106,6 @@ services:
       start_period: 90s
 
 volumes:
-  iknow-memory-pg:
-  iknow-memory-neo4j:
-  iknow-memory-es:
+  iknow-memory-dev-pg:
+  iknow-memory-dev-neo4j:
+  iknow-memory-dev-es:

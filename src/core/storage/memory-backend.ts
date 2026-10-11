@@ -487,6 +487,7 @@ export class MemoryBackend
       ...carryStatus(existing, doc),
       valid_until:
         previousWindow !== null && sameContent ? previousWindow : null,
+      ...preservedExtractionFingerprint(existing, doc),
     };
     this.sourceDocs.set(doc.source_ref, merged);
     return merged;
@@ -591,6 +592,39 @@ export class MemoryBackend
     const stored: IndexJobRecord = { ...record };
     this.indexJobs.set(record.job_id, stored);
     return { record: { ...stored }, inserted: true };
+  }
+
+  /**
+   * Record the extraction fingerprint on a new job and the 资料 it indexes.
+   * A fingerprint already stored on either row is left unchanged.
+   */
+  async stampExtractionFingerprint(input: {
+    jobId: string;
+    sourceRef: string;
+    fingerprint: string;
+  }): Promise<void> {
+    const job = this.indexJobs.get(input.jobId);
+    if (
+      job !== undefined &&
+      (job.extraction_fingerprint === undefined ||
+        job.extraction_fingerprint === null)
+    ) {
+      this.indexJobs.set(input.jobId, {
+        ...job,
+        extraction_fingerprint: input.fingerprint,
+      });
+    }
+    const doc = this.sourceDocs.get(input.sourceRef);
+    if (
+      doc !== undefined &&
+      (doc.extraction_fingerprint === undefined ||
+        doc.extraction_fingerprint === null)
+    ) {
+      this.sourceDocs.set(input.sourceRef, {
+        ...doc,
+        extraction_fingerprint: input.fingerprint,
+      });
+    }
   }
 
   async getJob(jobId: string): Promise<IndexJobRecord | null> {
@@ -1886,9 +1920,7 @@ export class MemoryBackend
     sourceVersionId: string
   ): Promise<CollectionDeleteSharedReferences> {
     const record = this.collectionDeleteVersionRow(sourceVersionId);
-    const countBy = (
-      pick: (row: SourceVersionRecord) => string
-    ): number => {
+    const countBy = (pick: (row: SourceVersionRecord) => string): number => {
       let count = 0;
       for (const row of this.sourceVersions.values()) {
         if (row.source_version_id === sourceVersionId) continue;
@@ -1920,7 +1952,9 @@ export class MemoryBackend
    * and a later call the world can move, and the surface throws rather than
    * returning a decision the plan already made.
    */
-  private collectionDeleteVersionRow(sourceVersionId: string): SourceVersionRecord {
+  private collectionDeleteVersionRow(
+    sourceVersionId: string
+  ): SourceVersionRecord {
     const record = this.sourceVersions.get(
       assertUuid(sourceVersionId, "source_version_id")
     );
@@ -1934,9 +1968,7 @@ export class MemoryBackend
   }
 
   /** The support ids one version row owns — the per-phase WHERE's inner join. */
-  private collectionDeleteSupportIds(
-    record: SourceVersionRecord
-  ): Set<string> {
+  private collectionDeleteSupportIds(record: SourceVersionRecord): Set<string> {
     const ids = new Set<string>();
     for (const support of this.supports.values()) {
       if (support.source_version_id === record.source_version_id) {
@@ -2111,6 +2143,21 @@ function toRetrievedChunk(chunk: ChunkRecord, score: number): RetrievedChunk {
     valid_window: [chunk.valid_from, chunk.valid_until],
     score,
   };
+}
+
+function preservedExtractionFingerprint(
+  existing: SourceDocRecord | undefined,
+  doc: SourceDocRecord
+): Pick<SourceDocRecord, "extraction_fingerprint"> {
+  const priorFingerprint = existing?.extraction_fingerprint;
+  const extractionFingerprint =
+    priorFingerprint !== undefined && priorFingerprint !== null
+      ? priorFingerprint
+      : doc.extraction_fingerprint;
+  if (extractionFingerprint === undefined || extractionFingerprint === null) {
+    return {};
+  }
+  return { extraction_fingerprint: extractionFingerprint };
 }
 
 /**

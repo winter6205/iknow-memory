@@ -124,6 +124,11 @@ export interface DashboardServerDeps {
   entityLexical?: EntityLexicalStorage;
   graphRanker?: GraphRanker;
   reranker?: ChunkReranker;
+  retrievalIdentity?: {
+    retrievalFingerprint: string;
+    generationId: string;
+    epoch: string;
+  };
   storageMode: "memory" | "pgvector";
   version: string;
   /** Injected Neo4j read session; omitted = sidecar unconfigured. */
@@ -152,6 +157,9 @@ export function createDashboardServer(deps: DashboardServerDeps): Server {
       ? { graphRanker: deps.graphRanker }
       : {}),
     ...(deps.reranker !== undefined ? { reranker: deps.reranker } : {}),
+    ...(deps.retrievalIdentity !== undefined
+      ? { retrievalIdentity: deps.retrievalIdentity }
+      : {}),
   };
   const readPort = asReadPort(deps.storage);
   const routes: Route[] = [

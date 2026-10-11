@@ -51,6 +51,7 @@ const BOOTSTRAP_COLUMNS = [
   // corpus-index-job T2: forward-compat ALTER in createSourceDocuments, so it
   // MUST be probed or deployed databases never get the column.
   ["source_documents", "content_identity"],
+  ["source_documents", "extraction_fingerprint"],
   // the judge-failure proposal payload. Deployed
   // extraction_records tables predate the column, so it rides the probe too.
   ["extraction_records", "proposed_payload"],
@@ -62,6 +63,7 @@ const BOOTSTRAP_COLUMNS = [
   ["embedding_generation", "rollback_slot"],
   ["embedding_generation", "rollback_model"],
   ["embedding_generation", "rollback_dimensions"],
+  ["embedding_generation", "embed_host_hash"],
   // community-level T1: added by the forward-compat ALTER in
   // createCommunitySummaries, so it MUST be probed or deployed databases
   // never get the column (bootstrap-columns lockstep).
@@ -79,6 +81,7 @@ const BOOTSTRAP_COLUMNS = [
   // createEvidenceGrants. Probing it is what makes a store that predates the
   // column answer "not ready" so the ALTER actually replays there.
   ["evidence_grants", "consumer_id"],
+  ["index_jobs", "extraction_fingerprint"],
 ] as const;
 const BOOTSTRAP_TABLES = [
   "entities",

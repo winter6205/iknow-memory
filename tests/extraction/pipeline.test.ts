@@ -24,9 +24,13 @@ import {
   selectPendingChunks,
   selectChunksByIds,
   selectPendingChunksBySourceRef,
+  batchFailureCode,
   processBatch,
+  type BatchSummary,
   type ExtractPipelineDeps,
 } from "../../src/core/extraction/pipeline.js";
+import type { EmbeddingClient } from "../../src/core/embedder.js";
+import { createMergeEmbedBudget } from "../../src/core/entities/merge-budget.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import type { LLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
@@ -35,6 +39,11 @@ import {
   JUDGE_REJECTED_CODE,
 } from "../../src/core/extraction/judge.js";
 import { SELF_LOOP_REJECTED_CODE } from "../../src/core/extraction/records.js";
+import { deriveMergeEmbedCap } from "../../src/core/extraction/persist.js";
+import {
+  createMergeEmbedBudget,
+  ENTITY_MERGE_EMBED_LIMIT,
+} from "../../src/core/entities/merge-budget.js";
 import { EXTRACT_METHOD_CONFLICT_CODE } from "../../src/core/extraction/method.js";
 import { FAST_EMPTY_GRAPH_CODE } from "../../src/core/extraction/fast.js";
 import type { Logger } from "../../src/logging.js";
@@ -44,16 +53,31 @@ class FakeQueryable implements Queryable {
   queries: string[] = [];
   valuesList: unknown[][] = [];
   rowsFor: (text: string, values: unknown[]) => any[] = () => [];
+  /** The commit phase re-reads `chunks.content` by id, so the fake needs the
+   *  text the lifecycle was handed — `runBatch` registers it per run. */
+  readonly chunkText = new Map<string, string>();
 
   async query(text: string, values: unknown[] = []) {
     this.queries.push(text);
     this.valuesList.push(values);
+    if (text.includes("FROM chunks c WHERE c.id = $1")) {
+      const id = String(values[0]);
+      return { rows: [{ id, content: this.chunkText.get(id) ?? "" }] };
+    }
     return { rows: this.rowsFor(text, values) };
   }
 
-  /** Index of the first query containing `fragment`, or -1. */
-  indexOf(fragment: string): number {
-    return this.queries.findIndex((q) => q.includes(fragment));
+  /** Index of the first query containing `fragment` at or after `from`, or -1. */
+  indexOf(fragment: string, from = 0): number {
+    return this.queries.findIndex((q, i) => i >= from && q.includes(fragment));
+  }
+
+  /** Index of the last query containing `fragment` before `before`, or -1. */
+  lastIndexOf(fragment: string, before: number): number {
+    for (let i = before; i >= 0; i -= 1) {
+      if (this.queries[i]!.includes(fragment)) return i;
+    }
+    return -1;
   }
 }
 
@@ -71,7 +95,23 @@ function makeDeps(llm: LLMClient): ExtractPipelineDeps {
     embedder: new FakeEmbedder(8),
     logger: SILENT_LOGGER,
     now: () => "2026-01-01T00:00:00.000Z",
+    mergeBudget: createMergeEmbedBudget(),
   };
+}
+
+/**
+ * The seam the commit phase needs: phase E stages outputs only, so phase C
+ * re-reads the chunk text by id. The fake answers from what the run handed
+ * over, which is exactly what a real Postgres would return.
+ */
+function runBatch(
+  deps: ExtractPipelineDeps,
+  client: FakeQueryable,
+  chunks: Array<{ id: string; content: string }>,
+  opts?: Parameters<typeof processBatch>[3]
+): Promise<BatchSummary> {
+  for (const chunk of chunks) client.chunkText.set(chunk.id, chunk.content);
+  return processBatch(deps, client, chunks, opts);
 }
 
 const GROUNDED_OUTPUT = {
@@ -239,7 +279,7 @@ describe("processBatch (core batch orchestration, no CLI argv)", () => {
       ],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [
@@ -262,12 +302,15 @@ describe("processBatch (core batch orchestration, no CLI argv)", () => {
     );
 
     // Transaction 1 (chunk-ok): BEGIN → record insert → entity/triple
-    // writes → outbox emit → markSucceeded → COMMIT, in that order.
-    const begin1 = client.indexOf("BEGIN");
-    const record1 = client.indexOf("INSERT INTO extraction_records");
+    // writes → outbox emit → markSucceeded → COMMIT, in that order. The
+    // failing sibling seals its own transaction in phase E, so these are the
+    // successful leg's boundaries, not the first BEGIN/COMMIT in the log
+    // (ADR-0013 Decision 6).
     const outbox1 = client.indexOf("INSERT INTO projection_outbox");
     const succeeded1 = client.indexOf("SET status = 'succeeded'");
-    const commit1 = client.indexOf("COMMIT");
+    const record1 = client.lastIndexOf("INSERT INTO extraction_records", outbox1);
+    const begin1 = client.lastIndexOf("BEGIN", record1);
+    const commit1 = client.indexOf("COMMIT", succeeded1);
     expect(begin1).toBeGreaterThanOrEqual(0);
     expect(
       begin1 < record1 &&
@@ -277,9 +320,11 @@ describe("processBatch (core batch orchestration, no CLI argv)", () => {
     ).toBe(true);
 
     // Transaction 2 (chunk-bad): the failed chunk is marked failed with the
-    // LLM error code and still commits its own record row.
+    // LLM error code and still commits its own record row. It seals in phase E,
+    // which now precedes chunk-ok's commit (ADR-0013 Decision 6).
     const failed2 = client.indexOf("SET status = 'failed'");
-    expect(failed2).toBeGreaterThan(commit1);
+    expect(failed2).toBeGreaterThanOrEqual(0);
+    expect(failed2).toBeLessThan(begin1);
     const failedValues = client.valuesList[failed2]!;
     expect(failedValues).toContain("5xx");
     expect(client.indexOf("ROLLBACK")).toBe(-1);
@@ -301,7 +346,7 @@ describe("processBatch (core batch orchestration, no CLI argv)", () => {
       ],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -326,7 +371,7 @@ describe("processBatch (core batch orchestration, no CLI argv)", () => {
       ],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Alice." }],
@@ -353,7 +398,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
       queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -376,7 +421,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
     // would land as a write-failure, not a success.
     const llm = new FakeLLMClient({ queue: [] });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "the a Alice Bob" }],
@@ -401,7 +446,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
     const client = new FakeQueryable();
     const llm = new FakeLLMClient({ queue: [] });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "的了 于 与 之" }],
@@ -429,7 +474,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
     const llm = new FakeLLMClient({ queue: [] });
 
     const outcomes: string[] = [];
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -468,7 +513,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
       queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -489,7 +534,7 @@ describe("processBatch extract-method routing (T1 seam)", () => {
       queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -545,7 +590,7 @@ describe("processBatch standard post-merge enrichment (T3)", () => {
       { scriptedDescribe: describeDrafts, scriptedClaims: claimsOk }
     );
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -587,7 +632,7 @@ describe("processBatch standard post-merge enrichment (T3)", () => {
       },
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "the a Alice Bob" }],
@@ -623,7 +668,7 @@ describe("processBatch standard post-merge enrichment (T3)", () => {
       }
     );
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -656,7 +701,7 @@ describe("processBatch standard post-merge enrichment (T3)", () => {
       }
     );
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -695,7 +740,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
       queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -724,7 +769,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
     // chunk would land as a write-failure, not the expected success.
     const llm = new FakeLLMClient({ queue: [] });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "the a Alice Bob" }],
@@ -752,7 +797,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
       ],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Alice." }],
@@ -769,7 +814,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
     const client = new FakeQueryable();
     const llm = new FakeLLMClient({ queue: [{ kind: "ok", outputs: [] }] });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -790,7 +835,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
       queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
     });
 
-    await processBatch(
+    await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -827,7 +872,7 @@ describe("processBatch producer-side C-state demotion (T5 review gap)", () => {
       queue: [{ kind: "ok", outputs: [GROUNDED_OUTPUT] }],
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -855,7 +900,7 @@ describe("processBatch entity-description embedding class (T6)", () => {
       { scriptedDescribe: describeDrafts, scriptedClaims: claimsOk }
     );
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       { ...makeDeps(llm), embedder },
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -887,7 +932,7 @@ describe("processBatch entity-description embedding class (T6)", () => {
       scriptedClaims: claimsOk,
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       { ...makeDeps(llm), embedder },
       client,
       [{ id: "chunk-1", content: "the a Alice Bob" }],
@@ -920,7 +965,7 @@ describe("processBatch grounded judge gate (extract-verify T1)", () => {
       }),
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -971,7 +1016,7 @@ describe("processBatch grounded judge gate (extract-verify T1)", () => {
       },
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -997,7 +1042,7 @@ describe("processBatch grounded judge gate (extract-verify T1)", () => {
       extract: async () => ({ kind: "ok", outputs: [GROUNDED_OUTPUT] }),
     } as unknown as LLMClient;
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -1027,7 +1072,7 @@ describe("processBatch grounded judge gate (extract-verify T1)", () => {
     });
 
     const outcomes: string[] = [];
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [
@@ -1064,7 +1109,7 @@ describe("processBatch grounded judge gate (extract-verify T1)", () => {
       },
     });
 
-    const summary = await processBatch(
+    const summary = await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "the a Alice Bob" }],
@@ -1102,7 +1147,7 @@ describe("processBatch grounded judge gate (extract-verify T1)", () => {
       },
     });
 
-    await processBatch(
+    await runBatch(
       makeDeps(llm),
       client,
       [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
@@ -1122,4 +1167,424 @@ describe("processBatch grounded judge gate (extract-verify T1)", () => {
       })),
     };
   }
+});
+
+/**
+ * The entity-merge embed cap (ADR-0013): one cap per lifecycle, derived after
+ * the extract phase and before the commit phase, counted per merge-gate
+ * RESOLUTION and refused loudly.
+ */
+
+/** Counts the raw provider requests a lifecycle spent, under the real vectors. */
+class CountingEmbedder implements EmbeddingClient {
+  requests = 0;
+  constructor(private readonly inner: EmbeddingClient) {}
+  async embed(texts: string[]): Promise<number[][]> {
+    this.requests += 1;
+    return await this.inner.embed(texts);
+  }
+}
+
+/** A logger that keeps what it was told, so the cap lines can be asserted. */
+function recordingLogger(): { logger: Logger; lines: { msg: string; fields?: unknown }[] } {
+  const lines: { msg: string; fields?: unknown }[] = [];
+  const logger: Logger = {
+    level: "info",
+    debug: () => {},
+    info: (msg, fields) => lines.push({ msg, fields }),
+    warn: () => {},
+    error: (msg, fields) => lines.push({ msg, fields }),
+  };
+  return { logger, lines };
+}
+
+/**
+ * One live candidate that never matches an incoming name exactly, so every
+ * resolution reaches L2 and embeds, and a human judge that refuses every gray
+ * pair — the loser is never materialized, so a repeated key costs another
+ * resolution instead of hitting the zero-cost L0 path.
+ */
+const GRAY_HEAD = {
+  head: "Alicia Smith",
+  headType: "person",
+  relationRaw: "works at",
+  relationNorm: "RELATED_TO",
+  tail: "Acme Corp",
+  tailType: "organization",
+  description: "Alicia Smith works at Acme Corp on the billing platform",
+  evidenceSpan: "Alicia Smith works at Acme Corp on the billing platform",
+  confidence: 0.9,
+};
+
+function grayHarness(outputs: number): {
+  client: FakeQueryable;
+  llm: FakeLLMClient;
+  embedder: CountingEmbedder;
+  deps: ExtractPipelineDeps;
+  lines: { msg: string; fields?: unknown }[];
+} {
+  const client = new FakeQueryable();
+  client.rowsFor = (text) => {
+    if (text.includes("FROM entities WHERE retired = false")) {
+      return [
+        {
+          id: "alice-1",
+          canonical_name: "Alice Smith",
+          type: "person",
+          embedding: null,
+          description: "Alice Smith works at Acme Corp on the billing platform",
+        },
+      ];
+    }
+    return [];
+  };
+  const llm = new FakeLLMClient({
+    queue: [
+      {
+        kind: "ok",
+        outputs: Array.from({ length: outputs }, () => ({ ...GRAY_HEAD })),
+      },
+    ],
+  });
+  const embedder = new CountingEmbedder(new FakeEmbedder(8));
+  const { logger, lines } = recordingLogger();
+  const deps: ExtractPipelineDeps = {
+    llm,
+    embedder,
+    logger,
+    now: () => "2026-01-01T00:00:00.000Z",
+    mergeBudget: createMergeEmbedBudget(),
+    mergeJudge: async () => "human",
+  };
+  return { client, llm, embedder, deps, lines };
+}
+
+const GRAY_CHUNK = "Alicia Smith works at Acme Corp on the billing platform.";
+
+describe("entity-merge embed cap — one cap per lifecycle", () => {
+  it("row 1: a fresh source's resolutions are bounded and reported", async () => {
+    // Characterization: before the cap there was no bound at all and the
+    // completion line carried no cap, so both assertions below failed.
+    const client = new FakeQueryable();
+    const { logger, lines } = recordingLogger();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [{ ...GROUNDED_OUTPUT }] }],
+    });
+    const embedder = new CountingEmbedder(new FakeEmbedder(8));
+
+    await runBatch(
+      {
+        llm,
+        embedder,
+        logger,
+        now: () => "2026-01-01T00:00:00.000Z",
+        mergeBudget: createMergeEmbedBudget(),
+      },
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1, sourceRef: "doc-1/1/main" }
+    );
+
+    const done = lines.filter((line) => line.msg === "extract-batch-complete");
+    expect(done).toHaveLength(1);
+    const fields = done[0]!.fields as Record<string, unknown>;
+    // A new entity resolves with no live candidate, so the fresh source spends
+    // no merge-gate request at all — and says so, rather than staying silent.
+    expect(fields.embed_cap).toBe(deriveMergeEmbedCap([GROUNDED_OUTPUT], 1).embedCap);
+    expect(fields.embed_calls).toBe(0);
+    expect(fields.source_ref).toBe("doc-1/1/main");
+  });
+
+  it("row 3: a population the cap derivation filters out yields cap = N and no breach", async () => {
+    // A type outside the closed set is filtered by BOTH the cap derivation and
+    // persistOutputs, so it contributes neither E nor T nor a resolution.
+    const client = new FakeQueryable();
+    const { logger, lines } = recordingLogger();
+    const llm = new FakeLLMClient({
+      queue: [
+        {
+          kind: "ok",
+          outputs: [{ ...GROUNDED_OUTPUT, headType: "unicorn" }],
+        },
+      ],
+    });
+    const embedder = new CountingEmbedder(new FakeEmbedder(8));
+
+    const summary = await runBatch(
+      {
+        llm,
+        embedder,
+        logger,
+        now: () => "2026-01-01T00:00:00.000Z",
+        mergeBudget: createMergeEmbedBudget(),
+      },
+      client,
+      [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+      { batchSize: 1 }
+    );
+
+    expect(deriveMergeEmbedCap([{ ...GROUNDED_OUTPUT, headType: "unicorn" }], 1)).toEqual({
+      embedCap: 1,
+      calls: 0,
+    });
+    const fields = lines.find((line) => line.msg === "extract-batch-complete")
+      ?.fields as Record<string, unknown>;
+    expect(fields.embed_cap).toBe(1);
+    expect(fields.embed_calls).toBe(0);
+    expect(summary.succeeded).toBe(1);
+    expect(lines.some((line) => line.msg === "entity-merge-embed-limit")).toBe(false);
+  });
+
+  it("row 4: a sealed-failed leg contributes nothing to N and keeps its own code", async () => {
+    const onlyFailed = await (async () => {
+      const client = new FakeQueryable();
+      const { logger } = recordingLogger();
+      const llm = new FakeLLMClient({
+        queue: [{ kind: "ok", outputs: [{ ...GROUNDED_OUTPUT }] }],
+      });
+      await runBatch(
+        {
+          llm,
+          logger,
+          embedder: new FakeEmbedder(8),
+          now: () => "2026-01-01T00:00:00.000Z",
+          mergeBudget: createMergeEmbedBudget(),
+        },
+        client,
+        [{ id: "chunk-ok", content: "Alice works at Acme Corp." }],
+        { batchSize: 1 }
+      );
+      return client;
+    })();
+
+    const client = new FakeQueryable();
+    const { logger } = recordingLogger();
+    const llm = new FakeLLMClient({
+      queue: [
+        { kind: "ok", outputs: [{ ...GROUNDED_OUTPUT }] },
+        { kind: "5xx", message: "upstream refused" },
+      ],
+    });
+    const summary = await runBatch(
+      {
+        llm,
+        logger,
+        embedder: new FakeEmbedder(8),
+        now: () => "2026-01-01T00:00:00.000Z",
+        mergeBudget: createMergeEmbedBudget(),
+      },
+      client,
+      [
+        { id: "chunk-ok", content: "Alice works at Acme Corp." },
+        { id: "chunk-bad", content: "Bob works at Beta Corp." },
+      ],
+      { batchSize: 2 }
+    );
+
+    // N counts the staged `ok` leg only, so the failed sibling leaves the cap
+    // exactly where the same source would be with that chunk omitted.
+    expect(deriveMergeEmbedCap([{ ...GROUNDED_OUTPUT }], 1).embedCap).toBe(4);
+    // The failure is visible as its OWN code, never as the budget's.
+    expect(summary.failureCodes).toEqual(["5xx"]);
+    expect(batchFailureCode(summary)).toBe("5xx");
+    expect(batchFailureCode(summary)).not.toBe(ENTITY_MERGE_EMBED_LIMIT);
+    // Phase E committed the sealed failure record, so it is readable now.
+    const sealed = client.queries.findIndex((q) => q.includes("SET status = 'failed'"));
+    expect(sealed).toBeGreaterThanOrEqual(0);
+    expect(onlyFailed.queries.some((q) => q.includes("SET status = 'failed'"))).toBe(
+      false
+    );
+  });
+
+  it("row 8: exactly embed_cap resolutions pass and the (cap+1)-th embeds nothing", async () => {
+    // Five identical gray pairs: the human judge never materializes the loser,
+    // so each one re-embeds instead of hitting the zero-cost L0 path. E=2,
+    // T=1, N=1 → cap 4, and the fifth resolution is refused.
+    const breached = grayHarness(5);
+    await expect(
+      runBatch(
+        breached.deps,
+        breached.client,
+        [{ id: "chunk-1", content: GRAY_CHUNK }],
+        { batchSize: 1 }
+      )
+    ).rejects.toMatchObject({
+      failureCode: ENTITY_MERGE_EMBED_LIMIT,
+    });
+    const breach = breached.lines.find(
+      (line) => line.msg === "entity-merge-embed-limit"
+    )?.fields as Record<string, unknown>;
+    expect(breach.embed_cap).toBe(4);
+    expect(breach.embed_calls).toBe(4);
+
+    // The refusal cost nothing: the identical run that fits inside the cap
+    // spends the SAME number of provider requests, so the (cap+1)-th
+    // resolution issued no call of its own.
+    const permitted = grayHarness(4);
+    await runBatch(
+      permitted.deps,
+      permitted.client,
+      [{ id: "chunk-1", content: GRAY_CHUNK }],
+      { batchSize: 1 }
+    );
+    expect(permitted.embedder.requests).toBeGreaterThan(0);
+    expect(breached.embedder.requests).toBe(permitted.embedder.requests);
+  });
+
+  it("row 9: one resolution over a multi-row candidate set charges once", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = (text) => {
+      if (text.includes("FROM entities WHERE retired = false")) {
+        return ["Zoe Prior", "Zack Pond", "Zara Quill"].map((name, index) => ({
+          id: `candidate-${index}`,
+          canonical_name: name,
+          type: "person",
+          embedding: null,
+          description: `${name} works at Acme Corp on the billing platform`,
+        }));
+      }
+      return [];
+    };
+    const llm = new FakeLLMClient({
+      queue: [
+        {
+          kind: "ok",
+          outputs: [
+            { ...GRAY_HEAD, tail: "Yara Young", tailType: "person" },
+          ],
+        },
+      ],
+    });
+    const embedder = new CountingEmbedder(new FakeEmbedder(8));
+    const { logger, lines } = recordingLogger();
+
+    await runBatch(
+      {
+        llm,
+        embedder,
+        logger,
+        now: () => "2026-01-01T00:00:00.000Z",
+        mergeBudget: createMergeEmbedBudget(),
+      },
+      client,
+      [{ id: "chunk-1", content: "Alicia Smith works at Yara Young today." }],
+      { batchSize: 1 }
+    );
+
+    // One resolution charged even though three candidates made the gate ask
+    // several times: the counter counts RESOLUTIONS, and the requests are
+    // strictly greater — asserted here rather than tolerated silently.
+    const fields = lines.find((line) => line.msg === "extract-batch-complete")
+      ?.fields as Record<string, unknown>;
+    // One charge per output role, however many candidates each one weighs.
+    expect(fields.embed_calls).toBe(2);
+    expect(embedder.requests).toBeGreaterThan(fields.embed_calls as number);
+  });
+
+  it("row 10: staged output bytes above the ceiling refuse before any merge", async () => {
+    const client = new FakeQueryable();
+    const { logger, lines } = recordingLogger();
+    const llm = new FakeLLMClient({
+      queue: [{ kind: "ok", outputs: [{ ...GROUNDED_OUTPUT }] }],
+    });
+
+    await expect(
+      runBatch(
+        {
+          llm,
+          embedder: new FakeEmbedder(8),
+          logger,
+          now: () => "2026-01-01T00:00:00.000Z",
+          mergeBudget: createMergeEmbedBudget(),
+        },
+        client,
+        [{ id: "chunk-1", content: "Alice works at Acme Corp." }],
+        { batchSize: 1, stageMaxBytes: 8 }
+      )
+    ).rejects.toMatchObject({
+      failureCode: ENTITY_MERGE_EMBED_LIMIT,
+      name: "MergeStageScopeError",
+    });
+
+    // Nothing committed and no merge ran: phase E is the only phase reached.
+    expect(client.indexOf("INSERT INTO triples")).toBe(-1);
+    expect(lines.some((line) => line.msg === "entity-merge-stage-limit")).toBe(true);
+  });
+});
+
+describe("entity-merge embed cap — a breach is a run-level failure", () => {
+  it("row 5: rolls back only the in-flight chunk and keeps earlier successes", async () => {
+    const client = new FakeQueryable();
+    client.rowsFor = (text) => {
+      if (text.includes("FROM entities WHERE retired = false")) {
+        return [
+          {
+            id: "alice-1",
+            canonical_name: "Alice Smith",
+            type: "person",
+            embedding: null,
+            description: "Alice Smith works at Acme Corp on the billing platform",
+          },
+        ];
+      }
+      return [];
+    };
+    const { logger, lines } = recordingLogger();
+    const llm = new FakeLLMClient({
+      queue: [
+        { kind: "ok", outputs: [{ ...GROUNDED_OUTPUT }] },
+        { kind: "5xx", message: "upstream refused" },
+        { kind: "ok", outputs: Array.from({ length: 20 }, () => ({ ...GRAY_HEAD })) },
+      ],
+    });
+    const deps: ExtractPipelineDeps = {
+      llm,
+      embedder: new FakeEmbedder(8),
+      logger,
+      now: () => "2026-01-01T00:00:00.000Z",
+      mergeBudget: createMergeEmbedBudget(),
+      mergeJudge: async () => "human",
+    };
+
+    await expect(
+      runBatch(
+        deps,
+        client,
+        [
+          { id: "chunk-1", content: "Alice works at Acme Corp." },
+          { id: "chunk-2", content: "Bob works at Beta Corp." },
+          { id: "chunk-3", content: GRAY_CHUNK },
+        ],
+        { batchSize: 3, sourceRef: "doc-1/1/main" }
+      )
+    ).rejects.toMatchObject({ failureCode: ENTITY_MERGE_EMBED_LIMIT });
+
+    // The chunk committed before the breach keeps its succeeded record...
+    const succeeded = client.queries.filter((q) =>
+      q.includes("SET status = 'succeeded'")
+    );
+    const breach = lines.filter((line) => line.msg === "entity-merge-embed-limit");
+    expect(succeeded).toHaveLength(1);
+    // ...and the in-flight chunk rolled back rather than sealing a write failure.
+    expect(client.indexOf("ROLLBACK")).toBeGreaterThanOrEqual(0);
+    // Phase E's sealed failure record survives the breach.
+    const failed = client.valuesList[
+      client.indexOf("SET status = 'failed'")
+    ]!;
+    expect(failed).toContain("5xx");
+
+    expect(breach).toHaveLength(1);
+    expect(Object.keys(breach[0]!.fields as object).sort()).toEqual([
+      "embed_calls",
+      "embed_cap",
+      "source_ref",
+    ]);
+    // Spent resolutions are not refunded: the counter still shows what was spent.
+    expect(breach[0]?.fields as Record<string, unknown>).toMatchObject({
+      embed_calls: (breach[0]?.fields as Record<string, unknown>).embed_cap,
+    });
+    // No `ceiling` alias, no raw-request counter, and no ledger column for any
+    // of it: the only place the cap is persisted is the failure code.
+    expect(client.queries.every((q) => !q.includes("embed_cap"))).toBe(true);
+  });
 });

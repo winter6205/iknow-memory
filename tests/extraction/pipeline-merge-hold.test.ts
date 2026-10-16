@@ -19,6 +19,7 @@ import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import type { EmbeddingClient } from "../../src/core/embedder.js";
 import type { GrayZoneJudge } from "../../src/core/entities/types.js";
 import type { Logger } from "../../src/logging.js";
+import { createMergeEmbedBudget } from "../../src/core/entities/merge-budget.js";
 
 const SILENT_LOGGER: Logger = {
   level: "error",
@@ -135,6 +136,18 @@ class FakeBatchClient implements Queryable {
     }
     if (text.includes("INSERT INTO projection_outbox")) return { rows: [] };
     if (text.includes("UPDATE community_index_state")) return { rows: [] };
+    // The commit phase re-reads the chunk text by id (phase E stages outputs
+    // only) and grounds the output's evidence span against it.
+    if (text.includes("FROM chunks c WHERE c.id = $1")) {
+      return {
+        rows: [
+          {
+            id: "chunk-1",
+            content: "Alice Smith works at Acme Corp, reported Alicia Smith.",
+          },
+        ],
+      };
+    }
     if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(text.trim())) return { rows: [] };
     throw new Error(`unexpected query: ${text}`);
   }
@@ -170,6 +183,7 @@ describe("processBatch — human merge hold lands on the maintenance lane", () =
       logger: SILENT_LOGGER,
       now: () => "2026-01-01T00:00:00.000Z",
       mergeJudge,
+      mergeBudget: createMergeEmbedBudget(),
     };
 
     const summary = await processBatch(

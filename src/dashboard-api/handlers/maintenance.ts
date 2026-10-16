@@ -23,6 +23,7 @@ import {
   promoteRecord,
 } from "../../core/extraction/actions.js";
 import type { ExtractPersistDeps } from "../../core/extraction/persist.js";
+import { createMergeEmbedBudget } from "../../core/entities/merge-budget.js";
 import {
   listChunkSourceLinks,
   listFailed,
@@ -59,10 +60,16 @@ const NOOP_LOGGER: Logger = {
   error: () => {},
 };
 
+/**
+ * Built per handler invocation, so each promote request owns its own
+ * entity-merge budget (ADR-0013): a promote is a single-record lifecycle and
+ * must not inherit another request's spent counter.
+ */
 function persistDeps(deps: MaintenanceDeps): ExtractPersistDeps {
   return {
     embedder: deps.embedder,
     logger: deps.logger ?? NOOP_LOGGER,
+    mergeBudget: createMergeEmbedBudget(),
     ...(deps.slotEmbedding !== undefined
       ? { slotEmbedding: deps.slotEmbedding }
       : {}),
@@ -185,10 +192,10 @@ function recordActionHandler(
 }
 
 export function promoteWriteHandler(deps: MaintenanceDeps): RouteHandler {
-  const persist = persistDeps(deps);
   return recordActionHandler(
     deps,
-    (client, recordId) => promoteRecord(persist, client, recordId),
+    (client, recordId) =>
+      promoteRecord(persistDeps(deps), client, recordId),
     (recordId) => ({ promoted: true, record_id: recordId })
   );
 }

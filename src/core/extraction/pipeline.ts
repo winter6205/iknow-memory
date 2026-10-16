@@ -14,24 +14,43 @@
  * (the batch still proceeds — the caller decides what the counts mean, e.g.
  * the CLI maps `writeFailures > 0` to exit 2).
  *
- * Transaction shape per chunk (SC3): BEGIN → insertRecord(pending) →
- * method-conflict check (T1) → runExtractMethod → judgeProposals
- * (a reject / judge-down leg persists NOTHING and seals
- * the chunk as a failed record carrying the proposal payload) →
- * persistOutputs (canonical merge) → enrichStandardChunk (standard only:
- * survivor descriptions +
- * claims) → emitProjectionIntents (same transaction as the ledger rows it
- * describes) → recordChunkExtractMethod (T1 version claim) → C-state READY →
+ * A lifecycle is one population of chunks and it runs in two phases
+ * (ADR-0013):
+ *
+ *   E — extract, per chunk, with NO transaction open: the method-conflict
+ *       gate, the extract method, the judge. A sealed failure commits its own
+ *       single-row transaction; an `ok` leg stages `{chunkId, outputs}`.
+ *   C — commit: the merge-embed cap is derived ONCE from the phase-E
+ *       population and armed, then every staged chunk runs its own
+ *       transaction exactly as before.
+ *
+ * Phase E exists so the cap can be pre-declared: a cap computed while the
+ * merge work it bounds is already running can only fire after the blow-up.
+ *
+ * Commit-phase transaction shape per chunk (SC3): BEGIN → insertRecord(pending)
+ * → method-conflict re-check (T1) → persistOutputs (canonical merge) →
+ * enrichStandardChunk (standard only: survivor descriptions + claims) →
+ * emitProjectionIntents (same transaction as the ledger rows it describes) →
+ * recordChunkExtractMethod (T1 version claim) → C-state READY →
  * STALE demotion when the chunk wrote graph rows (T5 gap) → markSucceeded →
- * COMMIT. The
- * ES precision layer mirrors AFTER commit, fail-open, never aborting the
- * chunk.
+ * COMMIT. The ES precision layer mirrors AFTER commit, fail-open, never
+ * aborting the chunk.
  */
 import { writeStderr, type Logger } from "../../logging.js";
+import { GraphragError } from "../errors.js";
+import {
+  DEFAULT_ENTITY_MERGE_STAGE_MAX_BYTES,
+  ENTITY_MERGE_STAGE_MAX_BYTES_VAR,
+} from "../../config.js";
 import type { PrecisionIndexer } from "../storage/elasticsearch-precision.js";
 import { emitProjectionIntents } from "../storage/projection-outbox.js";
 import { fetchEntityProjection } from "../storage/entity-projection.js";
+import {
+  MergeBudgetError,
+  MergeStageScopeError,
+} from "../entities/merge-budget.js";
 import { type ChunkInput } from "./extract.js";
+import type { ExtractionOutput, TripleVerdict } from "./types.js";
 import {
   enrichStandardChunk,
   ZERO_ENRICH,
@@ -58,6 +77,7 @@ import {
 import { judgeProposals } from "./judge.js";
 import {
   persistOutputs,
+  deriveMergeEmbedCap,
   depsNow,
   type ExtractPersistDeps,
   type PersistCounts,
@@ -76,6 +96,12 @@ export interface ExtractPipelineDeps extends ExtractPersistDeps {
    * chunk transaction. Absent when no precision layer is configured.
    */
   precision?: PrecisionIndexer;
+  /**
+   * Byte ceiling over one lifecycle's staged outputs (ADR-0013), resolved by
+   * the process owner (its own env knob) once at boot. Absent → the published
+   * default, so no caller can run unbounded without asking for it.
+   */
+  stageMaxBytes?: number;
 }
 
 export interface PendingScanOptions {
@@ -141,7 +167,7 @@ export async function selectPendingChunks(
   const { rows } = await client.query(
     `SELECT c.id, c.content FROM chunks c
      WHERE ${where.join(" AND ")}
-     ORDER BY c.created_at
+     ORDER BY c.created_at, c.id
      LIMIT $${values.length + 1}`,
     [...values, opts.batchSize]
   );
@@ -207,7 +233,7 @@ export async function selectPendingChunksBySourceRef(
     `SELECT c.id, c.content FROM chunks c
      WHERE c.source_ref = $1
        AND ${PENDING_CHUNK_PREDICATE}
-     ORDER BY c.created_at
+     ORDER BY c.created_at, c.id
      LIMIT $2`,
     [sourceRef, effectiveCap + 1]
   );
@@ -215,6 +241,106 @@ export async function selectPendingChunksBySourceRef(
     .slice(0, effectiveCap)
     .map((r) => ({ id: r.id as string, content: r.content as string }));
   return { chunks, hasMore: rows.length > effectiveCap };
+}
+
+/** The keyset position one page ended on; `createdAt` rides as pg returned it. */
+export interface PendingChunkCursor {
+  readonly createdAt: unknown;
+  readonly id: string;
+}
+
+export interface SourceRefPendingPage extends SourceRefPendingScan {
+  /** Position to resume after — null once the population is exhausted. */
+  readonly cursor: PendingChunkCursor | null;
+}
+
+/**
+ * The extract lifecycle's page selector: `selectPendingChunksBySourceRef` on a
+ * keyset cursor, so paging a source forward can neither skip nor repeat.
+ *
+ * The cursor is `(created_at, id)` and the `id` term is required, not a
+ * refinement: a page boundary can fall inside a group of rows sharing one
+ * `created_at`, which this repo already treats as non-deterministic. With
+ * `created_at` alone, either `>` drops the rest of that group or `>=` reads it
+ * twice. `hasMore` keeps the `cap + 1` probe.
+ */
+export async function selectPendingChunksBySourceRefAfter(
+  client: Queryable,
+  sourceRef: string,
+  after: PendingChunkCursor | null,
+  cap: number
+): Promise<SourceRefPendingPage> {
+  const effectiveCap = Math.max(cap, 0);
+  const values: unknown[] = [sourceRef];
+  const resumed =
+    after === null
+      ? ""
+      : ` AND (c.created_at, c.id) > ($${values.push(after.createdAt)}, $${values.push(after.id)})`;
+  const { rows } = await client.query(
+    `SELECT c.id, c.content, c.created_at FROM chunks c
+     WHERE c.source_ref = $1
+       AND ${PENDING_CHUNK_PREDICATE}${resumed}
+     ORDER BY c.created_at, c.id
+     LIMIT $${values.length + 1}`,
+    [...values, effectiveCap + 1]
+  );
+  const page = rows.slice(0, effectiveCap);
+  const last = page[page.length - 1];
+  return {
+    chunks: page.map((r) => ({ id: r.id as string, content: r.content as string })),
+    hasMore: rows.length > effectiveCap,
+    cursor:
+      last === undefined
+        ? null
+        : { createdAt: last.created_at, id: last.id as string },
+  };
+}
+
+/** One source's share of a caller's selection, in first-appearance order. */
+export interface ChunkSourcePartition {
+  readonly sourceRef: string;
+  readonly chunkIds: string[];
+}
+
+/**
+ * The caller's partition key: which `source_ref`s an already-selected chunk
+ * list belongs to. A selection can span sources, and one lifecycle is one
+ * source (ADR-0013), so the CLI and the MCP tool resolve the split here
+ * rather than sharing or summing a cap across sources.
+ */
+export async function selectSourcePartitions(
+  client: Queryable,
+  chunkIds: readonly string[]
+): Promise<ChunkSourcePartition[]> {
+  const unique = [...new Set(chunkIds)];
+  if (unique.length === 0) return [];
+  const placeholders = unique.map((_, i) => `$${i + 1}`).join(", ");
+  const { rows } = await client.query(
+    `SELECT c.id, c.source_ref FROM chunks c WHERE c.id IN (${placeholders})`,
+    unique
+  );
+  const sourceOf = new Map(
+    rows.map((r) => [r.id as string, r.source_ref as string])
+  );
+  const order: string[] = [];
+  const grouped = new Map<string, string[]>();
+  for (const id of unique) {
+    const sourceRef = sourceOf.get(id);
+    // A chunk whose row is gone cannot join a source lifecycle; the caller's
+    // own selector already reported it as missing.
+    if (sourceRef === undefined) continue;
+    const bucket = grouped.get(sourceRef);
+    if (bucket === undefined) {
+      order.push(sourceRef);
+      grouped.set(sourceRef, [id]);
+    } else {
+      bucket.push(id);
+    }
+  }
+  return order.map((sourceRef) => ({
+    sourceRef,
+    chunkIds: grouped.get(sourceRef) ?? [],
+  }));
 }
 
 export interface BatchSummary {
@@ -257,6 +383,21 @@ export interface ProcessBatchOptions {
    * standard default (a Fast switch there is a later surface).
    */
   method?: ExtractMethod;
+  /**
+   * The lifecycle's `source_ref`, for the two cap log lines ONLY (ADR-0013
+   * Decision 7). It never scopes the run — the population is whatever the
+   * caller handed over — and it exists so a caller that already partitioned
+   * its selection can still label the cap it just paid.
+   */
+  sourceRef?: string | null;
+  /**
+   * Byte ceiling over the outputs staged between phase E and phase C
+   * (ADR-0013 Decision 8). The production entries pass the configured knob;
+   * the default here is the constant so this module never reads the operator
+   * environment itself, and a test may lower it to reach the refusal without a
+   * 64 MiB fixture.
+   */
+  stageMaxBytes?: number;
 }
 
 /**
@@ -326,68 +467,6 @@ export interface ChunkOutcomeReport {
   errorMsg?: string;
 }
 
-/** Run the batch, one transaction per chunk (record + entities + triples). */
-export async function processBatch(
-  deps: ExtractPipelineDeps,
-  client: Queryable,
-  chunks: ChunkInput[],
-  opts: ProcessBatchOptions = {}
-): Promise<BatchSummary> {
-  const batchId = newRecordId();
-  const method: ExtractMethod = opts.method ?? "standard";
-  const startedAt = depsNow(deps);
-  let writeFailures = 0;
-  let succeeded = 0;
-  let failed = 0;
-  let ungrounded = 0;
-  const failureCodes: string[] = [];
-  for (const chunk of chunks) {
-    const out = await processChunk(
-      deps,
-      client,
-      chunk,
-      batchId,
-      startedAt,
-      method
-    );
-    if (out.kind === "write-failure") writeFailures += 1;
-    else if (out.kind === "ok") succeeded += 1;
-    else {
-      failed += 1;
-      failureCodes.push(out.errorCode);
-    }
-    // Every leg defines `ungrounded` (failed legs are 0), so no guard needed.
-    ungrounded += out.ungrounded;
-    opts.onChunkOutcome?.({
-      chunkId: chunk.id,
-      kind: out.kind,
-      ...(out.kind === "failed"
-        ? { errorCode: out.errorCode, errorMsg: out.errorMsg }
-        : out.kind === "write-failure"
-          ? { errorMsg: out.errorMsg }
-          : {}),
-    });
-  }
-  deps.logger.info("extract-batch-complete", {
-    batchId,
-    batchSize: opts.batchSize ?? chunks.length,
-    processed: chunks.length,
-    succeeded,
-    failed,
-    writeFailures,
-    ungrounded,
-  });
-  return {
-    batchId,
-    processed: chunks.length,
-    succeeded,
-    failed,
-    writeFailures,
-    ungrounded,
-    failureCodes,
-  };
-}
-
 type ChunkOutcome =
   | { kind: "ok"; ungrounded: number }
   | {
@@ -397,6 +476,196 @@ type ChunkOutcome =
       errorMsg: string;
     }
   | { kind: "write-failure"; ungrounded: 0; errorMsg: string };
+
+/** One phase-E leg that reached phase C, with the outputs it extracted. */
+interface StagedLeg {
+  readonly kind: "staged";
+  readonly chunkId: string;
+  readonly outputs: ExtractionOutput[];
+}
+
+/** What phase E leaves behind per chunk: staged work, or a settled failure. */
+type PhaseELeg =
+  | StagedLeg
+  | Exclude<ChunkOutcome, { kind: "ok" }>;
+
+async function* onePage(chunks: ChunkInput[]): AsyncGenerator<ChunkInput[]> {
+  if (chunks.length > 0) yield chunks;
+}
+
+/**
+ * One extract lifecycle over an already-selected chunk list: phase E over the
+ * whole list, then one cap and phase C.
+ */
+export async function processBatch(
+  deps: ExtractPipelineDeps,
+  client: Queryable,
+  chunks: ChunkInput[],
+  opts: ProcessBatchOptions = {}
+): Promise<BatchSummary> {
+  return runExtractLifecycle(deps, client, onePage(chunks), opts);
+}
+
+/**
+ * One extract lifecycle over a source's whole pending set, paged by the
+ * caller: the page loop is phase E's, and every page feeds ONE cap. A
+ * lifecycle per page would multiply the formula by the page count.
+ */
+export async function runPagedExtractLifecycle(
+  deps: ExtractPipelineDeps,
+  client: Queryable,
+  pages: AsyncIterable<ChunkInput[]>,
+  opts: ProcessBatchOptions = {}
+): Promise<BatchSummary> {
+  return runExtractLifecycle(deps, client, pages, opts);
+}
+
+async function runExtractLifecycle(
+  deps: ExtractPipelineDeps,
+  client: Queryable,
+  pages: AsyncIterable<ChunkInput[]>,
+  opts: ProcessBatchOptions
+): Promise<BatchSummary> {
+  const batchId = newRecordId();
+  const method: ExtractMethod = opts.method ?? "standard";
+  const startedAt = depsNow(deps);
+  const sourceRef = opts.sourceRef ?? null;
+  const stageMaxBytes =
+    opts.stageMaxBytes ??
+    deps.stageMaxBytes ??
+    DEFAULT_ENTITY_MERGE_STAGE_MAX_BYTES;
+  // Forked per lifecycle: the deps object outlives the run, and two
+  // lifecycles in one process must not share a counter.
+  const mergeBudget = deps.mergeBudget.fork();
+  const staged: StagedLeg[] = [];
+  const legOrder: string[] = [];
+  const outcomes = new Map<string, ChunkOutcome>();
+  const failureCodes: string[] = [];
+  let writeFailures = 0;
+  let succeeded = 0;
+  let failed = 0;
+  let ungrounded = 0;
+  let stagedBytes = 0;
+
+  for await (const page of pages) {
+    for (const chunk of page) {
+      const leg = await extractPhase(
+        deps,
+        client,
+        chunk,
+        batchId,
+        startedAt,
+        method
+      );
+      legOrder.push(chunk.id);
+      if (leg.kind === "staged") {
+        staged.push(leg);
+        stagedBytes += Buffer.byteLength(JSON.stringify(leg.outputs), "utf8");
+      } else {
+        outcomes.set(chunk.id, leg);
+      }
+    }
+    // Checked at every page boundary, before the next page's round trips: the
+    // pages already staged are discarded with the lifecycle and nothing was
+    // committed.
+    if (stagedBytes > stageMaxBytes) {
+      const selection = sourceRef ?? "this selection";
+      const message =
+        `entity-merge staging scope refused for ${selection}: staged ` +
+        `output bytes ${stagedBytes} exceed the ceiling ${stageMaxBytes}; ` +
+        `raise ${ENTITY_MERGE_STAGE_MAX_BYTES_VAR} or split the source`;
+      deps.logger.error("entity-merge-stage-limit", {
+        source_ref: sourceRef,
+        staged_bytes: stagedBytes,
+        stage_max_bytes: stageMaxBytes,
+      });
+      throw new MergeStageScopeError(message, stagedBytes, stageMaxBytes);
+    }
+  }
+
+  // The cap is derived from the phase-E population and armed before the first
+  // merge-gate resolution of the lifecycle.
+  mergeBudget.arm(
+    deriveMergeEmbedCap(
+      staged.flatMap((leg) => leg.outputs),
+      staged.length
+    ).embedCap
+  );
+
+  try {
+    for (const leg of staged) {
+      outcomes.set(
+        leg.chunkId,
+        await commitPhase(
+          deps,
+          { ...deps, mergeBudget },
+          client,
+          leg,
+          batchId,
+          startedAt,
+          method
+        )
+      );
+    }
+  } catch (err) {
+    // A budget refusal is a run-level failure: it must not be sealed as a
+    // chunk leg, so it re-throws past phase C with the frozen three fields.
+    if (err instanceof MergeBudgetError) {
+      const budget = mergeBudget.snapshot();
+      deps.logger.error("entity-merge-embed-limit", {
+        source_ref: sourceRef,
+        embed_calls: budget.embedCalls,
+        embed_cap: budget.embedCap,
+      });
+    }
+    throw err;
+  }
+
+  for (const chunkId of legOrder) {
+    const out = outcomes.get(chunkId);
+    if (out === undefined) continue;
+    if (out.kind === "write-failure") writeFailures += 1;
+    else if (out.kind === "ok") succeeded += 1;
+    else {
+      failed += 1;
+      failureCodes.push(out.errorCode);
+    }
+    // Every leg defines `ungrounded` (failed legs are 0), so no guard needed.
+    ungrounded += out.ungrounded;
+    opts.onChunkOutcome?.({
+      chunkId,
+      kind: out.kind,
+      ...(out.kind === "failed"
+        ? { errorCode: out.errorCode, errorMsg: out.errorMsg }
+        : out.kind === "write-failure"
+          ? { errorMsg: out.errorMsg }
+          : {}),
+    });
+  }
+
+  const budget = mergeBudget.snapshot();
+  deps.logger.info("extract-batch-complete", {
+    batchId,
+    batchSize: opts.batchSize ?? legOrder.length,
+    processed: legOrder.length,
+    succeeded,
+    failed,
+    writeFailures,
+    ungrounded,
+    source_ref: sourceRef,
+    embed_cap: budget.embedCap,
+    embed_calls: budget.embedCalls,
+  });
+  return {
+    batchId,
+    processed: legOrder.length,
+    succeeded,
+    failed,
+    writeFailures,
+    ungrounded,
+    failureCodes,
+  };
+}
 
 /**
  * Process-log field whitelist (SC10): { time, chunkId, modelId, latencyMs,
@@ -424,17 +693,101 @@ function chunkLogFields(
   };
 }
 
-/** One chunk in one transaction; mark-and-continue on every failure leg. */
-async function processChunk(
+/**
+ * Phase E, one chunk: no transaction is open, so no merge gate can run here.
+ * A sealed failure commits its OWN single-row transaction at the point it is
+ * sealed, so a crash during phase E never loses a failure record.
+ */
+async function extractPhase(
   deps: ExtractPipelineDeps,
   client: Queryable,
   chunk: ChunkInput,
   batchId: string,
   startedAt: string,
   method: ExtractMethod
+): Promise<PhaseELeg> {
+  const recordId = newRecordId();
+  const latencyStart = Date.now();
+  const sealFailed = async (
+    code: string,
+    msg: string,
+    proposal?: { triples: ExtractionOutput[]; verdicts: TripleVerdict[] }
+  ): Promise<PhaseELeg> => {
+    await client.query("BEGIN", []);
+    try {
+      await insertRecord(client, { id: recordId, batchId, chunkId: chunk.id, startedAt });
+      if (proposal === undefined) {
+        await markFailed(client, recordId, { code, msg });
+      } else {
+        // A judge reject/down seals the reviewable proposal the maintenance
+        // lane replays later — never triples, intents or graph rows.
+        await markFailedWithProposal(client, recordId, { code, msg }, proposal);
+      }
+      await client.query("COMMIT", []);
+    } catch (err) {
+      await client.query("ROLLBACK", []);
+      throw err;
+    }
+    deps.logger.info("chunk-failed", {
+      ...chunkLogFields(deps, chunk.id, latencyStart),
+      code,
+      outcome: "failed",
+    });
+    return { kind: "failed", ungrounded: 0, errorCode: code, errorMsg: msg };
+  };
+
+  try {
+    // T1 conflict gate, run early here only to avoid paying a model round trip
+    // for a chunk that will be refused. The commit point re-checks it.
+    const conflict = await findChunkMethodConflict(client, chunk.id, method);
+    if (conflict) {
+      return await sealFailed(
+        EXTRACT_METHOD_CONFLICT_CODE,
+        `source ${conflict.sourceRef} already extracted with method "${conflict.recorded}"; refusing "${method}" on the same version`
+      );
+    }
+    const outcome = await runExtractMethod(method, chunk, { llm: deps.llm });
+    if (outcome.kind === "failed") {
+      return await sealFailed(outcome.errorCode, outcome.errorMsg);
+    }
+    const judged = await judgeProposals(deps.llm, chunk, outcome.outputs);
+    if (judged.kind === "failed") {
+      return await sealFailed(judged.errorCode, judged.errorMsg, {
+        triples: outcome.outputs,
+        verdicts: judged.verdicts,
+      });
+    }
+    return { kind: "staged", chunkId: chunk.id, outputs: outcome.outputs };
+  } catch (err) {
+    deps.logger.error("chunk-write-failed", {
+      ...chunkLogFields(deps, chunk.id, latencyStart),
+      outcome: "write-failed",
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return {
+      kind: "write-failure",
+      ungrounded: 0,
+      errorMsg: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
+ * Phase C, one staged chunk, in one transaction; mark-and-continue on every
+ * failure leg except a budget refusal, which is a run-level failure and
+ * re-throws after rolling this chunk back.
+ */
+async function commitPhase(
+  deps: ExtractPipelineDeps,
+  mergeDeps: ExtractPipelineDeps,
+  client: Queryable,
+  leg: StagedLeg,
+  batchId: string,
+  startedAt: string,
+  method: ExtractMethod
 ): Promise<ChunkOutcome> {
   const recordId = newRecordId();
-  // Latency covers the whole chunk (LLM call + persist) so the per-chunk
+  // Latency covers the whole commit (merge + persist) so the per-chunk
   // process log reflects what an operator would wait for (SC10).
   const latencyStart = Date.now();
   await client.query("BEGIN", []);
@@ -442,13 +795,12 @@ async function processChunk(
     await insertRecord(client, {
       id: recordId,
       batchId,
-      chunkId: chunk.id,
+      chunkId: leg.chunkId,
       startedAt,
     });
-    // T1 conflict gate: a 资料 version that already recorded ANOTHER method
-    // refuses this run before any extraction work — typed failed leg, never
-    // a silent overwrite of the recorded method.
-    const conflict = await findChunkMethodConflict(client, chunk.id, method);
+    // The guard belongs at the commit point, so a writer that claimed another
+    // method during phase E cannot slip a second claim in between.
+    const conflict = await findChunkMethodConflict(client, leg.chunkId, method);
     if (conflict) {
       const msg = `source ${conflict.sourceRef} already extracted with method "${conflict.recorded}"; refusing "${method}" on the same version`;
       await markFailed(client, recordId, {
@@ -457,7 +809,7 @@ async function processChunk(
       });
       await client.query("COMMIT", []);
       deps.logger.info("chunk-failed", {
-        ...chunkLogFields(deps, chunk.id, latencyStart),
+        ...chunkLogFields(deps, leg.chunkId, latencyStart),
         code: EXTRACT_METHOD_CONFLICT_CODE,
         outcome: "failed",
       });
@@ -468,56 +820,13 @@ async function processChunk(
         errorMsg: msg,
       };
     }
-    const outcome = await runExtractMethod(method, chunk, { llm: deps.llm });
-    if (outcome.kind === "failed") {
-      await markFailed(client, recordId, {
-        code: outcome.errorCode,
-        msg: outcome.errorMsg,
-      });
-      await client.query("COMMIT", []);
-      deps.logger.info("chunk-failed", {
-        ...chunkLogFields(deps, chunk.id, latencyStart),
-        code: outcome.errorCode,
-        outcome: "failed",
-      });
-      return {
-        kind: "failed",
-        ungrounded: 0,
-        errorCode: outcome.errorCode,
-        errorMsg: outcome.errorMsg,
-      };
-    }
-    const judged = await judgeProposals(deps.llm, chunk, outcome.outputs);
-    if (judged.kind === "failed") {
-      // nothing becomes graph fact without a grounded
-      // yes. The sealed leg writes NO triples, NO projection intents and NO
-      // Neo4j touch — it commits only the failed record plus the reviewable
-      // proposal payload the maintenance lane replays later.
-      await markFailedWithProposal(
-        client,
-        recordId,
-        { code: judged.errorCode, msg: judged.errorMsg },
-        { triples: outcome.outputs, verdicts: judged.verdicts }
-      );
-      await client.query("COMMIT", []);
-      deps.logger.info("chunk-failed", {
-        ...chunkLogFields(deps, chunk.id, latencyStart),
-        code: judged.errorCode,
-        outcome: "failed",
-      });
-      return {
-        kind: "failed",
-        ungrounded: 0,
-        errorCode: judged.errorCode,
-        errorMsg: judged.errorMsg,
-      };
-    }
+    const chunk = await readChunkContent(client, leg.chunkId);
     const counts = await persistOutputs(
-      deps,
+      mergeDeps,
       client,
       chunk.id,
       chunk.content,
-      outcome.outputs,
+      leg.outputs,
       startedAt
     );
     // Gray pairs the judge held for the operator get one independent
@@ -527,7 +836,7 @@ async function processChunk(
     // maintenance item, not an extraction failure — and listFailed() shows
     // the pair next to extract failures for the operator to review or
     // discard.
-    await recordMergeHolds(client, batchId, chunk.id, startedAt, counts);
+    await recordMergeHolds(client, batchId, leg.chunkId, startedAt, counts);
     if (counts.allSelfLoop) {
       // SC5: every output was a self-loop, so the chunk produced zero graph
       // edges and zero entities. Record the chunk as a permanent reject — the
@@ -537,7 +846,7 @@ async function processChunk(
       await commitSelfLoopRejection(client, recordId, deps.logger, {
         name: "chunk-rejected",
         fields: {
-          ...chunkLogFields(deps, chunk.id, latencyStart),
+          ...chunkLogFields(deps, leg.chunkId, latencyStart),
           code: SELF_LOOP_REJECTED_CODE,
           reason: "all-outputs-self-loop",
           outcome: "failed",
@@ -578,7 +887,7 @@ async function processChunk(
     // the chunk's 资料 row inside the SAME transaction — a rolled-back chunk
     // never leaves a version claim behind, and the overwrite guard keeps a
     // conflicting method from being replaced (SC2).
-    await recordChunkExtractMethod(client, chunk.id, method);
+    await recordChunkExtractMethod(client, leg.chunkId, method);
     // T5 review gap (graph-index-standard-fast): producer-side C demotion.
     // Graph rows committed by this chunk make the stored summary generation
     // outdated; a chunk that persisted nothing (`projected` empty) leaves the
@@ -608,7 +917,7 @@ async function processChunk(
     // enrichment counts and the T6 description-embed counts ride the same
     // whitelist (numbers only — never the summary text or claim text).
     deps.logger.info("chunk-extracted", {
-      ...chunkLogFields(deps, chunk.id, latencyStart),
+      ...chunkLogFields(deps, leg.chunkId, latencyStart),
       outcome: "ok",
       triples: counts.triples,
       unmapped: counts.unmapped,
@@ -623,8 +932,11 @@ async function processChunk(
     return { kind: "ok", ungrounded: counts.ungrounded };
   } catch (err) {
     await client.query("ROLLBACK", []);
+    // EXIT: sealing a cap breach as a chunk leg would report a cost refusal as
+    // an ordinary write failure; the run-level refusal owns the whole batch.
+    if (err instanceof MergeBudgetError) throw err;
     deps.logger.error("chunk-write-failed", {
-      ...chunkLogFields(deps, chunk.id, latencyStart),
+      ...chunkLogFields(deps, leg.chunkId, latencyStart),
       outcome: "write-failed",
       error: err instanceof Error ? err.message : String(err),
     });
@@ -634,6 +946,29 @@ async function processChunk(
       errorMsg: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+/**
+ * The chunk text phase C needs: the grounding gate compares the evidence span
+ * against it and the standard enrichment takes the chunk. Phase E stages
+ * outputs only, so it is re-read here, by id, inside this chunk's transaction.
+ */
+async function readChunkContent(
+  client: Queryable,
+  chunkId: string
+): Promise<ChunkInput> {
+  const { rows } = await client.query(
+    `SELECT c.id, c.content FROM chunks c WHERE c.id = $1`,
+    [chunkId]
+  );
+  const row = rows[0];
+  if (row === undefined) {
+    throw new GraphragError(
+      `chunk ${chunkId} is gone by the commit phase of its lifecycle`,
+      "STORAGE_ERROR"
+    );
+  }
+  return { id: row.id as string, content: row.content as string };
 }
 
 /**

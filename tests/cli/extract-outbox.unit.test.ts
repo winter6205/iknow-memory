@@ -56,6 +56,12 @@ class FakeClient implements CliClient {
     if (this.failOn && text.includes(this.failOn)) {
       throw new Error(`simulated failure on ${this.failOn}`);
     }
+    if (text.includes("FROM chunks c WHERE c.id = $1")) {
+      return { rows: [scannedChunk()] };
+    }
+    if (text.includes("SELECT c.id, c.source_ref FROM chunks c")) {
+      return { rows: [{ id: scannedChunk().id, source_ref: "doc-1" }] };
+    }
     return { rows: /FROM chunks c/.test(text) ? [scannedChunk()] : [] };
   }
   release(): void {}

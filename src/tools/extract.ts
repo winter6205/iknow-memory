@@ -61,10 +61,14 @@ import {
   processBatch,
   selectChunksByIds,
   selectPendingChunksBySourceRef,
+  selectSourcePartitions,
   type BatchSummary,
   type ChunkOutcomeReport,
   type ExtractPipelineDeps,
+  type ProcessBatchOptions,
 } from "../core/extraction/pipeline.js";
+import type { ChunkInput } from "../core/extraction/extract.js";
+import { createMergeEmbedBudget } from "../core/entities/merge-budget.js";
 import type { PrecisionIndexer } from "../core/storage/elasticsearch-precision.js";
 import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
 import { ConfigError } from "../config.js";
@@ -201,6 +205,12 @@ export interface ExtractPool {
 
 /** Dependencies injected at wiring time. */
 export interface ExtractDeps {
+  /**
+   * Byte ceiling over one lifecycle's staged outputs (ADR-0013). Resolved by
+   * the wiring at registration, never per call. Absent → the published
+   * default, so the tool never fails on a settings read it did not need.
+   */
+  stageMaxBytes?: number;
   /**
    * ANTHROPIC_AUTH_TOKEN family, resolved by the wiring from its own env.
    * Undefined authToken on this always-extraction tool is a typed error.
@@ -398,6 +408,52 @@ function failedChunkFromOutcome(
  * Assemble the Host-facing JSON payload from the batch summary plus the
  * selector's report fields.
  */
+/**
+ * One lifecycle per source_ref over an already-selected chunk list. The
+ * tallies are summed for the host view; `batch_id` is the first lifecycle's,
+ * which is what a single-source call reports unchanged.
+ */
+async function runLifecyclesPerSource(
+  deps: ExtractPipelineDeps,
+  client: ExtractClient,
+  chunks: ChunkInput[],
+  opts: ProcessBatchOptions
+): Promise<BatchSummary> {
+  const byId = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+  const partitions = await selectSourcePartitions(
+    client,
+    chunks.map((chunk) => chunk.id)
+  );
+  const total: BatchSummary = {
+    batchId: "",
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    writeFailures: 0,
+    ungrounded: 0,
+    failureCodes: [],
+  };
+  for (const partition of partitions) {
+    const summary = await processBatch(
+      deps,
+      client,
+      partition.chunkIds.flatMap((id) => {
+        const chunk = byId.get(id);
+        return chunk === undefined ? [] : [chunk];
+      }),
+      { ...opts, sourceRef: partition.sourceRef }
+    );
+    if (total.batchId === "") total.batchId = summary.batchId;
+    total.processed += summary.processed;
+    total.succeeded += summary.succeeded;
+    total.failed += summary.failed;
+    total.writeFailures += summary.writeFailures;
+    total.ungrounded += summary.ungrounded;
+    total.failureCodes.push(...summary.failureCodes);
+  }
+  return total;
+}
+
 function buildExtractOutput(
   summary: BatchSummary,
   failedChunks: ExtractFailedChunk[],
@@ -446,6 +502,14 @@ function buildPipelineDeps(
     // the persist paths derive each slot's embedder from `embedderEnv`.
     slotEmbedding: createSlotEmbeddingSource(deps.embedderEnv, embedder),
     logger: deps.logger ?? NOOP_LOGGER,
+    // Each lifecycle forks its own counter out of this handle, so two
+    // concurrent MCP extracts in one server process never share a budget.
+    mergeBudget: createMergeEmbedBudget(),
+    // The server's own wiring supplies the operator's ceiling; without it the
+    // lifecycle uses the published default.
+    ...(deps.stageMaxBytes !== undefined
+      ? { stageMaxBytes: deps.stageMaxBytes }
+      : {}),
     ...(deps.precision !== undefined ? { precision: deps.precision } : {}),
     ...(deps.now !== undefined ? { now: deps.now } : {}),
     ...(deps.writeTimeSupersede === true ? { writeTimeSupersede: true } : {}),
@@ -515,20 +579,37 @@ export function createExtractHandler(deps: ExtractDeps) {
 
       const failedChunks: ExtractFailedChunk[] = [];
       const pipelineDeps = buildPipelineDeps(deps, llm, embedder);
-      const summary = await processBatch(
-        pipelineDeps,
-        client,
-        selector.chunks,
-        {
-          // The source_ref selector is scan-capped at the batch limit; report
-          // the configured cap verbatim, same as the CLI's --batch-size.
-          ...(input.chunk_ids === undefined ? { batchSize: batchLimit } : {}),
-          onChunkOutcome: (outcome: ChunkOutcomeReport) => {
-            const failed = failedChunkFromOutcome(outcome);
-            if (failed !== undefined) failedChunks.push(failed);
-          },
-        }
-      );
+      const onChunkOutcome = (outcome: ChunkOutcomeReport) => {
+        const failed = failedChunkFromOutcome(outcome);
+        if (failed !== undefined) failedChunks.push(failed);
+      };
+      const summary =
+        input.chunk_ids === undefined
+          ? // A source_ref selection is ONE source by construction: one
+            // lifecycle, one cap, no partition query.
+            await processBatch(
+              pipelineDeps,
+              client,
+              selector.chunks,
+              {
+                // The selector is scan-capped at the batch limit; report the
+                // configured cap verbatim, same as the CLI's --batch-size.
+                batchSize: batchLimit,
+                sourceRef: input.source_ref as string,
+                ...(pipelineDeps.stageMaxBytes !== undefined
+                  ? { stageMaxBytes: pipelineDeps.stageMaxBytes }
+                  : {}),
+                onChunkOutcome,
+              }
+            )
+          : // An explicit id selection can span sources, so it becomes one
+            // lifecycle per source with an independent cap each.
+            await runLifecyclesPerSource(pipelineDeps, client, selector.chunks, {
+              ...(pipelineDeps.stageMaxBytes !== undefined
+                ? { stageMaxBytes: pipelineDeps.stageMaxBytes }
+                : {}),
+              onChunkOutcome,
+            });
       return textResult(
         JSON.stringify(buildExtractOutput(summary, failedChunks, selector))
       );

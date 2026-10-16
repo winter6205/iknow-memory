@@ -46,13 +46,45 @@ class FakeClient implements CliClient {
   rowsOverride?: (text: string) => unknown[];
   /** When set, queries matching it throw — simulates a mid-transaction write error. */
   failOn?: RegExp;
+  /**
+   * Chunk text the commit phase re-reads by id (phase E stages outputs only),
+   * learned from whatever the selectors scanned.
+   */
+  private readonly chunkText = new Map<string, string>();
+
   async query(text: string, values?: unknown[]) {
     this.queries.push(text);
     this.valuesList.push(values ?? []);
     if (this.failOn !== undefined && this.failOn.test(text)) {
       throw new Error("simulated write failure");
     }
+    if (text.includes("FROM chunks c WHERE c.id = $1")) {
+      const id = String(values?.[0]);
+      return { rows: [{ id, content: this.chunkText.get(id) ?? "" }] };
+    }
+    if (text.includes("SELECT c.id, c.source_ref FROM chunks c")) {
+      // The caller's partition query. Answered from what the scan returned, so
+      // these suites — which key off the scan, not the partition — keep one
+      // source for the whole selection.
+      return {
+        rows: [...this.chunkText.keys()].map((id) => ({
+          id,
+          source_ref: "doc-1",
+        })),
+      };
+    }
     const rows = this.rowsOverride ? this.rowsOverride(text) : [];
+    for (const row of rows) {
+      if (
+        typeof (row as { id?: unknown })?.id === "string" &&
+        typeof (row as { content?: unknown })?.content === "string"
+      ) {
+        this.chunkText.set(
+          (row as { id: string }).id,
+          (row as { content: string }).content
+        );
+      }
+    }
     return { rows };
   }
   release(): void {}

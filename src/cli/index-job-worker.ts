@@ -29,6 +29,7 @@ import { Pool } from "pg";
 import {
   ConfigError,
   loadEnv,
+  readEntityMergeStageMaxBytes,
   readIngestBatchLimit,
   type GraphragEnv,
 } from "../config.js";
@@ -53,12 +54,18 @@ import {
   isExtractMethod,
 } from "../core/extraction/method.js";
 import {
-  notIndexed,
-  processBatch,
-  selectPendingChunksBySourceRef,
+  runPagedExtractLifecycle,
+  selectPendingChunksBySourceRefAfter,
   type ExtractPipelineDeps,
+  type PendingChunkCursor,
 } from "../core/extraction/pipeline.js";
+import {
+  createMergeEmbedBudget,
+  ENTITY_MERGE_EMBED_LIMIT,
+  MergeBudgetError,
+} from "../core/entities/merge-budget.js";
 import { createSlotSourceFromGraphragEnv } from "../core/embed-slots.js";
+import type { ChunkInput } from "../core/extraction/extract.js";
 import {
   COMMUNITY_SUMMARY_INDEX_FAILURE,
   type ExtractMethod,
@@ -115,10 +122,11 @@ export const COMMUNITY_SUMMARY_NOT_CONFIGURED =
 export const JOB_SERIALIZATION_KEY = "iknow-memory:index-job";
 
 /**
- * WHY a ceiling: a chunk whose write leg rolled back stays pending, so a broken
- * source can keep answering "more remain" forever. Stopping quietly would
- * publish `ready` over an unindexed remainder, so the stage refuses with a
- * typed code instead and the operator sees an incomplete job.
+ * WHY a ceiling: it bounds the extract phase's PAGE loop, so a source whose
+ * pending set is larger than `EXTRACT_ROUND_CEILING × batchLimit` is refused
+ * before anything is committed rather than silently truncated. It is not a
+ * zero-progress guard any more: phase E commits nothing, so no page can be
+ * handed back to the scanner, and phase C runs once over the staged set.
  */
 export const EXTRACT_ROUND_CEILING = 100;
 
@@ -278,6 +286,12 @@ export interface StageAdapterDeps {
   pool: WorkerPool;
   pipelineDeps: ExtractPipelineDeps;
   batchLimit: number;
+  /**
+   * Byte ceiling over one lifecycle's staged outputs (ADR-0013). Read once at
+   * boot from its own owner, like the batch limit — never per extract, so a
+   * run cannot fail on a settings read it did not need.
+   */
+  stageMaxBytes?: number;
   drainDeps: DrainDeps;
   /** Undefined when the deployment gives the stage nothing to run with — no
    * projection target or no summarizer credential. The stage then answers the
@@ -339,53 +353,68 @@ async function runExtractStage(
 ): Promise<IndexJobExtractOutcome> {
   const client = await deps.pool.connect();
   try {
-    let processed = 0;
-    let failed = 0;
-    let writeFailures = 0;
-    const failureCodes: string[] = [];
-    for (let round = 0; ; round += 1) {
-      if (round >= EXTRACT_ROUND_CEILING) {
-        throw new IndexJobStageError(
-          INDEX_JOB_EXTRACT_INCOMPLETE,
-          `pending chunks for ${sourceRef} still remained after ${EXTRACT_ROUND_CEILING} batches of ${deps.batchLimit}`
-        );
-      }
-      const scan = await selectPendingChunksBySourceRef(
-        client,
+    const summary = await runPagedExtractLifecycle(
+      deps.pipelineDeps,
+      client,
+      extractPhasePages(client, deps.batchLimit, sourceRef),
+      {
+        batchSize: deps.batchLimit,
         sourceRef,
-        deps.batchLimit
-      );
-      if (scan.chunks.length === 0) break;
-      const summary = await processBatch(
-        deps.pipelineDeps,
-        client,
-        scan.chunks,
-        {
-          batchSize: deps.batchLimit,
-          ...(method === null ? {} : { method }),
-        }
-      );
-      processed += summary.processed;
-      // The two not-indexed legs stay apart: a rolled-back leg sealed no record
-      // and so carries no code of its own, which is why the stage's failure
-      // code comes from `batchFailureCode` and not from a count here. They share
-      // one reason to stop the rescan — neither indexed anything, and a
-      // rolled-back chunk is still pending, so a rescan would hand back the same
-      // batch instead of draining it. The job records this attempt; the chunk
-      // waits for the next extract run.
-      failed += summary.failed;
-      writeFailures += summary.writeFailures;
-      failureCodes.push(...summary.failureCodes);
-      // EXIT: the first leg that indexed nothing ends the stage.
-      if (notIndexed(summary) > 0 || !scan.hasMore) break;
+        ...(deps.stageMaxBytes !== undefined
+          ? { stageMaxBytes: deps.stageMaxBytes }
+          : {}),
+        ...(method === null ? {} : { method }),
+      }
+    );
+    return {
+      processed: summary.processed,
+      failed: summary.failed,
+      writeFailures: summary.writeFailures,
+      failureCodes: summary.failureCodes,
+    };
+  } catch (err) {
+    // The re-wrap is required: an untyped throw would leave the row running
+    // and reclaimable instead of publishing a named, actionable failure.
+    if (err instanceof MergeBudgetError) {
+      throw new IndexJobStageError(ENTITY_MERGE_EMBED_LIMIT, err.message);
     }
-    return { processed, failed, writeFailures, failureCodes };
+    throw err;
   } finally {
     client.release();
   }
 }
 
-async function drainStage(deps: DrainDeps): Promise<void> {
+/**
+ * Phase E's page source for one source: `(created_at, id)` keyset paging, so
+ * chunks sharing a `created_at` are neither skipped at a page boundary nor
+ * extracted twice. The population is frozen at stage start by construction —
+ * the cursor only moves forward and phase E commits nothing.
+ */
+async function* extractPhasePages(
+  client: WorkerClient,
+  batchLimit: number,
+  sourceRef: string
+): AsyncGenerator<ChunkInput[]> {
+  let cursor: PendingChunkCursor | null = null;
+  for (let page = 0; ; page += 1) {
+    if (page >= EXTRACT_ROUND_CEILING) {
+      throw new IndexJobStageError(
+        INDEX_JOB_EXTRACT_INCOMPLETE,
+        `pending chunks for ${sourceRef} still remained after ${EXTRACT_ROUND_CEILING} batches of ${batchLimit}`
+      );
+    }
+    const scan = await selectPendingChunksBySourceRefAfter(
+      client,
+      sourceRef,
+      cursor,
+      batchLimit
+    );
+    if (scan.chunks.length === 0) return;
+    yield scan.chunks;
+    if (!scan.hasMore) return;
+    cursor = scan.cursor;
+  }
+}async function drainStage(deps: DrainDeps): Promise<void> {
   // Re-arm first: a previous run's `failed` intent stays out of the pending
   // scan, so a drain over an empty queue would exit 0 and let this job publish
   // `ready` while an earlier projection leg never landed.
@@ -504,6 +533,9 @@ function buildWorkerDeps(parts: WorkerParts): IndexJobWorkerDeps {
     embedder,
     logger,
     slotEmbedding,
+    // The lifecycle forks its own counter out of this handle, so the worker's
+    // long-lived deps never carry a spent budget between jobs.
+    mergeBudget: createMergeEmbedBudget(),
     writeTimeSupersede: env.extractWriteTimeSupersede,
     ...(precision === undefined ? {} : { precision }),
   };
@@ -535,6 +567,8 @@ function buildWorkerDeps(parts: WorkerParts): IndexJobWorkerDeps {
       // The cap is the shared GRAPHRAG_MEMORY_INGEST_BATCH_LIMIT, read from its
       // own owner: the same ceiling the extract tool caps a batch at.
       batchLimit: readIngestBatchLimit(),
+      // Read here, at boot, for the same reason as the batch limit.
+      stageMaxBytes: readEntityMergeStageMaxBytes(),
       drainDeps,
       summaryDeps,
     }),

@@ -82,6 +82,9 @@ class FakeQueryable implements ExtractClient {
   /** Chunk text the commit phase re-reads by id, learned from the scans. */
   private readonly chunkText = new Map<string, string>();
 
+  /** Source each selected chunk belongs to, learned from the selector scans. */
+  private readonly chunkSource = new Map<string, string>();
+
   async query(text: string, values: unknown[] = []) {
     this.queries.push(text);
     this.valuesList.push(values);
@@ -96,10 +99,25 @@ class FakeQueryable implements ExtractClient {
       const id = String(values[0]);
       return { rows: [{ id, content: this.chunkText.get(id) ?? "" }] };
     }
+    // A chunk_ids selection is split into one lifecycle per source_ref, and
+    // selectSourcePartitions drops any id it cannot place. The selector scans
+    // here do not carry source_ref, so fall back to the document these tests
+    // already address.
+    if (text.includes("SELECT c.id, c.source_ref FROM chunks c WHERE c.id IN")) {
+      return {
+        rows: values.map((id) => ({
+          id: String(id),
+          source_ref: this.chunkSource.get(String(id)) ?? "doc-1",
+        })),
+      };
+    }
     const rows = this.rowsFor(text);
     for (const row of rows) {
       if (typeof row?.id === "string" && typeof row?.content === "string") {
         this.chunkText.set(row.id, row.content);
+      }
+      if (typeof row?.id === "string" && typeof row?.source_ref === "string") {
+        this.chunkSource.set(row.id, row.source_ref);
       }
     }
     return { rows };

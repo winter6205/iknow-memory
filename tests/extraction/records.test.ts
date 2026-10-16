@@ -22,6 +22,7 @@ import type {
   JudgeInput,
 } from "../../src/core/extraction/types.js";
 import type { Logger } from "../../src/logging.js";
+import { createMergeEmbedBudget } from "../../src/core/entities/merge-budget.js";
 
 interface StoredRecord {
   id: string;
@@ -477,6 +478,7 @@ function pipelineDeps(llm: FakeLLMClient) {
     embedder: new FakeEmbedder(8),
     logger: SILENT_LOGGER,
     now: () => "2026-02-01T00:00:00.000Z",
+    mergeBudget: createMergeEmbedBudget(),
   };
 }
 

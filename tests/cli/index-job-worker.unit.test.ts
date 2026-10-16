@@ -69,12 +69,19 @@ import {
   type LogLevel,
 } from "../../src/config.js";
 import {
-  processBatch,
-  selectPendingChunksBySourceRef,
+  runPagedExtractLifecycle,
+  selectPendingChunksBySourceRefAfter,
   type BatchSummary,
   type ExtractPipelineDeps,
 } from "../../src/core/extraction/pipeline.js";
+import {
+  createMergeEmbedBudget,
+  ENTITY_MERGE_EMBED_LIMIT,
+  MergeStageScopeError,
+} from "../../src/core/entities/merge-budget.js";
 import type { Logger } from "../../src/logging.js";
+import { FakeEmbedder } from "../../src/core/embedder.js";
+import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 
 /** The summary CLI's exit decision is faked at its own seam: the mapping to a
  * job code is what this file owns, and the real job needs Neo4j plus an LLM. */
@@ -85,8 +92,10 @@ vi.mock("../../src/cli/community-summary.js", async (importOriginal) => {
 });
 
 /** The extract stage's two calls are faked at the same seam: the pipeline has
- * its own suite, and what belongs to this file is the rescan rule — when to
- * take another round, when to stop, and when to refuse instead of truncating. */
+ * its own suite, and what belongs to this file is the paging rule — how the
+ * phase-E cursor advances, that ONE lifecycle spans every page, and when the
+ * page loop refuses instead of truncating. A test that needs the real lifecycle
+ * (the one-cap-across-pages proof) installs the actual implementation. */
 vi.mock("../../src/core/extraction/pipeline.js", async (importOriginal) => {
   const actual =
     await importOriginal<
@@ -94,10 +103,14 @@ vi.mock("../../src/core/extraction/pipeline.js", async (importOriginal) => {
     >();
   return {
     ...actual,
-    selectPendingChunksBySourceRef: vi.fn(),
-    processBatch: vi.fn(),
+    selectPendingChunksBySourceRefAfter: vi.fn(),
+    runPagedExtractLifecycle: vi.fn(),
   };
 });
+
+const actualPipeline = await vi.importActual<
+  typeof import("../../src/core/extraction/pipeline.js")
+>("../../src/core/extraction/pipeline.js");
 
 const SOURCE_A = "doc-1/1/main";
 const SOURCE_B = "doc-2/1/main";
@@ -299,6 +312,41 @@ function fakeDbPool(client: FakeDbClient): WorkerPool {
   };
 }
 
+/**
+ * A ledger fake for the one test that runs the REAL lifecycle: it answers the
+ * commit-phase chunk read and hands the merge gate a live candidate whose name
+ * never matches an incoming one, so every resolution reaches L2 and embeds.
+ */
+class LifecycleDbClient {
+  async query(text: string, values: unknown[] = []): Promise<{ rows: unknown[] }> {
+    if (text.includes("FROM chunks c WHERE c.id = $1")) {
+      return {
+        rows: [
+          {
+            id: values[0],
+            content: `Person works at Acme Corp on the billing platform`,
+          },
+        ],
+      };
+    }
+    if (text.includes("FROM entities WHERE retired = false")) {
+      return {
+        rows: [
+          {
+            id: "candidate-1",
+            canonical_name: "Zoe Prior",
+            type: "person",
+            embedding: null,
+            description: "Zoe Prior works at Acme Corp on the billing platform",
+          },
+        ],
+      };
+    }
+    return { rows: [] };
+  }
+  release(): void {}
+}
+
 const emptyGraphWriter: GraphWriter = {
   async ensureConstraints(): Promise<void> {},
   async mergeNodes(): Promise<void> {},
@@ -319,10 +367,13 @@ function drainDepsThatFailWith(fault: unknown): DrainDeps {
 }
 
 function adapters(over: Partial<StageAdapterDeps> = {}): IndexJobStagePorts {
-  const logger = new RecordingLogger();
+  const logger = over.pipelineDeps?.logger ?? new RecordingLogger();
   return createIndexJobStagePorts({
     pool: fakeDbPool(new FakeDbClient()),
-    pipelineDeps: { logger } as unknown as ExtractPipelineDeps,
+    pipelineDeps: {
+      logger,
+      mergeBudget: createMergeEmbedBudget(),
+    } as unknown as ExtractPipelineDeps,
     batchLimit: 5,
     drainDeps: {
       pool: fakeDbPool(new FakeDbClient()) as unknown as DrainDeps["pool"],
@@ -823,11 +874,12 @@ describe("index job stage adapters", () => {
 });
 
 describe("index job extract stage", () => {
-  const scan = vi.mocked(selectPendingChunksBySourceRef);
-  const batch = vi.mocked(processBatch);
+  const page = vi.mocked(selectPendingChunksBySourceRefAfter);
+  const lifecycle = vi.mocked(runPagedExtractLifecycle);
   const oneChunk = {
     chunks: [{ id: "chunk-1", content: "text" }],
     hasMore: true,
+    cursor: { createdAt: "2026-01-01T00:00:01.000Z", id: "chunk-1" },
   };
 
   function summary(over: Partial<BatchSummary> = {}): BatchSummary {
@@ -843,16 +895,35 @@ describe("index job extract stage", () => {
     };
   }
 
+  /**
+   * The page loop lives inside the lifecycle, so a stub that does not drain the
+   * page source never touches the scanner. These tests care about the scan, so
+   * the stub consumes every page like the real one does.
+   */
+  function drainingLifecycle(over: Partial<BatchSummary> = {}): void {
+    lifecycle.mockImplementation((async (_deps, _client, pages) => {
+      for await (const _page of pages) void _page;
+      return summary(over);
+    }) as unknown as typeof runPagedExtractLifecycle);
+  }
+
   beforeEach(() => {
-    scan.mockReset();
-    batch.mockReset();
+    page.mockReset();
+    lifecycle.mockReset();
   });
 
-  it("takes another round while the scan says more chunks remain", async () => {
-    scan
+  it("pages the source with a keyset cursor and runs ONE lifecycle over them", async () => {
+    // The lifecycle is entered once and the page loop lives inside it, so the
+    // cap it derives covers every page (ADR-0013 Decision 1).
+    page
       .mockResolvedValueOnce(oneChunk)
-      .mockResolvedValueOnce({ ...oneChunk, hasMore: false });
-    batch.mockResolvedValue(summary());
+      .mockResolvedValueOnce({
+        ...oneChunk,
+        chunks: [{ id: "chunk-2", content: "text" }],
+        cursor: { createdAt: "2026-01-01T00:00:02.000Z", id: "chunk-2" },
+      })
+      .mockResolvedValueOnce({ ...oneChunk, chunks: [], hasMore: false, cursor: null });
+    drainingLifecycle({ processed: 2 });
 
     await expect(adapters().runExtract(SOURCE_A, null)).resolves.toEqual({
       processed: 2,
@@ -860,55 +931,85 @@ describe("index job extract stage", () => {
       writeFailures: 0,
       failureCodes: [],
     });
-    expect(scan).toHaveBeenCalledTimes(2);
+    expect(page).toHaveBeenCalledTimes(3);
+    expect(lifecycle).toHaveBeenCalledTimes(1);
   });
 
-  it("caps the scan and forwards the recorded switch to the pipeline", async () => {
-    scan.mockResolvedValue({ ...oneChunk, hasMore: false });
-    batch.mockResolvedValue(summary());
-
-    await adapters().runExtract(SOURCE_A, "fast");
-
-    expect(scan.mock.calls[0]?.slice(1)).toEqual([SOURCE_A, 5]);
-    expect(batch.mock.calls[0]?.[3]).toEqual({ batchSize: 5, method: "fast" });
-  });
-
-  it("sends no switch when the source never recorded one", async () => {
-    scan.mockResolvedValue({ ...oneChunk, hasMore: false });
-    batch.mockResolvedValue(summary());
+  it("resumes the keyset scan on (created_at, id), not on created_at alone", async () => {
+    // Row 15: a page boundary can fall inside a group of chunks sharing one
+    // created_at, so the `id` term is what stops the scan skipping the rest of
+    // that group (or reading it twice).
+    page
+      .mockResolvedValueOnce(oneChunk)
+      .mockResolvedValueOnce({ ...oneChunk, chunks: [], hasMore: false, cursor: null });
+    drainingLifecycle();
 
     await adapters().runExtract(SOURCE_A, null);
 
-    expect(batch.mock.calls[0]?.[3]).toEqual({ batchSize: 5 });
+    expect(page.mock.calls[0]?.slice(1)).toEqual([SOURCE_A, null, 5]);
+    expect(page.mock.calls[1]?.slice(1)).toEqual([
+      SOURCE_A,
+      { createdAt: "2026-01-01T00:00:01.000Z", id: "chunk-1" },
+      5,
+    ]);
   });
 
-  it("stops rescanning the moment a leg fails", async () => {
-    // A rolled-back write leaves its chunk pending, so re-scanning would hand
-    // back the same batch: the stage reports the failure and stops.
-    scan.mockResolvedValue(oneChunk);
-    batch.mockResolvedValue(
-      summary({ failed: 1, succeeded: 0, failureCodes: ["FAST_EMPTY_GRAPH"] })
-    );
+  it("caps the scan and forwards the recorded switch to the lifecycle", async () => {
+    page.mockResolvedValue({ ...oneChunk, hasMore: false });
+    drainingLifecycle();
+
+    await adapters().runExtract(SOURCE_A, "fast");
+
+    expect(page.mock.calls[0]?.slice(1)).toEqual([SOURCE_A, null, 5]);
+    expect(lifecycle.mock.calls[0]?.[3]).toEqual({
+      batchSize: 5,
+      sourceRef: SOURCE_A,
+      method: "fast",
+    });
+  });
+
+  it("sends no switch when the source never recorded one", async () => {
+    page.mockResolvedValue({ ...oneChunk, hasMore: false });
+    drainingLifecycle();
+
+    await adapters().runExtract(SOURCE_A, null);
+
+    expect(lifecycle.mock.calls[0]?.[3]).toEqual({
+      batchSize: 5,
+      sourceRef: SOURCE_A,
+    });
+  });
+
+  it("does not truncate the population when the first page indexes nothing", async () => {
+    // Row 16: the `notIndexed > 0` rescan break is gone. A first page of
+    // sealed failures no longer ends the stage early, because phase E commits
+    // nothing and the cursor cannot be handed the same page twice.
+    page
+      .mockResolvedValueOnce(oneChunk)
+      .mockResolvedValueOnce({
+        ...oneChunk,
+        chunks: [{ id: "chunk-2", content: "text" }],
+        hasMore: false,
+      });
+    drainingLifecycle({ processed: 2, failed: 1, succeeded: 1, failureCodes: ["FAST_EMPTY_GRAPH"] });
 
     await expect(adapters().runExtract(SOURCE_A, null)).resolves.toEqual({
-      processed: 1,
+      processed: 2,
       failed: 1,
       writeFailures: 0,
       failureCodes: ["FAST_EMPTY_GRAPH"],
     });
-    expect(scan).toHaveBeenCalledTimes(1);
+    expect(page).toHaveBeenCalledTimes(2);
+    expect(lifecycle).toHaveBeenCalledTimes(1);
   });
 
   it("counts a rolled-back write leg as a failure of the stage", async () => {
     // The pipeline keeps `writeFailures` apart from `failed` because a rolled
-    // back leg sealed no record and so carries no code — but the leg indexed
-    // nothing and left its chunk pending, so the stage stops rescanning on the
-    // total `notIndexed` answers, and the tally it returns still shows the leg
-    // (the runner's `batchFailureCode` gate then names WRITE_FAILURE for the
-    // job): a batch of rolled-back legs must not read as a clean drain and let
-    // the job publish `ready`.
-    scan.mockResolvedValue(oneChunk);
-    batch.mockResolvedValue(summary({ succeeded: 0, writeFailures: 1 }));
+    // back leg sealed no record and so carries no code — the tally the stage
+    // returns still shows the leg, which is what the runner's
+    // `batchFailureCode` gate names WRITE_FAILURE for the job.
+    page.mockResolvedValue({ ...oneChunk, hasMore: false });
+    drainingLifecycle({ succeeded: 0, writeFailures: 1 });
 
     await expect(adapters().runExtract(SOURCE_A, null)).resolves.toEqual({
       processed: 1,
@@ -916,17 +1017,113 @@ describe("index job extract stage", () => {
       writeFailures: 1,
       failureCodes: [],
     });
-    expect(scan).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-wraps a budget refusal onto the entity-merge embed limit code", async () => {
+    // An untyped throw would leave the row running and reclaimable instead of
+    // publishing the named, actionable failure the seed classifier branches on.
+    page.mockResolvedValue({ ...oneChunk, hasMore: false });
+    lifecycle.mockRejectedValue(
+      new MergeStageScopeError("staged output bytes exceed the ceiling", 10, 1)
+    );
+
+    await expect(adapters().runExtract(SOURCE_A, null)).rejects.toMatchObject({
+      failureCode: ENTITY_MERGE_EMBED_LIMIT,
+    });
   });
 
   it("refuses with a typed code rather than finishing over an unindexed remainder", async () => {
-    scan.mockResolvedValue(oneChunk);
-    batch.mockResolvedValue(summary());
+    page.mockResolvedValue(oneChunk);
+    lifecycle.mockImplementation(async (_deps, _client, pages) => {
+      // Drain the page loop the way the real lifecycle does, so the ceiling is
+      // observed on the generator itself.
+      for await (const _ of pages) void _;
+      return summary();
+    });
 
     await expect(adapters().runExtract(SOURCE_A, null)).rejects.toMatchObject({
       failureCode: INDEX_JOB_EXTRACT_INCOMPLETE,
     });
-    expect(scan).toHaveBeenCalledTimes(EXTRACT_ROUND_CEILING);
+    expect(page).toHaveBeenCalledTimes(EXTRACT_ROUND_CEILING);
+  });
+});
+
+describe("index job extract stage — one cap across every page", () => {
+  const page = vi.mocked(selectPendingChunksBySourceRefAfter);
+  const lifecycle = vi.mocked(runPagedExtractLifecycle);
+
+  beforeEach(() => {
+    page.mockReset();
+    lifecycle.mockReset();
+  });
+
+  it("derives ONE cap from all pages and never resets the counter between them", async () => {
+    // Row 2, the row the old batching loop could not express: three pages, ONE
+    // lifecycle, so `embed_calls` is the SUM of what every page spent. A
+    // per-page cap would show at most 2 here and a per-page lifecycle would be
+    // three entries in the completion log.
+    const outputs = (n: number) => ({
+      head: `Person ${n}`,
+      headType: "person",
+      relationRaw: "works at",
+      relationNorm: "RELATED_TO",
+      tail: "Acme Corp",
+      tailType: "organization",
+      description: "Person works at Acme Corp on the billing platform",
+      evidenceSpan: `Person ${n} works at Acme Corp`,
+      confidence: 0.9,
+    });
+    const logger = new RecordingLogger();
+    page
+      .mockResolvedValueOnce({
+        chunks: [{ id: "chunk-1", content: "Person 1 works at Acme Corp" }],
+        hasMore: true,
+        cursor: { createdAt: "2026-01-01T00:00:01.000Z", id: "chunk-1" },
+      })
+      .mockResolvedValueOnce({
+        chunks: [{ id: "chunk-2", content: "Person 2 works at Acme Corp" }],
+        hasMore: true,
+        cursor: { createdAt: "2026-01-01T00:00:02.000Z", id: "chunk-2" },
+      })
+      .mockResolvedValueOnce({
+        chunks: [{ id: "chunk-3", content: "Person 3 works at Acme Corp" }],
+        hasMore: false,
+        cursor: null,
+      });
+    lifecycle.mockImplementation(actualPipeline.runPagedExtractLifecycle);
+
+    const client = new LifecycleDbClient();
+    const ports = adapters({
+      pool: fakeDbPool(client as unknown as WorkerClient),
+      pipelineDeps: {
+        logger,
+        llm: new FakeLLMClient({
+          queue: [
+            { kind: "ok", outputs: [outputs(1)] },
+            { kind: "ok", outputs: [outputs(2)] },
+            { kind: "ok", outputs: [outputs(3)] },
+          ],
+        }),
+        embedder: new FakeEmbedder(8),
+        mergeBudget: createMergeEmbedBudget(),
+      } as unknown as ExtractPipelineDeps,
+    });
+
+    await ports.runExtract(SOURCE_A, null);
+
+    const completions = logger.logs.filter(
+      (entry) => entry.msg === "extract-batch-complete"
+    );
+    expect(completions).toHaveLength(1);
+    const fields = completions[0]?.fields as Record<string, unknown>;
+    expect(fields.source_ref).toBe(SOURCE_A);
+    expect(fields.processed).toBe(3);
+    // E = 4 distinct (role, name, type) keys across the three pages
+    // (Person 1/2/3 heads + one shared Acme Corp tail), T = 3 triples, N = 3.
+    expect(fields.embed_cap).toBe(10);
+    // Every page's resolutions accumulate on the one lifecycle counter: one
+    // embed call per chunk's head resolution, none of them refunded or reset.
+    expect(fields.embed_calls).toBe(3);
   });
 });
 

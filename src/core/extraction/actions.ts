@@ -21,7 +21,16 @@
  */
 import { GraphragError } from "../errors.js";
 import { emitProjectionIntents } from "../storage/projection-outbox.js";
-import { depsNow, persistOutputs, type ExtractPersistDeps } from "./persist.js";
+import {
+  MergeBudgetError,
+  type MergeEmbedBudget,
+} from "../entities/merge-budget.js";
+import {
+  depsNow,
+  deriveMergeEmbedCap,
+  persistOutputs,
+  type ExtractPersistDeps,
+} from "./persist.js";
 import { ProposalPayloadSchema } from "./judge.js";
 import {
   commitSelfLoopRejection,
@@ -117,6 +126,13 @@ interface PromotionRecord {
  * no ES precision mirror. NOT equivalent to a batch success: promoted facts
  * reach the graph/outbox only — the ES precision mirror catches up via the
  * existing `es:reindex` repair path.
+ *
+ * This is its own single-record lifecycle (ADR-0013): no extract stage, no
+ * page loop, and no phase E — the sealed `proposed_payload` IS the pre-merge
+ * population. It is budgeted by the SAME cap derivation with `N = 1`, armed
+ * after the payload is parsed and before `persistOutputs` can resolve
+ * anything. A breach rolls this transaction back and re-throws: it is a
+ * retryable cost refusal, NOT the promotion's permanent SELF_LOOP_REJECTED.
  */
 export async function promoteRecord(
   deps: ExtractPersistDeps,
@@ -124,6 +140,9 @@ export async function promoteRecord(
   recordId: string
 ): Promise<void> {
   await client.query("BEGIN", []);
+  // Read by the completion / breach log lines; null until the chunk answers.
+  let promoteSourceRef: string | null = null;
+  let promoteBudget: MergeEmbedBudget | null = null;
   try {
     const { rows } = await client.query(
       `SELECT id, chunk_id, status, discarded_at, proposed_payload FROM extraction_records WHERE id = $1 FOR UPDATE`,
@@ -162,18 +181,25 @@ export async function promoteRecord(
       );
     }
     const chunkRows = await client.query(
-      `SELECT id, content FROM chunks c WHERE c.id = $1`,
+      `SELECT id, content, source_ref FROM chunks c WHERE c.id = $1`,
       [record.chunk_id]
     );
-    const chunk: { id: string; content: string } | undefined =
-      chunkRows.rows[0];
+    const chunk:
+      | { id: string; content: string; source_ref: string | null }
+      | undefined = chunkRows.rows[0];
     if (chunk === undefined) {
       throw new PromotionRefusedError(
         `the chunk of record ${recordId} no longer exists (its row was deleted)`
       );
     }
+    // One lifecycle, one cap, armed before the first merge resolution. Same
+    // formula and same derivation as the extract lifecycle — N = 1 because
+    // this commits exactly the one chunk it read.
+    promoteSourceRef = chunk.source_ref;
+    promoteBudget = deps.mergeBudget.fork();
+    promoteBudget.arm(deriveMergeEmbedCap(parsed.data.triples, 1).embedCap);
     const counts = await persistOutputs(
-      deps,
+      { ...deps, mergeBudget: promoteBudget },
       client,
       chunk.id,
       chunk.content,
@@ -206,14 +232,31 @@ export async function promoteRecord(
       unmappedCount: counts.unmapped,
     });
     await client.query("COMMIT", []);
+    const budget = promoteBudget?.snapshot() ?? { embedCap: null, embedCalls: 0 };
     deps.logger.info("promote-record-complete", {
       record: recordId,
       chunk: chunk.id,
       triples: counts.triples,
       unmapped: counts.unmapped,
+      // The same three fields the extract lifecycle logs, so one reader
+      // parses a cap on a run that did not breach (ADR-0013 Decision 7).
+      source_ref: chunk.source_ref,
+      embed_cap: budget.embedCap,
+      embed_calls: budget.embedCalls,
     });
   } catch (err) {
     await client.query("ROLLBACK", []);
+    if (err instanceof MergeBudgetError) {
+      const budget = promoteBudget?.snapshot() ?? {
+        embedCap: null,
+        embedCalls: 0,
+      };
+      deps.logger.error("entity-merge-embed-limit", {
+        source_ref: promoteSourceRef,
+        embed_calls: budget.embedCalls,
+        embed_cap: budget.embedCap,
+      });
+    }
     throw err;
   }
 }

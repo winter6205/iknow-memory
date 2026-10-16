@@ -27,7 +27,14 @@ import {
 } from "../../src/cli/extract.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
+import { deriveMergeEmbedCap } from "../../src/core/extraction/persist.js";
+import {
+  createMergeEmbedBudget,
+  ENTITY_MERGE_EMBED_LIMIT,
+} from "../../src/core/entities/merge-budget.js";
+import type { GrayZoneJudge } from "../../src/core/entities/types.js";
 import type { ExtractionOutput } from "../../src/core/extraction/types.js";
+import type { Logger } from "../../src/logging.js";
 
 const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
 const savedAnnMaxDimensions = process.env[ANN_MAX_DIMENSIONS_VAR];
@@ -98,6 +105,7 @@ function makeDeps(client: FakeClient): CliDeps {
     dims: 8,
     logger: silentLogger(),
     now: () => "2026-08-08T00:00:00.000Z",
+    mergeBudget: createMergeEmbedBudget(),
   };
 }
 
@@ -107,7 +115,9 @@ function serveRows(
   rows: {
     promoteRecord?: Record<string, unknown> | null;
     discardRecord?: Record<string, unknown> | null;
-    chunk?: { id: string; content: string } | null;
+    chunk?: { id: string; content: string; source_ref?: string | null } | null;
+    /** Live entity rows the merge gate weighs (the gray-pair fixture needs one). */
+    entities?: unknown[];
   }
 ): void {
   client.rowsOverride = (text) => {
@@ -123,6 +133,9 @@ function serveRows(
     }
     if (/FROM chunks c WHERE/.test(text)) {
       return rows.chunk ? [rows.chunk] : [];
+    }
+    if (text.includes("FROM entities WHERE retired = false")) {
+      return rows.entities ?? [];
     }
     return [];
   };
@@ -365,4 +378,156 @@ describe("credential guards on the review lane", () => {
     expect(persistsEmbeddings(flagsOf(["--promote", REC]))).toBe(true);
     expect(persistsEmbeddings(flagsOf(["--discard", REC]))).toBe(false);
   });
+});
+
+/**
+ * The promote lifecycle's entity-merge embed cap (ADR-0013 Decision 1A): one
+ * single-record lifecycle, its own cap from the SAME derivation with N = 1,
+ * armed before any merge resolution and refused loudly.
+ */
+describe("runCli --promote and the entity-merge embed cap", () => {
+  /** Counts provider requests so a refusal can be shown to precede every one. */
+class CountingEmbedder {
+  requests = 0;
+  constructor(private readonly inner: FakeEmbedder) {}
+  async embed(texts: string[]): Promise<number[][]> {
+    this.requests += 1;
+    return await this.inner.embed(texts);
+  }
+}
+
+/** A payload whose gray pairs re-embed: the human judge never materializes. */
+  const GRAY: ExtractionOutput = {
+    head: "Alicia Smith",
+    headType: "person",
+    relationRaw: "works at",
+    relationNorm: "RELATED_TO",
+    tail: "Acme Corp",
+    tailType: "organization",
+    description: "Alicia Smith works at Acme Corp on the billing platform",
+    evidenceSpan: "Alicia Smith works at Acme Corp on the billing platform",
+    confidence: 0.9,
+  };
+
+  function payloadOf(triples: ExtractionOutput[]) {
+    return {
+      triples,
+      verdicts: triples.map((_, index) => ({
+        index,
+        grounded: true,
+        reason: "stated",
+      })),
+    };
+  }
+
+  function promoteDeps(client: FakeClient): {
+    deps: CliDeps;
+    lines: { msg: string; fields?: unknown }[];
+    embedder: CountingEmbedder;
+  } {
+    const lines: { msg: string; fields?: unknown }[] = [];
+    const logger: Logger = {
+      level: "info",
+      debug: () => {},
+      info: (msg, fields) => lines.push({ msg, fields }),
+      warn: () => {},
+      error: (msg, fields) => lines.push({ msg, fields }),
+    };
+    const embedder = new CountingEmbedder(new FakeEmbedder(8));
+    const grayJudge: GrayZoneJudge = async () => "human";
+    return {
+      lines,
+      embedder,
+      deps: {
+        ...makeDeps(client),
+        logger,
+        embedder,
+        mergeBudget: createMergeEmbedBudget(),
+        mergeJudge: grayJudge,
+      } as CliDeps,
+    };
+  }
+
+  it("row 12: derives embed_cap = E + T + 1 before persistOutputs and reports it", async () => {
+    const client = new FakeClient();
+    serveRows(client, {
+      promoteRecord: { ...failedWithPayload(), proposed_payload: payloadOf([PROPOSED]) },
+      chunk: {
+        id: CHUNK,
+        content: "Alice works at Acme Corp.",
+        source_ref: "doc-7/1/main",
+      },
+    });
+    const { deps, lines } = promoteDeps(client);
+
+    expect(await runCli(["--promote", REC], deps)).toBe(0);
+
+    const done = lines.find((line) => line.msg === "promote-record-complete");
+    const fields = done?.fields as Record<string, unknown>;
+    // The SAME exported derivation, with N = 1 for the one chunk this
+    // lifecycle commits.
+    expect(fields.embed_cap).toBe(deriveMergeEmbedCap([PROPOSED], 1).embedCap);
+    expect(fields.source_ref).toBe("doc-7/1/main");
+    expect(typeof fields.embed_calls).toBe("number");
+  });
+
+  it("row 12: a payload over its cap refuses, rolls back, and embeds nothing at the refusal", async () => {
+    // E=2, T=1, N=1 → cap 4 either way. The held head is never materialized, so
+    // each triple spends one more resolution: four fit the cap, five do not.
+    const refused = await promoteWith(Array.from({ length: 5 }, () => ({ ...GRAY })));
+    const permitted = await promoteWith(Array.from({ length: 4 }, () => ({ ...GRAY })));
+
+    expect(refused.exit).toBe(1);
+    expect(refused.client.queries.some((q) => q.trim() === "ROLLBACK")).toBe(true);
+    // Nothing was promoted: the record keeps its payload and stays failed.
+    expect(
+      refused.client.queries.some((q) => q.includes("SET status = 'succeeded'"))
+    ).toBe(false);
+
+    const breach = refused.lines.find(
+      (line) => line.msg === "entity-merge-embed-limit"
+    );
+    const fields = breach?.fields as Record<string, unknown>;
+    expect(Object.keys(fields).sort()).toEqual([
+      "embed_calls",
+      "embed_cap",
+      "source_ref",
+    ]);
+    expect(fields.source_ref).toBe("doc-7/1/main");
+    expect(fields.embed_cap).toBe(4);
+    expect(fields.embed_calls).toBe(4);
+    expect(permitted.exit).toBe(0);
+    // The refusal cost nothing: the payload that fits the cap spends exactly
+    // the same provider requests, so the refused resolutions issued none.
+    expect(refused.embedder.requests).toBe(permitted.embedder.requests);
+  });
+
+  async function promoteWith(triples: ExtractionOutput[]) {
+    const client = new FakeClient();
+    serveRows(client, {
+      promoteRecord: { ...failedWithPayload(), proposed_payload: payloadOf(triples) },
+      chunk: {
+        id: CHUNK,
+        content: "Alicia Smith works at Acme Corp on the billing platform.",
+        source_ref: "doc-7/1/main",
+      },
+      entities: [
+        {
+          id: "alice-1",
+          canonical_name: "Alice Smith",
+          type: "person",
+          embedding: null,
+          description: "Alice Smith works at Acme Corp on the billing platform",
+        },
+      ],
+    });
+    const harness = promoteDeps(client);
+    return {
+      client,
+      lines: harness.lines,
+      embedder: harness.embedder,
+      exit: await runCli(["--promote", REC], harness.deps),
+    };
+  }
+
 });

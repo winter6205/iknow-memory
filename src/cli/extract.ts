@@ -35,7 +35,12 @@
  */
 import { Pool } from "pg";
 
-import { loadEnv, ConfigError, type GraphragEnv } from "../config.js";
+import {
+  loadEnv,
+  ConfigError,
+  DEFAULT_ENTITY_MERGE_STAGE_MAX_BYTES,
+  type GraphragEnv,
+} from "../config.js";
 import { createLogger, writeStderr, type Logger } from "../logging.js";
 import { createPrecisionLayer } from "../core/storage/elasticsearch-precision.js";
 import { upSchemaBootstrap } from "../core/storage/schema-bootstrap.js";
@@ -46,9 +51,14 @@ import { runExtractMethod } from "../core/extraction/method.js";
 import {
   selectPendingChunks,
   selectPendingChunksBySourceRef,
+  selectSourcePartitions,
   processBatch,
   type BatchSummary,
 } from "../core/extraction/pipeline.js";
+import {
+  createMergeEmbedBudget,
+  type MergeEmbedBudget,
+} from "../core/entities/merge-budget.js";
 import { FAST_EMPTY_GRAPH_CODE } from "../core/extraction/fast.js";
 import { embedEntity, toVectorLiteral } from "../core/extraction/persist.js";
 import {
@@ -151,6 +161,18 @@ export interface CliDeps {
    * merge-on-overlap shape.
    */
   writeTimeSupersede?: boolean;
+  /**
+   * Owner of this process's entity-merge embed budgets (ADR-0013). Required by
+   * the core persist deps, so every lifecycle threads it in; optional here so
+   * an injected test dep that never merges does not have to build one.
+   */
+  mergeBudget?: MergeEmbedBudget;
+  /**
+   * Byte ceiling over one lifecycle's staged outputs (ADR-0013), read once at
+   * boot from its own owner — never per run, so an extract cannot fail on a
+   * settings read it did not need.
+   */
+  stageMaxBytes?: number;
   /**
    * Embedding generation rotate T2: the per-slot embed source the persist
    * paths use to dual-write an open rotate. `--backfill-embeddings` reads it
@@ -423,6 +445,15 @@ function flagConflict(flags: CliFlags): string | null {
   return conflict === undefined ? null : conflict.message(flags, selected);
 }
 
+type CliLifecycleDeps = CliDeps & { mergeBudget: MergeEmbedBudget };
+
+function lifecycleDeps(deps: CliDeps): CliLifecycleDeps {
+  return {
+    ...deps,
+    mergeBudget: deps.mergeBudget ?? createMergeEmbedBudget(),
+  };
+}
+
 /** Top-level entry, testable: parse flags, route, map results to exit codes. */
 export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
   const parsed = parseArgs(argv);
@@ -442,7 +473,7 @@ export async function runCli(argv: string[], deps: CliDeps): Promise<number> {
       return await discardRecordAction(deps, parsed.flags.discard);
     }
     if (parsed.flags.backfillEmbeddings) {
-      return await backfillEmbeddings(deps);
+      return await backfillEmbeddings(lifecycleDeps(deps));
     }
     return await runPipeline(deps, parsed.flags);
   } catch (err) {
@@ -487,10 +518,30 @@ async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
       await dryRunPlan(deps, chunks, method);
       return 0;
     }
-    const summary = await processBatch(deps, client, chunks, {
+    const batchOptions = {
       batchSize: flags.batchSize,
+      ...(deps.stageMaxBytes !== undefined
+        ? { stageMaxBytes: deps.stageMaxBytes }
+        : {}),
       ...(method !== null ? { method } : {}),
-    });
+    };
+    const summary =
+      flags.sourceRef !== null
+        ? // A --source-ref selection is ONE source by construction: one
+          // lifecycle, one cap, no partition query.
+          await processBatch(lifecycleDeps(deps), client, chunks, {
+            ...batchOptions,
+            sourceRef: flags.sourceRef,
+          })
+        : // A corpus-wide scan can span sources, so it becomes one lifecycle
+          // per source with an independent cap each: a cheap source's cap must
+          // not pay for another's fan-out (ADR-0013 Decision 1).
+          await runLifecyclesPerSource(
+            lifecycleDeps(deps),
+            client,
+            chunks,
+            batchOptions
+          );
     // EXIT severity (not the failure-code ranking, which `batchFailureCode`
     // owns): a rolled-back leg is the one failure the operator must handle
     // outside this run, so it outranks the content-level job fail below, then
@@ -508,6 +559,54 @@ async function runPipeline(deps: CliDeps, flags: CliFlags): Promise<number> {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Resolve the selection's distinct sources with ONE query and run one
+ * lifecycle per source, in first-appearance order. The tallies are summed for
+ * the caller's exit code; `batchId` is the first lifecycle's, which is what a
+ * single-source run (the common shape) reports unchanged.
+ */
+async function runLifecyclesPerSource(
+  deps: CliLifecycleDeps,
+  client: CliClient,
+  chunks: ChunkInput[],
+  opts: { batchSize: number; method?: ExtractMethod }
+): Promise<BatchSummary> {
+  const byId = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+  const partitions = await selectSourcePartitions(
+    client,
+    chunks.map((chunk) => chunk.id)
+  );
+  let first: BatchSummary | undefined;
+  const total: BatchSummary = {
+    batchId: "",
+    processed: 0,
+    succeeded: 0,
+    failed: 0,
+    writeFailures: 0,
+    ungrounded: 0,
+    failureCodes: [],
+  };
+  for (const partition of partitions) {
+    const summary = await processBatch(
+      deps,
+      client,
+      partition.chunkIds.flatMap((id) => {
+        const chunk = byId.get(id);
+        return chunk === undefined ? [] : [chunk];
+      }),
+      { ...opts, sourceRef: partition.sourceRef }
+    );
+    if (first === undefined) first = summary;
+    total.processed += summary.processed;
+    total.succeeded += summary.succeeded;
+    total.failed += summary.failed;
+    total.writeFailures += summary.writeFailures;
+    total.ungrounded += summary.ungrounded;
+    total.failureCodes.push(...summary.failureCodes);
+  }
+  return { ...total, batchId: first?.batchId ?? "" };
 }
 
 /**
@@ -606,7 +705,7 @@ async function promoteRecordAction(
   const client = await deps.pool.connect();
   try {
     await upSchemaBootstrap(client, deps.dims);
-    await promoteRecord(deps, client, recordId);
+    await promoteRecord(lifecycleDeps(deps), client, recordId);
     return 0;
   } finally {
     client.release();
@@ -645,7 +744,7 @@ async function discardRecordAction(
  * UPDATE instead of one batch transaction, so an interrupted repair keeps
  * the rows it already filled and a re-run picks up the remainder.
  */
-async function backfillEmbeddings(deps: CliDeps): Promise<number> {
+async function backfillEmbeddings(deps: CliLifecycleDeps): Promise<number> {
   const client = await deps.pool.connect();
   try {
     await upSchemaBootstrap(client, deps.dims);
@@ -683,7 +782,7 @@ async function backfillEmbeddings(deps: CliDeps): Promise<number> {
  * counted as not backfilled rather than silently overwritten.
  */
 async function backfillOne(
-  deps: CliDeps,
+  deps: CliLifecycleDeps,
   client: CliClient,
   row: { id: string; canonical_name: string; description: string | null },
   slot: { state: EmbeddingGenerationState | null; activeSlot: string }
@@ -817,6 +916,8 @@ function buildCliDeps(
     llm,
     embedder,
     slotEmbedding: createSlotSourceFromGraphragEnv(env, embedder),
+    stageMaxBytes:
+      env.entityMergeStageMaxBytes ?? DEFAULT_ENTITY_MERGE_STAGE_MAX_BYTES,
     dims: env.embedDimensions,
     logger: createLogger(env.logLevel),
     ...(precision !== undefined ? { precision } : {}),

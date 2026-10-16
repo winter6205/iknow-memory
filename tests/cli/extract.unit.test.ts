@@ -29,6 +29,7 @@ import type { ExtractionOutput } from "../../src/core/extraction/types.js";
 import type { EmbeddingGenerationState } from "../../src/core/types.js";
 import { FakeEmbedder, type EmbeddingClient } from "../../src/core/embedder.js";
 import { computeEntityEmbeddingText } from "../../src/core/entities/embedding.js";
+import { createMergeEmbedBudget } from "../../src/core/entities/merge-budget.js";
 import { ALLOWED } from "../../src/core/extraction/vocabulary.js";
 
 const ANN_MAX_DIMENSIONS_VAR = "GRAPHRAG_MEMORY_PGVECTOR_ANN_MAX_DIMENSIONS";
@@ -49,12 +50,44 @@ class FakeClient implements CliClient {
   valuesList: unknown[][] = [];
   /** Optional per-query row override; receives the SQL text. */
   rowsOverride?: (text: string) => unknown[];
+  /**
+   * Chunk text the commit phase re-reads by id (phase E stages outputs only),
+   * learned from whatever the selectors scanned.
+   */
+  private readonly chunkText = new Map<string, string>();
+
   async query(text: string, values?: unknown[]) {
     this.queries.push(text);
     // Always push (even when undefined) so valuesList[i] stays in lockstep
     // with queries[i] — queries without bound params still occupy a slot.
     this.valuesList.push(values ?? []);
+    if (text.includes("FROM chunks c WHERE c.id = $1")) {
+      const id = String(values?.[0]);
+      return { rows: [{ id, content: this.chunkText.get(id) ?? "" }] };
+    }
+    if (text.includes("SELECT c.id, c.source_ref FROM chunks c")) {
+      // The caller's partition query. Answered from what the scan returned, so
+      // these suites — which key off the scan, not the partition — keep one
+      // source for the whole selection.
+      return {
+        rows: [...this.chunkText.keys()].map((id) => ({
+          id,
+          source_ref: "doc-1",
+        })),
+      };
+    }
     const rows = this.rowsOverride ? this.rowsOverride(text) : [];
+    for (const row of rows) {
+      if (
+        typeof (row as { id?: unknown })?.id === "string" &&
+        typeof (row as { content?: unknown })?.content === "string"
+      ) {
+        this.chunkText.set(
+          (row as { id: string }).id,
+          (row as { content: string }).content
+        );
+      }
+    }
     return { rows };
   }
   release(): void {}
@@ -631,6 +664,7 @@ describe("loadEntities read half (A13)", () => {
       embedder: new FakeEmbedder(8),
       logger: silentLogger(),
       now: () => "2026-08-07T00:00:00.000Z",
+      mergeBudget: createMergeEmbedBudget(),
     };
     const output: ExtractionOutput = {
       head: "Alice Smith",
@@ -1063,8 +1097,13 @@ describe("self-loop outputs are extract rejects (T4 / SC5)", () => {
     // record (SELF_LOOP_REJECTED), --only-failed skips it: there is no
     // re-extract path for a permanent reject.
     expect(extractCalls).toBe(1);
-    const onlyFailedScan = client.queries.filter((query) =>
-      /FROM chunks c/.test(query)
+    // The SELECT scans only: the commit phase's chunk re-read and the
+    // caller's partition query are not the --only-failed scan.
+    const onlyFailedScan = client.queries.filter(
+      (query) =>
+        /FROM chunks c/.test(query) &&
+        !query.includes("c.source_ref FROM") &&
+        !query.includes("WHERE c.id = $1")
     )[1];
     expect(onlyFailedScan).toContain("status = 'failed'");
     // The WHERE clause also excludes the SELF_LOOP_REJECTED sentinel.
@@ -1123,8 +1162,13 @@ describe("self-loop outputs are extract rejects (T4 / SC5)", () => {
     expect(await runCli(["--only-failed", "--batch-size", "1"], deps)).toBe(0);
 
     expect(extractCalls).toBe(1);
-    const onlyFailedScan = client.queries.filter((query) =>
-      /FROM chunks c/.test(query)
+    // The SELECT scans only: the commit phase's chunk re-read and the
+    // caller's partition query are not the --only-failed scan.
+    const onlyFailedScan = client.queries.filter(
+      (query) =>
+        /FROM chunks c/.test(query) &&
+        !query.includes("c.source_ref FROM") &&
+        !query.includes("WHERE c.id = $1")
     )[1];
     expect(onlyFailedScan).toContain("status = 'failed'");
   });
@@ -2611,5 +2655,70 @@ describe("insertEntity fail-closed backstop (review C4)", () => {
     expect(err).toBeInstanceOf(GraphragError);
     expect((err as GraphragError).code).toBe("INVALID_INPUT");
     expect(client.queries).toEqual([]);
+  });
+});
+
+/**
+ * Caller-side partitioning (ADR-0013 Decision 1): one lifecycle per
+ * `source_ref`, each with its own cap. `processBatch` itself cannot see a
+ * source — the partition key is the caller's, resolved with ONE query.
+ */
+describe("runCli — one lifecycle per source_ref", () => {
+  function mixedSourceClient(): FakeClient {
+    const client = new FakeClient();
+    const chunks = [
+      { id: "chunk-a1", content: "Alice works at Acme Corp.", source_ref: "doc-a" },
+      { id: "chunk-b1", content: "Bob works at Beta Corp.", source_ref: "doc-b" },
+      { id: "chunk-a2", content: "Alice leads Acme Corp.", source_ref: "doc-a" },
+    ];
+    client.rowsOverride = (text: string) => {
+      if (text.includes("SELECT c.id, c.source_ref FROM chunks c")) {
+        return chunks.map(({ id, source_ref }) => ({ id, source_ref }));
+      }
+      if (text.includes("FROM chunks c")) {
+        if (text.includes("source_ref")) return [];
+        return chunks.map(({ id, content }) => ({ id, content }));
+      }
+      return [];
+    };
+    return client;
+  }
+
+  it("row 11: resolves the sources once and runs one lifecycle per source", async () => {
+    const client = mixedSourceClient();
+    const deps = makeDeps(client, new FakeLLMClient({ queue: [] }));
+
+    expect(await runCli(["--batch-size", "3"], deps)).toBe(0);
+
+    const partition = client.queries.filter((q) =>
+      q.includes("SELECT c.id, c.source_ref FROM chunks c")
+    );
+    // Exactly one resolution query for the whole selection, whatever its size.
+    expect(partition).toHaveLength(1);
+    // The partition query covers the selection, so it is asked for every id.
+    expect(client.valuesList[client.queries.indexOf(partition[0]!)]).toEqual([
+      "chunk-a1",
+      "chunk-b1",
+      "chunk-a2",
+    ]);
+  });
+
+  it("row 11: a selection that spans sources is extracted once per source chunk", async () => {
+    const client = mixedSourceClient();
+    const extracted: string[] = [];
+    const llm = new FakeLLMClient({
+      scripted: async (chunkText: string) => {
+        extracted.push(chunkText);
+        return { kind: "ok" as const, outputs: [] };
+      },
+    });
+    const deps = makeDeps(client, llm);
+
+    expect(await runCli(["--batch-size", "3"], deps)).toBe(0);
+    // Every selected chunk is extracted exactly once, and none is handed to a
+    // second source's lifecycle.
+    expect(extracted.sort()).toEqual(
+      ["Alice leads Acme Corp.", "Alice works at Acme Corp.", "Bob works at Beta Corp."].sort()
+    );
   });
 });

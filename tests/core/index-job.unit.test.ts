@@ -49,6 +49,11 @@ import {
 import { MemoryBackend } from "../../src/core/storage/memory-backend.js";
 import type { LogLevel } from "../../src/config.js";
 import type { Logger } from "../../src/logging.js";
+import {
+  createMergeEmbedBudget,
+  ENTITY_MERGE_EMBED_LIMIT,
+  MergeEmbedLimitError,
+} from "../../src/core/entities/merge-budget.js";
 
 const SOURCE_REF = "doc-1/1/main";
 const IDENTITY = "identity-v1";
@@ -516,5 +521,86 @@ describe("index job runner lease", () => {
     expect(row?.status).toBe(INDEX_JOB_STATUS.FAILED);
     expect(row?.failure_code).toBe("OTHER");
     expect(row?.finished_at).toBe("2026-09-26T00:06:00.000Z");
+  });
+});
+
+/**
+ * The runner's half of the entity-merge embed cap (ADR-0013): the breach
+ * publishes as a named terminal failure, a reclaimed job re-runs a fresh
+ * lifecycle, and two lifecycles never share a counter.
+ */
+describe("index job runner and the entity-merge embed cap", () => {
+  it("row 5: a budget refusal publishes failed with the entity-merge code", async () => {
+    const h = harness({
+      extractFault: new IndexJobStageError(
+        ENTITY_MERGE_EMBED_LIMIT,
+        "entity-merge embed cap reached: embed_calls=12 embed_cap=12"
+      ),
+    });
+    const job = await claimed(h.store);
+
+    const published = await runIndexJob(h.deps, job);
+
+    // Named and terminal: the seed classifier branches on this literal, and a
+    // cap refusal is retryable by an operator, not an internal fault to reclaim.
+    expect(published?.status).toBe(INDEX_JOB_STATUS.FAILED);
+    expect(published?.failure_code).toBe(ENTITY_MERGE_EMBED_LIMIT);
+    const row = await h.store.getJob(job.job_id);
+    expect(row?.failure_code).toBe(ENTITY_MERGE_EMBED_LIMIT);
+    // The graph stages never run over a population the cap refused.
+    expect(h.ports.calls).toEqual(["readSourceVersion", "runExtract"]);
+  });
+
+  it("row 6: a reclaimed job runs a fresh lifecycle over pending chunks only", async () => {
+    // First attempt breaches; the row is settled as failed and the operator
+    // re-queues it. The second lifecycle starts from the pending set again —
+    // nothing about the spent counter survives, and a chunk the first
+    // lifecycle already committed is out of scope for the new cap.
+    const first = harness({
+      extractFault: new IndexJobStageError(
+        ENTITY_MERGE_EMBED_LIMIT,
+        "entity-merge embed cap reached"
+      ),
+    });
+    const firstJob = await claimed(first.store);
+    await runIndexJob(first.deps, firstJob);
+
+    const second = harness();
+    const secondJob = await claimed(second.store);
+    const published = await runIndexJob(second.deps, secondJob);
+
+    expect(published?.status).toBe(INDEX_JOB_STATUS.READY);
+    expect(published?.failure_code).toBeNull();
+    // The fresh lifecycle asked for the same source and got a fresh run.
+    expect(second.ports.selectors.map((call) => call.sourceRef)).toEqual([
+      SOURCE_REF,
+      SOURCE_REF,
+      SOURCE_REF,
+    ]);
+  });
+
+  it("row 7: two lifecycles in one process keep independent budgets", async () => {
+    // The budget is per-lifecycle, never module state: a shared counter would
+    // let one job's spend refuse the other's first resolution.
+    const budget = createMergeEmbedBudget();
+    const first = budget.fork();
+    const second = budget.fork();
+
+    first.arm(3);
+    second.arm(5);
+    first.countResolution();
+    first.countResolution();
+    second.countResolution();
+
+    expect(first.snapshot()).toEqual({ embedCap: 3, embedCalls: 2 });
+    expect(second.snapshot()).toEqual({ embedCap: 5, embedCalls: 1 });
+    // Neither one exhausted the shared owner, and the owner itself is unarmed:
+    // it holds no cap of its own to leak into a lifecycle.
+    expect(budget.snapshot()).toEqual({ embedCap: null, embedCalls: 0 });
+    // The fourth charge on `first` is the one that refuses, on its own cap.
+    first.countResolution();
+    expect(() => first.countResolution()).toThrow(MergeEmbedLimitError);
+    expect(() => second.countResolution()).not.toThrow();
+    expect(second.snapshot()).toEqual({ embedCap: 5, embedCalls: 2 });
   });
 });

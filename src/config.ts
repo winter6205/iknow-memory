@@ -200,6 +200,8 @@ export interface GraphragEnv {
   pgvectorAnnMaxDimensions: number;
   /** Maximum number of items accepted by one ingest call. */
   ingestBatchLimit: number;
+  /** Staged-output byte ceiling for one extract lifecycle (ADR-0013). */
+  entityMergeStageMaxBytes: number;
   /** Maximum number of concurrent PostgreSQL pool clients. */
   pgvectorPoolMax: number;
   /** Maximum pool-acquisition wait before a typed failure. */
@@ -571,6 +573,26 @@ export function readIngestBatchLimit(): number {
     INGEST_BATCH_LIMIT_VAR,
     readRawEnv(INGEST_BATCH_LIMIT_VAR),
     DEFAULT_INGEST_BATCH_LIMIT
+  );
+}
+
+/**
+ * Environment variable bounding the OUTPUTS one extract lifecycle stages
+ * between its extract phase and its commit phase (ADR-0013). Staged outputs
+ * only — the commit phase re-reads chunk text by id — so the bound measures
+ * what the lifecycle actually holds.
+ */
+export const ENTITY_MERGE_STAGE_MAX_BYTES_VAR =
+  "GRAPHRAG_MEMORY_ENTITY_MERGE_STAGE_MAX_BYTES";
+/** 64 MiB: far above a real source's extracted outputs, far below a memory budget. */
+export const DEFAULT_ENTITY_MERGE_STAGE_MAX_BYTES = 67_108_864;
+
+/** Read the staged-output byte ceiling for one extract lifecycle. */
+export function readEntityMergeStageMaxBytes(): number {
+  return parseConfiguredPositiveInt(
+    ENTITY_MERGE_STAGE_MAX_BYTES_VAR,
+    readRawEnv(ENTITY_MERGE_STAGE_MAX_BYTES_VAR),
+    DEFAULT_ENTITY_MERGE_STAGE_MAX_BYTES
   );
 }
 
@@ -1221,6 +1243,7 @@ export function loadEnv(): GraphragEnv {
     );
   }
   const ingestBatchLimit = readIngestBatchLimit();
+  const entityMergeStageMaxBytes = readEntityMergeStageMaxBytes();
   const pgvectorPool = readPgvectorPoolConfig();
   const embedApiKey = resolveEmbedApiKey();
 
@@ -1266,6 +1289,7 @@ export function loadEnv(): GraphragEnv {
     embedDimensions,
     pgvectorAnnMaxDimensions,
     ingestBatchLimit,
+    entityMergeStageMaxBytes,
     pgvectorPoolMax: pgvectorPool.max,
     pgvectorConnectionWaitTimeoutMs: pgvectorPool.connectionWaitTimeoutMs,
     embedBaseUrl: embedBaseUrl?.replace(/\/$/, ""),

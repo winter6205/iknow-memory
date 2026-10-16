@@ -23,6 +23,7 @@ import {
   type MergeDecision,
 } from "./types.js";
 import { computeEntityEmbeddingText } from "./embedding.js";
+import { MergeBudgetError } from "./merge-budget.js";
 
 export type {
   MergeConfig,
@@ -361,8 +362,13 @@ async function judgeGrayPair(
  * `cosineSimilarity` throws `RangeError` on a dimension mismatch. Anything
  * else is an unexpected fault, and a skipped candidate would hide it behind a
  * plausible-looking `created-new`, so it propagates to the caller instead.
+ *
+ * A budget refusal is explicitly NOT an embed failure (ADR-0013): swallowing it
+ * would report a cost refusal as a skipped candidate and run the lifecycle to
+ * the end with the cap already spent.
  */
 function isUnprovableEmbed(err: unknown): boolean {
+  if (err instanceof MergeBudgetError) return false;
   return err instanceof GraphragError;
 }
 

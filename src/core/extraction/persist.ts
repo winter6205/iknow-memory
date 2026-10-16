@@ -33,6 +33,7 @@ import {
   type CandidateEntity,
   type IncomingEntity,
 } from "../entities/merge.js";
+import type { MergeEmbedBudget } from "../entities/merge-budget.js";
 import type {
   GrayZoneJudge,
   MergeDecision,
@@ -83,6 +84,13 @@ export interface ExtractPersistDeps {
    * without a judge (reject stands, two live entities).
    */
   mergeJudge?: GrayZoneJudge;
+  /**
+   * The lifecycle's entity-merge embed budget (ADR-0013). REQUIRED so no
+   * caller can reach a merge without a declared cap: the handle counts merge
+   * resolutions and refuses one that was never armed. A lifecycle owner forks
+   * it, arms its own derived cap, and threads that into persistOutputs.
+   */
+  mergeBudget: MergeEmbedBudget;
 }
 
 /** Injectable clock fallback: every log/timestamp site reads the time here. */
@@ -347,6 +355,46 @@ function isAliasSelfLoop(out: ExtractionOutput, types: ClosedSetTypes): boolean 
   );
 }
 
+/** Key separator for the cap's dedup keys; NUL never appears in a name. */
+const CAP_KEY_SEP = "\u0000";
+
+/**
+ * The one merge-embed cap derivation: `E + T + N` for a population of outputs
+ * and the chunk count that reached the commit phase (ADR-0013).
+ *
+ * `E` counts DISTINCT `(role, normalizeAlias(name), closed-set type)` keys and
+ * `T` counts DISTINCT `(normalizeAlias(head), normalizeAlias(tail), raw
+ * relation)` keys — deduplicated because a repeat of a key resolves by L0
+ * exact-name match at zero embed cost, once the first resolution has left a
+ * live row carrying that surface form. `N` is the caller's chunk count (the
+ * single-record promote lifecycle passes 1).
+ *
+ * It lives here, beside the two module-private filters it must apply in the
+ * same order `persistOutputs` applies them, so the counted population cannot
+ * drift from the committed one.
+ */
+export function deriveMergeEmbedCap(
+  outputs: readonly ExtractionOutput[],
+  chunks: number
+): { embedCap: number; calls: 0 } {
+  const entityKeys = new Set<string>();
+  const tripleKeys = new Set<string>();
+  for (const out of outputs) {
+    const types = resolveClosedSetTypes(out);
+    if (types === null) continue;
+    if (isAliasSelfLoop(out, types)) continue;
+    const head = normalizeAlias(out.head);
+    const tail = normalizeAlias(out.tail);
+    // Both roles count: a self-pair ran two resolutions.
+    entityKeys.add(`head${CAP_KEY_SEP}${head}${CAP_KEY_SEP}${types.headType}`);
+    entityKeys.add(`tail${CAP_KEY_SEP}${tail}${CAP_KEY_SEP}${types.tailType}`);
+    tripleKeys.add(
+      `${head}${CAP_KEY_SEP}${tail}${CAP_KEY_SEP}${out.relationRaw.trim().toLowerCase()}`
+    );
+  }
+  return { embedCap: entityKeys.size + tripleKeys.size + chunks, calls: 0 };
+}
+
 /**
  * Backstop for the SC6 exclusion above: a triple whose two ends resolved to
  * the same entity asserts nothing, so it is rejected. Only THAT triple is
@@ -542,7 +590,10 @@ async function resolveEntity(
     incoming,
     live,
     {
-      embedder: deps.embedder,
+      // The ONLY change on the merge-context seam: the budget's per-resolution
+      // counting proxy. `deps.embedder` stays raw, so the entity write embed
+      // and the relation-normalization batch are deliberately not capped.
+      embedder: deps.mergeBudget.countingProxy(deps.embedder),
       judgeGrayZone: deps.mergeJudge,
     }
   );

@@ -59,11 +59,14 @@ class FakeClient implements CliClient {
   async query(text: string, values?: unknown[]) {
     this.queries.push(text);
     this.valuesList.push(values ?? []);
-    return {
-      rows: /FROM chunks c/.test(text)
-        ? [{ id: CHUNK_ID, content: `${CHUNK_CONTENT} ${CANARY_KEY}` }]
-        : [],
-    };
+    const chunk = { id: CHUNK_ID, content: `${CHUNK_CONTENT} ${CANARY_KEY}` };
+    // Phase E stages outputs only, so the commit phase re-reads the chunk text
+    // by id; and the caller's partition query names the source.
+    if (text.includes("FROM chunks c WHERE c.id = $1")) return { rows: [chunk] };
+    if (text.includes("SELECT c.id, c.source_ref FROM chunks c")) {
+      return { rows: [{ id: CHUNK_ID, source_ref: "doc-1" }] };
+    }
+    return { rows: /FROM chunks c/.test(text) ? [chunk] : [] };
   }
   release(): void {}
 }

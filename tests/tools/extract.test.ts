@@ -22,7 +22,10 @@
  * lifted core pipeline — the tool only adds the selector contract, the cap
  * and the error mapping on top of it.
  */
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   createExtractHandler,
@@ -34,7 +37,7 @@ import {
 } from "../../src/tools/extract.js";
 import { FakeLLMClient } from "../../src/core/extraction/llm-client.js";
 import { FakeEmbedder } from "../../src/core/embedder.js";
-import { ConfigError } from "../../src/config.js";
+import { ConfigError, setSettingHomeForTests } from "../../src/config.js";
 import type { Logger } from "../../src/logging.js";
 import type { ToolResult } from "../../src/tools/registry.js";
 
@@ -76,6 +79,9 @@ class FakeQueryable implements ExtractClient {
    */
   failOn: string | undefined;
 
+  /** Chunk text the commit phase re-reads by id, learned from the scans. */
+  private readonly chunkText = new Map<string, string>();
+
   async query(text: string, values: unknown[] = []) {
     this.queries.push(text);
     this.valuesList.push(values);
@@ -84,7 +90,19 @@ class FakeQueryable implements ExtractClient {
       this.failOn = undefined;
       throw new Error(`simulated write failure on: ${fragment}`);
     }
-    return { rows: this.rowsFor(text) };
+    // Phase E stages outputs only, so the commit phase re-reads the chunk text
+    // by id; the fake answers from whatever the selector scans returned.
+    if (text.includes("FROM chunks c WHERE c.id = $1")) {
+      const id = String(values[0]);
+      return { rows: [{ id, content: this.chunkText.get(id) ?? "" }] };
+    }
+    const rows = this.rowsFor(text);
+    for (const row of rows) {
+      if (typeof row?.id === "string" && typeof row?.content === "string") {
+        this.chunkText.set(row.id, row.content);
+      }
+    }
+    return { rows };
   }
 
   release(): void {}
@@ -600,5 +618,59 @@ describe("createExtractHandler — concurrent class", () => {
       );
       expect(client.indexOf("ROLLBACK")).toBe(-1);
     }
+  });
+});
+
+/**
+ * Caller-side partitioning (ADR-0013 Decision 1): a `chunk_ids` selection that
+ * spans sources runs one lifecycle per source, each with its own cap.
+ */
+describe("createExtractHandler — one lifecycle per source_ref", () => {
+  // Isolated from the machine's operator settings file: the handler reads it
+  // before anything else, and this suite is about the partition, not env.
+  beforeAll(() => {
+    setSettingHomeForTests(
+      mkdtempSync(join(tmpdir(), "iknow-tools-extract-setting-"))
+    );
+  });
+  afterAll(() => setSettingHomeForTests(null));
+
+  function mixedSourceRows(_clientIndex: number, text: string): any[] {
+    const chunks = [
+      { id: UUID_A, content: "Alice works at Acme Corp.", source_ref: "doc-a" },
+      { id: UUID_B, content: "Bob works at Beta Corp.", source_ref: "doc-b" },
+    ];
+    if (text.includes("SELECT c.id, c.source_ref FROM chunks c")) {
+      return chunks.map(({ id, source_ref }) => ({ id, source_ref }));
+    }
+    if (text.includes("FROM chunks c")) {
+      if (text.includes("source_ref")) return [];
+      return chunks.map(({ id, content }) => ({ id, content }));
+    }
+    return [];
+  }
+
+  it("row 11: resolves the sources once and extracts every selected chunk once", async () => {
+    const extracted: string[] = [];
+    const llm = new FakeLLMClient({
+      scripted: async (chunkText: string) => {
+        extracted.push(chunkText);
+        return { kind: "ok" as const, outputs: [] };
+      },
+    });
+    const { deps, clients } = makeHarness({ llm, rowsFor: mixedSourceRows });
+    const handler = createExtractHandler(deps);
+
+    const result = await handler({ chunk_ids: [UUID_A, UUID_B] });
+    const body = parseBody(result);
+    expect(body.processed).toBe(2);
+    expect(extracted.sort()).toEqual(
+      ["Alice works at Acme Corp.", "Bob works at Beta Corp."].sort()
+    );
+    // One partition query for the whole selection, whatever its size.
+    const partition = clients[0]!.queries.filter((q) =>
+      q.includes("SELECT c.id, c.source_ref FROM chunks c")
+    );
+    expect(partition).toHaveLength(1);
   });
 });

@@ -26,6 +26,7 @@ import {
   DiscardRefusedError,
   PromotionRefusedError,
 } from "../../src/core/extraction/actions.js";
+import { MergeEmbedLimitError } from "../../src/core/entities/merge-budget.js";
 import type { ExtractClient } from "../../src/tools/extract.js";
 
 import { boot, fetchJson, memoryDeps } from "./helpers.js";
@@ -340,5 +341,65 @@ describe("re-extract — the failed chunk rides the extract thin write", () => {
     expect(runner.mock.calls[0]?.[0]).toEqual({ chunk_ids: [CHUNK_A] });
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ batch_id: BATCH_A, failed: 1 });
+  });
+});
+
+/**
+ * The promote lifecycle's entity-merge embed cap (ADR-0013 Decision 1A): the
+ * dashboard entry and the CLI entry are ONE semantic, and a breach is a cost
+ * refusal the operator retries — 503, never a 400 the caller treats as its own
+ * bad request.
+ */
+describe("POST /api/maintenance/promote — entity-merge embed cap", () => {
+  it("row 13: maps a budget breach to 503, not 400", async () => {
+    vi.spyOn(actionsModule, "promoteRecord").mockRejectedValue(
+      new MergeEmbedLimitError(
+        "entity-merge embed cap reached: embed_calls=4 embed_cap=4",
+        4,
+        4
+      )
+    );
+    const { baseUrl } = await boot(maintenanceDeps());
+    const res = await fetchJson(`${baseUrl}/api/maintenance/promote`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ record_id: REC_A }),
+    });
+
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ error: { code: "STORAGE_ERROR" } });
+  });
+
+  it("row 13: hands the promote a budget handle of its own", async () => {
+    // Per request, never shared across requests: one promote's spend must not
+    // be visible to the next one's cap.
+    const promoteSpy = vi
+      .spyOn(actionsModule, "promoteRecord")
+      .mockResolvedValue(undefined);
+    const { baseUrl } = await boot(maintenanceDeps());
+
+    await fetchJson(`${baseUrl}/api/maintenance/promote`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ record_id: REC_A }),
+    });
+    await fetchJson(`${baseUrl}/api/maintenance/promote`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ record_id: REC_B }),
+    });
+
+    const [first] = promoteSpy.mock.calls[0] as unknown as [
+      { mergeBudget: unknown },
+      ExtractClient,
+      string,
+    ];
+    const [second] = promoteSpy.mock.calls[1] as unknown as [
+      { mergeBudget: unknown },
+      ExtractClient,
+      string,
+    ];
+    expect(first.mergeBudget).toBeTruthy();
+    expect(second.mergeBudget).not.toBe(first.mergeBudget);
   });
 });

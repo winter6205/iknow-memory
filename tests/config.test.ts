@@ -179,6 +179,7 @@ describe("loadEnv — stage 0 stdio-only contract", () => {
       "embedBaseUrl",
       "embedDimensions",
       "embedModel",
+      "entityMergeStageMaxBytes",
       "extractWriteTimeSupersede",
       "ingestBatchLimit",
       "jev",
